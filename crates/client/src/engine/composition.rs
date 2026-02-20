@@ -19,7 +19,9 @@ use shared::AppConfig;
 use windows::Win32::{
     Foundation::{LPARAM, WPARAM},
     UI::{
-        Input::KeyboardAndMouse::{VK_CONTROL, VK_LMENU, VK_MENU, VK_RMENU},
+        Input::KeyboardAndMouse::{
+            VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_MENU, VK_RCONTROL, VK_RMENU,
+        },
         TextServices::{ITfComposition, ITfCompositionSink_Impl, ITfContext},
     },
 };
@@ -70,6 +72,11 @@ impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
 
 impl TextServiceFactory {
     #[inline]
+    fn is_ctrl_pressed() -> bool {
+        VK_CONTROL.is_pressed() || VK_LCONTROL.is_pressed() || VK_RCONTROL.is_pressed()
+    }
+
+    #[inline]
     fn is_alt_backquote(wparam: WPARAM, lparam: LPARAM) -> bool {
         const VK_OEM_3: usize = 0xC0;
         const SCAN_CODE_BACKQUOTE: usize = 0x29;
@@ -95,11 +102,12 @@ impl TextServiceFactory {
             return Ok(None);
         };
 
-        let is_ctrl_space = VK_CONTROL.is_pressed() && wparam.0 == 0x20;
+        let is_ctrl_pressed = Self::is_ctrl_pressed();
+        let is_ctrl_space = is_ctrl_pressed && wparam.0 == 0x20;
         let is_alt_backquote = Self::is_alt_backquote(wparam, lparam);
 
         // check shortcut keys
-        if VK_CONTROL.is_pressed() && !is_ctrl_space && !is_alt_backquote {
+        if is_ctrl_pressed && !is_ctrl_space && !is_alt_backquote {
             return Ok(None);
         }
 

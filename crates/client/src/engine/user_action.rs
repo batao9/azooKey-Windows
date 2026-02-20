@@ -1,7 +1,7 @@
 use crate::extension::VKeyExt;
 use anyhow::{Context, Result};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyboardState, ToUnicode, VK_CONTROL, VK_SHIFT,
+    GetKeyboardState, ToUnicode, VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_SHIFT,
 };
 
 #[derive(Debug)]
@@ -38,6 +38,11 @@ pub enum Function {
     Ten,
 }
 
+#[inline]
+fn is_ctrl_pressed() -> bool {
+    VK_CONTROL.is_pressed() || VK_LCONTROL.is_pressed() || VK_RCONTROL.is_pressed()
+}
+
 impl TryFrom<usize> for UserAction {
     type Error = anyhow::Error;
     fn try_from(key_code: usize) -> Result<UserAction> {
@@ -46,7 +51,7 @@ impl TryFrom<usize> for UserAction {
             0x09 => UserAction::Tab,       // VK_TAB
             0x0D => UserAction::Enter,     // VK_RETURN
             0x20 => {
-                if VK_CONTROL.is_pressed() {
+                if is_ctrl_pressed() {
                     UserAction::ToggleInputMode
                 } else {
                     UserAction::Space
