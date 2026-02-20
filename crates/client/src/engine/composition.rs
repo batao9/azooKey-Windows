@@ -15,8 +15,9 @@ use super::{
     text_util::{to_half_katakana, to_katakana},
     user_action::{Function, Navigation},
 };
+use shared::AppConfig;
 use windows::Win32::{
-    Foundation::WPARAM,
+    Foundation::{LPARAM, WPARAM},
     UI::{
         Input::KeyboardAndMouse::VK_CONTROL,
         TextServices::{ITfComposition, ITfCompositionSink_Impl, ITfContext},
@@ -68,19 +69,42 @@ impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
 }
 
 impl TextServiceFactory {
+    #[inline]
+    fn is_alt_backquote(wparam: WPARAM, lparam: LPARAM) -> bool {
+        const VK_OEM_3: usize = 0xC0;
+        const ALT_CONTEXT_BIT: usize = 0x2000_0000;
+        wparam.0 == VK_OEM_3 && ((lparam.0 as usize) & ALT_CONTEXT_BIT) != 0
+    }
+
     #[tracing::instrument]
     pub fn process_key(
         &self,
         context: Option<&ITfContext>,
         wparam: WPARAM,
+        lparam: LPARAM,
     ) -> Result<Option<(Vec<ClientAction>, CompositionState)>> {
         if context.is_none() {
             return Ok(None);
         };
 
+        let is_ctrl_space = VK_CONTROL.is_pressed() && wparam.0 == 0x20;
+        let is_alt_backquote = Self::is_alt_backquote(wparam, lparam);
+
         // check shortcut keys
-        if VK_CONTROL.is_pressed() && wparam.0 != 0x20 {
+        if VK_CONTROL.is_pressed() && !is_ctrl_space {
             return Ok(None);
+        }
+
+        if is_ctrl_space || is_alt_backquote {
+            let shortcuts = AppConfig::read().shortcuts;
+
+            if is_ctrl_space && !shortcuts.ctrl_space_toggle {
+                return Ok(None);
+            }
+
+            if is_alt_backquote && !shortcuts.alt_backquote_toggle {
+                return Ok(None);
+            }
         }
 
         #[allow(clippy::let_and_return)]
@@ -91,7 +115,11 @@ impl TextServiceFactory {
             (composition, mode)
         };
 
-        let action = UserAction::try_from(wparam.0)?;
+        let action = if is_alt_backquote {
+            UserAction::ToggleInputMode
+        } else {
+            UserAction::try_from(wparam.0)?
+        };
 
         let (transition, actions) = match composition.state {
             CompositionState::None => match action {
@@ -341,14 +369,19 @@ impl TextServiceFactory {
     }
 
     #[tracing::instrument]
-    pub fn handle_key(&self, context: Option<&ITfContext>, wparam: WPARAM) -> Result<bool> {
+    pub fn handle_key(
+        &self,
+        context: Option<&ITfContext>,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Result<bool> {
         if let Some(context) = context {
             self.borrow_mut()?.context = Some(context.clone());
         } else {
             return Ok(false);
         };
 
-        if let Some((actions, transition)) = self.process_key(context, wparam)? {
+        if let Some((actions, transition)) = self.process_key(context, wparam, lparam)? {
             self.handle_action(&actions, transition)?;
         } else {
             return Ok(false);

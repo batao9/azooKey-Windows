@@ -1,7 +1,7 @@
 use crate::extension::VKeyExt;
 use anyhow::{Context, Result};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyboardState, ToUnicode, VK_CONTROL, VK_MENU, VK_SHIFT,
+    GetKeyboardState, ToUnicode, VK_CONTROL, VK_SHIFT,
 };
 
 #[derive(Debug)]
@@ -80,7 +80,6 @@ impl TryFrom<usize> for UserAction {
             0x77 => UserAction::Function(Function::Eight), // VK_F8
             0x78 => UserAction::Function(Function::Nine), // VK_F9
             0x79 => UserAction::Function(Function::Ten), // VK_F10
-            0xC0 if VK_MENU.is_pressed() => UserAction::ToggleInputMode, // Alt + VK_OEM_3 (`)
             0x16 => UserAction::InputModeOn,  // VK_IME_ON
             0x1A => UserAction::InputModeOff, // VK_IME_OFF
 

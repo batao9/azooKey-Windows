@@ -1,6 +1,6 @@
 import { Textarea } from "@/components/ui/textarea";
 import { Switch } from "@/components/ui/switch";
-import { Bot, User, Cpu } from "lucide-react";
+import { Bot, User, Cpu, Keyboard } from "lucide-react";
 import {
     Select,
     SelectContent,
@@ -51,6 +51,10 @@ export const Zenzai = () => {
         profile: "",
         backend: "",
     });
+    const [shortcutValue, setShortcutValue] = useState({
+        ctrlSpaceToggle: true,
+        altBackquoteToggle: true,
+    });
 
     const [capability, setCapability] = useState({
         cpu: true,
@@ -63,10 +67,15 @@ export const Zenzai = () => {
         invoke<any>("get_config")
             .then((data) => {
                 const zenzai = data.zenzai;
+                const shortcuts = data.shortcuts ?? {};
                 setValue({
                     enable: zenzai.enable,
                     profile: zenzai.profile,
                     backend: zenzai.backend,
+                });
+                setShortcutValue({
+                    ctrlSpaceToggle: shortcuts.ctrl_space_toggle ?? true,
+                    altBackquoteToggle: shortcuts.alt_backquote_toggle ?? true,
                 });
             })
             .catch(() => {
@@ -127,6 +136,30 @@ export const Zenzai = () => {
         }
     };
 
+    const handleCtrlSpaceToggle = async () => {
+        const nextValue = !shortcutValue.ctrlSpaceToggle;
+        const data = await updateConfig((data) => {
+            data.shortcuts = data.shortcuts ?? {};
+            data.shortcuts.ctrl_space_toggle = nextValue;
+        });
+
+        if (data) {
+            setShortcutValue((prev) => ({ ...prev, ctrlSpaceToggle: nextValue }));
+        }
+    };
+
+    const handleAltBackquoteToggle = async () => {
+        const nextValue = !shortcutValue.altBackquoteToggle;
+        const data = await updateConfig((data) => {
+            data.shortcuts = data.shortcuts ?? {};
+            data.shortcuts.alt_backquote_toggle = nextValue;
+        });
+
+        if (data) {
+            setShortcutValue((prev) => ({ ...prev, altBackquoteToggle: nextValue }));
+        }
+    };
+
     return (
         <div className="space-y-8">
             <section className="space-y-2">
@@ -177,6 +210,34 @@ export const Zenzai = () => {
                             <ToolTipSelectItem name="Vulkan" value="vulkan" disabled={!capability.vulkan} tooltip="お使いのPCはVulkanに対応していません" />
                         </SelectContent>
                     </Select>
+                </div>
+            </section>
+
+            <section className="space-y-2">
+                <h1 className="text-sm font-bold text-foreground">入力モード切替ショートカット</h1>
+                <div className="flex items-center space-x-4 rounded-md border p-4">
+                    <Keyboard />
+                    <div className="flex-1 space-y-1">
+                        <p className="text-sm font-medium leading-none">
+                            Ctrl + Space を有効化
+                        </p>
+                        <p className="text-xs text-muted-foreground">
+                            英数/かな切り替えのショートカットとして Ctrl + Space を使用します
+                        </p>
+                    </div>
+                    <Switch checked={shortcutValue.ctrlSpaceToggle} onCheckedChange={handleCtrlSpaceToggle} />
+                </div>
+                <div className="flex items-center space-x-4 rounded-md border p-4">
+                    <Keyboard />
+                    <div className="flex-1 space-y-1">
+                        <p className="text-sm font-medium leading-none">
+                            Alt + ` を有効化
+                        </p>
+                        <p className="text-xs text-muted-foreground">
+                            英数/かな切り替えのショートカットとして Alt + ` を使用します
+                        </p>
+                    </div>
+                    <Switch checked={shortcutValue.altBackquoteToggle} onCheckedChange={handleAltBackquoteToggle} />
                 </div>
             </section>
         </div>
