@@ -2,6 +2,7 @@ target
 build
 scripts/*.exe
 logs/*
+.local/
 .idea
 
 *.gguf
