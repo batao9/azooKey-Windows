@@ -79,7 +79,7 @@ impl TextServiceFactory {
         };
 
         // check shortcut keys
-        if VK_CONTROL.is_pressed() {
+        if VK_CONTROL.is_pressed() && wparam.0 != 0x20 {
             return Ok(None);
         }
 
@@ -115,6 +115,14 @@ impl TextServiceFactory {
                         InputMode::Kana => ClientAction::SetIMEMode(InputMode::Latin),
                         InputMode::Latin => ClientAction::SetIMEMode(InputMode::Kana),
                     }],
+                ),
+                UserAction::InputModeOn => (
+                    CompositionState::None,
+                    vec![ClientAction::SetIMEMode(InputMode::Kana)],
+                ),
+                UserAction::InputModeOff => (
+                    CompositionState::None,
+                    vec![ClientAction::SetIMEMode(InputMode::Latin)],
                 ),
                 _ => {
                     return Ok(None);
@@ -172,6 +180,20 @@ impl TextServiceFactory {
                     ),
                 },
                 UserAction::ToggleInputMode => (
+                    CompositionState::None,
+                    vec![
+                        ClientAction::EndComposition,
+                        ClientAction::SetIMEMode(InputMode::Latin),
+                    ],
+                ),
+                UserAction::InputModeOn => (
+                    CompositionState::None,
+                    vec![
+                        ClientAction::EndComposition,
+                        ClientAction::SetIMEMode(InputMode::Kana),
+                    ],
+                ),
+                UserAction::InputModeOff => (
                     CompositionState::None,
                     vec![
                         ClientAction::EndComposition,
@@ -260,6 +282,20 @@ impl TextServiceFactory {
                     ),
                 },
                 UserAction::ToggleInputMode => (
+                    CompositionState::None,
+                    vec![
+                        ClientAction::EndComposition,
+                        ClientAction::SetIMEMode(InputMode::Latin),
+                    ],
+                ),
+                UserAction::InputModeOn => (
+                    CompositionState::None,
+                    vec![
+                        ClientAction::EndComposition,
+                        ClientAction::SetIMEMode(InputMode::Kana),
+                    ],
+                ),
+                UserAction::InputModeOff => (
                     CompositionState::None,
                     vec![
                         ClientAction::EndComposition,
