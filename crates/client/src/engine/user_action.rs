@@ -1,6 +1,8 @@
 use crate::extension::VKeyExt;
 use anyhow::{Context, Result};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, ToUnicode, VK_SHIFT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyboardState, ToUnicode, VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_SHIFT,
+};
 
 #[derive(Debug)]
 pub enum UserAction {
@@ -15,6 +17,8 @@ pub enum UserAction {
     Function(Function),
     Number(i8),
     ToggleInputMode,
+    InputModeOn,
+    InputModeOff,
 }
 
 #[derive(Debug)]
@@ -34,6 +38,11 @@ pub enum Function {
     Ten,
 }
 
+#[inline]
+fn is_ctrl_pressed() -> bool {
+    VK_CONTROL.is_pressed() || VK_LCONTROL.is_pressed() || VK_RCONTROL.is_pressed()
+}
+
 impl TryFrom<usize> for UserAction {
     type Error = anyhow::Error;
     fn try_from(key_code: usize) -> Result<UserAction> {
@@ -41,7 +50,13 @@ impl TryFrom<usize> for UserAction {
             0x08 => UserAction::Backspace, // VK_BACK
             0x09 => UserAction::Tab,       // VK_TAB
             0x0D => UserAction::Enter,     // VK_RETURN
-            0x20 => UserAction::Space,     // VK_SPACE
+            0x20 => {
+                if is_ctrl_pressed() {
+                    UserAction::ToggleInputMode
+                } else {
+                    UserAction::Space
+                }
+            } // VK_SPACE
             0x1B => UserAction::Escape,    // VK_ESCAPE
 
             0x25 => UserAction::Navigation(Navigation::Left), // VK_LEFT
@@ -70,6 +85,8 @@ impl TryFrom<usize> for UserAction {
             0x77 => UserAction::Function(Function::Eight), // VK_F8
             0x78 => UserAction::Function(Function::Nine), // VK_F9
             0x79 => UserAction::Function(Function::Ten), // VK_F10
+            0x16 => UserAction::InputModeOn,  // VK_IME_ON
+            0x1A => UserAction::InputModeOff, // VK_IME_OFF
 
             0xF3 | 0xF4 => UserAction::ToggleInputMode, // Zenkaku/Hankaku
 

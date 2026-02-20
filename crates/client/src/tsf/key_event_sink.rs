@@ -18,21 +18,21 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
         &self,
         pic: Option<&ITfContext>,
         wparam: WPARAM,
-        _lparam: LPARAM,
+        lparam: LPARAM,
     ) -> Result<BOOL> {
         // this function checks if the key event will be handled by "OnKeyUp" function
         // so we need to return TRUE if we want to handle the key event
-        let result = self.process_key(pic, wparam)?.is_some();
+        let result = self.process_key(pic, wparam, lparam)?.is_some();
 
         Ok(result.into())
     }
 
     #[macros::anyhow]
     #[tracing::instrument]
-    fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+    fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
         // this function is called when a key is pressed
         // we can handle key events here
-        let result = self.handle_key(pic, wparam)?;
+        let result = self.handle_key(pic, wparam, lparam)?;
 
         Ok(result.into())
     }

@@ -15,10 +15,13 @@ use super::{
     text_util::{to_half_katakana, to_katakana},
     user_action::{Function, Navigation},
 };
+use shared::AppConfig;
 use windows::Win32::{
-    Foundation::WPARAM,
+    Foundation::{LPARAM, WPARAM},
     UI::{
-        Input::KeyboardAndMouse::VK_CONTROL,
+        Input::KeyboardAndMouse::{
+            VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_MENU, VK_RCONTROL, VK_RMENU,
+        },
         TextServices::{ITfComposition, ITfCompositionSink_Impl, ITfContext},
     },
 };
@@ -68,19 +71,56 @@ impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
 }
 
 impl TextServiceFactory {
+    #[inline]
+    fn is_ctrl_pressed() -> bool {
+        VK_CONTROL.is_pressed() || VK_LCONTROL.is_pressed() || VK_RCONTROL.is_pressed()
+    }
+
+    #[inline]
+    fn is_alt_backquote(wparam: WPARAM, lparam: LPARAM) -> bool {
+        const VK_OEM_3: usize = 0xC0;
+        const SCAN_CODE_BACKQUOTE: usize = 0x29;
+        const ALT_CONTEXT_BIT: usize = 0x2000_0000;
+        let is_alt_pressed = VK_MENU.is_pressed()
+            || VK_LMENU.is_pressed()
+            || VK_RMENU.is_pressed()
+            || ((lparam.0 as usize) & ALT_CONTEXT_BIT) != 0;
+        let scan_code = ((lparam.0 as usize) >> 16) & 0xFF;
+        let is_backquote_key = wparam.0 == VK_OEM_3 || scan_code == SCAN_CODE_BACKQUOTE;
+
+        is_alt_pressed && is_backquote_key
+    }
+
     #[tracing::instrument]
     pub fn process_key(
         &self,
         context: Option<&ITfContext>,
         wparam: WPARAM,
+        lparam: LPARAM,
     ) -> Result<Option<(Vec<ClientAction>, CompositionState)>> {
         if context.is_none() {
             return Ok(None);
         };
 
+        let is_ctrl_pressed = Self::is_ctrl_pressed();
+        let is_ctrl_space = is_ctrl_pressed && wparam.0 == 0x20;
+        let is_alt_backquote = Self::is_alt_backquote(wparam, lparam);
+
         // check shortcut keys
-        if VK_CONTROL.is_pressed() {
+        if is_ctrl_pressed && !is_ctrl_space && !is_alt_backquote {
             return Ok(None);
+        }
+
+        if is_ctrl_space || is_alt_backquote {
+            let shortcuts = AppConfig::read().shortcuts;
+
+            if is_ctrl_space && !shortcuts.ctrl_space_toggle {
+                return Ok(None);
+            }
+
+            if is_alt_backquote && !shortcuts.alt_backquote_toggle {
+                return Ok(None);
+            }
         }
 
         #[allow(clippy::let_and_return)]
@@ -91,7 +131,11 @@ impl TextServiceFactory {
             (composition, mode)
         };
 
-        let action = UserAction::try_from(wparam.0)?;
+        let action = if is_alt_backquote {
+            UserAction::ToggleInputMode
+        } else {
+            UserAction::try_from(wparam.0)?
+        };
 
         let (transition, actions) = match composition.state {
             CompositionState::None => match action {
@@ -115,6 +159,14 @@ impl TextServiceFactory {
                         InputMode::Kana => ClientAction::SetIMEMode(InputMode::Latin),
                         InputMode::Latin => ClientAction::SetIMEMode(InputMode::Kana),
                     }],
+                ),
+                UserAction::InputModeOn => (
+                    CompositionState::None,
+                    vec![ClientAction::SetIMEMode(InputMode::Kana)],
+                ),
+                UserAction::InputModeOff => (
+                    CompositionState::None,
+                    vec![ClientAction::SetIMEMode(InputMode::Latin)],
                 ),
                 _ => {
                     return Ok(None);
@@ -172,6 +224,20 @@ impl TextServiceFactory {
                     ),
                 },
                 UserAction::ToggleInputMode => (
+                    CompositionState::None,
+                    vec![
+                        ClientAction::EndComposition,
+                        ClientAction::SetIMEMode(InputMode::Latin),
+                    ],
+                ),
+                UserAction::InputModeOn => (
+                    CompositionState::None,
+                    vec![
+                        ClientAction::EndComposition,
+                        ClientAction::SetIMEMode(InputMode::Kana),
+                    ],
+                ),
+                UserAction::InputModeOff => (
                     CompositionState::None,
                     vec![
                         ClientAction::EndComposition,
@@ -266,6 +332,20 @@ impl TextServiceFactory {
                         ClientAction::SetIMEMode(InputMode::Latin),
                     ],
                 ),
+                UserAction::InputModeOn => (
+                    CompositionState::None,
+                    vec![
+                        ClientAction::EndComposition,
+                        ClientAction::SetIMEMode(InputMode::Kana),
+                    ],
+                ),
+                UserAction::InputModeOff => (
+                    CompositionState::None,
+                    vec![
+                        ClientAction::EndComposition,
+                        ClientAction::SetIMEMode(InputMode::Latin),
+                    ],
+                ),
                 UserAction::Space | UserAction::Tab => (
                     CompositionState::Previewing,
                     vec![ClientAction::SetSelection(SetSelectionType::Down)],
@@ -305,14 +385,19 @@ impl TextServiceFactory {
     }
 
     #[tracing::instrument]
-    pub fn handle_key(&self, context: Option<&ITfContext>, wparam: WPARAM) -> Result<bool> {
+    pub fn handle_key(
+        &self,
+        context: Option<&ITfContext>,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Result<bool> {
         if let Some(context) = context {
             self.borrow_mut()?.context = Some(context.clone());
         } else {
             return Ok(false);
         };
 
-        if let Some((actions, transition)) = self.process_key(context, wparam)? {
+        if let Some((actions, transition)) = self.process_key(context, wparam, lparam)? {
             self.handle_action(&actions, transition)?;
         } else {
             return Ok(false);

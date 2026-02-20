@@ -23,9 +23,32 @@ pub struct ZenzaiConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ShortcutConfig {
+    #[serde(default = "default_shortcut_enabled")]
+    pub ctrl_space_toggle: bool,
+    #[serde(default = "default_shortcut_enabled")]
+    pub alt_backquote_toggle: bool,
+}
+
+fn default_shortcut_enabled() -> bool {
+    true
+}
+
+impl Default for ShortcutConfig {
+    fn default() -> Self {
+        Self {
+            ctrl_space_toggle: true,
+            alt_backquote_toggle: true,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AppConfig {
     pub version: String,
     pub zenzai: ZenzaiConfig,
+    #[serde(default)]
+    pub shortcuts: ShortcutConfig,
 }
 
 impl Default for AppConfig {
@@ -37,6 +60,7 @@ impl Default for AppConfig {
                 profile: "".to_string(),
                 backend: "cpu".to_string(),
             },
+            shortcuts: ShortcutConfig::default(),
         }
     }
 }
