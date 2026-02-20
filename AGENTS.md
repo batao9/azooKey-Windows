@@ -50,3 +50,4 @@ git diff --name-only upstream/master...HEAD
 ```
 
 出力に禁止変更が含まれる場合は、PR を作成せずコミット構成を整理する。
+upstream PRは必ずユーザーの許可を得てから実行する。
