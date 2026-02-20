@@ -2,6 +2,7 @@
 // extracted with scripts/extract_fullwidth.py
 
 use std::{collections::HashMap, sync::LazyLock};
+use shared::CHARACTER_WIDTH_SYMBOL_DEFAULTS;
 
 // in azookey, fullwidth alphabet will not be processed
 static HALF_FULL_AZOOKEY: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
@@ -103,6 +104,26 @@ static HALF_FULL_AZOOKEY: LazyLock<HashMap<&'static str, &'static str>> = LazyLo
     ])
 });
 
+static HALF_FULL_CONFIGURABLE: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
+    let mut map = HALF_FULL_AZOOKEY.clone();
+    map.extend([
+        ("0", "０"),
+        ("1", "１"),
+        ("2", "２"),
+        ("3", "３"),
+        ("4", "４"),
+        ("5", "５"),
+        ("6", "６"),
+        ("7", "７"),
+        ("8", "８"),
+        ("9", "９"),
+    ]);
+    map
+});
+
+static SYMBOL_FULLWIDTH_DEFAULTS: LazyLock<HashMap<&'static str, bool>> =
+    LazyLock::new(|| HashMap::from(CHARACTER_WIDTH_SYMBOL_DEFAULTS));
+
 static HALF_FULL: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
     HashMap::from([
         ("a", "ａ"),
@@ -163,6 +184,37 @@ pub fn to_fullwidth(s: &str, process_alphabet: bool) -> String {
             } else {
                 c.to_string()
             }
+        })
+        .collect()
+}
+
+pub fn to_fullwidth_with_config(
+    s: &str,
+    process_alphabet: bool,
+    symbol_fullwidth: &HashMap<String, bool>,
+) -> String {
+    s.chars()
+        .map(|c| {
+            let key = c.to_string();
+
+            if process_alphabet {
+                if let Some(&v) = HALF_FULL.get(key.as_str()) {
+                    return v.to_string();
+                }
+            }
+
+            if let Some(&v) = HALF_FULL_CONFIGURABLE.get(key.as_str()) {
+                let is_fullwidth = symbol_fullwidth
+                    .get(key.as_str())
+                    .copied()
+                    .or_else(|| SYMBOL_FULLWIDTH_DEFAULTS.get(key.as_str()).copied())
+                    .unwrap_or(false);
+                if is_fullwidth {
+                    return v.to_string();
+                }
+            }
+
+            c.to_string()
         })
         .collect()
 }

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/azookey.rs"));
@@ -15,6 +15,58 @@ fn get_config_root() -> PathBuf {
 
 const SETTINGS_FILENAME: &str = "settings.json";
 
+pub const CHARACTER_WIDTH_SYMBOL_DEFAULTS: [(&str, bool); 42] = [
+    ("0", false),
+    ("1", false),
+    ("2", false),
+    ("3", false),
+    ("4", false),
+    ("5", false),
+    ("6", false),
+    ("7", false),
+    ("8", false),
+    ("9", false),
+    ("!", true),
+    ("\"", true),
+    ("#", true),
+    ("$", true),
+    ("%", true),
+    ("&", true),
+    ("'", true),
+    ("(", true),
+    (")", true),
+    ("*", true),
+    ("+", true),
+    (",", true),
+    ("-", true),
+    (".", true),
+    ("/", true),
+    (":", true),
+    (";", true),
+    ("<", true),
+    ("=", true),
+    (">", true),
+    ("?", true),
+    ("@", true),
+    ("[", true),
+    ("\\", true),
+    ("]", true),
+    ("^", true),
+    ("_", true),
+    ("`", true),
+    ("{", true),
+    ("|", true),
+    ("}", true),
+    ("~", true),
+];
+
+pub fn default_symbol_fullwidth_map() -> HashMap<String, bool> {
+    CHARACTER_WIDTH_SYMBOL_DEFAULTS
+        .into_iter()
+        .map(|(symbol, is_fullwidth)| (symbol.to_string(), is_fullwidth))
+        .collect()
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ZenzaiConfig {
     pub enable: bool,
@@ -28,6 +80,20 @@ pub struct ShortcutConfig {
     pub ctrl_space_toggle: bool,
     #[serde(default = "default_shortcut_enabled")]
     pub alt_backquote_toggle: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct CharacterWidthConfig {
+    #[serde(default = "default_symbol_fullwidth_map")]
+    pub symbol_fullwidth: HashMap<String, bool>,
+}
+
+impl Default for CharacterWidthConfig {
+    fn default() -> Self {
+        Self {
+            symbol_fullwidth: default_symbol_fullwidth_map(),
+        }
+    }
 }
 
 fn default_shortcut_enabled() -> bool {
@@ -49,6 +115,8 @@ pub struct AppConfig {
     pub zenzai: ZenzaiConfig,
     #[serde(default)]
     pub shortcuts: ShortcutConfig,
+    #[serde(default)]
+    pub character_width: CharacterWidthConfig,
 }
 
 impl Default for AppConfig {
@@ -61,6 +129,7 @@ impl Default for AppConfig {
                 backend: "cpu".to_string(),
             },
             shortcuts: ShortcutConfig::default(),
+            character_width: CharacterWidthConfig::default(),
         }
     }
 }

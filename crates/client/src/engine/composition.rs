@@ -8,7 +8,7 @@ use crate::{
 
 use super::{
     client_action::{ClientAction, SetSelectionType, SetTextType},
-    full_width::{to_fullwidth, to_halfwidth},
+    full_width::{to_fullwidth, to_fullwidth_with_config, to_halfwidth},
     input_mode::InputMode,
     ipc_service::Candidates,
     state::IMEState,
@@ -130,6 +130,7 @@ impl TextServiceFactory {
             let mode = IMEState::get()?.input_mode.clone();
             (composition, mode)
         };
+        let symbol_fullwidth = AppConfig::read().character_width.symbol_fullwidth;
 
         let action = if is_alt_backquote {
             UserAction::ToggleInputMode
@@ -458,7 +459,9 @@ impl TextServiceFactory {
                     raw_input.push_str(&text);
 
                     let text = match mode {
-                        InputMode::Kana => to_fullwidth(text, false),
+                        InputMode::Kana => {
+                            to_fullwidth_with_config(text, false, &symbol_fullwidth)
+                        }
                         InputMode::Latin => text.to_string(),
                     };
 
@@ -578,7 +581,9 @@ impl TextServiceFactory {
 
                     ipc_service.shrink_text(corresponding_count.clone())?;
                     let text = match mode {
-                        InputMode::Kana => to_fullwidth(text, false),
+                        InputMode::Kana => {
+                            to_fullwidth_with_config(text, false, &symbol_fullwidth)
+                        }
                         InputMode::Latin => text.to_string(),
                     };
                     candidates = ipc_service.append_text(text)?;
