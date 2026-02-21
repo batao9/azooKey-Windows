@@ -9,7 +9,12 @@ use crate::extension::StringExt as _;
 use crate::globals::DllModule;
 use crate::tracing_chrome::{ChromeLayerBuilder, EventOrSpan};
 
-const LOG_FOLDER: &str = "D:/azookey-windows/logs";
+fn log_folder() -> std::path::PathBuf {
+    let base = std::env::var("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    base.join("azookey-windows").join("logs")
+}
 
 pub struct StringVisitor<'a> {
     string: &'a mut String,
@@ -25,15 +30,14 @@ impl<'a> Visit for StringVisitor<'a> {
 }
 
 pub fn setup_logger() -> anyhow::Result<()> {
-    #[cfg(not(debug_assertions))]
-    {
-        return Ok(());
-    }
+    let log_folder = log_folder();
+    std::fs::create_dir_all(&log_folder).ok();
+
     let timestamp = chrono::Local::now().format("%Y-%m-%d-%H.%M.%S");
-    let path = format!("{}/{}.json", LOG_FOLDER, timestamp);
+    let path = log_folder.join(format!("{}.json", timestamp));
 
     let writer = {
-        if let Ok(file) = std::fs::File::create(&path) {
+        if let Ok(file) = std::fs::File::create(path) {
             file
         } else {
             return Ok(());
@@ -79,6 +83,7 @@ pub fn setup_logger() -> anyhow::Result<()> {
     // ignore traces from other crates
     let filter = Targets::new()
         .with_target("azookey_windows", LevelFilter::DEBUG)
+        .with_target("ime_diag", LevelFilter::DEBUG)
         .with_default(LevelFilter::OFF);
 
     tracing_subscriber::registry()

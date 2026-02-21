@@ -498,7 +498,8 @@ impl TextServiceFactory {
                         state = ?composition.state,
                         input = %input_text,
                         converted = %converted_text,
-                        raw_input = %raw_input
+                        raw_input = %raw_input,
+                        "ime_diag_append_text"
                     );
 
                     candidates = ipc_service.append_text(converted_text)?;
@@ -520,7 +521,8 @@ impl TextServiceFactory {
                         suffix = %sub_text,
                         raw_hiragana = %hiragana,
                         corresponding_count,
-                        candidate_count = candidates.texts.len()
+                        candidate_count = candidates.texts.len(),
+                        "ime_diag_append_text_result"
                     );
 
                     self.set_text(&text, &sub_text)?;
@@ -646,7 +648,8 @@ impl TextServiceFactory {
                         input = %input_text,
                         converted = %converted_text,
                         raw_input = %raw_input,
-                        corresponding_count
+                        corresponding_count,
+                        "ime_diag_shrink_text_append"
                     );
 
                     candidates = ipc_service.append_text(converted_text)?;
@@ -670,7 +673,8 @@ impl TextServiceFactory {
                         suffix = %sub_text,
                         raw_hiragana = %hiragana,
                         corresponding_count,
-                        candidate_count = candidates.texts.len()
+                        candidate_count = candidates.texts.len(),
+                        "ime_diag_shrink_text_result"
                     );
 
                     ipc_service.set_candidates(candidates.texts.clone())?;
