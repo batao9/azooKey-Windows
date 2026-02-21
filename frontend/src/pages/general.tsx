@@ -96,23 +96,18 @@ const WIDTH_OPTIONS = [
 const WIDTH_ROWS: Array<{
     key: keyof CharacterWidthGroupsState;
     label: string;
-    example: string;
 }> = [
-    { key: "alphabet", label: "アルファベット", example: "A a" },
-    { key: "number", label: "数字", example: "0 1 2 3" },
-    { key: "bracket", label: "() {} []", example: "（ ） ｛ ｝ ［ ］" },
-    { key: "comma_period", label: "、 。", example: "､ ｡ / 、 。" },
-    { key: "middle_dot_corner_bracket", label: "･ ｢｣", example: "･ ｢ ｣ / ・ 「 」" },
-    { key: "quote", label: "\" '", example: "\" ' / ” ’" },
-    { key: "colon_semicolon", label: ": ;", example: ": ; / ： ；" },
-    {
-        key: "hash_group",
-        label: "# % & @ $ ^ _ | ` \\",
-        example: "# % & @ $ ^ _ | ` \\",
-    },
-    { key: "tilde", label: "~", example: "~ / ～" },
-    { key: "math_symbol", label: "< > = + - / *", example: "< > = + - / *" },
-    { key: "question_exclamation", label: "? !", example: "? ! / ？ ！" },
+    { key: "alphabet", label: "アルファベット" },
+    { key: "number", label: "数字" },
+    { key: "bracket", label: "() {} []" },
+    { key: "comma_period", label: "、 。" },
+    { key: "middle_dot_corner_bracket", label: "･ ｢｣" },
+    { key: "quote", label: "\" '" },
+    { key: "colon_semicolon", label: ": ;" },
+    { key: "hash_group", label: "# % & @ $ ^ _ | ` \\" },
+    { key: "tilde", label: "~" },
+    { key: "math_symbol", label: "< > = + - / *" },
+    { key: "question_exclamation", label: "? !" },
 ];
 
 const normalizeGeneralConfig = (value?: Record<string, unknown>): GeneralConfigState => ({
@@ -483,7 +478,6 @@ export const General = () => {
                                 <thead className="bg-muted/30 text-left text-xs text-muted-foreground">
                                     <tr>
                                         <th className="px-3 py-2 font-medium">文字グループ</th>
-                                        <th className="px-3 py-2 font-medium">例</th>
                                         <th className="px-3 py-2 font-medium">変換前文字列</th>
                                     </tr>
                                 </thead>
@@ -491,7 +485,6 @@ export const General = () => {
                                     {WIDTH_ROWS.map((row) => (
                                         <tr key={row.key} className="border-t">
                                             <td className="px-3 py-2 font-medium">{row.label}</td>
-                                            <td className="px-3 py-2 text-muted-foreground">{row.example}</td>
                                             <td className="px-3 py-2">
                                                 <Select
                                                     value={widthGroups[row.key]}

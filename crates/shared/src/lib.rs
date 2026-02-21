@@ -139,56 +139,6 @@ impl Default for CharacterWidthGroups {
     }
 }
 
-fn group_mode_from_legacy(
-    symbol_fullwidth: &HashMap<String, bool>,
-    keys: &[&str],
-    fallback: WidthMode,
-) -> WidthMode {
-    let mut full = 0;
-    let mut half = 0;
-
-    for key in keys {
-        if let Some(value) = symbol_fullwidth.get(*key) {
-            if *value {
-                full += 1;
-            } else {
-                half += 1;
-            }
-        }
-    }
-
-    if full == 0 && half == 0 {
-        fallback
-    } else if full >= half {
-        WidthMode::Full
-    } else {
-        WidthMode::Half
-    }
-}
-
-impl CharacterWidthGroups {
-    pub fn from_legacy_symbol_fullwidth(symbol_fullwidth: &HashMap<String, bool>) -> Self {
-        let defaults = Self::default();
-        Self {
-            alphabet: defaults.alphabet,
-            number: group_mode_from_legacy(symbol_fullwidth, &["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"], defaults.number),
-            bracket: group_mode_from_legacy(symbol_fullwidth, &["(", ")", "{", "}", "[", "]"], defaults.bracket),
-            comma_period: group_mode_from_legacy(symbol_fullwidth, &[",", "."], defaults.comma_period),
-            middle_dot_corner_bracket: group_mode_from_legacy(symbol_fullwidth, &["/", "[", "]"], defaults.middle_dot_corner_bracket),
-            quote: group_mode_from_legacy(symbol_fullwidth, &["\"", "'"], defaults.quote),
-            colon_semicolon: group_mode_from_legacy(symbol_fullwidth, &[":", ";"], defaults.colon_semicolon),
-            hash_group: group_mode_from_legacy(
-                symbol_fullwidth,
-                &["#", "%", "&", "@", "$", "^", "_", "|", "`", "\\"],
-                defaults.hash_group,
-            ),
-            tilde: group_mode_from_legacy(symbol_fullwidth, &["~"], defaults.tilde),
-            math_symbol: group_mode_from_legacy(symbol_fullwidth, &["<", ">", "=", "+", "-", "/", "*"], defaults.math_symbol),
-            question_exclamation: group_mode_from_legacy(symbol_fullwidth, &["?", "!"], defaults.question_exclamation),
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct GeneralConfig {
     #[serde(default)]
@@ -292,12 +242,6 @@ impl Default for CharacterWidthConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct LegacyCharacterWidthConfig {
-    #[serde(default = "default_symbol_fullwidth_map")]
-    symbol_fullwidth: HashMap<String, bool>,
-}
-
 impl Default for PunctuationStyle {
     fn default() -> Self {
         Self::ToutenKuten
@@ -379,28 +323,7 @@ impl AppConfig {
             return AppConfig::default();
         }
         let config_str = std::fs::read_to_string(config_path).unwrap();
-        let mut config: AppConfig = serde_json::from_str(&config_str).unwrap();
-
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&config_str) {
-            let has_groups = value
-                .get("character_width")
-                .and_then(|character_width| character_width.get("groups"))
-                .is_some();
-
-            if !has_groups {
-                let legacy = value
-                    .get("character_width")
-                    .cloned()
-                    .and_then(|cw| serde_json::from_value::<LegacyCharacterWidthConfig>(cw).ok())
-                    .unwrap_or(LegacyCharacterWidthConfig {
-                        symbol_fullwidth: config.character_width.symbol_fullwidth.clone(),
-                    });
-                config.character_width.groups =
-                    CharacterWidthGroups::from_legacy_symbol_fullwidth(&legacy.symbol_fullwidth);
-            }
-        }
-
-        config
+        serde_json::from_str(&config_str).unwrap()
     }
 
     pub fn new() -> Self {

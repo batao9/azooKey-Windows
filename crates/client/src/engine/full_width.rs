@@ -238,16 +238,33 @@ pub fn convert_kana_symbol(
 
     s.chars()
         .map(|c| {
-            let key = c.to_string();
+            let key = normalize_input_key(c);
 
-            let base = find_romaji_priority_output(&key, romaji_rows)
-                .or_else(|| apply_basic_setting(&key, general).map(str::to_string))
+            if let Some(romaji_output) = find_romaji_priority_output(&key, romaji_rows) {
+                return romaji_output;
+            }
+
+            let base = apply_basic_setting(&key, general)
+                .map(str::to_string)
                 .unwrap_or_else(|| legacy_fullwidth_or_half(&key, &character_width.symbol_fullwidth));
 
             apply_width_groups(&base, groups)
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn normalize_input_key(c: char) -> String {
+    match c {
+        'ˆ' | '＾' => "^".to_string(),
+        '〜' | '～' => "~".to_string(),
+        '＼' | '￥' | '¥' => "\\".to_string(),
+        '，' => ",".to_string(),
+        '．' => ".".to_string(),
+        '”' => "\"".to_string(),
+        '’' => "'".to_string(),
+        _ => c.to_string(),
+    }
 }
 
 fn find_romaji_priority_output(key: &str, romaji_rows: &[RomajiRule]) -> Option<String> {
@@ -281,7 +298,7 @@ fn apply_basic_setting(key: &str, general: &GeneralConfig) -> Option<&'static st
             SymbolStyle::CornerBracketMiddleDot | SymbolStyle::CornerBracketBackslash => "」",
             SymbolStyle::SquareBracketBackslash | SymbolStyle::SquareBracketMiddleDot => "］",
         }),
-        "\\" | "/" => Some(match general.symbol_style {
+        "/" => Some(match general.symbol_style {
             SymbolStyle::CornerBracketMiddleDot | SymbolStyle::SquareBracketMiddleDot => "・",
             SymbolStyle::SquareBracketBackslash | SymbolStyle::CornerBracketBackslash => "＼",
         }),
@@ -310,7 +327,6 @@ fn apply_width_groups(text: &str, groups: &CharacterWidthGroups) -> String {
 
 fn apply_width_group_char(c: char, groups: &CharacterWidthGroups) -> char {
     match c {
-        'a'..='z' | 'A'..='Z' | 'ａ'..='ｚ' | 'Ａ'..='Ｚ' => apply_alphabet(c, groups.alphabet),
         '0' | '０' => toggle_with_mode(c, groups.number, '0', '０'),
         '1' | '１' => toggle_with_mode(c, groups.number, '1', '１'),
         '2' | '２' => toggle_with_mode(c, groups.number, '2', '２'),
@@ -329,19 +345,21 @@ fn apply_width_group_char(c: char, groups: &CharacterWidthGroups) -> char {
         '[' | '［' => toggle_with_mode(c, groups.bracket, '[', '［'),
         ']' | '］' => toggle_with_mode(c, groups.bracket, ']', '］'),
 
-        ',' | '、' | '，' | '､' => match groups.comma_period {
+        ',' | '、' | '､' => match groups.comma_period {
             WidthMode::Half => '､',
-            WidthMode::Full => match c {
-                '，' => '，',
-                _ => '、',
-            },
+            WidthMode::Full => '、',
         },
-        '.' | '。' | '．' | '｡' => match groups.comma_period {
+        '，' => match groups.comma_period {
+            WidthMode::Half => ',',
+            WidthMode::Full => '，',
+        },
+        '.' | '。' | '｡' => match groups.comma_period {
             WidthMode::Half => '｡',
-            WidthMode::Full => match c {
-                '．' => '．',
-                _ => '。',
-            },
+            WidthMode::Full => '。',
+        },
+        '．' => match groups.comma_period {
+            WidthMode::Half => '.',
+            WidthMode::Full => '．',
         },
 
         '･' | '・' => toggle_with_mode(c, groups.middle_dot_corner_bracket, '･', '・'),
@@ -359,11 +377,11 @@ fn apply_width_group_char(c: char, groups: &CharacterWidthGroups) -> char {
         '%' | '％' => toggle_with_mode(c, groups.hash_group, '%', '％'),
         '&' | '＆' => toggle_with_mode(c, groups.hash_group, '&', '＆'),
         '@' | '＠' => toggle_with_mode(c, groups.hash_group, '@', '＠'),
-        '^' | '＾' => toggle_with_mode(c, groups.hash_group, '^', '＾'),
+        '^' | '＾' | 'ˆ' => toggle_with_mode(c, groups.hash_group, '^', '＾'),
         '_' | '＿' => toggle_with_mode(c, groups.hash_group, '_', '＿'),
         '|' | '｜' => toggle_with_mode(c, groups.hash_group, '|', '｜'),
         '`' | '｀' => toggle_with_mode(c, groups.hash_group, '`', '｀'),
-        '\\' | '￥' | '＼' => match groups.hash_group {
+        '\\' | '￥' | '＼' | '¥' => match groups.hash_group {
             WidthMode::Half => '\\',
             WidthMode::Full => '＼',
         },
@@ -407,30 +425,6 @@ fn toggle_with_mode(current: char, mode: WidthMode, half: char, full: char) -> c
                 current
             }
         }
-    }
-}
-
-fn apply_alphabet(current: char, mode: WidthMode) -> char {
-    match mode {
-        WidthMode::Half => to_halfwidth_alphabet(current).unwrap_or(current),
-        WidthMode::Full => to_fullwidth_alphabet(current).unwrap_or(current),
-    }
-}
-
-fn to_halfwidth_alphabet(c: char) -> Option<char> {
-    let code = c as u32;
-    if (0xFF21..=0xFF3A).contains(&code) || (0xFF41..=0xFF5A).contains(&code) {
-        char::from_u32(code - 0xFEE0)
-    } else {
-        None
-    }
-}
-
-fn to_fullwidth_alphabet(c: char) -> Option<char> {
-    if c.is_ascii_alphabetic() {
-        char::from_u32((c as u32) + 0xFEE0)
-    } else {
-        None
     }
 }
 
@@ -487,11 +481,63 @@ mod tests {
     }
 
     #[test]
+    fn punctuation_half_mode_keeps_style_specific_ascii_forms() {
+        let mut config = default_character_width();
+        config.groups.comma_period = WidthMode::Half;
+
+        let mut general = GeneralConfig::default();
+        general.punctuation_style = PunctuationStyle::FullwidthCommaFullwidthPeriod;
+        assert_eq!(convert_kana_symbol(",.", &general, &config, &[]), ",.");
+
+        general.punctuation_style = PunctuationStyle::ToutenFullwidthPeriod;
+        assert_eq!(convert_kana_symbol(",.", &general, &config, &[]), "､.");
+
+        general.punctuation_style = PunctuationStyle::FullwidthCommaKuten;
+        assert_eq!(convert_kana_symbol(",.", &general, &config, &[]), ",｡");
+    }
+
+    #[test]
     fn symbol_style_switches_brackets_and_middle_dot() {
         let mut general = GeneralConfig::default();
         general.symbol_style = SymbolStyle::SquareBracketBackslash;
 
         let output = convert_kana_symbol("[]\\", &general, &default_character_width(), &[]);
         assert_eq!(output, "［］\\");
+    }
+
+    #[test]
+    fn romaji_rule_bypasses_width_settings() {
+        let mut config = default_character_width();
+        config.groups.tilde = WidthMode::Half;
+
+        let rows = vec![RomajiRule {
+            input: "~".to_string(),
+            output: "〜".to_string(),
+            next_input: String::new(),
+        }];
+
+        assert_eq!(
+            convert_kana_symbol("~", &GeneralConfig::default(), &config, &rows),
+            "〜"
+        );
+    }
+
+    #[test]
+    fn backslash_is_not_forced_to_middle_dot_by_basic_setting() {
+        let mut general = GeneralConfig::default();
+        general.symbol_style = SymbolStyle::CornerBracketMiddleDot;
+
+        let mut config = default_character_width();
+        config.groups.hash_group = WidthMode::Half;
+
+        assert_eq!(convert_kana_symbol("\\", &general, &config, &[]), "\\");
+    }
+
+    #[test]
+    fn circumflex_variant_is_normalized() {
+        let mut config = default_character_width();
+        config.groups.hash_group = WidthMode::Full;
+
+        assert_eq!(convert_kana_symbol("ˆ", &GeneralConfig::default(), &config, &[]), "＾");
     }
 }
