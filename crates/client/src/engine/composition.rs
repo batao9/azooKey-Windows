@@ -479,18 +479,29 @@ impl TextServiceFactory {
                 }
                 ClientAction::AppendText(text) => {
                     raw_input.push_str(&text);
+                    let input_text = text.to_string();
 
-                    let text = match mode {
+                    let converted_text = match mode {
                         InputMode::Kana => convert_kana_symbol(
-                            text,
+                            &input_text,
                             &app_config.general,
                             &app_config.character_width,
                             &app_config.romaji_table.rows,
                         ),
-                        InputMode::Latin => text.to_string(),
+                        InputMode::Latin => input_text.clone(),
                     };
 
-                    candidates = ipc_service.append_text(text.clone())?;
+                    tracing::debug!(
+                        target: "ime_diag",
+                        action = "append_text",
+                        input_mode = ?mode,
+                        state = ?composition.state,
+                        input = %input_text,
+                        converted = %converted_text,
+                        raw_input = %raw_input
+                    );
+
+                    candidates = ipc_service.append_text(converted_text)?;
                     let text = candidates.texts[selection_index as usize].clone();
                     let sub_text = candidates.sub_texts[selection_index as usize].clone();
                     let hiragana = candidates.hiragana.clone();
@@ -500,6 +511,17 @@ impl TextServiceFactory {
                     preview = text.clone();
                     suffix = sub_text.clone();
                     raw_hiragana = hiragana.clone();
+
+                    tracing::debug!(
+                        target: "ime_diag",
+                        action = "append_text_result",
+                        input_mode = ?mode,
+                        preview = %text,
+                        suffix = %sub_text,
+                        raw_hiragana = %hiragana,
+                        corresponding_count,
+                        candidate_count = candidates.texts.len()
+                    );
 
                     self.set_text(&text, &sub_text)?;
                     ipc_service.set_candidates(candidates.texts.clone())?;
@@ -605,16 +627,29 @@ impl TextServiceFactory {
                         .collect();
 
                     ipc_service.shrink_text(corresponding_count.clone())?;
-                    let text = match mode {
+                    let input_text = text.to_string();
+                    let converted_text = match mode {
                         InputMode::Kana => convert_kana_symbol(
-                            text,
+                            &input_text,
                             &app_config.general,
                             &app_config.character_width,
                             &app_config.romaji_table.rows,
                         ),
-                        InputMode::Latin => text.to_string(),
+                        InputMode::Latin => input_text.clone(),
                     };
-                    candidates = ipc_service.append_text(text)?;
+
+                    tracing::debug!(
+                        target: "ime_diag",
+                        action = "shrink_text_append",
+                        input_mode = ?mode,
+                        state = ?composition.state,
+                        input = %input_text,
+                        converted = %converted_text,
+                        raw_input = %raw_input,
+                        corresponding_count
+                    );
+
+                    candidates = ipc_service.append_text(converted_text)?;
                     selection_index = 0;
 
                     let text = candidates.texts[selection_index as usize].clone();
@@ -626,6 +661,17 @@ impl TextServiceFactory {
                     preview = text.clone();
                     suffix = sub_text.clone();
                     raw_hiragana = hiragana.clone();
+
+                    tracing::debug!(
+                        target: "ime_diag",
+                        action = "shrink_text_result",
+                        input_mode = ?mode,
+                        preview = %text,
+                        suffix = %sub_text,
+                        raw_hiragana = %hiragana,
+                        corresponding_count,
+                        candidate_count = candidates.texts.len()
+                    );
 
                     ipc_service.set_candidates(candidates.texts.clone())?;
                     ipc_service.set_selection(selection_index as i32)?;
