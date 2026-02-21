@@ -15,7 +15,7 @@ pub enum UserAction {
     Unknown,
     Navigation(Navigation),
     Function(Function),
-    Number(i8),
+    Number { value: i8, is_numpad: bool },
     ToggleInputMode,
     InputModeOn,
     InputModeOff,
@@ -66,16 +66,86 @@ impl TryFrom<usize> for UserAction {
 
             0x30..=0x39 | 0x60..=0x69 if !VK_SHIFT.is_pressed() => {
                 match key_code {
-                    0x30 | 0x60 => UserAction::Number(0), // VK_0, VK_NUMPAD0
-                    0x31 | 0x61 => UserAction::Number(1), // VK_1, VK_NUMPAD1
-                    0x32 | 0x62 => UserAction::Number(2), // VK_2, VK_NUMPAD2
-                    0x33 | 0x63 => UserAction::Number(3), // VK_3, VK_NUMPAD3
-                    0x34 | 0x64 => UserAction::Number(4), // VK_4, VK_NUMPAD4
-                    0x35 | 0x65 => UserAction::Number(5), // VK_5, VK_NUMPAD5
-                    0x36 | 0x66 => UserAction::Number(6), // VK_6, VK_NUMPAD6
-                    0x37 | 0x67 => UserAction::Number(7), // VK_7, VK_NUMPAD7
-                    0x38 | 0x68 => UserAction::Number(8), // VK_8, VK_NUMPAD8
-                    0x39 | 0x69 => UserAction::Number(9), // VK_9, VK_NUMPAD9
+                    0x30 => UserAction::Number {
+                        value: 0,
+                        is_numpad: false,
+                    }, // VK_0
+                    0x31 => UserAction::Number {
+                        value: 1,
+                        is_numpad: false,
+                    }, // VK_1
+                    0x32 => UserAction::Number {
+                        value: 2,
+                        is_numpad: false,
+                    }, // VK_2
+                    0x33 => UserAction::Number {
+                        value: 3,
+                        is_numpad: false,
+                    }, // VK_3
+                    0x34 => UserAction::Number {
+                        value: 4,
+                        is_numpad: false,
+                    }, // VK_4
+                    0x35 => UserAction::Number {
+                        value: 5,
+                        is_numpad: false,
+                    }, // VK_5
+                    0x36 => UserAction::Number {
+                        value: 6,
+                        is_numpad: false,
+                    }, // VK_6
+                    0x37 => UserAction::Number {
+                        value: 7,
+                        is_numpad: false,
+                    }, // VK_7
+                    0x38 => UserAction::Number {
+                        value: 8,
+                        is_numpad: false,
+                    }, // VK_8
+                    0x39 => UserAction::Number {
+                        value: 9,
+                        is_numpad: false,
+                    }, // VK_9
+                    0x60 => UserAction::Number {
+                        value: 0,
+                        is_numpad: true,
+                    }, // VK_NUMPAD0
+                    0x61 => UserAction::Number {
+                        value: 1,
+                        is_numpad: true,
+                    }, // VK_NUMPAD1
+                    0x62 => UserAction::Number {
+                        value: 2,
+                        is_numpad: true,
+                    }, // VK_NUMPAD2
+                    0x63 => UserAction::Number {
+                        value: 3,
+                        is_numpad: true,
+                    }, // VK_NUMPAD3
+                    0x64 => UserAction::Number {
+                        value: 4,
+                        is_numpad: true,
+                    }, // VK_NUMPAD4
+                    0x65 => UserAction::Number {
+                        value: 5,
+                        is_numpad: true,
+                    }, // VK_NUMPAD5
+                    0x66 => UserAction::Number {
+                        value: 6,
+                        is_numpad: true,
+                    }, // VK_NUMPAD6
+                    0x67 => UserAction::Number {
+                        value: 7,
+                        is_numpad: true,
+                    }, // VK_NUMPAD7
+                    0x68 => UserAction::Number {
+                        value: 8,
+                        is_numpad: true,
+                    }, // VK_NUMPAD8
+                    0x69 => UserAction::Number {
+                        value: 9,
+                        is_numpad: true,
+                    }, // VK_NUMPAD9
                     _ => UserAction::Unknown,
                 }
             }

@@ -8,14 +8,14 @@ use crate::{
 
 use super::{
     client_action::{ClientAction, SetSelectionType, SetTextType},
-    full_width::{to_fullwidth, to_fullwidth_with_config, to_halfwidth},
+    full_width::{convert_kana_symbol, to_fullwidth, to_halfwidth},
     input_mode::InputMode,
     ipc_service::Candidates,
     state::IMEState,
     text_util::{to_half_katakana, to_katakana},
     user_action::{Function, Navigation},
 };
-use shared::AppConfig;
+use shared::{AppConfig, NumpadInputMode, SpaceInputMode};
 use windows::Win32::{
     Foundation::{LPARAM, WPARAM},
     UI::{
@@ -105,6 +105,7 @@ impl TextServiceFactory {
         let is_ctrl_pressed = Self::is_ctrl_pressed();
         let is_ctrl_space = is_ctrl_pressed && wparam.0 == 0x20;
         let is_alt_backquote = Self::is_alt_backquote(wparam, lparam);
+        let app_config = AppConfig::read();
 
         // check shortcut keys
         if is_ctrl_pressed && !is_ctrl_space && !is_alt_backquote {
@@ -112,7 +113,7 @@ impl TextServiceFactory {
         }
 
         if is_ctrl_space || is_alt_backquote {
-            let shortcuts = AppConfig::read().shortcuts;
+            let shortcuts = &app_config.shortcuts;
 
             if is_ctrl_space && !shortcuts.ctrl_space_toggle {
                 return Ok(None);
@@ -146,13 +147,33 @@ impl TextServiceFactory {
                         ClientAction::AppendText(char.to_string()),
                     ],
                 ),
-                UserAction::Number(number) if mode == InputMode::Kana => (
-                    CompositionState::Composing,
-                    vec![
-                        ClientAction::StartComposition,
-                        ClientAction::AppendText(number.to_string()),
-                    ],
-                ),
+                UserAction::Number { value, is_numpad } if mode == InputMode::Kana => {
+                    if is_numpad
+                        && app_config.general.numpad_input == NumpadInputMode::AlwaysHalf
+                    {
+                        return Ok(None);
+                    }
+                    (
+                        CompositionState::Composing,
+                        vec![
+                            ClientAction::StartComposition,
+                            ClientAction::AppendText(value.to_string()),
+                        ],
+                    )
+                }
+                UserAction::Space
+                    if mode == InputMode::Kana
+                        && app_config.general.space_input == SpaceInputMode::FollowInputMode =>
+                {
+                    (
+                        CompositionState::None,
+                        vec![
+                            ClientAction::StartComposition,
+                            ClientAction::AppendText("　".to_string()),
+                            ClientAction::EndComposition,
+                        ],
+                    )
+                }
                 UserAction::ToggleInputMode => (
                     CompositionState::None,
                     vec![match mode {
@@ -177,9 +198,9 @@ impl TextServiceFactory {
                     CompositionState::Composing,
                     vec![ClientAction::AppendText(char.to_string())],
                 ),
-                UserAction::Number(number) => (
+                UserAction::Number { value, .. } => (
                     CompositionState::Composing,
-                    vec![ClientAction::AppendText(number.to_string())],
+                    vec![ClientAction::AppendText(value.to_string())],
                 ),
                 UserAction::Backspace => {
                     if composition.preview.chars().count() == 1 {
@@ -279,9 +300,9 @@ impl TextServiceFactory {
                     CompositionState::Composing,
                     vec![ClientAction::ShrinkText(char.to_string())],
                 ),
-                UserAction::Number(number) => (
+                UserAction::Number { value, .. } => (
                     CompositionState::Composing,
-                    vec![ClientAction::ShrinkText(number.to_string())],
+                    vec![ClientAction::ShrinkText(value.to_string())],
                 ),
                 UserAction::Backspace => {
                     if composition.preview.chars().count() == 1 {
@@ -419,7 +440,7 @@ impl TextServiceFactory {
             let mode = IMEState::get()?.input_mode.clone();
             (composition, mode)
         };
-        let symbol_fullwidth = AppConfig::read().character_width.symbol_fullwidth;
+        let app_config = AppConfig::read();
 
         let mut preview = composition.preview.clone();
         let mut suffix = composition.suffix.clone();
@@ -459,9 +480,12 @@ impl TextServiceFactory {
                     raw_input.push_str(&text);
 
                     let text = match mode {
-                        InputMode::Kana => {
-                            to_fullwidth_with_config(text, false, &symbol_fullwidth)
-                        }
+                        InputMode::Kana => convert_kana_symbol(
+                            text,
+                            &app_config.general,
+                            &app_config.character_width,
+                            &app_config.romaji_table.rows,
+                        ),
                         InputMode::Latin => text.to_string(),
                     };
 
@@ -581,9 +605,12 @@ impl TextServiceFactory {
 
                     ipc_service.shrink_text(corresponding_count.clone())?;
                     let text = match mode {
-                        InputMode::Kana => {
-                            to_fullwidth_with_config(text, false, &symbol_fullwidth)
-                        }
+                        InputMode::Kana => convert_kana_symbol(
+                            text,
+                            &app_config.general,
+                            &app_config.character_width,
+                            &app_config.romaji_table.rows,
+                        ),
                         InputMode::Latin => text.to_string(),
                     };
                     candidates = ipc_service.append_text(text)?;
