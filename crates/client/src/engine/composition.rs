@@ -130,7 +130,6 @@ impl TextServiceFactory {
             let mode = IMEState::get()?.input_mode.clone();
             (composition, mode)
         };
-        let symbol_fullwidth = AppConfig::read().character_width.symbol_fullwidth;
 
         let action = if is_alt_backquote {
             UserAction::ToggleInputMode
@@ -420,6 +419,7 @@ impl TextServiceFactory {
             let mode = IMEState::get()?.input_mode.clone();
             (composition, mode)
         };
+        let symbol_fullwidth = AppConfig::read().character_width.symbol_fullwidth;
 
         let mut preview = composition.preview.clone();
         let mut suffix = composition.suffix.clone();
