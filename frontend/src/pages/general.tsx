@@ -73,8 +73,8 @@ const PUNCTUATION_OPTIONS = [
 
 const SYMBOL_OPTIONS = [
     { value: "corner_bracket_middle_dot", label: "「」・" },
-    { value: "square_bracket_backslash", label: "［］＼" },
-    { value: "corner_bracket_backslash", label: "「」＼" },
+    { value: "square_bracket_backslash", label: "［］／" },
+    { value: "corner_bracket_backslash", label: "「」／" },
     { value: "square_bracket_middle_dot", label: "［］・" },
 ];
 
@@ -97,7 +97,6 @@ const WIDTH_ROWS: Array<{
     key: keyof CharacterWidthGroupsState;
     label: string;
 }> = [
-    { key: "alphabet", label: "アルファベット" },
     { key: "number", label: "数字" },
     { key: "bracket", label: "() {} []" },
     { key: "comma_period", label: "、 。" },
@@ -339,8 +338,9 @@ export const General = () => {
     };
 
     const widthSummary = useMemo(() => {
-        const fullCount = Object.values(widthGroups).filter((mode) => mode === "full").length;
-        const halfCount = Object.values(widthGroups).length - fullCount;
+        const visibleModes = WIDTH_ROWS.map((row) => widthGroups[row.key]);
+        const fullCount = visibleModes.filter((mode) => mode === "full").length;
+        const halfCount = visibleModes.length - fullCount;
         return `半角 ${halfCount} / 全角 ${fullCount}`;
     }, [widthGroups]);
 

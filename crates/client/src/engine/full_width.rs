@@ -248,7 +248,7 @@ pub fn convert_kana_symbol(
                 .map(str::to_string)
                 .unwrap_or_else(|| legacy_fullwidth_or_half(&key, &character_width.symbol_fullwidth));
 
-            apply_width_groups(&base, groups)
+            apply_width_groups_with_source_key(&base, &key, groups)
         })
         .collect::<Vec<_>>()
         .join("")
@@ -300,7 +300,7 @@ fn apply_basic_setting(key: &str, general: &GeneralConfig) -> Option<&'static st
         }),
         "/" => Some(match general.symbol_style {
             SymbolStyle::CornerBracketMiddleDot | SymbolStyle::SquareBracketMiddleDot => "・",
-            SymbolStyle::SquareBracketBackslash | SymbolStyle::CornerBracketBackslash => "＼",
+            SymbolStyle::SquareBracketBackslash | SymbolStyle::CornerBracketBackslash => "／",
         }),
         _ => None,
     }
@@ -323,6 +323,31 @@ fn legacy_fullwidth_or_half(key: &str, symbol_fullwidth: &HashMap<String, bool>)
 
 fn apply_width_groups(text: &str, groups: &CharacterWidthGroups) -> String {
     text.chars().map(|c| apply_width_group_char(c, groups)).collect()
+}
+
+fn apply_width_groups_with_source_key(
+    text: &str,
+    source_key: &str,
+    groups: &CharacterWidthGroups,
+) -> String {
+    if source_key == "/" {
+        return text
+            .chars()
+            .map(|c| match c {
+                '・' | '･' => match groups.math_symbol {
+                    WidthMode::Half => '･',
+                    WidthMode::Full => '・',
+                },
+                '/' | '／' => match groups.math_symbol {
+                    WidthMode::Half => '/',
+                    WidthMode::Full => '／',
+                },
+                _ => apply_width_group_char(c, groups),
+            })
+            .collect();
+    }
+
+    apply_width_groups(text, groups)
 }
 
 fn apply_width_group_char(c: char, groups: &CharacterWidthGroups) -> char {
@@ -503,6 +528,28 @@ mod tests {
 
         let output = convert_kana_symbol("[]\\", &general, &default_character_width(), &[]);
         assert_eq!(output, "［］\\");
+    }
+
+    #[test]
+    fn slash_style_uses_fullwidth_solidus() {
+        let mut general = GeneralConfig::default();
+        general.symbol_style = SymbolStyle::SquareBracketBackslash;
+
+        let output = convert_kana_symbol("/", &general, &default_character_width(), &[]);
+        assert_eq!(output, "／");
+    }
+
+    #[test]
+    fn slash_to_middle_dot_follows_math_symbol_width_group() {
+        let mut general = GeneralConfig::default();
+        general.symbol_style = SymbolStyle::CornerBracketMiddleDot;
+
+        let mut config = default_character_width();
+        config.groups.middle_dot_corner_bracket = WidthMode::Half;
+        config.groups.math_symbol = WidthMode::Full;
+
+        let output = convert_kana_symbol("/", &general, &config, &[]);
+        assert_eq!(output, "・");
     }
 
     #[test]

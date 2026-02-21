@@ -43,6 +43,12 @@ fn is_ctrl_pressed() -> bool {
     VK_CONTROL.is_pressed() || VK_LCONTROL.is_pressed() || VK_RCONTROL.is_pressed()
 }
 
+fn clear_dead_key_state(key_state: &[u8; 256]) {
+    let mut unicode = [0u16; 8];
+    // Use VK_SPACE to clear dead-key state left by ToUnicode.
+    unsafe { ToUnicode(0x20, 0, Some(key_state), &mut unicode, 0) };
+}
+
 impl TryFrom<usize> for UserAction {
     type Error = anyhow::Error;
     fn try_from(key_code: usize) -> Result<UserAction> {
@@ -168,13 +174,17 @@ impl TryFrom<usize> for UserAction {
                     }
                     key_state
                 };
-                let unicode = {
+                let (unicode, unicode_result) = {
                     let mut unicode = [0u16; 1];
-                    unsafe { ToUnicode(key_code as u32, 0, Some(&key_state), &mut unicode, 0) };
-                    unicode[0]
+                    let result =
+                        unsafe { ToUnicode(key_code as u32, 0, Some(&key_state), &mut unicode, 0) };
+                    (unicode[0], result)
                 };
 
                 if unicode != 0 {
+                    if unicode_result < 0 {
+                        clear_dead_key_state(&key_state);
+                    }
                     UserAction::Input(char::from_u32(unicode as u32).context("Invalid char")?)
                 } else {
                     UserAction::Unknown

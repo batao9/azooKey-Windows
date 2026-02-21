@@ -161,15 +161,16 @@ impl TextServiceFactory {
                         ],
                     )
                 }
-                UserAction::Space
-                    if mode == InputMode::Kana
-                        && app_config.general.space_input == SpaceInputMode::FollowInputMode =>
-                {
+                UserAction::Space if mode == InputMode::Kana => {
+                    let space = match app_config.general.space_input {
+                        SpaceInputMode::AlwaysHalf => " ",
+                        SpaceInputMode::FollowInputMode => "　",
+                    };
                     (
                         CompositionState::None,
                         vec![
                             ClientAction::StartComposition,
-                            ClientAction::AppendText("　".to_string()),
+                            ClientAction::AppendText(space.to_string()),
                             ClientAction::EndComposition,
                         ],
                     )

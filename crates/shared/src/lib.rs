@@ -14,6 +14,7 @@ fn get_config_root() -> PathBuf {
 }
 
 const SETTINGS_FILENAME: &str = "settings.json";
+const CONFIG_VERSION: &str = "0.1.1";
 
 pub const CHARACTER_WIDTH_SYMBOL_DEFAULTS: [(&str, bool); 42] = [
     ("0", false),
@@ -106,7 +107,7 @@ pub enum NumpadInputMode {
     FollowInputMode,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct CharacterWidthGroups {
     pub alphabet: WidthMode,
     pub number: WidthMode,
@@ -139,6 +140,78 @@ impl Default for CharacterWidthGroups {
     }
 }
 
+fn group_mode_from_legacy(
+    symbol_fullwidth: &HashMap<String, bool>,
+    keys: &[&str],
+    fallback: WidthMode,
+) -> WidthMode {
+    let mut full = 0;
+    let mut half = 0;
+
+    for key in keys {
+        if let Some(value) = symbol_fullwidth.get(*key) {
+            if *value {
+                full += 1;
+            } else {
+                half += 1;
+            }
+        }
+    }
+
+    if full == 0 && half == 0 {
+        fallback
+    } else if full >= half {
+        WidthMode::Full
+    } else {
+        WidthMode::Half
+    }
+}
+
+fn legacy_groups_from_symbol_fullwidth(symbol_fullwidth: &HashMap<String, bool>) -> CharacterWidthGroups {
+    let defaults = CharacterWidthGroups::default();
+    CharacterWidthGroups {
+        alphabet: defaults.alphabet,
+        number: group_mode_from_legacy(
+            symbol_fullwidth,
+            &["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
+            defaults.number,
+        ),
+        bracket: group_mode_from_legacy(
+            symbol_fullwidth,
+            &["(", ")", "{", "}", "[", "]"],
+            defaults.bracket,
+        ),
+        comma_period: group_mode_from_legacy(symbol_fullwidth, &[",", "."], defaults.comma_period),
+        middle_dot_corner_bracket: group_mode_from_legacy(
+            symbol_fullwidth,
+            &["/", "[", "]"],
+            defaults.middle_dot_corner_bracket,
+        ),
+        quote: group_mode_from_legacy(symbol_fullwidth, &["\"", "'"], defaults.quote),
+        colon_semicolon: group_mode_from_legacy(
+            symbol_fullwidth,
+            &[":", ";"],
+            defaults.colon_semicolon,
+        ),
+        hash_group: group_mode_from_legacy(
+            symbol_fullwidth,
+            &["#", "%", "&", "@", "$", "^", "_", "|", "`", "\\"],
+            defaults.hash_group,
+        ),
+        tilde: group_mode_from_legacy(symbol_fullwidth, &["~"], defaults.tilde),
+        math_symbol: group_mode_from_legacy(
+            symbol_fullwidth,
+            &["<", ">", "=", "+", "-", "/", "*"],
+            defaults.math_symbol,
+        ),
+        question_exclamation: group_mode_from_legacy(
+            symbol_fullwidth,
+            &["?", "!"],
+            defaults.question_exclamation,
+        ),
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct GeneralConfig {
     #[serde(default)]
@@ -168,6 +241,23 @@ pub struct RomajiRule {
     pub output: String,
     #[serde(default)]
     pub next_input: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct LegacyCharacterWidthConfig {
+    #[serde(default = "default_symbol_fullwidth_map")]
+    symbol_fullwidth: HashMap<String, bool>,
+}
+
+fn is_legacy_removed_default_row(row: &RomajiRule) -> bool {
+    matches!(
+        (row.input.as_str(), row.output.as_str(), row.next_input.as_str()),
+        ("~", "〜", "")
+            | (".", "。", "")
+            | (",", "、", "")
+            | ("[", "「", "")
+            | ("]", "」", "")
+    )
 }
 
 fn default_romaji_rows() -> Vec<RomajiRule> {
@@ -296,7 +386,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         AppConfig {
-            version: "0.1.0".to_string(),
+            version: CONFIG_VERSION.to_string(),
             zenzai: ZenzaiConfig {
                 enable: false,
                 profile: "".to_string(),
@@ -323,7 +413,32 @@ impl AppConfig {
             return AppConfig::default();
         }
         let config_str = std::fs::read_to_string(config_path).unwrap();
-        serde_json::from_str(&config_str).unwrap()
+        let mut config: AppConfig = serde_json::from_str(&config_str).unwrap();
+
+        if config.version != CONFIG_VERSION {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&config_str) {
+                let legacy = value
+                    .get("character_width")
+                    .cloned()
+                    .and_then(|cw| serde_json::from_value::<LegacyCharacterWidthConfig>(cw).ok())
+                    .unwrap_or(LegacyCharacterWidthConfig {
+                        symbol_fullwidth: config.character_width.symbol_fullwidth.clone(),
+                    });
+                let legacy_groups = legacy_groups_from_symbol_fullwidth(&legacy.symbol_fullwidth);
+
+                if config.character_width.groups == legacy_groups {
+                    config.character_width.groups = CharacterWidthGroups::default();
+                }
+            }
+
+            config
+                .romaji_table
+                .rows
+                .retain(|row| !is_legacy_removed_default_row(row));
+            config.version = CONFIG_VERSION.to_string();
+        }
+
+        config
     }
 
     pub fn new() -> Self {
