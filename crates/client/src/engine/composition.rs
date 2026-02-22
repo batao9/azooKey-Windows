@@ -20,7 +20,7 @@ use windows::Win32::{
     Foundation::{LPARAM, WPARAM},
     UI::{
         Input::KeyboardAndMouse::{
-            VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_MENU, VK_RCONTROL, VK_RMENU,
+            VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_MENU, VK_RCONTROL, VK_RMENU, VK_SHIFT,
         },
         TextServices::{ITfComposition, ITfCompositionSink_Impl, ITfContext},
     },
@@ -77,6 +77,11 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn is_shift_pressed() -> bool {
+        VK_SHIFT.is_pressed()
+    }
+
+    #[inline]
     fn is_alt_backquote(wparam: WPARAM, lparam: LPARAM) -> bool {
         const VK_OEM_3: usize = 0xC0;
         const SCAN_CODE_BACKQUOTE: usize = 0x29;
@@ -103,6 +108,7 @@ impl TextServiceFactory {
         };
 
         let is_ctrl_pressed = Self::is_ctrl_pressed();
+        let is_shift_pressed = Self::is_shift_pressed();
         let is_ctrl_space = is_ctrl_pressed && wparam.0 == 0x20;
         let is_alt_backquote = Self::is_alt_backquote(wparam, lparam);
         let app_config = AppConfig::read();
@@ -162,10 +168,11 @@ impl TextServiceFactory {
                     )
                 }
                 UserAction::Space if mode == InputMode::Kana => {
-                    let space = match app_config.general.space_input {
-                        SpaceInputMode::AlwaysHalf => " ",
-                        SpaceInputMode::FollowInputMode => "　",
-                    };
+                    let mut use_halfwidth = matches!(app_config.general.space_input, SpaceInputMode::AlwaysHalf);
+                    if is_shift_pressed {
+                        use_halfwidth = !use_halfwidth;
+                    }
+                    let space = if use_halfwidth { " " } else { "　" };
                     (
                         CompositionState::None,
                         vec![

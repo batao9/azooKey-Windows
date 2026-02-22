@@ -97,6 +97,7 @@ pub enum SymbolStyle {
 #[serde(rename_all = "snake_case")]
 pub enum SpaceInputMode {
     AlwaysHalf,
+    #[serde(alias = "always_full")]
     FollowInputMode,
 }
 
