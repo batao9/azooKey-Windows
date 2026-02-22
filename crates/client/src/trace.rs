@@ -30,14 +30,6 @@ impl<'a> Visit for StringVisitor<'a> {
 }
 
 pub fn setup_logger() -> anyhow::Result<()> {
-    let force_enable = std::env::var("AZOOKEY_ENABLE_LOG")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
-    if !cfg!(debug_assertions) && !force_enable {
-        return Ok(());
-    }
-
     let log_folder = log_folder();
     std::fs::create_dir_all(&log_folder).ok();
 
@@ -94,10 +86,10 @@ pub fn setup_logger() -> anyhow::Result<()> {
         .with_target("ime_diag", LevelFilter::DEBUG)
         .with_default(LevelFilter::OFF);
 
-    let _ = tracing_subscriber::registry()
+    tracing_subscriber::registry()
         .with(filter)
         .with(chrome_layer)
-        .try_init();
+        .init();
 
     Ok(())
 }
