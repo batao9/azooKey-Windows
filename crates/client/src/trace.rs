@@ -30,6 +30,14 @@ impl<'a> Visit for StringVisitor<'a> {
 }
 
 pub fn setup_logger() -> anyhow::Result<()> {
+    let force_enable = std::env::var("AZOOKEY_ENABLE_LOG")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if !cfg!(debug_assertions) && !force_enable {
+        return Ok(());
+    }
+
     let log_folder = log_folder();
     std::fs::create_dir_all(&log_folder).ok();
 
@@ -80,18 +88,11 @@ pub fn setup_logger() -> anyhow::Result<()> {
 
     DllModule::get()?.sender = Some(sender);
 
-    // ignore traces from other crates.
-    // Release builds keep only ime_diag to reduce log volume.
-    let filter = if cfg!(debug_assertions) {
-        Targets::new()
-            .with_target("azookey_windows", LevelFilter::DEBUG)
-            .with_target("ime_diag", LevelFilter::DEBUG)
-            .with_default(LevelFilter::OFF)
-    } else {
-        Targets::new()
-            .with_target("ime_diag", LevelFilter::DEBUG)
-            .with_default(LevelFilter::OFF)
-    };
+    // ignore traces from other crates
+    let filter = Targets::new()
+        .with_target("azookey_windows", LevelFilter::DEBUG)
+        .with_target("ime_diag", LevelFilter::DEBUG)
+        .with_default(LevelFilter::OFF);
 
     let _ = tracing_subscriber::registry()
         .with(filter)
