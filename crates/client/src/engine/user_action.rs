@@ -47,7 +47,6 @@ fn clear_dead_key_state(key_state: &[u8; 256]) {
     let mut unicode = [0u16; 8];
     // Use VK_SPACE to clear dead-key state left by ToUnicode.
     unsafe { ToUnicode(0x20, 0, Some(key_state), &mut unicode, 0) };
-    tracing::debug!(target: "ime_diag", action = "clear_dead_key_state");
 }
 
 impl TryFrom<usize> for UserAction {
@@ -184,33 +183,10 @@ impl TryFrom<usize> for UserAction {
 
                 if unicode != 0 {
                     if unicode_result < 0 {
-                        tracing::debug!(
-                            target: "ime_diag",
-                            action = "to_unicode_dead_key",
-                            key_code,
-                            unicode,
-                            unicode_result
-                        );
                         clear_dead_key_state(&key_state);
                     }
-                    let input_char = char::from_u32(unicode as u32).context("Invalid char")?;
-                    tracing::debug!(
-                        target: "ime_diag",
-                        action = "to_unicode_input",
-                        key_code,
-                        unicode,
-                        unicode_result,
-                        input_char = %input_char
-                    );
-                    UserAction::Input(input_char)
+                    UserAction::Input(char::from_u32(unicode as u32).context("Invalid char")?)
                 } else {
-                    tracing::debug!(
-                        target: "ime_diag",
-                        action = "to_unicode_unknown",
-                        key_code,
-                        unicode,
-                        unicode_result
-                    );
                     UserAction::Unknown
                 }
             }
