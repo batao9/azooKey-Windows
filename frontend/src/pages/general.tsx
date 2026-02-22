@@ -119,9 +119,11 @@ const normalizeGeneralConfig = (value?: Record<string, unknown>): GeneralConfigS
             ? value.symbol_style
             : DEFAULT_GENERAL_CONFIG.symbol_style,
     space_input:
-        typeof value?.space_input === "string"
-            ? value.space_input
-            : DEFAULT_GENERAL_CONFIG.space_input,
+        value?.space_input === "always_full"
+            ? "follow_input_mode"
+            : typeof value?.space_input === "string"
+              ? value.space_input
+              : DEFAULT_GENERAL_CONFIG.space_input,
     numpad_input:
         typeof value?.numpad_input === "string"
             ? value.numpad_input
@@ -565,7 +567,7 @@ export const General = () => {
                                 </thead>
                                 <tbody>
                                     {romajiDraftRows.map((row, index) => (
-                                        <tr key={`${index}-${row.input}-${row.output}`} className="border-t">
+                                        <tr key={`row-${index}`} className="border-t">
                                             <td className="px-2 py-2 text-xs text-muted-foreground">{index + 1}</td>
                                             <td className="px-2 py-2">
                                                 <Input
