@@ -1,5 +1,3 @@
-use std::cmp::{max, min};
-
 use crate::{
     engine::user_action::UserAction,
     extension::VKeyExt as _,
@@ -51,6 +49,15 @@ pub struct Composition {
 
     pub state: CompositionState,
     pub tip_composition: Option<ITfComposition>,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateSelection {
+    index: i32,
+    text: String,
+    sub_text: String,
+    hiragana: String,
+    corresponding_count: i32,
 }
 
 impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
@@ -137,6 +144,68 @@ impl TextServiceFactory {
         }
     }
 
+    #[inline]
+    fn select_candidate(candidates: &Candidates, desired_index: i32) -> Option<CandidateSelection> {
+        if candidates.texts.is_empty() {
+            return None;
+        }
+
+        let max_index = candidates.texts.len().saturating_sub(1);
+        let index = desired_index.max(0) as usize;
+        let index = index.min(max_index);
+
+        Some(CandidateSelection {
+            index: index as i32,
+            text: candidates.texts.get(index).cloned().unwrap_or_default(),
+            sub_text: candidates.sub_texts.get(index).cloned().unwrap_or_default(),
+            hiragana: candidates.hiragana.clone(),
+            corresponding_count: candidates.corresponding_count.get(index).copied().unwrap_or(0),
+        })
+    }
+
+    #[inline]
+    fn next_boundary_index(
+        candidates: &Candidates,
+        current_index: i32,
+        current_count: i32,
+        direction: i32,
+    ) -> Option<i32> {
+        if direction == 0 || candidates.texts.is_empty() {
+            return None;
+        }
+
+        let indexed_counts: Vec<(usize, i32)> = candidates
+            .texts
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let count = candidates.corresponding_count.get(index).copied().unwrap_or(0);
+                (index, count)
+            })
+            .collect();
+
+        let target_count = if direction > 0 {
+            indexed_counts
+                .iter()
+                .map(|(_, count)| *count)
+                .filter(|count| *count > current_count)
+                .min()
+        } else {
+            indexed_counts
+                .iter()
+                .map(|(_, count)| *count)
+                .filter(|count| *count < current_count)
+                .max()
+        }?;
+
+        let current_index = current_index.max(0) as isize;
+        indexed_counts
+            .into_iter()
+            .filter(|(_, count)| *count == target_count)
+            .min_by_key(|(index, _)| (((*index as isize) - current_index).abs(), *index))
+            .map(|(index, _)| index as i32)
+    }
+
     #[tracing::instrument]
     pub fn process_key(
         &self,
@@ -151,11 +220,20 @@ impl TextServiceFactory {
         let is_ctrl_pressed = Self::is_ctrl_pressed();
         let is_shift_pressed = Self::is_shift_pressed();
         let is_ctrl_space = is_ctrl_pressed && wparam.0 == 0x20;
+        let is_ctrl_enter = is_ctrl_pressed && wparam.0 == 0x0D;
+        let is_ctrl_down = is_ctrl_pressed && wparam.0 == 0x28;
+        let is_shift_left = is_shift_pressed && wparam.0 == 0x25;
+        let is_shift_right = is_shift_pressed && wparam.0 == 0x27;
         let is_alt_backquote = Self::is_alt_backquote(wparam, lparam);
         let app_config = AppConfig::read();
 
         // check shortcut keys
-        if is_ctrl_pressed && !is_ctrl_space && !is_alt_backquote {
+        if is_ctrl_pressed
+            && !is_ctrl_space
+            && !is_alt_backquote
+            && !is_ctrl_enter
+            && !is_ctrl_down
+        {
             return Ok(None);
         }
 
@@ -181,6 +259,14 @@ impl TextServiceFactory {
 
         let action = if is_alt_backquote {
             UserAction::ToggleInputMode
+        } else if is_ctrl_enter {
+            UserAction::CommitFirstClause
+        } else if is_ctrl_down {
+            UserAction::CommitAndNextClause
+        } else if is_shift_left {
+            UserAction::AdjustClauseBoundary(-1)
+        } else if is_shift_right {
+            UserAction::AdjustClauseBoundary(1)
         } else {
             UserAction::try_from(wparam.0)?
         };
@@ -321,7 +407,7 @@ impl TextServiceFactory {
                         (CompositionState::Composing, vec![ClientAction::RemoveText])
                     }
                 }
-                UserAction::Enter => {
+                UserAction::Enter | UserAction::CommitFirstClause | UserAction::CommitAndNextClause => {
                     if composition.suffix.is_empty() {
                         (CompositionState::None, vec![ClientAction::EndComposition])
                     } else {
@@ -331,6 +417,10 @@ impl TextServiceFactory {
                         )
                     }
                 }
+                UserAction::AdjustClauseBoundary(direction) => (
+                    CompositionState::Composing,
+                    vec![ClientAction::AdjustBoundary(direction)],
+                ),
                 UserAction::Escape => (
                     CompositionState::None,
                     vec![ClientAction::RemoveText, ClientAction::EndComposition],
@@ -453,7 +543,7 @@ impl TextServiceFactory {
                         (CompositionState::Composing, vec![ClientAction::RemoveText])
                     }
                 }
-                UserAction::Enter => {
+                UserAction::Enter | UserAction::CommitFirstClause | UserAction::CommitAndNextClause => {
                     if composition.suffix.is_empty() {
                         (CompositionState::None, vec![ClientAction::EndComposition])
                     } else {
@@ -463,6 +553,10 @@ impl TextServiceFactory {
                         )
                     }
                 }
+                UserAction::AdjustClauseBoundary(direction) => (
+                    CompositionState::Previewing,
+                    vec![ClientAction::AdjustBoundary(direction)],
+                ),
                 UserAction::Escape => (
                     CompositionState::None,
                     vec![ClientAction::RemoveText, ClientAction::EndComposition],
@@ -629,73 +723,86 @@ impl TextServiceFactory {
                     };
 
                     candidates = ipc_service.append_text(text.clone())?;
-                    let text = candidates.texts[selection_index as usize].clone();
-                    let sub_text = candidates.sub_texts[selection_index as usize].clone();
-                    let hiragana = candidates.hiragana.clone();
+                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
+                        selection_index = selected.index;
+                        corresponding_count = selected.corresponding_count;
+                        preview = selected.text.clone();
+                        suffix = selected.sub_text.clone();
+                        raw_hiragana = selected.hiragana;
 
-                    corresponding_count = candidates.corresponding_count[selection_index as usize];
-
-                    preview = text.clone();
-                    suffix = sub_text.clone();
-                    raw_hiragana = hiragana.clone();
-
-                    self.set_text(&text, &sub_text)?;
-                    ipc_service.set_candidates(candidates.texts.clone())?;
-                    ipc_service.set_selection(selection_index as i32)?;
+                        self.set_text(&preview, &suffix)?;
+                        ipc_service.set_candidates(candidates.texts.clone())?;
+                        ipc_service.set_selection(selection_index)?;
+                    }
                 }
                 ClientAction::AppendTextRaw(text) => {
                     raw_input.push_str(&text);
 
                     candidates = ipc_service.append_text(text.clone())?;
-                    let text = candidates.texts[selection_index as usize].clone();
-                    let sub_text = candidates.sub_texts[selection_index as usize].clone();
-                    let hiragana = candidates.hiragana.clone();
+                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
+                        selection_index = selected.index;
+                        corresponding_count = selected.corresponding_count;
+                        preview = selected.text.clone();
+                        suffix = selected.sub_text.clone();
+                        raw_hiragana = selected.hiragana;
 
-                    corresponding_count = candidates.corresponding_count[selection_index as usize];
-
-                    preview = text.clone();
-                    suffix = sub_text.clone();
-                    raw_hiragana = hiragana.clone();
-
-                    self.set_text(&text, &sub_text)?;
-                    ipc_service.set_candidates(candidates.texts.clone())?;
-                    ipc_service.set_selection(selection_index as i32)?;
+                        self.set_text(&preview, &suffix)?;
+                        ipc_service.set_candidates(candidates.texts.clone())?;
+                        ipc_service.set_selection(selection_index)?;
+                    }
                 }
                 ClientAction::RemoveText => {
                     candidates = ipc_service.remove_text()?;
-                    let empty = "".to_string();
-                    let text = candidates
-                        .texts
-                        .get(selection_index as usize)
-                        .cloned()
-                        .unwrap_or(empty.clone());
-                    let sub_text = candidates
-                        .sub_texts
-                        .get(selection_index as usize)
-                        .cloned()
-                        .unwrap_or(empty.clone());
-                    let hiragana = candidates.hiragana.clone();
-                    corresponding_count = candidates
-                        .corresponding_count
-                        .get(selection_index as usize)
-                        .cloned()
-                        .unwrap_or(0);
+                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
+                        selection_index = selected.index;
+                        corresponding_count = selected.corresponding_count;
 
-                    raw_input = raw_input
-                        .chars()
-                        .take(corresponding_count as usize)
-                        .collect();
-                    preview = text.clone();
-                    suffix = sub_text.clone();
-                    raw_hiragana = hiragana.clone();
+                        raw_input = raw_input
+                            .chars()
+                            .take(corresponding_count.max(0) as usize)
+                            .collect();
+                        preview = selected.text.clone();
+                        suffix = selected.sub_text.clone();
+                        raw_hiragana = selected.hiragana;
 
-                    self.set_text(&text, &sub_text)?;
-                    ipc_service.set_candidates(candidates.texts.clone())?;
-                    ipc_service.set_selection(selection_index as i32)?;
+                        self.set_text(&preview, &suffix)?;
+                        ipc_service.set_candidates(candidates.texts.clone())?;
+                        ipc_service.set_selection(selection_index)?;
+                    }
                 }
-                ClientAction::MoveCursor(_offset) => {
-                    // TODO: I'll use azookey-kkc's composingText
-                    // self.set_cursor(offset)?;
+                ClientAction::MoveCursor(offset) => {
+                    candidates = ipc_service.move_cursor(*offset)?;
+                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
+                        selection_index = selected.index;
+                        corresponding_count = selected.corresponding_count;
+                        preview = selected.text.clone();
+                        suffix = selected.sub_text.clone();
+                        raw_hiragana = selected.hiragana;
+
+                        self.set_text(&preview, &suffix)?;
+                        ipc_service.set_candidates(candidates.texts.clone())?;
+                        ipc_service.set_selection(selection_index)?;
+                        self.update_pos()?;
+                    }
+                }
+                ClientAction::AdjustBoundary(direction) => {
+                    if let Some(next_index) = Self::next_boundary_index(
+                        &candidates,
+                        selection_index,
+                        corresponding_count,
+                        *direction,
+                    ) {
+                        if let Some(selected) = Self::select_candidate(&candidates, next_index) {
+                            selection_index = selected.index;
+                            corresponding_count = selected.corresponding_count;
+                            preview = selected.text.clone();
+                            suffix = selected.sub_text.clone();
+                            raw_hiragana = selected.hiragana;
+
+                            self.set_text(&preview, &suffix)?;
+                            ipc_service.set_selection(selection_index)?;
+                        }
+                    }
                 }
                 ClientAction::SetIMEMode(mode) => {
                     self.start_composition()?;
@@ -724,40 +831,29 @@ impl TextServiceFactory {
                     ipc_service.clear_text()?;
                 }
                 ClientAction::SetSelection(selection) => {
-                    let candidates = {
-                        let text_service = self.borrow()?;
-                        let composition = text_service.borrow_composition()?.clone();
-                        let candidates = composition.candidates.clone();
-                        candidates
-                    };
-
-                    let texts = candidates.texts.clone();
-                    let sub_texts = candidates.sub_texts.clone();
-
-                    selection_index = match selection {
-                        SetSelectionType::Up => max(0, selection_index - 1),
-                        SetSelectionType::Down => min(texts.len() as i32 - 1, selection_index + 1),
+                    let desired_index = match selection {
+                        SetSelectionType::Up => selection_index - 1,
+                        SetSelectionType::Down => selection_index + 1,
                         SetSelectionType::Number(number) => *number,
                     };
 
-                    ipc_service.set_selection(selection_index as i32)?;
-                    let text = texts[selection_index as usize].clone();
-                    let sub_text = sub_texts[selection_index as usize].clone();
-                    let hiragana = candidates.hiragana.clone();
-                    corresponding_count = candidates.corresponding_count[selection_index as usize];
+                    if let Some(selected) = Self::select_candidate(&candidates, desired_index) {
+                        selection_index = selected.index;
+                        corresponding_count = selected.corresponding_count;
+                        preview = selected.text.clone();
+                        suffix = selected.sub_text.clone();
+                        raw_hiragana = selected.hiragana;
 
-                    preview = text.clone();
-                    suffix = sub_text.clone();
-                    raw_hiragana = hiragana.clone();
-
-                    self.set_text(&text, &sub_text)?;
+                        ipc_service.set_selection(selection_index)?;
+                        self.set_text(&preview, &suffix)?;
+                    }
                 }
                 ClientAction::ShrinkText(text) => {
                     // shrink text
                     raw_input.push_str(&text);
                     raw_input = raw_input
                         .chars()
-                        .skip(corresponding_count as usize)
+                        .skip(corresponding_count.max(0) as usize)
                         .collect();
 
                     ipc_service.shrink_text(corresponding_count.clone())?;
@@ -773,19 +869,19 @@ impl TextServiceFactory {
                     candidates = ipc_service.append_text(text)?;
                     selection_index = 0;
 
-                    let text = candidates.texts[selection_index as usize].clone();
-                    let sub_text = candidates.sub_texts[selection_index as usize].clone();
-                    let hiragana = candidates.hiragana.clone();
-                    self.shift_start(&preview, &text)?;
+                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
+                        self.shift_start(&preview, &selected.text)?;
 
-                    corresponding_count = candidates.corresponding_count[selection_index as usize];
-                    preview = text.clone();
-                    suffix = sub_text.clone();
-                    raw_hiragana = hiragana.clone();
+                        selection_index = selected.index;
+                        corresponding_count = selected.corresponding_count;
+                        preview = selected.text.clone();
+                        suffix = selected.sub_text.clone();
+                        raw_hiragana = selected.hiragana;
 
-                    ipc_service.set_candidates(candidates.texts.clone())?;
-                    ipc_service.set_selection(selection_index as i32)?;
-                    self.update_pos()?;
+                        ipc_service.set_candidates(candidates.texts.clone())?;
+                        ipc_service.set_selection(selection_index)?;
+                        self.update_pos()?;
+                    }
 
                     transition = CompositionState::Composing;
                 }
@@ -793,26 +889,26 @@ impl TextServiceFactory {
                     raw_input.push_str(&text);
                     raw_input = raw_input
                         .chars()
-                        .skip(corresponding_count as usize)
+                        .skip(corresponding_count.max(0) as usize)
                         .collect();
 
                     ipc_service.shrink_text(corresponding_count.clone())?;
                     candidates = ipc_service.append_text(text.clone())?;
                     selection_index = 0;
 
-                    let text = candidates.texts[selection_index as usize].clone();
-                    let sub_text = candidates.sub_texts[selection_index as usize].clone();
-                    let hiragana = candidates.hiragana.clone();
-                    self.shift_start(&preview, &text)?;
+                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
+                        self.shift_start(&preview, &selected.text)?;
 
-                    corresponding_count = candidates.corresponding_count[selection_index as usize];
-                    preview = text.clone();
-                    suffix = sub_text.clone();
-                    raw_hiragana = hiragana.clone();
+                        selection_index = selected.index;
+                        corresponding_count = selected.corresponding_count;
+                        preview = selected.text.clone();
+                        suffix = selected.sub_text.clone();
+                        raw_hiragana = selected.hiragana;
 
-                    ipc_service.set_candidates(candidates.texts.clone())?;
-                    ipc_service.set_selection(selection_index as i32)?;
-                    self.update_pos()?;
+                        ipc_service.set_candidates(candidates.texts.clone())?;
+                        ipc_service.set_selection(selection_index)?;
+                        self.update_pos()?;
+                    }
 
                     transition = CompositionState::Composing;
                 }
