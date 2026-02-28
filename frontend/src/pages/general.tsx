@@ -380,78 +380,86 @@ export const General = () => {
                     <div className="space-y-3 rounded-md border p-4">
                         <div className="grid grid-cols-[1fr_220px] items-center gap-4">
                             <p className="text-sm font-medium">句読点</p>
-                            <Select
-                                value={generalValue.punctuation_style}
-                                onValueChange={(value) => void updateGeneralConfig("punctuation_style", value)}
-                            >
-                                <SelectTrigger className="w-full">
-                                    <SelectValue placeholder="句読点を選択" />
-                                </SelectTrigger>
-                                <SelectContent>
-                                    {PUNCTUATION_OPTIONS.map((option) => (
-                                        <SelectItem key={option.value} value={option.value}>
-                                            {option.label}
-                                        </SelectItem>
-                                    ))}
-                                </SelectContent>
-                            </Select>
+                            <div className="flex justify-end">
+                                <Select
+                                    value={generalValue.punctuation_style}
+                                    onValueChange={(value) => void updateGeneralConfig("punctuation_style", value)}
+                                >
+                                    <SelectTrigger>
+                                        <SelectValue placeholder="句読点を選択" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        {PUNCTUATION_OPTIONS.map((option) => (
+                                            <SelectItem key={option.value} value={option.value}>
+                                                {option.label}
+                                            </SelectItem>
+                                        ))}
+                                    </SelectContent>
+                                </Select>
+                            </div>
                         </div>
 
                         <div className="grid grid-cols-[1fr_220px] items-center gap-4">
                             <p className="text-sm font-medium">記号</p>
-                            <Select
-                                value={generalValue.symbol_style}
-                                onValueChange={(value) => void updateGeneralConfig("symbol_style", value)}
-                            >
-                                <SelectTrigger className="w-full">
-                                    <SelectValue placeholder="記号を選択" />
-                                </SelectTrigger>
-                                <SelectContent>
-                                    {SYMBOL_OPTIONS.map((option) => (
-                                        <SelectItem key={option.value} value={option.value}>
-                                            {option.label}
-                                        </SelectItem>
-                                    ))}
-                                </SelectContent>
-                            </Select>
+                            <div className="flex justify-end">
+                                <Select
+                                    value={generalValue.symbol_style}
+                                    onValueChange={(value) => void updateGeneralConfig("symbol_style", value)}
+                                >
+                                    <SelectTrigger>
+                                        <SelectValue placeholder="記号を選択" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        {SYMBOL_OPTIONS.map((option) => (
+                                            <SelectItem key={option.value} value={option.value}>
+                                                {option.label}
+                                            </SelectItem>
+                                        ))}
+                                    </SelectContent>
+                                </Select>
+                            </div>
                         </div>
 
                         <div className="grid grid-cols-[1fr_220px] items-center gap-4">
                             <p className="text-sm font-medium">スペースの入力</p>
-                            <Select
-                                value={generalValue.space_input}
-                                onValueChange={(value) => void updateGeneralConfig("space_input", value)}
-                            >
-                                <SelectTrigger className="w-full">
-                                    <SelectValue placeholder="スペースの入力を選択" />
-                                </SelectTrigger>
-                                <SelectContent>
-                                    {SPACE_OPTIONS.map((option) => (
-                                        <SelectItem key={option.value} value={option.value}>
-                                            {option.label}
-                                        </SelectItem>
-                                    ))}
-                                </SelectContent>
-                            </Select>
+                            <div className="flex justify-end">
+                                <Select
+                                    value={generalValue.space_input}
+                                    onValueChange={(value) => void updateGeneralConfig("space_input", value)}
+                                >
+                                    <SelectTrigger>
+                                        <SelectValue placeholder="スペースの入力を選択" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        {SPACE_OPTIONS.map((option) => (
+                                            <SelectItem key={option.value} value={option.value}>
+                                                {option.label}
+                                            </SelectItem>
+                                        ))}
+                                    </SelectContent>
+                                </Select>
+                            </div>
                         </div>
 
                         <div className="grid grid-cols-[1fr_220px] items-center gap-4">
                             <p className="text-sm font-medium">テンキーからの入力</p>
-                            <Select
-                                value={generalValue.numpad_input}
-                                onValueChange={(value) => void updateGeneralConfig("numpad_input", value)}
-                            >
-                                <SelectTrigger className="w-full">
-                                    <SelectValue placeholder="テンキー入力を選択" />
-                                </SelectTrigger>
-                                <SelectContent>
-                                    {NUMPAD_OPTIONS.map((option) => (
-                                        <SelectItem key={option.value} value={option.value}>
-                                            {option.label}
-                                        </SelectItem>
-                                    ))}
-                                </SelectContent>
-                            </Select>
+                            <div className="flex justify-end">
+                                <Select
+                                    value={generalValue.numpad_input}
+                                    onValueChange={(value) => void updateGeneralConfig("numpad_input", value)}
+                                >
+                                    <SelectTrigger>
+                                        <SelectValue placeholder="テンキー入力を選択" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        {NUMPAD_OPTIONS.map((option) => (
+                                            <SelectItem key={option.value} value={option.value}>
+                                                {option.label}
+                                            </SelectItem>
+                                        ))}
+                                    </SelectContent>
+                                </Select>
+                            </div>
                         </div>
                     </div>
                 </section>
@@ -480,12 +488,12 @@ export const General = () => {
                         <p className="text-xs text-muted-foreground">
                             記号カテゴリごとに半角/全角を指定します（{widthSummary}）。
                         </p>
-                        <div className="overflow-x-auto rounded-md border">
-                            <table className="w-full min-w-[640px] text-sm">
+                        <div className="rounded-md border">
+                            <table className="w-full table-fixed text-sm">
                                 <thead className="bg-muted/30 text-left text-xs text-muted-foreground">
                                     <tr>
                                         <th className="px-3 py-2 font-medium">文字グループ</th>
-                                        <th className="px-3 py-2 font-medium">変換前文字列</th>
+                                        <th className="w-40 px-3 py-2 text-right font-medium">変換前文字列</th>
                                     </tr>
                                 </thead>
                                 <tbody>
