@@ -22,6 +22,7 @@
 
 1. `master` から `dev/<feature>` を作成する。
 2. 実装して `origin/dev/<feature>` に push し、CI で検証する。
+3. `origin/master` へ PR を出す。
 
 ## ビルド / 検証
 
