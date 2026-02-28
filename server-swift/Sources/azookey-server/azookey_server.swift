@@ -10,6 +10,30 @@ import ffi
     "enable": false,
     "profile": "",
 ]
+let maxUserDictionaryEntryCount = 50
+
+private struct AppSettings: Decodable {
+    let zenzai: ZenzaiSettings?
+    let user_dictionary: UserDictionarySettings?
+}
+
+private struct ZenzaiSettings: Decodable {
+    let enable: Bool?
+    let profile: String?
+}
+
+private struct UserDictionarySettings: Decodable {
+    let entries: [UserDictionaryEntry]?
+}
+
+private struct UserDictionaryEntry: Decodable {
+    let reading: String
+    let word: String
+}
+
+private func normalizeReading(_ reading: String) -> String {
+    reading.applyingTransform(.hiraganaToKatakana, reverse: false) ?? reading
+}
 
 @MainActor func getOptions(context: String = "") -> ConvertRequestOptions {
     return ConvertRequestOptions(
@@ -74,21 +98,63 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 
 @_silgen_name("LoadConfig")
 @MainActor public func load_config() {
+    var dynamicUserDictionary: [DicdataElement] = []
+    defer {
+        converter.sendToDicdataStore(.importDynamicUserDict(dynamicUserDictionary))
+    }
+
+    config["enable"] = false
+    config["profile"] = ""
+
     if let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] {
         let settingsPath = URL(filePath: appDataPath).appendingPathComponent("Azookey/settings.json")
         
         do {
             let data = try Data(contentsOf: settingsPath)
-            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let zenzaiDict = json["zenzai"] as? [String: Any] {
-                
-                if let enableValue = zenzaiDict["enable"] as? Bool {
+            let settings = try JSONDecoder().decode(AppSettings.self, from: data)
+
+            if let zenzai = settings.zenzai {
+                if let enableValue = zenzai.enable {
                     config["enable"] = enableValue
                 }
-                
-                if let profileValue = zenzaiDict["profile"] as? String {
+
+                if let profileValue = zenzai.profile {
                     config["profile"] = profileValue
                 }
+            }
+
+            let sourceEntries = settings.user_dictionary?.entries ?? []
+            var seen: Set<String> = []
+            for entry in sourceEntries {
+                if dynamicUserDictionary.count >= maxUserDictionaryEntryCount {
+                    break
+                }
+
+                let reading = entry.reading.trimmingCharacters(in: .whitespacesAndNewlines)
+                let word = entry.word.trimmingCharacters(in: .whitespacesAndNewlines)
+                if reading.isEmpty || word.isEmpty {
+                    continue
+                }
+
+                let key = reading + "\u{0}" + word
+                if seen.contains(key) {
+                    continue
+                }
+                seen.insert(key)
+
+                dynamicUserDictionary.append(
+                    DicdataElement(
+                        word: word,
+                        ruby: normalizeReading(reading),
+                        cid: CIDData.固有名詞.cid,
+                        mid: MIDData.一般.mid,
+                        value: PValue(-5)
+                    )
+                )
+            }
+
+            if sourceEntries.count > maxUserDictionaryEntryCount {
+                print("User dictionary entries are truncated to \(maxUserDictionaryEntryCount).")
             }
         } catch {
             print("Failed to read settings: \(error)")
