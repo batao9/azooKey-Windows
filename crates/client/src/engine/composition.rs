@@ -310,7 +310,9 @@ impl TextServiceFactory {
                     vec![ClientAction::AppendText(value.to_string())],
                 ),
                 UserAction::Backspace => {
-                    if composition.preview.chars().count() == 1 {
+                    // preview length can differ from raw input (e.g. "れい" -> "例"),
+                    // so decide end-of-composition by remaining raw input length.
+                    if composition.raw_input.chars().count() <= 1 {
                         (
                             CompositionState::None,
                             vec![ClientAction::RemoveText, ClientAction::EndComposition],
@@ -440,7 +442,9 @@ impl TextServiceFactory {
                     vec![ClientAction::ShrinkText(value.to_string())],
                 ),
                 UserAction::Backspace => {
-                    if composition.preview.chars().count() == 1 {
+                    // preview length can differ from raw input (e.g. "れい" -> "例"),
+                    // so decide end-of-composition by remaining raw input length.
+                    if composition.raw_input.chars().count() <= 1 {
                         (
                             CompositionState::None,
                             vec![ClientAction::RemoveText, ClientAction::EndComposition],
