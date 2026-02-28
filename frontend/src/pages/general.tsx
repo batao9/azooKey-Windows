@@ -47,7 +47,7 @@ const DEFAULT_GENERAL_CONFIG: GeneralConfigState = {
     punctuation_style: "touten_kuten",
     symbol_style: "corner_bracket_middle_dot",
     space_input: "always_half",
-    numpad_input: "always_half",
+    numpad_input: "direct_input",
 };
 
 const DEFAULT_WIDTH_GROUPS: CharacterWidthGroupsState = {
@@ -84,6 +84,7 @@ const SPACE_OPTIONS = [
 ];
 
 const NUMPAD_OPTIONS = [
+    { value: "direct_input", label: "直接入力" },
     { value: "always_half", label: "常に半角" },
     { value: "follow_input_mode", label: "入力モードに従う" },
 ];
@@ -125,9 +126,13 @@ const normalizeGeneralConfig = (value?: Record<string, unknown>): GeneralConfigS
               ? value.space_input
               : DEFAULT_GENERAL_CONFIG.space_input,
     numpad_input:
-        typeof value?.numpad_input === "string"
-            ? value.numpad_input
-            : DEFAULT_GENERAL_CONFIG.numpad_input,
+        value?.numpad_input === "direct_input"
+            ? "direct_input"
+            : value?.numpad_input === "always_half"
+              ? "always_half"
+              : value?.numpad_input === "follow_input_mode"
+                ? "follow_input_mode"
+                : DEFAULT_GENERAL_CONFIG.numpad_input,
 });
 
 const normalizeWidthGroups = (
