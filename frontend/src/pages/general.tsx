@@ -384,7 +384,7 @@ export const General = () => {
                                 value={generalValue.punctuation_style}
                                 onValueChange={(value) => void updateGeneralConfig("punctuation_style", value)}
                             >
-                                <SelectTrigger>
+                                <SelectTrigger className="w-full">
                                     <SelectValue placeholder="句読点を選択" />
                                 </SelectTrigger>
                                 <SelectContent>
@@ -403,7 +403,7 @@ export const General = () => {
                                 value={generalValue.symbol_style}
                                 onValueChange={(value) => void updateGeneralConfig("symbol_style", value)}
                             >
-                                <SelectTrigger>
+                                <SelectTrigger className="w-full">
                                     <SelectValue placeholder="記号を選択" />
                                 </SelectTrigger>
                                 <SelectContent>
@@ -422,7 +422,7 @@ export const General = () => {
                                 value={generalValue.space_input}
                                 onValueChange={(value) => void updateGeneralConfig("space_input", value)}
                             >
-                                <SelectTrigger>
+                                <SelectTrigger className="w-full">
                                     <SelectValue placeholder="スペースの入力を選択" />
                                 </SelectTrigger>
                                 <SelectContent>
@@ -441,7 +441,7 @@ export const General = () => {
                                 value={generalValue.numpad_input}
                                 onValueChange={(value) => void updateGeneralConfig("numpad_input", value)}
                             >
-                                <SelectTrigger>
+                                <SelectTrigger className="w-full">
                                     <SelectValue placeholder="テンキー入力を選択" />
                                 </SelectTrigger>
                                 <SelectContent>
@@ -493,23 +493,25 @@ export const General = () => {
                                         <tr key={row.key} className="border-t">
                                             <td className="px-3 py-2 font-medium">{row.label}</td>
                                             <td className="px-3 py-2">
-                                                <Select
-                                                    value={widthGroups[row.key]}
-                                                    onValueChange={(value: WidthMode) =>
-                                                        void updateWidthGroup(row.key, value)
-                                                    }
-                                                >
-                                                    <SelectTrigger className="w-28">
-                                                        <SelectValue placeholder="幅" />
-                                                    </SelectTrigger>
-                                                    <SelectContent>
-                                                        {WIDTH_OPTIONS.map((option) => (
-                                                            <SelectItem key={option.value} value={option.value}>
-                                                                {option.label}
-                                                            </SelectItem>
-                                                        ))}
-                                                    </SelectContent>
-                                                </Select>
+                                                <div className="flex justify-end">
+                                                    <Select
+                                                        value={widthGroups[row.key]}
+                                                        onValueChange={(value: WidthMode) =>
+                                                            void updateWidthGroup(row.key, value)
+                                                        }
+                                                    >
+                                                        <SelectTrigger className="w-28">
+                                                            <SelectValue placeholder="幅" />
+                                                        </SelectTrigger>
+                                                        <SelectContent>
+                                                            {WIDTH_OPTIONS.map((option) => (
+                                                                <SelectItem key={option.value} value={option.value}>
+                                                                    {option.label}
+                                                                </SelectItem>
+                                                            ))}
+                                                        </SelectContent>
+                                                    </Select>
+                                                </div>
                                             </td>
                                         </tr>
                                     ))}
