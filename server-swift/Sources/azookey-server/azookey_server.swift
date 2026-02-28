@@ -125,6 +125,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 
             let sourceEntries = settings.user_dictionary?.entries ?? []
             var seen: Set<String> = []
+            var priorityRank = 0
             for entry in sourceEntries {
                 if dynamicUserDictionary.count >= maxUserDictionaryEntryCount {
                     break
@@ -142,15 +143,17 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
                 }
                 seen.insert(key)
 
+                let priorityAdjustedValue = PValue(-5 - Float(priorityRank) * 0.01)
                 dynamicUserDictionary.append(
                     DicdataElement(
                         word: word,
                         ruby: normalizeReading(reading),
                         cid: CIDData.固有名詞.cid,
                         mid: MIDData.一般.mid,
-                        value: PValue(-5)
+                        value: priorityAdjustedValue
                     )
                 )
+                priorityRank += 1
             }
 
             if sourceEntries.count > maxUserDictionaryEntryCount {

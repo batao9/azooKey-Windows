@@ -134,9 +134,9 @@ export const Dictionary = () => {
             </section>
 
             <section className="space-y-3 rounded-md border p-4">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center gap-2">
                     <p className="text-sm font-medium">登録件数: {entries.length} 件</p>
-                    <div className="flex items-center gap-2">
+                    <div className="ml-auto flex w-full justify-end gap-2 sm:w-auto">
                         <Button variant="secondary" onClick={addEntry} disabled={entries.length >= MAX_ENTRIES || isLoading}>
                             <Plus className="h-4 w-4" />
                             追加
@@ -164,7 +164,7 @@ export const Dictionary = () => {
                             </thead>
                             <tbody>
                                 {entries.map((entry, index) => (
-                                    <tr key={`${index}-${entry.reading}-${entry.word}`} className="border-t">
+                                    <tr key={`row-${index}`} className="border-t">
                                         <td className="px-3 py-2">
                                             <Input
                                                 value={entry.reading}
