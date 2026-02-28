@@ -1,5 +1,5 @@
 {
-    "version": "0.0.1",
+    "version": "0.1.2",
     "zenzai": {
         "enable": false,
         "profile": "",
@@ -8,5 +8,71 @@
     "shortcuts": {
         "ctrl_space_toggle": true,
         "alt_backquote_toggle": true
+    },
+    "general": {
+        "punctuation_style": "touten_kuten",
+        "symbol_style": "corner_bracket_middle_dot",
+        "space_input": "always_half",
+        "numpad_input": "direct_input"
+    },
+    "romaji_table": {},
+    "character_width": {
+        "groups": {
+            "alphabet": "half",
+            "number": "half",
+            "bracket": "full",
+            "comma_period": "full",
+            "middle_dot_corner_bracket": "full",
+            "quote": "full",
+            "colon_semicolon": "full",
+            "hash_group": "half",
+            "tilde": "full",
+            "math_symbol": "full",
+            "question_exclamation": "full"
+        },
+        "symbol_fullwidth": {
+            "0": false,
+            "1": false,
+            "2": false,
+            "3": false,
+            "4": false,
+            "5": false,
+            "6": false,
+            "7": false,
+            "8": false,
+            "9": false,
+            "!": true,
+            "\"": true,
+            "#": false,
+            "$": false,
+            "%": false,
+            "&": false,
+            "'": true,
+            "(": true,
+            ")": true,
+            "*": true,
+            "+": true,
+            ",": true,
+            "-": true,
+            ".": true,
+            "/": true,
+            ":": true,
+            ";": true,
+            "<": true,
+            "=": true,
+            ">": true,
+            "?": true,
+            "@": false,
+            "[": true,
+            "\\": false,
+            "]": true,
+            "^": false,
+            "_": false,
+            "`": false,
+            "{": true,
+            "|": false,
+            "}": true,
+            "~": true
+        }
     }
 }
