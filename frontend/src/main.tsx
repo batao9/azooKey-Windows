@@ -17,7 +17,7 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <SidebarProvider>
       <BrowserRouter>
         <AppSidebar />
-        <main className="w-full p-6">
+        <main className="flex-1 min-w-0 p-6">
           <ThemeProvider defaultTheme="system" storageKey="vite-ui-theme">
             <Routes>
               <Route path="/" element={<General />} />
