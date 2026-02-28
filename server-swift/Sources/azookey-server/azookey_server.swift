@@ -137,7 +137,8 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
                     continue
                 }
 
-                let key = reading + "\u{0}" + word
+                let normalizedReading = normalizeReading(reading)
+                let key = normalizedReading + "\u{0}" + word
                 if seen.contains(key) {
                     continue
                 }
@@ -147,7 +148,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
                 dynamicUserDictionary.append(
                     DicdataElement(
                         word: word,
-                        ruby: normalizeReading(reading),
+                        ruby: normalizedReading,
                         cid: CIDData.固有名詞.cid,
                         mid: MIDData.一般.mid,
                         value: priorityAdjustedValue
