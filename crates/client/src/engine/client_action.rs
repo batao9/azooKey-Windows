@@ -6,8 +6,10 @@ pub enum ClientAction {
     EndComposition,
 
     AppendText(String),
+    AppendTextRaw(String),
     RemoveText,
     ShrinkText(String),
+    ShrinkTextRaw(String),
 
     SetTextWithType(SetTextType),
 

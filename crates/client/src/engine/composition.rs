@@ -96,6 +96,47 @@ impl TextServiceFactory {
         is_alt_pressed && is_backquote_key
     }
 
+    #[inline]
+    fn to_fullwidth_ascii_char(c: char) -> char {
+        if c == ' ' {
+            return '　';
+        }
+
+        if c.is_ascii_punctuation() || c.is_ascii_digit() {
+            return char::from_u32(c as u32 + 0xFEE0).unwrap_or(c);
+        }
+
+        c
+    }
+
+    #[inline]
+    fn to_halfwidth_ascii_char(c: char) -> char {
+        if c == '　' {
+            return ' ';
+        }
+
+        if ('！'..='～').contains(&c) {
+            return char::from_u32(c as u32 - 0xFEE0).unwrap_or(c);
+        }
+
+        c
+    }
+
+    #[inline]
+    fn numpad_text_for_mode(
+        c: char,
+        mode: NumpadInputMode,
+        allow_direct_passthrough: bool,
+    ) -> Option<String> {
+        match mode {
+            NumpadInputMode::DirectInput if allow_direct_passthrough => None,
+            NumpadInputMode::DirectInput | NumpadInputMode::AlwaysHalf => {
+                Some(Self::to_halfwidth_ascii_char(c).to_string())
+            }
+            NumpadInputMode::FollowInputMode => Some(Self::to_fullwidth_ascii_char(c).to_string()),
+        }
+    }
+
     #[tracing::instrument]
     pub fn process_key(
         &self,
@@ -146,6 +187,20 @@ impl TextServiceFactory {
 
         let (transition, actions) = match composition.state {
             CompositionState::None => match action {
+                UserAction::NumpadSymbol(symbol) if mode == InputMode::Kana => {
+                    let Some(text) = Self::numpad_text_for_mode(
+                        symbol,
+                        app_config.general.numpad_input,
+                        true,
+                    ) else {
+                        return Ok(None);
+                    };
+
+                    (
+                        CompositionState::Composing,
+                        vec![ClientAction::StartComposition, ClientAction::AppendTextRaw(text)],
+                    )
+                }
                 UserAction::Input(char) if mode == InputMode::Kana => (
                     CompositionState::Composing,
                     vec![
@@ -153,12 +208,28 @@ impl TextServiceFactory {
                         ClientAction::AppendText(char.to_string()),
                     ],
                 ),
-                UserAction::Number { value, is_numpad } if mode == InputMode::Kana => {
-                    if is_numpad
-                        && app_config.general.numpad_input == NumpadInputMode::AlwaysHalf
-                    {
+                UserAction::Number {
+                    value,
+                    is_numpad: true,
+                } if mode == InputMode::Kana => {
+                    let digit = char::from_digit(value as u32, 10).unwrap_or('0');
+                    let Some(text) = Self::numpad_text_for_mode(
+                        digit,
+                        app_config.general.numpad_input,
+                        true,
+                    ) else {
                         return Ok(None);
-                    }
+                    };
+
+                    (
+                        CompositionState::Composing,
+                        vec![ClientAction::StartComposition, ClientAction::AppendTextRaw(text)],
+                    )
+                }
+                UserAction::Number {
+                    value,
+                    is_numpad: false,
+                } if mode == InputMode::Kana => {
                     (
                         CompositionState::Composing,
                         vec![
@@ -202,10 +273,38 @@ impl TextServiceFactory {
                 }
             },
             CompositionState::Composing => match action {
+                UserAction::NumpadSymbol(symbol) if mode == InputMode::Kana => {
+                    let text = Self::numpad_text_for_mode(
+                        symbol,
+                        app_config.general.numpad_input,
+                        false,
+                    )
+                    .unwrap_or_else(|| symbol.to_string());
+                    (
+                        CompositionState::Composing,
+                        vec![ClientAction::AppendTextRaw(text)],
+                    )
+                }
                 UserAction::Input(char) => (
                     CompositionState::Composing,
                     vec![ClientAction::AppendText(char.to_string())],
                 ),
+                UserAction::Number {
+                    value,
+                    is_numpad: true,
+                } if mode == InputMode::Kana => {
+                    let digit = char::from_digit(value as u32, 10).unwrap_or('0');
+                    let text = Self::numpad_text_for_mode(
+                        digit,
+                        app_config.general.numpad_input,
+                        false,
+                    )
+                    .unwrap_or_else(|| digit.to_string());
+                    (
+                        CompositionState::Composing,
+                        vec![ClientAction::AppendTextRaw(text)],
+                    )
+                }
                 UserAction::Number { value, .. } => (
                     CompositionState::Composing,
                     vec![ClientAction::AppendText(value.to_string())],
@@ -304,10 +403,38 @@ impl TextServiceFactory {
                 }
             },
             CompositionState::Previewing => match action {
+                UserAction::NumpadSymbol(symbol) if mode == InputMode::Kana => {
+                    let text = Self::numpad_text_for_mode(
+                        symbol,
+                        app_config.general.numpad_input,
+                        false,
+                    )
+                    .unwrap_or_else(|| symbol.to_string());
+                    (
+                        CompositionState::Composing,
+                        vec![ClientAction::ShrinkTextRaw(text)],
+                    )
+                }
                 UserAction::Input(char) => (
                     CompositionState::Composing,
                     vec![ClientAction::ShrinkText(char.to_string())],
                 ),
+                UserAction::Number {
+                    value,
+                    is_numpad: true,
+                } if mode == InputMode::Kana => {
+                    let digit = char::from_digit(value as u32, 10).unwrap_or('0');
+                    let text = Self::numpad_text_for_mode(
+                        digit,
+                        app_config.general.numpad_input,
+                        false,
+                    )
+                    .unwrap_or_else(|| digit.to_string());
+                    (
+                        CompositionState::Composing,
+                        vec![ClientAction::ShrinkTextRaw(text)],
+                    )
+                }
                 UserAction::Number { value, .. } => (
                     CompositionState::Composing,
                     vec![ClientAction::ShrinkText(value.to_string())],
@@ -512,6 +639,24 @@ impl TextServiceFactory {
                     ipc_service.set_candidates(candidates.texts.clone())?;
                     ipc_service.set_selection(selection_index as i32)?;
                 }
+                ClientAction::AppendTextRaw(text) => {
+                    raw_input.push_str(&text);
+
+                    candidates = ipc_service.append_text(text.clone())?;
+                    let text = candidates.texts[selection_index as usize].clone();
+                    let sub_text = candidates.sub_texts[selection_index as usize].clone();
+                    let hiragana = candidates.hiragana.clone();
+
+                    corresponding_count = candidates.corresponding_count[selection_index as usize];
+
+                    preview = text.clone();
+                    suffix = sub_text.clone();
+                    raw_hiragana = hiragana.clone();
+
+                    self.set_text(&text, &sub_text)?;
+                    ipc_service.set_candidates(candidates.texts.clone())?;
+                    ipc_service.set_selection(selection_index as i32)?;
+                }
                 ClientAction::RemoveText => {
                     candidates = ipc_service.remove_text()?;
                     let empty = "".to_string();
@@ -622,6 +767,33 @@ impl TextServiceFactory {
                         InputMode::Latin => text.to_string(),
                     };
                     candidates = ipc_service.append_text(text)?;
+                    selection_index = 0;
+
+                    let text = candidates.texts[selection_index as usize].clone();
+                    let sub_text = candidates.sub_texts[selection_index as usize].clone();
+                    let hiragana = candidates.hiragana.clone();
+                    self.shift_start(&preview, &text)?;
+
+                    corresponding_count = candidates.corresponding_count[selection_index as usize];
+                    preview = text.clone();
+                    suffix = sub_text.clone();
+                    raw_hiragana = hiragana.clone();
+
+                    ipc_service.set_candidates(candidates.texts.clone())?;
+                    ipc_service.set_selection(selection_index as i32)?;
+                    self.update_pos()?;
+
+                    transition = CompositionState::Composing;
+                }
+                ClientAction::ShrinkTextRaw(text) => {
+                    raw_input.push_str(&text);
+                    raw_input = raw_input
+                        .chars()
+                        .skip(corresponding_count as usize)
+                        .collect();
+
+                    ipc_service.shrink_text(corresponding_count.clone())?;
+                    candidates = ipc_service.append_text(text.clone())?;
                     selection_index = 0;
 
                     let text = candidates.texts[selection_index as usize].clone();

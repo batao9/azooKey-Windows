@@ -14,7 +14,7 @@ fn get_config_root() -> PathBuf {
 }
 
 const SETTINGS_FILENAME: &str = "settings.json";
-const CONFIG_VERSION: &str = "0.1.1";
+const CONFIG_VERSION: &str = "0.1.2";
 
 pub const CHARACTER_WIDTH_SYMBOL_DEFAULTS: [(&str, bool); 42] = [
     ("0", false),
@@ -104,6 +104,7 @@ pub enum SpaceInputMode {
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NumpadInputMode {
+    DirectInput,
     AlwaysHalf,
     FollowInputMode,
 }
@@ -231,7 +232,7 @@ impl Default for GeneralConfig {
             punctuation_style: PunctuationStyle::ToutenKuten,
             symbol_style: SymbolStyle::CornerBracketMiddleDot,
             space_input: SpaceInputMode::AlwaysHalf,
-            numpad_input: NumpadInputMode::AlwaysHalf,
+            numpad_input: NumpadInputMode::DirectInput,
         }
     }
 }
@@ -353,7 +354,7 @@ impl Default for SpaceInputMode {
 
 impl Default for NumpadInputMode {
     fn default() -> Self {
-        Self::AlwaysHalf
+        Self::DirectInput
     }
 }
 
@@ -417,6 +418,14 @@ impl AppConfig {
         let mut config: AppConfig = serde_json::from_str(&config_str).unwrap();
 
         if config.version != CONFIG_VERSION {
+            config.general.numpad_input = match config.general.numpad_input {
+                // 旧仕様との互換: always_half(直接入力) -> direct_input
+                NumpadInputMode::AlwaysHalf => NumpadInputMode::DirectInput,
+                // 旧仕様との互換: follow_input_mode(変換待ち半角) -> always_half
+                NumpadInputMode::FollowInputMode => NumpadInputMode::AlwaysHalf,
+                NumpadInputMode::DirectInput => NumpadInputMode::DirectInput,
+            };
+
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&config_str) {
                 let legacy = value
                     .get("character_width")
