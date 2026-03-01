@@ -220,7 +220,19 @@ impl TextServiceFactory {
 
         for snapshot in clause_snapshots.iter_mut() {
             if let Some(updated_suffix) = full_text.strip_prefix(&snapshot.preview) {
-                snapshot.suffix = updated_suffix.to_string();
+                let updated_suffix = updated_suffix.to_string();
+                snapshot.suffix = updated_suffix.clone();
+
+                for (sub_text, candidate_corresponding_count) in snapshot
+                    .candidates
+                    .sub_texts
+                    .iter_mut()
+                    .zip(snapshot.candidates.corresponding_count.iter())
+                {
+                    if *candidate_corresponding_count == snapshot.corresponding_count {
+                        *sub_text = updated_suffix.clone();
+                    }
+                }
             }
         }
     }
