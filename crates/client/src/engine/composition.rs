@@ -848,7 +848,8 @@ impl TextServiceFactory {
 
         let composition = {
             let text_service = self.borrow()?;
-            text_service.borrow_composition()?.clone()
+            let composition = text_service.borrow_composition()?.clone();
+            composition
         };
 
         if !composition.temporary_latin_shift_pending {
