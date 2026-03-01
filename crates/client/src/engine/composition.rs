@@ -760,8 +760,9 @@ impl TextServiceFactory {
                         continue;
                     }
 
-                    let moved_candidates = ipc_service.move_cursor(*direction)?;
-                    if moved_candidates.texts.is_empty() {
+                    ipc_service.move_cursor(*direction)?;
+                    let boundary_candidates = ipc_service.move_cursor(0)?;
+                    if boundary_candidates.texts.is_empty() {
                         // Keep at least one hiragana on the left side for clause adjustment.
                         // If cursor moved to head, rollback so Shift+Left works as no-op.
                         if *direction < 0 {
@@ -770,7 +771,7 @@ impl TextServiceFactory {
                         continue;
                     }
 
-                    candidates = moved_candidates;
+                    candidates = boundary_candidates;
                     if let Some(selected) = Self::select_candidate(&candidates, 0) {
                         selection_index = selected.index;
                         corresponding_count = selected.corresponding_count;

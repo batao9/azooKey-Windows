@@ -233,6 +233,33 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 @_silgen_name("GetComposedText")
 @MainActor public func get_composed_text(lengthPtr: UnsafeMutablePointer<Int>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
     let hiragana = composingText.convertTarget
+    let contextString = (config["context"] as? String) ?? ""
+    let options = getOptions(context: contextString)
+    let converted = converter.requestCandidates(composingText, options: options)
+    var result: [FFICandidate] = []
+
+    for i in 0..<converted.mainResults.count {
+        let candidate = converted.mainResults[i]
+
+        let text = strdup(constructCandidateString(candidate: candidate, hiragana: hiragana))
+        let hiragana = strdup(hiragana)
+        let correspondingCount = candidate.correspondingCount
+
+        var afterComposingText = composingText
+        afterComposingText.prefixComplete(correspondingCount: correspondingCount)
+        let subtext = strdup(afterComposingText.convertTarget)
+
+        result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))
+    }
+
+    lengthPtr.pointee = result.count
+
+    return to_list_pointer(result)
+}
+
+@_silgen_name("GetComposedTextForCursorPrefix")
+@MainActor public func get_composed_text_for_cursor_prefix(lengthPtr: UnsafeMutablePointer<Int>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
+    let hiragana = composingText.convertTarget
     let suffixAfterCursor = String(hiragana.dropFirst(composingText.convertTargetCursorPosition))
     let prefixComposingText = composingText.prefixToCursorPosition()
     let prefixHiragana = prefixComposingText.convertTarget
@@ -252,7 +279,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         remainingPrefixComposingText.prefixComplete(correspondingCount: correspondingCount)
         let subtext = strdup(remainingPrefixComposingText.convertTarget + suffixAfterCursor)
 
-        result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))        
+        result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))
     }
 
     lengthPtr.pointee = result.count
