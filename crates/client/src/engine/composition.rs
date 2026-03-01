@@ -923,6 +923,7 @@ impl TextServiceFactory {
                         continue;
                     }
 
+                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
                     ipc_service.move_cursor(*direction)?;
                     let boundary_candidates = ipc_service.move_cursor(0)?;
                     if boundary_candidates.texts.is_empty() {
@@ -977,6 +978,7 @@ impl TextServiceFactory {
                     ipc_service.clear_text()?;
                 }
                 ClientAction::SetSelection(selection) => {
+                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
                     let desired_index = match selection {
                         SetSelectionType::Up => selection_index - 1,
                         SetSelectionType::Down => selection_index + 1,
