@@ -205,6 +205,27 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn sync_clause_snapshot_suffixes(
+        clause_snapshots: &mut [ClauseSnapshot],
+        preview: &str,
+        suffix: &str,
+    ) {
+        if clause_snapshots.is_empty() {
+            return;
+        }
+
+        let mut full_text = String::with_capacity(preview.len() + suffix.len());
+        full_text.push_str(preview);
+        full_text.push_str(suffix);
+
+        for snapshot in clause_snapshots.iter_mut() {
+            if let Some(updated_suffix) = full_text.strip_prefix(&snapshot.preview) {
+                snapshot.suffix = updated_suffix.to_string();
+            }
+        }
+    }
+
+    #[inline]
     fn commit_current_clause_actions(composition: &Composition) -> (CompositionState, Vec<ClientAction>) {
         if composition.suffix.is_empty() {
             (CompositionState::None, vec![ClientAction::EndComposition])
@@ -923,7 +944,6 @@ impl TextServiceFactory {
                         continue;
                     }
 
-                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
                     ipc_service.move_cursor(*direction)?;
                     let boundary_candidates = ipc_service.move_cursor(0)?;
                     if boundary_candidates.texts.is_empty() {
@@ -942,6 +962,11 @@ impl TextServiceFactory {
                         preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
                         suffix = selected.sub_text.clone();
                         raw_hiragana = selected.hiragana;
+                        Self::sync_clause_snapshot_suffixes(
+                            &mut clause_snapshots,
+                            &preview,
+                            &suffix,
+                        );
 
                         self.set_text(&preview, &suffix)?;
                         ipc_service.set_candidates(candidates.texts.clone())?;
@@ -978,7 +1003,6 @@ impl TextServiceFactory {
                     ipc_service.clear_text()?;
                 }
                 ClientAction::SetSelection(selection) => {
-                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
                     let desired_index = match selection {
                         SetSelectionType::Up => selection_index - 1,
                         SetSelectionType::Down => selection_index + 1,
@@ -991,6 +1015,11 @@ impl TextServiceFactory {
                         preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
                         suffix = selected.sub_text.clone();
                         raw_hiragana = selected.hiragana;
+                        Self::sync_clause_snapshot_suffixes(
+                            &mut clause_snapshots,
+                            &preview,
+                            &suffix,
+                        );
 
                         ipc_service.set_selection(selection_index)?;
                         self.set_text(&preview, &suffix)?;
