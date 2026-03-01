@@ -560,7 +560,7 @@ impl TextServiceFactory {
                     CompositionState::None,
                     vec![ClientAction::RemoveText, ClientAction::EndComposition],
                 ),
-                UserAction::Navigation(direction) => match direction {
+                UserAction::Navigation(ref direction) => match direction {
                     Navigation::Right => (
                         CompositionState::Composing,
                         vec![ClientAction::MoveClause(1)],
@@ -704,7 +704,7 @@ impl TextServiceFactory {
                     CompositionState::None,
                     vec![ClientAction::RemoveText, ClientAction::EndComposition],
                 ),
-                UserAction::Navigation(direction) => match direction {
+                UserAction::Navigation(ref direction) => match direction {
                     Navigation::Right => (
                         CompositionState::Composing,
                         vec![ClientAction::MoveClause(1)],
