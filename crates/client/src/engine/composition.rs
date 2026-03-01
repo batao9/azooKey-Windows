@@ -796,21 +796,28 @@ impl TextServiceFactory {
                     } else {
                         // Server side text is fully removed. Close TSF composition too
                         // so preedit text does not linger in an inconsistent state.
+                        let committed_prefix = fixed_prefix.clone();
+
                         transition = CompositionState::None;
                         selection_index = 0;
                         corresponding_count = 0;
-                        preview.clear();
                         suffix.clear();
                         raw_input.clear();
                         raw_hiragana.clear();
-                        fixed_prefix.clear();
                         clause_snapshots.clear();
 
-                        self.set_text("", "")?;
+                        if committed_prefix.is_empty() {
+                            self.set_text("", "")?;
+                        } else {
+                            self.set_text(&committed_prefix, "")?;
+                        }
                         self.end_composition()?;
                         ipc_service.hide_window()?;
                         ipc_service.set_candidates(vec![])?;
                         ipc_service.clear_text()?;
+
+                        preview.clear();
+                        fixed_prefix.clear();
                     }
                 }
                 ClientAction::MoveCursor(offset) => {
