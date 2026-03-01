@@ -603,7 +603,7 @@ impl TextServiceFactory {
                     CompositionState::Previewing,
                     vec![ClientAction::SetSelection(SetSelectionType::Down)],
                 ),
-                UserAction::Function(key) => match key {
+                UserAction::Function(ref key) => match key {
                     Function::Six => (
                         CompositionState::Previewing,
                         vec![ClientAction::SetTextWithType(SetTextType::Hiragana)],
@@ -747,7 +747,7 @@ impl TextServiceFactory {
                     CompositionState::Previewing,
                     vec![ClientAction::SetSelection(SetSelectionType::Down)],
                 ),
-                UserAction::Function(key) => match key {
+                UserAction::Function(ref key) => match key {
                     Function::Six => (
                         CompositionState::Previewing,
                         vec![ClientAction::SetTextWithType(SetTextType::Hiragana)],
