@@ -8,7 +8,7 @@ use super::{
     client_action::{ClientAction, SetSelectionType, SetTextType},
     full_width::{convert_kana_symbol, to_fullwidth, to_halfwidth},
     input_mode::InputMode,
-    ipc_service::Candidates,
+    ipc_service::{Candidates, IPCService},
     state::IMEState,
     text_util::{to_half_katakana, to_katakana},
     user_action::{Function, Navigation},
@@ -92,6 +92,7 @@ impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
 }
 
 impl TextServiceFactory {
+    const MOVE_CURSOR_CLEAR_CLAUSE_SNAPSHOTS: i32 = 125;
     const MOVE_CURSOR_PUSH_CLAUSE_SNAPSHOT: i32 = 126;
     const MOVE_CURSOR_POP_CLAUSE_SNAPSHOT: i32 = 127;
 
@@ -186,6 +187,55 @@ impl TextServiceFactory {
             clause_preview.to_string()
         } else {
             format!("{fixed_prefix}{clause_preview}")
+        }
+    }
+
+    #[inline]
+    fn clear_clause_snapshots(
+        clause_snapshots: &mut Vec<ClauseSnapshot>,
+        ipc_service: &mut IPCService,
+    ) -> Result<()> {
+        if clause_snapshots.is_empty() {
+            return Ok(());
+        }
+
+        clause_snapshots.clear();
+        let _ = ipc_service.move_cursor(Self::MOVE_CURSOR_CLEAR_CLAUSE_SNAPSHOTS)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn commit_current_clause_actions(composition: &Composition) -> (CompositionState, Vec<ClientAction>) {
+        if composition.suffix.is_empty() {
+            (CompositionState::None, vec![ClientAction::EndComposition])
+        } else {
+            (
+                CompositionState::Composing,
+                vec![ClientAction::ShrinkText("".to_string())],
+            )
+        }
+    }
+
+    #[inline]
+    fn commit_first_clause_actions(composition: &Composition) -> (CompositionState, Vec<ClientAction>) {
+        let mut actions = Vec::with_capacity(composition.clause_snapshots.len() + 1);
+
+        for _ in 0..composition.clause_snapshots.len() {
+            actions.push(ClientAction::MoveClause(-1));
+        }
+
+        let first_suffix_is_empty = composition
+            .clause_snapshots
+            .first()
+            .map(|snapshot| snapshot.suffix.is_empty())
+            .unwrap_or(composition.suffix.is_empty());
+
+        if first_suffix_is_empty {
+            actions.push(ClientAction::EndComposition);
+            (CompositionState::None, actions)
+        } else {
+            actions.push(ClientAction::ShrinkText("".to_string()));
+            (CompositionState::Composing, actions)
         }
     }
 
@@ -390,16 +440,10 @@ impl TextServiceFactory {
                         (CompositionState::Composing, vec![ClientAction::RemoveText])
                     }
                 }
-                UserAction::Enter | UserAction::CommitFirstClause | UserAction::CommitAndNextClause => {
-                    if composition.suffix.is_empty() {
-                        (CompositionState::None, vec![ClientAction::EndComposition])
-                    } else {
-                        (
-                            CompositionState::Composing,
-                            vec![ClientAction::ShrinkText("".to_string())],
-                        )
-                    }
+                UserAction::Enter | UserAction::CommitAndNextClause => {
+                    Self::commit_current_clause_actions(&composition)
                 }
+                UserAction::CommitFirstClause => Self::commit_first_clause_actions(&composition),
                 UserAction::AdjustClauseBoundary(direction) => (
                     CompositionState::Composing,
                     vec![ClientAction::AdjustBoundary(direction)],
@@ -526,16 +570,10 @@ impl TextServiceFactory {
                         (CompositionState::Composing, vec![ClientAction::RemoveText])
                     }
                 }
-                UserAction::Enter | UserAction::CommitFirstClause | UserAction::CommitAndNextClause => {
-                    if composition.suffix.is_empty() {
-                        (CompositionState::None, vec![ClientAction::EndComposition])
-                    } else {
-                        (
-                            CompositionState::Composing,
-                            vec![ClientAction::ShrinkText("".to_string())],
-                        )
-                    }
+                UserAction::Enter | UserAction::CommitAndNextClause => {
+                    Self::commit_current_clause_actions(&composition)
                 }
+                UserAction::CommitFirstClause => Self::commit_first_clause_actions(&composition),
                 UserAction::AdjustClauseBoundary(direction) => (
                     CompositionState::Previewing,
                     vec![ClientAction::AdjustBoundary(direction)],
@@ -697,6 +735,7 @@ impl TextServiceFactory {
                     ipc_service.clear_text()?;
                 }
                 ClientAction::AppendText(text) => {
+                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
                     raw_input.push_str(&text);
 
                     let text = match mode {
@@ -723,6 +762,7 @@ impl TextServiceFactory {
                     }
                 }
                 ClientAction::AppendTextRaw(text) => {
+                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
                     raw_input.push_str(&text);
 
                     candidates = ipc_service.append_text(text.clone())?;
@@ -739,6 +779,7 @@ impl TextServiceFactory {
                     }
                 }
                 ClientAction::RemoveText => {
+                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
                     raw_input.pop();
                     candidates = ipc_service.remove_text()?;
                     if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
@@ -948,7 +989,7 @@ impl TextServiceFactory {
                 }
                 ClientAction::ShrinkText(text) => {
                     fixed_prefix.clear();
-                    clause_snapshots.clear();
+                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
                     // shrink text
                     raw_input.push_str(&text);
                     raw_input = raw_input
@@ -987,7 +1028,7 @@ impl TextServiceFactory {
                 }
                 ClientAction::ShrinkTextRaw(text) => {
                     fixed_prefix.clear();
-                    clause_snapshots.clear();
+                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
                     raw_input.push_str(&text);
                     raw_input = raw_input
                         .chars()

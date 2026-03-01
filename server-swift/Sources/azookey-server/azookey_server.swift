@@ -210,6 +210,12 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     offset: Int32,
     cursorPtr: UnsafeMutablePointer<Int>
 ) -> UnsafeMutablePointer<CChar> {
+    if offset == 125 {
+        composingTextSnapshots.removeAll()
+        cursorPtr.pointee = composingText.convertTargetCursorPosition
+        return _strdup(composingText.convertTarget)!
+    }
+
     if offset == 126 {
         composingTextSnapshots.append(composingText)
         cursorPtr.pointee = composingText.convertTargetCursorPosition
