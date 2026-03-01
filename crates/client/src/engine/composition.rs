@@ -220,18 +220,26 @@ impl TextServiceFactory {
 
         for snapshot in clause_snapshots.iter_mut() {
             if let Some(updated_suffix) = full_text.strip_prefix(&snapshot.preview) {
+                let previous_suffix = snapshot.suffix.clone();
                 let updated_suffix = updated_suffix.to_string();
                 snapshot.suffix = updated_suffix.clone();
 
-                for (sub_text, candidate_corresponding_count) in snapshot
+                for sub_text in snapshot.candidates.sub_texts.iter_mut() {
+                    if let Some(prefix_part) = sub_text.strip_suffix(&previous_suffix) {
+                        *sub_text = format!("{prefix_part}{updated_suffix}");
+                    }
+                }
+
+                if let Some((sub_text, _)) = snapshot
                     .candidates
                     .sub_texts
                     .iter_mut()
                     .zip(snapshot.candidates.corresponding_count.iter())
+                    .find(|(_, candidate_corresponding_count)| {
+                        **candidate_corresponding_count == snapshot.corresponding_count
+                    })
                 {
-                    if *candidate_corresponding_count == snapshot.corresponding_count {
-                        *sub_text = updated_suffix.clone();
-                    }
+                    *sub_text = updated_suffix;
                 }
             }
         }
