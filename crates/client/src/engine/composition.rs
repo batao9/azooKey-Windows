@@ -166,7 +166,6 @@ impl TextServiceFactory {
     #[inline]
     fn next_boundary_index(
         candidates: &Candidates,
-        current_index: i32,
         current_count: i32,
         direction: i32,
     ) -> Option<i32> {
@@ -198,12 +197,12 @@ impl TextServiceFactory {
                 .max()
         }?;
 
-        let current_index = current_index.max(0) as isize;
         indexed_counts
             .into_iter()
             .filter(|(_, count)| *count == target_count)
-            .min_by_key(|(index, _)| (((*index as isize) - current_index).abs(), *index))
-            .map(|(index, _)| index as i32)
+            .map(|(index, _)| index)
+            .min()
+            .map(|index| index as i32)
     }
 
     #[tracing::instrument]
@@ -752,15 +751,12 @@ impl TextServiceFactory {
                     }
                 }
                 ClientAction::RemoveText => {
+                    raw_input.pop();
                     candidates = ipc_service.remove_text()?;
                     if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
                         selection_index = selected.index;
                         corresponding_count = selected.corresponding_count;
 
-                        raw_input = raw_input
-                            .chars()
-                            .take(corresponding_count.max(0) as usize)
-                            .collect();
                         preview = selected.text.clone();
                         suffix = selected.sub_text.clone();
                         raw_hiragana = selected.hiragana;
@@ -768,6 +764,22 @@ impl TextServiceFactory {
                         self.set_text(&preview, &suffix)?;
                         ipc_service.set_candidates(candidates.texts.clone())?;
                         ipc_service.set_selection(selection_index)?;
+                    } else {
+                        // Server side text is fully removed. Close TSF composition too
+                        // so preedit text does not linger in an inconsistent state.
+                        transition = CompositionState::None;
+                        selection_index = 0;
+                        corresponding_count = 0;
+                        preview.clear();
+                        suffix.clear();
+                        raw_input.clear();
+                        raw_hiragana.clear();
+
+                        self.set_text("", "")?;
+                        self.end_composition()?;
+                        ipc_service.hide_window()?;
+                        ipc_service.set_candidates(vec![])?;
+                        ipc_service.clear_text()?;
                     }
                 }
                 ClientAction::MoveCursor(offset) => {
@@ -788,7 +800,6 @@ impl TextServiceFactory {
                 ClientAction::AdjustBoundary(direction) => {
                     if let Some(next_index) = Self::next_boundary_index(
                         &candidates,
-                        selection_index,
                         corresponding_count,
                         *direction,
                     ) {
