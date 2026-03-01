@@ -4,6 +4,7 @@ import ffi
 
 @MainActor let converter = KanaKanjiConverter()
 @MainActor var composingText = ComposingText()
+@MainActor var composingTextSnapshots: [ComposingText] = []
 
 @MainActor var execURL = URL(filePath: "")
 @MainActor var config: [String : Any] = [
@@ -179,6 +180,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     composingText.insertAtCursorPosition("a", inputStyle: .roman2kana)
     converter.requestCandidates(composingText, options: getOptions())
     composingText = ComposingText()
+    composingTextSnapshots.removeAll()
 }
 
 @_silgen_name("AppendText")
@@ -208,7 +210,20 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     offset: Int32,
     cursorPtr: UnsafeMutablePointer<Int>
 ) -> UnsafeMutablePointer<CChar> {
-    let previousCursor = composingText.convertTargetCursorPosition
+    if offset == 126 {
+        composingTextSnapshots.append(composingText)
+        cursorPtr.pointee = composingText.convertTargetCursorPosition
+        return _strdup(composingText.convertTarget)!
+    }
+
+    if offset == 127 {
+        if let restored = composingTextSnapshots.popLast() {
+            composingText = restored
+        }
+        cursorPtr.pointee = composingText.convertTargetCursorPosition
+        return _strdup(composingText.convertTarget)!
+    }
+
     let cursor = composingText.moveCursorFromCursorPosition(count: Int(offset))
     print("offset: \(offset), cursor: \(cursor)")
 
@@ -219,6 +234,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 @_silgen_name("ClearText")
 @MainActor public func clear_text() {
     composingText = ComposingText()
+    composingTextSnapshots.removeAll()
 }
 
 func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
