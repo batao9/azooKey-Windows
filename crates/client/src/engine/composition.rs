@@ -51,6 +51,7 @@ pub struct Composition {
 
     pub state: CompositionState,
     pub temporary_latin: bool,
+    pub temporary_latin_shift_pending: bool,
     pub tip_composition: Option<ITfComposition>,
 }
 
@@ -344,6 +345,7 @@ impl TextServiceFactory {
         let is_ctrl_down = is_ctrl_pressed && wparam.0 == 0x28;
         let is_shift_left = is_shift_pressed && wparam.0 == 0x25;
         let is_shift_right = is_shift_pressed && wparam.0 == 0x27;
+        let is_shift_key = Self::is_shift_key(wparam);
         let is_alt_backquote = Self::is_alt_backquote(wparam, lparam);
         let app_config = AppConfig::read();
 
@@ -380,16 +382,14 @@ impl TextServiceFactory {
             && mode == InputMode::Kana
             && Self::is_shift_alphabet_shortcut(wparam, is_shift_pressed);
 
-        if composition.temporary_latin
-            && Self::is_shift_key(wparam)
-            && !is_shift_left
-            && !is_shift_right
-        {
+        if composition.temporary_latin && is_shift_key && !is_shift_left && !is_shift_right {
             return Ok(Some((
-                vec![ClientAction::SetTemporaryLatin(false)],
+                vec![ClientAction::SetTemporaryLatinShiftPending(true)],
                 composition.state.clone(),
             )));
         }
+
+        let should_clear_shift_pending = composition.temporary_latin_shift_pending && !is_shift_key;
 
         let action = if is_alt_backquote {
             UserAction::ToggleInputMode
@@ -821,7 +821,46 @@ impl TextServiceFactory {
             }
         }
 
+        if should_clear_shift_pending
+            && !actions.iter().any(|current_action| {
+                matches!(
+                    current_action,
+                    ClientAction::SetTemporaryLatinShiftPending(_)
+                )
+            })
+        {
+            actions.insert(0, ClientAction::SetTemporaryLatinShiftPending(false));
+        }
+
         Ok(Some((actions, transition)))
+    }
+
+    #[tracing::instrument]
+    pub fn process_key_up(
+        &self,
+        context: Option<&ITfContext>,
+        wparam: WPARAM,
+        _lparam: LPARAM,
+    ) -> Result<Option<(Vec<ClientAction>, CompositionState)>> {
+        if context.is_none() || !Self::is_shift_key(wparam) {
+            return Ok(None);
+        }
+
+        let composition = {
+            let text_service = self.borrow()?;
+            text_service.borrow_composition()?.clone()
+        };
+
+        if !composition.temporary_latin_shift_pending {
+            return Ok(None);
+        }
+
+        let mut actions = vec![ClientAction::SetTemporaryLatinShiftPending(false)];
+        if composition.temporary_latin {
+            actions.insert(0, ClientAction::SetTemporaryLatin(false));
+        }
+
+        Ok(Some((actions, composition.state.clone())))
     }
 
     #[tracing::instrument]
@@ -844,6 +883,27 @@ impl TextServiceFactory {
         }
 
         Ok(true)
+    }
+
+    #[tracing::instrument]
+    pub fn handle_key_up(
+        &self,
+        context: Option<&ITfContext>,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Result<bool> {
+        if let Some(context) = context {
+            self.borrow_mut()?.context = Some(context.clone());
+        } else {
+            return Ok(false);
+        };
+
+        if let Some((actions, transition)) = self.process_key_up(context, wparam, lparam)? {
+            self.handle_action(&actions, transition)?;
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
     #[tracing::instrument]
@@ -871,6 +931,7 @@ impl TextServiceFactory {
         let mut clause_snapshots = composition.clause_snapshots.clone();
         let mut selection_index = composition.selection_index;
         let mut temporary_latin = composition.temporary_latin;
+        let mut temporary_latin_shift_pending = composition.temporary_latin_shift_pending;
         let mut ipc_service = IMEState::get()?
             .ipc_service
             .clone()
@@ -891,6 +952,7 @@ impl TextServiceFactory {
                     selection_index = 0;
                     corresponding_count = 0;
                     temporary_latin = false;
+                    temporary_latin_shift_pending = false;
                     preview.clear();
                     suffix.clear();
                     raw_input.clear();
@@ -986,6 +1048,7 @@ impl TextServiceFactory {
                         selection_index = 0;
                         corresponding_count = 0;
                         temporary_latin = false;
+                        temporary_latin_shift_pending = false;
                         suffix.clear();
                         raw_input.clear();
                         raw_hiragana.clear();
@@ -1159,6 +1222,7 @@ impl TextServiceFactory {
                     selection_index = 0;
                     corresponding_count = 0;
                     temporary_latin = false;
+                    temporary_latin_shift_pending = false;
                     preview.clear();
                     suffix.clear();
                     raw_input.clear();
@@ -1289,6 +1353,12 @@ impl TextServiceFactory {
                 }
                 ClientAction::SetTemporaryLatin(is_temporary_latin) => {
                     temporary_latin = *is_temporary_latin;
+                    if !temporary_latin {
+                        temporary_latin_shift_pending = false;
+                    }
+                }
+                ClientAction::SetTemporaryLatinShiftPending(is_shift_pending) => {
+                    temporary_latin_shift_pending = *is_shift_pending;
                 }
                 ClientAction::SetTextWithType(set_type) => {
                     let text = match set_type {
@@ -1318,6 +1388,7 @@ impl TextServiceFactory {
         composition.suffix = suffix.clone();
         composition.corresponding_count = corresponding_count;
         composition.temporary_latin = temporary_latin;
+        composition.temporary_latin_shift_pending = temporary_latin_shift_pending;
 
         Ok(())
     }

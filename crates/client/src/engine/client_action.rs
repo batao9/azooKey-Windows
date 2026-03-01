@@ -20,6 +20,7 @@ pub enum ClientAction {
     AdjustBoundary(i32),
     SetSelection(SetSelectionType),
     SetTemporaryLatin(bool),
+    SetTemporaryLatinShiftPending(bool),
 
     SetIMEMode(InputMode),
 }
