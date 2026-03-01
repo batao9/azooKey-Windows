@@ -7,9 +7,11 @@ pub enum ClientAction {
 
     AppendText(String),
     AppendTextRaw(String),
+    AppendTextDirect(String),
     RemoveText,
     ShrinkText(String),
     ShrinkTextRaw(String),
+    ShrinkTextDirect(String),
 
     SetTextWithType(SetTextType),
 
@@ -17,6 +19,7 @@ pub enum ClientAction {
     MoveClause(i32),
     AdjustBoundary(i32),
     SetSelection(SetSelectionType),
+    SetTemporaryLatin(bool),
 
     SetIMEMode(InputMode),
 }

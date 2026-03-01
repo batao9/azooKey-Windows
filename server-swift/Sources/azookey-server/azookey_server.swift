@@ -195,6 +195,18 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     return _strdup(composingText.convertTarget)!
 }
 
+@_silgen_name("AppendTextDirect")
+@MainActor public func append_text_direct(
+    input: UnsafePointer<CChar>,
+    cursorPtr: UnsafeMutablePointer<Int>
+) -> UnsafeMutablePointer<CChar> {
+    let inputString = String(cString: input)
+    composingText.insertAtCursorPosition(inputString, inputStyle: .direct)
+
+    cursorPtr.pointee = composingText.convertTargetCursorPosition
+    return _strdup(composingText.convertTarget)!
+}
+
 @_silgen_name("RemoveText")
 @MainActor public func remove_text(
     cursorPtr: UnsafeMutablePointer<Int>
