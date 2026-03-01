@@ -1,5 +1,3 @@
-use std::cmp::{max, min};
-
 use crate::{
     engine::user_action::UserAction,
     extension::VKeyExt as _,
@@ -10,7 +8,7 @@ use super::{
     client_action::{ClientAction, SetSelectionType, SetTextType},
     full_width::{convert_kana_symbol, to_fullwidth, to_halfwidth},
     input_mode::InputMode,
-    ipc_service::Candidates,
+    ipc_service::{Candidates, IPCService},
     state::IMEState,
     text_util::{to_half_katakana, to_katakana},
     user_action::{Function, Navigation},
@@ -43,14 +41,37 @@ pub struct Composition {
     pub suffix: String,  // text to be appended after preview
     pub raw_input: String,
     pub raw_hiragana: String,
+    pub fixed_prefix: String,
 
     pub corresponding_count: i32, // corresponding count of the preview
 
     pub selection_index: i32,
     pub candidates: Candidates,
+    pub clause_snapshots: Vec<ClauseSnapshot>,
 
     pub state: CompositionState,
     pub tip_composition: Option<ITfComposition>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClauseSnapshot {
+    preview: String,
+    suffix: String,
+    raw_input: String,
+    raw_hiragana: String,
+    fixed_prefix: String,
+    corresponding_count: i32,
+    selection_index: i32,
+    candidates: Candidates,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateSelection {
+    index: i32,
+    text: String,
+    sub_text: String,
+    hiragana: String,
+    corresponding_count: i32,
 }
 
 impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
@@ -71,6 +92,10 @@ impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
 }
 
 impl TextServiceFactory {
+    const MOVE_CURSOR_CLEAR_CLAUSE_SNAPSHOTS: i32 = 125;
+    const MOVE_CURSOR_PUSH_CLAUSE_SNAPSHOT: i32 = 126;
+    const MOVE_CURSOR_POP_CLAUSE_SNAPSHOT: i32 = 127;
+
     #[inline]
     fn is_ctrl_pressed() -> bool {
         VK_CONTROL.is_pressed() || VK_LCONTROL.is_pressed() || VK_RCONTROL.is_pressed()
@@ -137,6 +162,124 @@ impl TextServiceFactory {
         }
     }
 
+    #[inline]
+    fn select_candidate(candidates: &Candidates, desired_index: i32) -> Option<CandidateSelection> {
+        if candidates.texts.is_empty() {
+            return None;
+        }
+
+        let max_index = candidates.texts.len().saturating_sub(1);
+        let index = desired_index.max(0) as usize;
+        let index = index.min(max_index);
+
+        Some(CandidateSelection {
+            index: index as i32,
+            text: candidates.texts.get(index).cloned().unwrap_or_default(),
+            sub_text: candidates.sub_texts.get(index).cloned().unwrap_or_default(),
+            hiragana: candidates.hiragana.clone(),
+            corresponding_count: candidates.corresponding_count.get(index).copied().unwrap_or(0),
+        })
+    }
+
+    #[inline]
+    fn merge_preview_with_prefix(fixed_prefix: &str, clause_preview: &str) -> String {
+        if fixed_prefix.is_empty() {
+            clause_preview.to_string()
+        } else {
+            format!("{fixed_prefix}{clause_preview}")
+        }
+    }
+
+    #[inline]
+    fn clear_clause_snapshots(
+        clause_snapshots: &mut Vec<ClauseSnapshot>,
+        ipc_service: &mut IPCService,
+    ) -> Result<()> {
+        if clause_snapshots.is_empty() {
+            return Ok(());
+        }
+
+        clause_snapshots.clear();
+        let _ = ipc_service.move_cursor(Self::MOVE_CURSOR_CLEAR_CLAUSE_SNAPSHOTS)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn sync_clause_snapshot_suffixes(
+        clause_snapshots: &mut [ClauseSnapshot],
+        preview: &str,
+        suffix: &str,
+    ) {
+        if clause_snapshots.is_empty() {
+            return;
+        }
+
+        let mut full_text = String::with_capacity(preview.len() + suffix.len());
+        full_text.push_str(preview);
+        full_text.push_str(suffix);
+
+        for snapshot in clause_snapshots.iter_mut() {
+            if let Some(updated_suffix) = full_text.strip_prefix(&snapshot.preview) {
+                let previous_suffix = snapshot.suffix.clone();
+                let updated_suffix = updated_suffix.to_string();
+                snapshot.suffix = updated_suffix.clone();
+
+                for sub_text in snapshot.candidates.sub_texts.iter_mut() {
+                    if let Some(prefix_part) = sub_text.strip_suffix(&previous_suffix) {
+                        *sub_text = format!("{prefix_part}{updated_suffix}");
+                    }
+                }
+
+                if let Some((sub_text, _)) = snapshot
+                    .candidates
+                    .sub_texts
+                    .iter_mut()
+                    .zip(snapshot.candidates.corresponding_count.iter())
+                    .find(|(_, candidate_corresponding_count)| {
+                        **candidate_corresponding_count == snapshot.corresponding_count
+                    })
+                {
+                    *sub_text = updated_suffix;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn commit_current_clause_actions(composition: &Composition) -> (CompositionState, Vec<ClientAction>) {
+        if composition.suffix.is_empty() {
+            (CompositionState::None, vec![ClientAction::EndComposition])
+        } else {
+            (
+                CompositionState::Composing,
+                vec![ClientAction::ShrinkText("".to_string())],
+            )
+        }
+    }
+
+    #[inline]
+    fn commit_first_clause_actions(composition: &Composition) -> (CompositionState, Vec<ClientAction>) {
+        let mut actions = Vec::with_capacity(composition.clause_snapshots.len() + 1);
+
+        for _ in 0..composition.clause_snapshots.len() {
+            actions.push(ClientAction::MoveClause(-1));
+        }
+
+        let first_suffix_is_empty = composition
+            .clause_snapshots
+            .first()
+            .map(|snapshot| snapshot.suffix.is_empty())
+            .unwrap_or(composition.suffix.is_empty());
+
+        if first_suffix_is_empty {
+            actions.push(ClientAction::EndComposition);
+            (CompositionState::None, actions)
+        } else {
+            actions.push(ClientAction::ShrinkText("".to_string()));
+            (CompositionState::Composing, actions)
+        }
+    }
+
     #[tracing::instrument]
     pub fn process_key(
         &self,
@@ -151,11 +294,20 @@ impl TextServiceFactory {
         let is_ctrl_pressed = Self::is_ctrl_pressed();
         let is_shift_pressed = Self::is_shift_pressed();
         let is_ctrl_space = is_ctrl_pressed && wparam.0 == 0x20;
+        let is_ctrl_enter = is_ctrl_pressed && wparam.0 == 0x0D;
+        let is_ctrl_down = is_ctrl_pressed && wparam.0 == 0x28;
+        let is_shift_left = is_shift_pressed && wparam.0 == 0x25;
+        let is_shift_right = is_shift_pressed && wparam.0 == 0x27;
         let is_alt_backquote = Self::is_alt_backquote(wparam, lparam);
         let app_config = AppConfig::read();
 
         // check shortcut keys
-        if is_ctrl_pressed && !is_ctrl_space && !is_alt_backquote {
+        if is_ctrl_pressed
+            && !is_ctrl_space
+            && !is_alt_backquote
+            && !is_ctrl_enter
+            && !is_ctrl_down
+        {
             return Ok(None);
         }
 
@@ -181,6 +333,14 @@ impl TextServiceFactory {
 
         let action = if is_alt_backquote {
             UserAction::ToggleInputMode
+        } else if is_ctrl_enter {
+            UserAction::CommitFirstClause
+        } else if is_ctrl_down {
+            UserAction::CommitAndNextClause
+        } else if is_shift_left {
+            UserAction::AdjustClauseBoundary(-1)
+        } else if is_shift_right {
+            UserAction::AdjustClauseBoundary(1)
         } else {
             UserAction::try_from(wparam.0)?
         };
@@ -321,16 +481,14 @@ impl TextServiceFactory {
                         (CompositionState::Composing, vec![ClientAction::RemoveText])
                     }
                 }
-                UserAction::Enter => {
-                    if composition.suffix.is_empty() {
-                        (CompositionState::None, vec![ClientAction::EndComposition])
-                    } else {
-                        (
-                            CompositionState::Composing,
-                            vec![ClientAction::ShrinkText("".to_string())],
-                        )
-                    }
+                UserAction::Enter | UserAction::CommitAndNextClause => {
+                    Self::commit_current_clause_actions(&composition)
                 }
+                UserAction::CommitFirstClause => Self::commit_first_clause_actions(&composition),
+                UserAction::AdjustClauseBoundary(direction) => (
+                    CompositionState::Composing,
+                    vec![ClientAction::AdjustBoundary(direction)],
+                ),
                 UserAction::Escape => (
                     CompositionState::None,
                     vec![ClientAction::RemoveText, ClientAction::EndComposition],
@@ -338,11 +496,11 @@ impl TextServiceFactory {
                 UserAction::Navigation(direction) => match direction {
                     Navigation::Right => (
                         CompositionState::Composing,
-                        vec![ClientAction::MoveCursor(1)],
+                        vec![ClientAction::MoveClause(1)],
                     ),
                     Navigation::Left => (
                         CompositionState::Composing,
-                        vec![ClientAction::MoveCursor(-1)],
+                        vec![ClientAction::MoveClause(-1)],
                     ),
                     Navigation::Up => (
                         CompositionState::Previewing,
@@ -453,16 +611,14 @@ impl TextServiceFactory {
                         (CompositionState::Composing, vec![ClientAction::RemoveText])
                     }
                 }
-                UserAction::Enter => {
-                    if composition.suffix.is_empty() {
-                        (CompositionState::None, vec![ClientAction::EndComposition])
-                    } else {
-                        (
-                            CompositionState::Composing,
-                            vec![ClientAction::ShrinkText("".to_string())],
-                        )
-                    }
+                UserAction::Enter | UserAction::CommitAndNextClause => {
+                    Self::commit_current_clause_actions(&composition)
                 }
+                UserAction::CommitFirstClause => Self::commit_first_clause_actions(&composition),
+                UserAction::AdjustClauseBoundary(direction) => (
+                    CompositionState::Previewing,
+                    vec![ClientAction::AdjustBoundary(direction)],
+                ),
                 UserAction::Escape => (
                     CompositionState::None,
                     vec![ClientAction::RemoveText, ClientAction::EndComposition],
@@ -470,11 +626,11 @@ impl TextServiceFactory {
                 UserAction::Navigation(direction) => match direction {
                     Navigation::Right => (
                         CompositionState::Composing,
-                        vec![ClientAction::MoveCursor(1)],
+                        vec![ClientAction::MoveClause(1)],
                     ),
                     Navigation::Left => (
                         CompositionState::Composing,
-                        vec![ClientAction::MoveCursor(-1)],
+                        vec![ClientAction::MoveClause(-1)],
                     ),
                     Navigation::Up => (
                         CompositionState::Previewing,
@@ -585,8 +741,10 @@ impl TextServiceFactory {
         let mut suffix = composition.suffix.clone();
         let mut raw_input = composition.raw_input.clone();
         let mut raw_hiragana = composition.raw_hiragana.clone();
+        let mut fixed_prefix = composition.fixed_prefix.clone();
         let mut corresponding_count = composition.corresponding_count.clone();
         let mut candidates = composition.candidates.clone();
+        let mut clause_snapshots = composition.clause_snapshots.clone();
         let mut selection_index = composition.selection_index;
         let mut ipc_service = IMEState::get()?
             .ipc_service
@@ -611,11 +769,14 @@ impl TextServiceFactory {
                     suffix.clear();
                     raw_input.clear();
                     raw_hiragana.clear();
+                    fixed_prefix.clear();
+                    clause_snapshots.clear();
                     ipc_service.hide_window()?;
                     ipc_service.set_candidates(vec![])?;
                     ipc_service.clear_text()?;
                 }
                 ClientAction::AppendText(text) => {
+                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
                     raw_input.push_str(&text);
 
                     let text = match mode {
@@ -629,73 +790,209 @@ impl TextServiceFactory {
                     };
 
                     candidates = ipc_service.append_text(text.clone())?;
-                    let text = candidates.texts[selection_index as usize].clone();
-                    let sub_text = candidates.sub_texts[selection_index as usize].clone();
-                    let hiragana = candidates.hiragana.clone();
+                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
+                        selection_index = selected.index;
+                        corresponding_count = selected.corresponding_count;
+                        preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
+                        suffix = selected.sub_text.clone();
+                        raw_hiragana = selected.hiragana;
 
-                    corresponding_count = candidates.corresponding_count[selection_index as usize];
-
-                    preview = text.clone();
-                    suffix = sub_text.clone();
-                    raw_hiragana = hiragana.clone();
-
-                    self.set_text(&text, &sub_text)?;
-                    ipc_service.set_candidates(candidates.texts.clone())?;
-                    ipc_service.set_selection(selection_index as i32)?;
+                        self.set_text(&preview, &suffix)?;
+                        ipc_service.set_candidates(candidates.texts.clone())?;
+                        ipc_service.set_selection(selection_index)?;
+                    }
                 }
                 ClientAction::AppendTextRaw(text) => {
+                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
                     raw_input.push_str(&text);
 
                     candidates = ipc_service.append_text(text.clone())?;
-                    let text = candidates.texts[selection_index as usize].clone();
-                    let sub_text = candidates.sub_texts[selection_index as usize].clone();
-                    let hiragana = candidates.hiragana.clone();
+                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
+                        selection_index = selected.index;
+                        corresponding_count = selected.corresponding_count;
+                        preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
+                        suffix = selected.sub_text.clone();
+                        raw_hiragana = selected.hiragana;
 
-                    corresponding_count = candidates.corresponding_count[selection_index as usize];
-
-                    preview = text.clone();
-                    suffix = sub_text.clone();
-                    raw_hiragana = hiragana.clone();
-
-                    self.set_text(&text, &sub_text)?;
-                    ipc_service.set_candidates(candidates.texts.clone())?;
-                    ipc_service.set_selection(selection_index as i32)?;
+                        self.set_text(&preview, &suffix)?;
+                        ipc_service.set_candidates(candidates.texts.clone())?;
+                        ipc_service.set_selection(selection_index)?;
+                    }
                 }
                 ClientAction::RemoveText => {
+                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
+                    raw_input.pop();
                     candidates = ipc_service.remove_text()?;
-                    let empty = "".to_string();
-                    let text = candidates
-                        .texts
-                        .get(selection_index as usize)
-                        .cloned()
-                        .unwrap_or(empty.clone());
-                    let sub_text = candidates
-                        .sub_texts
-                        .get(selection_index as usize)
-                        .cloned()
-                        .unwrap_or(empty.clone());
-                    let hiragana = candidates.hiragana.clone();
-                    corresponding_count = candidates
-                        .corresponding_count
-                        .get(selection_index as usize)
-                        .cloned()
-                        .unwrap_or(0);
+                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
+                        selection_index = selected.index;
+                        corresponding_count = selected.corresponding_count;
 
-                    raw_input = raw_input
-                        .chars()
-                        .take(corresponding_count as usize)
-                        .collect();
-                    preview = text.clone();
-                    suffix = sub_text.clone();
-                    raw_hiragana = hiragana.clone();
+                        preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
+                        suffix = selected.sub_text.clone();
+                        raw_hiragana = selected.hiragana;
 
-                    self.set_text(&text, &sub_text)?;
-                    ipc_service.set_candidates(candidates.texts.clone())?;
-                    ipc_service.set_selection(selection_index as i32)?;
+                        self.set_text(&preview, &suffix)?;
+                        ipc_service.set_candidates(candidates.texts.clone())?;
+                        ipc_service.set_selection(selection_index)?;
+                    } else {
+                        // Server side text is fully removed. Close TSF composition too
+                        // so preedit text does not linger in an inconsistent state.
+                        let committed_prefix = fixed_prefix.clone();
+
+                        transition = CompositionState::None;
+                        selection_index = 0;
+                        corresponding_count = 0;
+                        suffix.clear();
+                        raw_input.clear();
+                        raw_hiragana.clear();
+                        clause_snapshots.clear();
+
+                        if committed_prefix.is_empty() {
+                            self.set_text("", "")?;
+                        } else {
+                            self.set_text(&committed_prefix, "")?;
+                        }
+                        self.end_composition()?;
+                        ipc_service.hide_window()?;
+                        ipc_service.set_candidates(vec![])?;
+                        ipc_service.clear_text()?;
+
+                        preview.clear();
+                        fixed_prefix.clear();
+                    }
                 }
-                ClientAction::MoveCursor(_offset) => {
-                    // TODO: I'll use azookey-kkc's composingText
-                    // self.set_cursor(offset)?;
+                ClientAction::MoveCursor(offset) => {
+                    candidates = ipc_service.move_cursor(*offset)?;
+                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
+                        selection_index = selected.index;
+                        corresponding_count = selected.corresponding_count;
+                        preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
+                        suffix = selected.sub_text.clone();
+                        raw_hiragana = selected.hiragana;
+
+                        self.set_text(&preview, &suffix)?;
+                        ipc_service.set_candidates(candidates.texts.clone())?;
+                        ipc_service.set_selection(selection_index)?;
+                        self.update_pos()?;
+                    }
+                }
+                ClientAction::MoveClause(direction) => {
+                    if *direction > 0 {
+                        if suffix.is_empty() {
+                            continue;
+                        }
+
+                        let snapshot = ClauseSnapshot {
+                            preview: preview.clone(),
+                            suffix: suffix.clone(),
+                            raw_input: raw_input.clone(),
+                            raw_hiragana: raw_hiragana.clone(),
+                            fixed_prefix: fixed_prefix.clone(),
+                            corresponding_count,
+                            selection_index,
+                            candidates: candidates.clone(),
+                        };
+
+                        let current_clause_preview = preview
+                            .strip_prefix(&fixed_prefix)
+                            .unwrap_or(&preview)
+                            .to_string();
+                        let current_corresponding_count = corresponding_count;
+
+                        ipc_service.move_cursor(Self::MOVE_CURSOR_PUSH_CLAUSE_SNAPSHOT)?;
+                        clause_snapshots.push(snapshot);
+
+                        candidates = ipc_service.shrink_text(current_corresponding_count)?;
+                        selection_index = 0;
+                        raw_input = raw_input
+                            .chars()
+                            .skip(current_corresponding_count.max(0) as usize)
+                            .collect();
+                        fixed_prefix.push_str(&current_clause_preview);
+
+                        if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
+                            selection_index = selected.index;
+                            corresponding_count = selected.corresponding_count;
+                            preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
+                            suffix = selected.sub_text.clone();
+                            raw_hiragana = selected.hiragana;
+
+                            self.set_text(&preview, &suffix)?;
+                            ipc_service.set_candidates(candidates.texts.clone())?;
+                            ipc_service.set_selection(selection_index)?;
+                            self.update_pos()?;
+                        } else {
+                            ipc_service.move_cursor(Self::MOVE_CURSOR_POP_CLAUSE_SNAPSHOT)?;
+                            if let Some(restored) = clause_snapshots.pop() {
+                                preview = restored.preview;
+                                suffix = restored.suffix;
+                                raw_input = restored.raw_input;
+                                raw_hiragana = restored.raw_hiragana;
+                                fixed_prefix = restored.fixed_prefix;
+                                corresponding_count = restored.corresponding_count;
+                                selection_index = restored.selection_index;
+                                candidates = restored.candidates;
+
+                                self.set_text(&preview, &suffix)?;
+                                ipc_service.set_candidates(candidates.texts.clone())?;
+                                ipc_service.set_selection(selection_index)?;
+                                self.update_pos()?;
+                            }
+                        }
+                    } else if *direction < 0 {
+                        if let Some(restored) = clause_snapshots.pop() {
+                            ipc_service.move_cursor(Self::MOVE_CURSOR_POP_CLAUSE_SNAPSHOT)?;
+
+                            preview = restored.preview;
+                            suffix = restored.suffix;
+                            raw_input = restored.raw_input;
+                            raw_hiragana = restored.raw_hiragana;
+                            fixed_prefix = restored.fixed_prefix;
+                            corresponding_count = restored.corresponding_count;
+                            selection_index = restored.selection_index;
+                            candidates = restored.candidates;
+
+                            self.set_text(&preview, &suffix)?;
+                            ipc_service.set_candidates(candidates.texts.clone())?;
+                            ipc_service.set_selection(selection_index)?;
+                            self.update_pos()?;
+                        }
+                    }
+                }
+                ClientAction::AdjustBoundary(direction) => {
+                    if *direction == 0 {
+                        continue;
+                    }
+
+                    ipc_service.move_cursor(*direction)?;
+                    let boundary_candidates = ipc_service.move_cursor(0)?;
+                    if boundary_candidates.texts.is_empty() {
+                        // Keep at least one hiragana on the left side for clause adjustment.
+                        // If cursor moved to head, rollback so Shift+Left works as no-op.
+                        if *direction < 0 {
+                            let _ = ipc_service.move_cursor(1)?;
+                        }
+                        continue;
+                    }
+
+                    candidates = boundary_candidates;
+                    if let Some(selected) = Self::select_candidate(&candidates, 0) {
+                        selection_index = selected.index;
+                        corresponding_count = selected.corresponding_count;
+                        preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
+                        suffix = selected.sub_text.clone();
+                        raw_hiragana = selected.hiragana;
+                        Self::sync_clause_snapshot_suffixes(
+                            &mut clause_snapshots,
+                            &preview,
+                            &suffix,
+                        );
+
+                        self.set_text(&preview, &suffix)?;
+                        ipc_service.set_candidates(candidates.texts.clone())?;
+                        ipc_service.set_selection(selection_index)?;
+                        self.update_pos()?;
+                    }
                 }
                 ClientAction::SetIMEMode(mode) => {
                     self.start_composition()?;
@@ -721,43 +1018,41 @@ impl TextServiceFactory {
                     suffix.clear();
                     raw_input.clear();
                     raw_hiragana.clear();
+                    fixed_prefix.clear();
+                    clause_snapshots.clear();
                     ipc_service.clear_text()?;
                 }
                 ClientAction::SetSelection(selection) => {
-                    let candidates = {
-                        let text_service = self.borrow()?;
-                        let composition = text_service.borrow_composition()?.clone();
-                        let candidates = composition.candidates.clone();
-                        candidates
-                    };
-
-                    let texts = candidates.texts.clone();
-                    let sub_texts = candidates.sub_texts.clone();
-
-                    selection_index = match selection {
-                        SetSelectionType::Up => max(0, selection_index - 1),
-                        SetSelectionType::Down => min(texts.len() as i32 - 1, selection_index + 1),
+                    let desired_index = match selection {
+                        SetSelectionType::Up => selection_index - 1,
+                        SetSelectionType::Down => selection_index + 1,
                         SetSelectionType::Number(number) => *number,
                     };
 
-                    ipc_service.set_selection(selection_index as i32)?;
-                    let text = texts[selection_index as usize].clone();
-                    let sub_text = sub_texts[selection_index as usize].clone();
-                    let hiragana = candidates.hiragana.clone();
-                    corresponding_count = candidates.corresponding_count[selection_index as usize];
+                    if let Some(selected) = Self::select_candidate(&candidates, desired_index) {
+                        selection_index = selected.index;
+                        corresponding_count = selected.corresponding_count;
+                        preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
+                        suffix = selected.sub_text.clone();
+                        raw_hiragana = selected.hiragana;
+                        Self::sync_clause_snapshot_suffixes(
+                            &mut clause_snapshots,
+                            &preview,
+                            &suffix,
+                        );
 
-                    preview = text.clone();
-                    suffix = sub_text.clone();
-                    raw_hiragana = hiragana.clone();
-
-                    self.set_text(&text, &sub_text)?;
+                        ipc_service.set_selection(selection_index)?;
+                        self.set_text(&preview, &suffix)?;
+                    }
                 }
                 ClientAction::ShrinkText(text) => {
+                    fixed_prefix.clear();
+                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
                     // shrink text
                     raw_input.push_str(&text);
                     raw_input = raw_input
                         .chars()
-                        .skip(corresponding_count as usize)
+                        .skip(corresponding_count.max(0) as usize)
                         .collect();
 
                     ipc_service.shrink_text(corresponding_count.clone())?;
@@ -773,46 +1068,48 @@ impl TextServiceFactory {
                     candidates = ipc_service.append_text(text)?;
                     selection_index = 0;
 
-                    let text = candidates.texts[selection_index as usize].clone();
-                    let sub_text = candidates.sub_texts[selection_index as usize].clone();
-                    let hiragana = candidates.hiragana.clone();
-                    self.shift_start(&preview, &text)?;
+                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
+                        self.shift_start(&preview, &selected.text)?;
 
-                    corresponding_count = candidates.corresponding_count[selection_index as usize];
-                    preview = text.clone();
-                    suffix = sub_text.clone();
-                    raw_hiragana = hiragana.clone();
+                        selection_index = selected.index;
+                        corresponding_count = selected.corresponding_count;
+                        preview = selected.text.clone();
+                        suffix = selected.sub_text.clone();
+                        raw_hiragana = selected.hiragana;
 
-                    ipc_service.set_candidates(candidates.texts.clone())?;
-                    ipc_service.set_selection(selection_index as i32)?;
-                    self.update_pos()?;
+                        ipc_service.set_candidates(candidates.texts.clone())?;
+                        ipc_service.set_selection(selection_index)?;
+                        self.update_pos()?;
+                    }
 
                     transition = CompositionState::Composing;
                 }
                 ClientAction::ShrinkTextRaw(text) => {
+                    fixed_prefix.clear();
+                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
                     raw_input.push_str(&text);
                     raw_input = raw_input
                         .chars()
-                        .skip(corresponding_count as usize)
+                        .skip(corresponding_count.max(0) as usize)
                         .collect();
 
                     ipc_service.shrink_text(corresponding_count.clone())?;
                     candidates = ipc_service.append_text(text.clone())?;
                     selection_index = 0;
 
-                    let text = candidates.texts[selection_index as usize].clone();
-                    let sub_text = candidates.sub_texts[selection_index as usize].clone();
-                    let hiragana = candidates.hiragana.clone();
-                    self.shift_start(&preview, &text)?;
+                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
+                        self.shift_start(&preview, &selected.text)?;
 
-                    corresponding_count = candidates.corresponding_count[selection_index as usize];
-                    preview = text.clone();
-                    suffix = sub_text.clone();
-                    raw_hiragana = hiragana.clone();
+                        selection_index = selected.index;
+                        corresponding_count = selected.corresponding_count;
+                        preview = selected.text.clone();
+                        suffix = selected.sub_text.clone();
+                        raw_hiragana = selected.hiragana;
 
-                    ipc_service.set_candidates(candidates.texts.clone())?;
-                    ipc_service.set_selection(selection_index as i32)?;
-                    self.update_pos()?;
+                        ipc_service.set_candidates(candidates.texts.clone())?;
+                        ipc_service.set_selection(selection_index)?;
+                        self.update_pos()?;
+                    }
 
                     transition = CompositionState::Composing;
                 }
@@ -838,7 +1135,9 @@ impl TextServiceFactory {
         composition.selection_index = selection_index;
         composition.raw_input = raw_input.clone();
         composition.raw_hiragana = raw_hiragana.clone();
+        composition.fixed_prefix = fixed_prefix.clone();
         composition.candidates = candidates;
+        composition.clause_snapshots = clause_snapshots;
         composition.suffix = suffix.clone();
         composition.corresponding_count = corresponding_count;
 

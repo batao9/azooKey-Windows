@@ -36,6 +36,7 @@ unsafe extern "C" {
     fn ShrinkText(offset: c_int) -> *mut c_char;
     fn ClearText();
     fn GetComposedText(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
+    fn GetComposedTextForCursorPrefix(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
     fn LoadConfig();
 }
 
@@ -100,10 +101,14 @@ fn clear_text() {
     }
 }
 
-fn get_composed_text() -> Vec<Suggestion> {
+fn get_composed_text(use_cursor_prefix: bool) -> Vec<Suggestion> {
     unsafe {
         let mut length: c_int = 0;
-        let result = GetComposedText(&mut length);
+        let result = if use_cursor_prefix {
+            GetComposedTextForCursorPrefix(&mut length)
+        } else {
+            GetComposedText(&mut length)
+        };
         let mut suggestions = Vec::with_capacity(length as usize);
 
         for index in 0..length as usize {
@@ -165,7 +170,7 @@ impl AzookeyService for MyAzookeyService {
         Ok(Response::new(AppendTextResponse {
             composing_text: Some(ComposingText {
                 hiragana: composing_text.text,
-                suggestions: get_composed_text().to_vec(),
+                suggestions: get_composed_text(false).to_vec(),
             }),
         }))
     }
@@ -179,7 +184,7 @@ impl AzookeyService for MyAzookeyService {
         Ok(Response::new(RemoveTextResponse {
             composing_text: Some(ComposingText {
                 hiragana: composing_text.text,
-                suggestions: get_composed_text().to_vec(),
+                suggestions: get_composed_text(false).to_vec(),
             }),
         }))
     }
@@ -189,12 +194,13 @@ impl AzookeyService for MyAzookeyService {
         request: Request<MoveCursorRequest>,
     ) -> Result<Response<MoveCursorResponse>, Status> {
         let offset = request.into_inner().offset as i8;
+        let use_cursor_prefix = offset == 0;
         let composing_text = move_cursor(offset);
 
         Ok(Response::new(MoveCursorResponse {
             composing_text: Some(ComposingText {
                 hiragana: composing_text.text,
-                suggestions: get_composed_text().to_vec(),
+                suggestions: get_composed_text(use_cursor_prefix).to_vec(),
             }),
         }))
     }
@@ -217,7 +223,7 @@ impl AzookeyService for MyAzookeyService {
         Ok(Response::new(ShrinkTextResponse {
             composing_text: Some(ComposingText {
                 hiragana: composing_text.text,
-                suggestions: get_composed_text().to_vec(),
+                suggestions: get_composed_text(false).to_vec(),
             }),
         }))
     }

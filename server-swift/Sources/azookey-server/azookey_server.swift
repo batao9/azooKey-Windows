@@ -4,6 +4,7 @@ import ffi
 
 @MainActor let converter = KanaKanjiConverter()
 @MainActor var composingText = ComposingText()
+@MainActor var composingTextSnapshots: [ComposingText] = []
 
 @MainActor var execURL = URL(filePath: "")
 @MainActor var config: [String : Any] = [
@@ -179,6 +180,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     composingText.insertAtCursorPosition("a", inputStyle: .roman2kana)
     converter.requestCandidates(composingText, options: getOptions())
     composingText = ComposingText()
+    composingTextSnapshots.removeAll()
 }
 
 @_silgen_name("AppendText")
@@ -208,7 +210,26 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     offset: Int32,
     cursorPtr: UnsafeMutablePointer<Int>
 ) -> UnsafeMutablePointer<CChar> {
-    let previousCursor = composingText.convertTargetCursorPosition
+    if offset == 125 {
+        composingTextSnapshots.removeAll()
+        cursorPtr.pointee = composingText.convertTargetCursorPosition
+        return _strdup(composingText.convertTarget)!
+    }
+
+    if offset == 126 {
+        composingTextSnapshots.append(composingText)
+        cursorPtr.pointee = composingText.convertTargetCursorPosition
+        return _strdup(composingText.convertTarget)!
+    }
+
+    if offset == 127 {
+        if let restored = composingTextSnapshots.popLast() {
+            composingText = restored
+        }
+        cursorPtr.pointee = composingText.convertTargetCursorPosition
+        return _strdup(composingText.convertTarget)!
+    }
+
     let cursor = composingText.moveCursorFromCursorPosition(count: Int(offset))
     print("offset: \(offset), cursor: \(cursor)")
 
@@ -219,6 +240,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 @_silgen_name("ClearText")
 @MainActor public func clear_text() {
     composingText = ComposingText()
+    composingTextSnapshots.removeAll()
 }
 
 func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
@@ -249,7 +271,37 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         afterComposingText.prefixComplete(correspondingCount: correspondingCount)
         let subtext = strdup(afterComposingText.convertTarget)
 
-        result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))        
+        result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))
+    }
+
+    lengthPtr.pointee = result.count
+
+    return to_list_pointer(result)
+}
+
+@_silgen_name("GetComposedTextForCursorPrefix")
+@MainActor public func get_composed_text_for_cursor_prefix(lengthPtr: UnsafeMutablePointer<Int>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
+    let hiragana = composingText.convertTarget
+    let suffixAfterCursor = String(hiragana.dropFirst(composingText.convertTargetCursorPosition))
+    let prefixComposingText = composingText.prefixToCursorPosition()
+    let prefixHiragana = prefixComposingText.convertTarget
+    let contextString = (config["context"] as? String) ?? ""
+    let options = getOptions(context: contextString)
+    let converted = converter.requestCandidates(prefixComposingText, options: options)
+    var result: [FFICandidate] = []
+
+    for i in 0..<converted.mainResults.count {
+        let candidate = converted.mainResults[i]
+
+        let text = strdup(constructCandidateString(candidate: candidate, hiragana: prefixHiragana))
+        let hiragana = strdup(hiragana)
+        let correspondingCount = candidate.correspondingCount
+
+        var remainingPrefixComposingText = prefixComposingText
+        remainingPrefixComposingText.prefixComplete(correspondingCount: correspondingCount)
+        let subtext = strdup(remainingPrefixComposingText.convertTarget + suffixAfterCursor)
+
+        result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))
     }
 
     lengthPtr.pointee = result.count
