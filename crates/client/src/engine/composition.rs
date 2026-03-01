@@ -120,7 +120,9 @@ impl TextServiceFactory {
     #[inline]
     fn direct_text_for_action(action: &UserAction) -> Option<String> {
         match action {
-            UserAction::Input(char) => Some(char.to_string()),
+            UserAction::Input(input_char) => {
+                Some(Self::normalize_direct_symbol_char(*input_char).to_string())
+            }
             UserAction::Space => Some(" ".to_string()),
             UserAction::NumpadSymbol(symbol) => Some(symbol.to_string()),
             UserAction::Number { value, .. } => {
@@ -128,6 +130,25 @@ impl TextServiceFactory {
                 Some(digit.to_string())
             }
             _ => None,
+        }
+    }
+
+    #[inline]
+    fn normalize_direct_symbol_char(c: char) -> char {
+        let halfwidth_ascii = Self::to_halfwidth_ascii_char(c);
+        if halfwidth_ascii.is_ascii_punctuation() {
+            return halfwidth_ascii;
+        }
+
+        if c.is_ascii_punctuation() {
+            return c;
+        }
+
+        let converted = to_halfwidth(&c.to_string());
+        let mut converted_chars = converted.chars();
+        match (converted_chars.next(), converted_chars.next()) {
+            (Some(converted_char), None) if converted_char.is_ascii_punctuation() => converted_char,
+            _ => c,
         }
     }
 
