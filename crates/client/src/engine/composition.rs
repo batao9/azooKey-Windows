@@ -163,48 +163,6 @@ impl TextServiceFactory {
         })
     }
 
-    #[inline]
-    fn next_boundary_index(
-        candidates: &Candidates,
-        current_count: i32,
-        direction: i32,
-    ) -> Option<i32> {
-        if direction == 0 || candidates.texts.is_empty() {
-            return None;
-        }
-
-        let indexed_counts: Vec<(usize, i32)> = candidates
-            .texts
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                let count = candidates.corresponding_count.get(index).copied().unwrap_or(0);
-                (index, count)
-            })
-            .collect();
-
-        let target_count = if direction > 0 {
-            indexed_counts
-                .iter()
-                .map(|(_, count)| *count)
-                .filter(|count| *count > current_count)
-                .min()
-        } else {
-            indexed_counts
-                .iter()
-                .map(|(_, count)| *count)
-                .filter(|count| *count < current_count)
-                .max()
-        }?;
-
-        indexed_counts
-            .into_iter()
-            .filter(|(_, count)| *count == target_count)
-            .map(|(index, _)| index)
-            .min()
-            .map(|index| index as i32)
-    }
-
     #[tracing::instrument]
     pub fn process_key(
         &self,
@@ -798,21 +756,32 @@ impl TextServiceFactory {
                     }
                 }
                 ClientAction::AdjustBoundary(direction) => {
-                    if let Some(next_index) = Self::next_boundary_index(
-                        &candidates,
-                        corresponding_count,
-                        *direction,
-                    ) {
-                        if let Some(selected) = Self::select_candidate(&candidates, next_index) {
-                            selection_index = selected.index;
-                            corresponding_count = selected.corresponding_count;
-                            preview = selected.text.clone();
-                            suffix = selected.sub_text.clone();
-                            raw_hiragana = selected.hiragana;
+                    if *direction == 0 {
+                        continue;
+                    }
 
-                            self.set_text(&preview, &suffix)?;
-                            ipc_service.set_selection(selection_index)?;
+                    let moved_candidates = ipc_service.move_cursor(*direction)?;
+                    if moved_candidates.texts.is_empty() {
+                        // Keep at least one hiragana on the left side for clause adjustment.
+                        // If cursor moved to head, rollback so Shift+Left works as no-op.
+                        if *direction < 0 {
+                            let _ = ipc_service.move_cursor(1)?;
                         }
+                        continue;
+                    }
+
+                    candidates = moved_candidates;
+                    if let Some(selected) = Self::select_candidate(&candidates, 0) {
+                        selection_index = selected.index;
+                        corresponding_count = selected.corresponding_count;
+                        preview = selected.text.clone();
+                        suffix = selected.sub_text.clone();
+                        raw_hiragana = selected.hiragana;
+
+                        self.set_text(&preview, &suffix)?;
+                        ipc_service.set_candidates(candidates.texts.clone())?;
+                        ipc_service.set_selection(selection_index)?;
+                        self.update_pos()?;
                     }
                 }
                 ClientAction::SetIMEMode(mode) => {
