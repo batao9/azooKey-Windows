@@ -277,7 +277,8 @@ impl AzookeyService for MyAzookeyService {
     }
 }
 
-#[tokio::main]
+// Swift FFI entry points are @MainActor; run tonic handlers on the main thread.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("AzookeyServer started");
     // get executable directory
