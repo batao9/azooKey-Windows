@@ -210,6 +210,21 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn clear_temporary_latin_shift_pending_if_needed(
+        &self,
+        should_clear_shift_pending: bool,
+    ) -> Result<()> {
+        if !should_clear_shift_pending {
+            return Ok(());
+        }
+
+        let text_service = self.borrow()?;
+        let mut composition = text_service.borrow_mut_composition()?;
+        composition.temporary_latin_shift_pending = false;
+        Ok(())
+    }
+
+    #[inline]
     fn select_candidate(candidates: &Candidates, desired_index: i32) -> Option<CandidateSelection> {
         if candidates.texts.is_empty() {
             return None;
@@ -356,6 +371,7 @@ impl TextServiceFactory {
             && !is_ctrl_enter
             && !is_ctrl_down
         {
+            self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(wparam))?;
             return Ok(None);
         }
 
@@ -363,10 +379,12 @@ impl TextServiceFactory {
             let shortcuts = &app_config.shortcuts;
 
             if is_ctrl_space && !shortcuts.ctrl_space_toggle {
+                self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(wparam))?;
                 return Ok(None);
             }
 
             if is_alt_backquote && !shortcuts.alt_backquote_toggle {
+                self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(wparam))?;
                 return Ok(None);
             }
         }
@@ -411,6 +429,9 @@ impl TextServiceFactory {
                     && Self::direct_text_for_action(&action).is_some() =>
                 {
                     let Some(text) = Self::direct_text_for_action(&action) else {
+                        self.clear_temporary_latin_shift_pending_if_needed(
+                            should_clear_shift_pending,
+                        )?;
                         return Ok(None);
                     };
 
@@ -427,6 +448,9 @@ impl TextServiceFactory {
                         app_config.general.numpad_input,
                         true,
                     ) else {
+                        self.clear_temporary_latin_shift_pending_if_needed(
+                            should_clear_shift_pending,
+                        )?;
                         return Ok(None);
                     };
 
@@ -452,6 +476,9 @@ impl TextServiceFactory {
                         app_config.general.numpad_input,
                         true,
                     ) else {
+                        self.clear_temporary_latin_shift_pending_if_needed(
+                            should_clear_shift_pending,
+                        )?;
                         return Ok(None);
                     };
 
@@ -503,6 +530,7 @@ impl TextServiceFactory {
                     vec![ClientAction::SetIMEMode(InputMode::Latin)],
                 ),
                 _ => {
+                    self.clear_temporary_latin_shift_pending_if_needed(should_clear_shift_pending)?;
                     return Ok(None);
                 }
             },
@@ -511,6 +539,9 @@ impl TextServiceFactory {
                     && Self::direct_text_for_action(&action).is_some() =>
                 {
                     let Some(text) = Self::direct_text_for_action(&action) else {
+                        self.clear_temporary_latin_shift_pending_if_needed(
+                            should_clear_shift_pending,
+                        )?;
                         return Ok(None);
                     };
 
@@ -647,6 +678,7 @@ impl TextServiceFactory {
                     ),
                 },
                 _ => {
+                    self.clear_temporary_latin_shift_pending_if_needed(should_clear_shift_pending)?;
                     return Ok(None);
                 }
             },
@@ -655,6 +687,9 @@ impl TextServiceFactory {
                     && Self::direct_text_for_action(&action).is_some() =>
                 {
                     let Some(text) = Self::direct_text_for_action(&action) else {
+                        self.clear_temporary_latin_shift_pending_if_needed(
+                            should_clear_shift_pending,
+                        )?;
                         return Ok(None);
                     };
 
@@ -791,10 +826,12 @@ impl TextServiceFactory {
                     ),
                 },
                 _ => {
+                    self.clear_temporary_latin_shift_pending_if_needed(should_clear_shift_pending)?;
                     return Ok(None);
                 }
             },
             _ => {
+                self.clear_temporary_latin_shift_pending_if_needed(should_clear_shift_pending)?;
                 return Ok(None);
             }
         };
