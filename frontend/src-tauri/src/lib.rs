@@ -7,14 +7,22 @@ use std::{path::PathBuf, sync::Mutex};
 #[derive(Debug)]
 pub struct AppState {
     settings: Mutex<AppConfig>,
-    ipc: ipc::IPCService,
+    ipc: Mutex<Option<ipc::IPCService>>,
 }
 
 impl AppState {
     fn new() -> Self {
+        let ipc = match ipc::IPCService::new() {
+            Ok(service) => Some(service),
+            Err(error) => {
+                eprintln!("Failed to initialize IPC service: {}", error);
+                None
+            }
+        };
+
         AppState {
             settings: Mutex::new(AppConfig::new()),
-            ipc: ipc::IPCService::new().unwrap(),
+            ipc: Mutex::new(ipc),
         }
     }
 }
@@ -36,7 +44,11 @@ fn update_config(state: tauri::State<AppState>, new_config: AppConfig) {
     *config = new_config;
     config.write();
 
-    state.ipc.clone().update_config().unwrap();
+    if let Some(ipc) = state.ipc.lock().unwrap().as_mut() {
+        if let Err(error) = ipc.update_config() {
+            eprintln!("Failed to notify IPC config update: {}", error);
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

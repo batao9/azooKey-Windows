@@ -19,13 +19,14 @@ jobs:
     - name: Install Swift
       uses: compnerd/gha-setup-swift@main
       with:
-        swift-version: swift-6.0.2-release
-        swift-build: 6.0.2-RELEASE
+        swift-version: swift-6.1.2-release
+        swift-build: 6.1.2-RELEASE
 
     - name: Fix swift sdk
       shell: pwsh
       run: |
-        $SwiftPath = "$env:APPDATA\..\Local\Programs\Swift\Platforms\6.0.2\Windows.platform\Developer\SDKs\Windows.sdk\usr"
+        $swiftVersionDir = $env:RESOLVED_SWIFT_BUILD -replace "-RELEASE$", ""
+        $SwiftPath = "$env:APPDATA\..\Local\Programs\Swift\Platforms\$swiftVersionDir\Windows.platform\Developer\SDKs\Windows.sdk\usr"
         $modulemapUrl = "https://gist.githubusercontent.com/fkunn1326/ef8be2217082302b291f2b8d4178194a/raw/c424968c250afcd5afa1131aea1329dc0744a7f9/ucrt.modulemap"
         $destination = "$SwiftPath\share\ucrt.modulemap"
         Invoke-WebRequest -Uri $modulemapUrl -OutFile $destination
