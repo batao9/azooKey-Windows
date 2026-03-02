@@ -12,6 +12,7 @@ use shared::proto::{
 use std::ffi::{c_char, c_int, CStr, CString};
 
 const USE_ZENZAI: bool = true;
+const INPUT_STYLE_DIRECT: i32 = 1;
 
 struct RawComposingText {
     text: String,
@@ -31,6 +32,7 @@ unsafe extern "C" {
     fn Initialize(path: *const c_char, use_zenzai: bool);
     fn SetContext(context: *const c_char);
     fn AppendText(input: *const c_char, cursorPtr: *mut c_int) -> *mut c_char;
+    fn AppendTextDirect(input: *const c_char, cursorPtr: *mut c_int) -> *mut c_char;
     fn RemoveText(cursorPtr: *mut c_int) -> *mut c_char;
     fn MoveCursor(offset: c_int, cursorPtr: *mut c_int) -> *mut c_char;
     fn ShrinkText(offset: c_int) -> *mut c_char;
@@ -53,6 +55,22 @@ fn add_text(input: &str) -> RawComposingText {
         let mut cursor: c_int = 0;
 
         let result = AppendText(input.as_ptr(), &mut cursor);
+
+        let text = CStr::from_ptr(&*result as *const c_char).to_str().unwrap();
+
+        RawComposingText {
+            text: text.to_string(),
+            cursor: cursor as i8,
+        }
+    }
+}
+
+fn add_text_direct(input: &str) -> RawComposingText {
+    unsafe {
+        let input = CString::new(input).expect("CString::new failed");
+        let mut cursor: c_int = 0;
+
+        let result = AppendTextDirect(input.as_ptr(), &mut cursor);
 
         let text = CStr::from_ptr(&*result as *const c_char).to_str().unwrap();
 
@@ -164,8 +182,13 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<AppendTextRequest>,
     ) -> Result<Response<AppendTextResponse>, Status> {
-        let input = request.into_inner().text_to_append;
-        let composing_text = add_text(&input);
+        let request = request.into_inner();
+        let input = request.text_to_append;
+        let composing_text = if request.input_style == INPUT_STYLE_DIRECT {
+            add_text_direct(&input)
+        } else {
+            add_text(&input)
+        };
 
         Ok(Response::new(AppendTextResponse {
             composing_text: Some(ComposingText {

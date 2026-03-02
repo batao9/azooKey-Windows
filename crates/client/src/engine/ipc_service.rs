@@ -9,6 +9,9 @@ use tonic::transport::Endpoint;
 use tower::service_fn;
 use windows::Win32::Foundation::ERROR_PIPE_BUSY;
 
+const INPUT_STYLE_ROMAN2KANA: i32 = 0;
+const INPUT_STYLE_DIRECT: i32 = 1;
+
 // connect to kkc server
 #[derive(Debug, Clone)]
 pub struct IPCService {
@@ -83,8 +86,19 @@ impl IPCService {
 impl IPCService {
     #[tracing::instrument]
     pub fn append_text(&mut self, text: String) -> anyhow::Result<Candidates> {
+        self.append_text_with_style(text, INPUT_STYLE_ROMAN2KANA)
+    }
+
+    #[tracing::instrument]
+    pub fn append_text_direct(&mut self, text: String) -> anyhow::Result<Candidates> {
+        self.append_text_with_style(text, INPUT_STYLE_DIRECT)
+    }
+
+    #[tracing::instrument]
+    fn append_text_with_style(&mut self, text: String, input_style: i32) -> anyhow::Result<Candidates> {
         let request = tonic::Request::new(shared::proto::AppendTextRequest {
             text_to_append: text,
+            input_style,
         });
 
         let response = self

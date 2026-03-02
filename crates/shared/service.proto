@@ -14,9 +14,15 @@ message ComposingText {
   repeated Suggestion suggestions = 2; // List of suggestions for the text.
 }
 
+enum InputStyle {
+  ROMAN2KANA = 0;
+  DIRECT = 1;
+}
+
 // Request message for AppendText.
 message AppendTextRequest {
   string text_to_append = 1; // The text to append to the current content.
+  InputStyle input_style = 2;
 }
 
 // Response message for AppendText.

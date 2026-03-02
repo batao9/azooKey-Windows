@@ -40,20 +40,18 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     fn OnTestKeyUp(
         &self,
-        _pic: Option<&ITfContext>,
-        _wparam: WPARAM,
-        _lparam: LPARAM,
+        pic: Option<&ITfContext>,
+        wparam: WPARAM,
+        lparam: LPARAM,
     ) -> Result<BOOL> {
-        // same as OnTestKeyDown
-        Ok(false.into())
+        let result = self.process_key_up(pic, wparam, lparam)?.is_some();
+        Ok(result.into())
     }
 
     #[macros::anyhow]
-    fn OnKeyUp(&self, _pic: Option<&ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
-        // this function is called when a key is released
-        // but we handle key events in OnKeyDown function
-        // so just return S_OK
-        Ok(false.into())
+    fn OnKeyUp(&self, pic: Option<&ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
+        let result = self.handle_key_up(pic, wparam, lparam)?;
+        Ok(result.into())
     }
 
     #[macros::anyhow]
