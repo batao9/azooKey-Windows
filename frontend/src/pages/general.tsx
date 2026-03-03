@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
-import { ExternalLink, Keyboard, RefreshCcw, Table2 } from "lucide-react";
+import { ExternalLink, Keyboard, RefreshCcw, Table2, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -201,6 +201,10 @@ export const General = () => {
     const [romajiRows, setRomajiRows] = useState<RomajiRow[]>([]);
     const [isRomajiEditorOpen, setIsRomajiEditorOpen] = useState(false);
     const [romajiDraftRows, setRomajiDraftRows] = useState<RomajiRow[]>([]);
+    const [defaultRomajiRows, setDefaultRomajiRows] = useState<RomajiRow[]>([]);
+    const [pendingFocusNewRow, setPendingFocusNewRow] = useState(false);
+    const romajiEditorScrollRef = useRef<HTMLDivElement | null>(null);
+    const romajiInputRefs = useRef<Array<HTMLInputElement | null>>([]);
 
     useEffect(() => {
         invoke<any>("get_config")
@@ -218,7 +222,37 @@ export const General = () => {
             .catch(() => {
                 // Keep default values if config fetch fails
             });
+
+        invoke<any>("get_default_romaji_rows")
+            .then((rows) => {
+                setDefaultRomajiRows(normalizeRomajiRows(rows));
+            })
+            .catch(() => {
+                // Keep empty defaults if fetch fails
+            });
     }, []);
+
+    useEffect(() => {
+        if (!isRomajiEditorOpen || !pendingFocusNewRow || romajiDraftRows.length === 0) {
+            return;
+        }
+
+        const rafId = requestAnimationFrame(() => {
+            const container = romajiEditorScrollRef.current;
+            if (container) {
+                container.scrollTo({ top: container.scrollHeight, behavior: "auto" });
+            }
+
+            const lastIndex = romajiDraftRows.length - 1;
+            const input = romajiInputRefs.current[lastIndex];
+            if (input) {
+                input.focus();
+            }
+            setPendingFocusNewRow(false);
+        });
+
+        return () => cancelAnimationFrame(rafId);
+    }, [isRomajiEditorOpen, pendingFocusNewRow, romajiDraftRows.length]);
 
     const updateConfig = async (updater: (config: any) => void) => {
         try {
@@ -296,6 +330,7 @@ export const General = () => {
 
     const closeRomajiEditor = () => {
         setIsRomajiEditorOpen(false);
+        setPendingFocusNewRow(false);
     };
 
     const setRomajiRowValue = (
@@ -321,6 +356,26 @@ export const General = () => {
 
     const addRomajiRow = () => {
         setRomajiDraftRows((prev) => [...prev, { input: "", output: "", next_input: "" }]);
+        setPendingFocusNewRow(true);
+    };
+
+    const resetRomajiTableDraft = async () => {
+        let rows = defaultRomajiRows;
+        if (rows.length === 0) {
+            try {
+                const fetchedRows = await invoke<any>("get_default_romaji_rows");
+                rows = normalizeRomajiRows(fetchedRows);
+                setDefaultRomajiRows(rows);
+            } catch (_error) {
+                toast("初期テーブルの取得に失敗しました");
+                return;
+            }
+        }
+
+        setRomajiDraftRows(
+            rows.length > 0 ? rows : [{ input: "", output: "", next_input: "" }],
+        );
+        toast("初期テーブルに戻しました（保存で反映されます）");
     };
 
     const saveRomajiTable = async () => {
@@ -569,15 +624,22 @@ export const General = () => {
                             </Button>
                         </div>
 
-                        <div className="flex-1 overflow-auto rounded-md border">
-                            <table className="w-full min-w-[860px] text-sm">
+                        <div ref={romajiEditorScrollRef} className="flex-1 overflow-auto rounded-md border">
+                            <table className="w-full table-fixed text-sm">
+                                <colgroup>
+                                    <col className="w-12" />
+                                    <col />
+                                    <col />
+                                    <col />
+                                    <col className="w-14" />
+                                </colgroup>
                                 <thead className="sticky top-0 bg-muted/30 text-left text-xs text-muted-foreground">
                                     <tr>
-                                        <th className="w-16 px-2 py-2 font-medium">#</th>
+                                        <th className="px-2 py-2 font-medium">#</th>
                                         <th className="px-2 py-2 font-medium">入力</th>
                                         <th className="px-2 py-2 font-medium">出力</th>
                                         <th className="px-2 py-2 font-medium">次の入力</th>
-                                        <th className="w-20 px-2 py-2 font-medium">操作</th>
+                                        <th className="px-2 py-2 text-center font-medium">操作</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -586,6 +648,9 @@ export const General = () => {
                                             <td className="px-2 py-2 text-xs text-muted-foreground">{index + 1}</td>
                                             <td className="px-2 py-2">
                                                 <Input
+                                                    ref={(element) => {
+                                                        romajiInputRefs.current[index] = element;
+                                                    }}
                                                     value={row.input}
                                                     onChange={(event) =>
                                                         setRomajiRowValue(index, "input", event.target.value)
@@ -611,13 +676,14 @@ export const General = () => {
                                                     placeholder="例: k"
                                                 />
                                             </td>
-                                            <td className="px-2 py-2">
+                                            <td className="px-2 py-2 text-center">
                                                 <Button
-                                                    variant="outline"
-                                                    size="sm"
+                                                    variant="ghost"
+                                                    size="icon"
                                                     onClick={() => removeRomajiRow(index)}
+                                                    aria-label="行を削除"
                                                 >
-                                                    削除
+                                                    <Trash2 className="h-4 w-4" />
                                                 </Button>
                                             </td>
                                         </tr>
@@ -627,9 +693,14 @@ export const General = () => {
                         </div>
 
                         <div className="mt-3 flex items-center justify-between gap-2">
-                            <Button variant="secondary" onClick={addRomajiRow}>
-                                行を追加
-                            </Button>
+                            <div className="flex gap-2">
+                                <Button variant="secondary" onClick={addRomajiRow}>
+                                    行を追加
+                                </Button>
+                                <Button variant="outline" onClick={() => void resetRomajiTableDraft()}>
+                                    テーブルを初期化
+                                </Button>
+                            </div>
                             <div className="flex gap-2">
                                 <Button variant="outline" onClick={closeRomajiEditor}>
                                     キャンセル

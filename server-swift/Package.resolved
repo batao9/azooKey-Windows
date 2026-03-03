@@ -6,8 +6,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/azookey/AzooKeyKanaKanjiConverter",
       "state" : {
-        "branch" : "7d5dd99",
-        "revision" : "7d5dd99fd7f4d1251ff94ae6c75642e4b36f327b"
+        "revision" : "884456d9d077f9e2136d273e0bfbd39b05374f7f"
       }
     },
     {

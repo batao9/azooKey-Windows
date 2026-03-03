@@ -288,6 +288,10 @@ fn default_romaji_rows() -> Vec<RomajiRule> {
         .collect()
 }
 
+pub fn get_default_romaji_rows() -> Vec<RomajiRule> {
+    default_romaji_rows()
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RomajiTableConfig {
     #[serde(default = "default_romaji_rows")]

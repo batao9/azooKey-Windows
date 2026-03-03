@@ -1,7 +1,7 @@
 mod ipc;
 
 use serde::{Deserialize, Serialize};
-use shared::AppConfig;
+use shared::{AppConfig, RomajiRule};
 use std::{path::PathBuf, sync::Mutex};
 
 #[derive(Debug)]
@@ -99,6 +99,11 @@ fn check_capability() -> Capability {
     capability
 }
 
+#[tauri::command]
+fn get_default_romaji_rows() -> Vec<RomajiRule> {
+    shared::get_default_romaji_rows()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = AppState::new();
@@ -110,7 +115,8 @@ pub fn run() {
             greet,
             get_config,
             update_config,
-            check_capability
+            check_capability,
+            get_default_romaji_rows
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

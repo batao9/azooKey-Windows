@@ -13,7 +13,7 @@ use super::{
     text_util::{to_half_katakana, to_katakana},
     user_action::{Function, Navigation},
 };
-use shared::{AppConfig, NumpadInputMode, SpaceInputMode};
+use shared::{AppConfig, NumpadInputMode, RomajiRule, SpaceInputMode};
 use windows::Win32::{
     Foundation::{LPARAM, WPARAM},
     UI::{
@@ -207,6 +207,132 @@ impl TextServiceFactory {
             }
             NumpadInputMode::FollowInputMode => Some(Self::to_fullwidth_ascii_char(c).to_string()),
         }
+    }
+
+    #[inline]
+    fn normalize_symbol_variant(c: char) -> Option<char> {
+        match c {
+            'ˆ' | '＾' => Some('^'),
+            '〜' | '～' => Some('~'),
+            '＼' | '￥' | '¥' => Some('\\'),
+            '，' => Some(','),
+            '．' => Some('.'),
+            '”' => Some('"'),
+            '’' => Some('\''),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn single_symbol_candidates(input: &str) -> Option<Vec<char>> {
+        let mut chars = input.chars();
+        let ch = chars.next()?;
+        if chars.next().is_some() {
+            return None;
+        }
+
+        let mut candidates = Vec::with_capacity(4);
+        let mut push_unique = |candidate: char| {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        };
+
+        if ch.is_ascii_punctuation() {
+            push_unique(ch);
+        }
+
+        let halfwidth = Self::to_halfwidth_ascii_char(ch);
+        if halfwidth.is_ascii_punctuation() {
+            push_unique(ch);
+            push_unique(halfwidth);
+        }
+
+        if let Some(mapped) = Self::normalize_symbol_variant(ch) {
+            push_unique(ch);
+            push_unique(mapped);
+        }
+
+        let converted = to_halfwidth(&ch.to_string());
+        let mut converted_chars = converted.chars();
+        if let (Some(converted_char), None) = (converted_chars.next(), converted_chars.next()) {
+            if converted_char.is_ascii_punctuation() {
+                push_unique(ch);
+                push_unique(converted_char);
+            }
+        }
+
+        if candidates.is_empty() {
+            None
+        } else {
+            Some(candidates)
+        }
+    }
+
+    #[inline]
+    fn has_romaji_table_context(
+        raw_input_before: &str,
+        symbol: char,
+        romaji_rows: &[RomajiRule],
+    ) -> bool {
+        if romaji_rows.is_empty() {
+            return false;
+        }
+
+        let mut combined = String::with_capacity(raw_input_before.len() + symbol.len_utf8());
+        combined.push_str(raw_input_before);
+        combined.push(symbol);
+
+        let combined_chars: Vec<char> = combined.chars().collect();
+        let max_row_len = romaji_rows
+            .iter()
+            .map(|row| row.input.chars().count())
+            .max()
+            .unwrap_or(0);
+
+        if max_row_len == 0 {
+            return false;
+        }
+
+        let start_index = combined_chars.len().saturating_sub(max_row_len);
+        for suffix_start in start_index..combined_chars.len() {
+            let suffix: String = combined_chars[suffix_start..].iter().collect();
+            if suffix.is_empty() {
+                continue;
+            }
+
+            if romaji_rows
+                .iter()
+                .filter_map(|row| {
+                    let trimmed = row.input.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed)
+                    }
+                })
+                .any(|input| input.starts_with(&suffix))
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    #[inline]
+    fn should_apply_symbol_fallback(
+        raw_input_before: &str,
+        input: &str,
+        romaji_rows: &[RomajiRule],
+    ) -> bool {
+        let Some(symbols) = Self::single_symbol_candidates(input) else {
+            return false;
+        };
+
+        !symbols
+            .iter()
+            .any(|symbol| Self::has_romaji_table_context(raw_input_before, *symbol, romaji_rows))
     }
 
     #[inline]
@@ -1003,15 +1129,24 @@ impl TextServiceFactory {
                 }
                 ClientAction::AppendText(text) => {
                     Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
+                    let should_apply_symbol_fallback = match mode {
+                        InputMode::Kana => Self::should_apply_symbol_fallback(
+                            &raw_input,
+                            text,
+                            &app_config.romaji_table.rows,
+                        ),
+                        InputMode::Latin => false,
+                    };
                     raw_input.push_str(&text);
 
                     let text = match mode {
-                        InputMode::Kana => convert_kana_symbol(
+                        InputMode::Kana if should_apply_symbol_fallback => convert_kana_symbol(
                             text,
                             &app_config.general,
                             &app_config.character_width,
                             &app_config.romaji_table.rows,
                         ),
+                        InputMode::Kana => text.to_string(),
                         InputMode::Latin => text.to_string(),
                     };
 
@@ -1295,7 +1430,18 @@ impl TextServiceFactory {
                 ClientAction::ShrinkText(text) => {
                     fixed_prefix.clear();
                     Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
-                    // shrink text
+                    let shrunk_raw_input: String = raw_input
+                        .chars()
+                        .skip(corresponding_count.max(0) as usize)
+                        .collect();
+                    let should_apply_symbol_fallback = match mode {
+                        InputMode::Kana => Self::should_apply_symbol_fallback(
+                            &shrunk_raw_input,
+                            text,
+                            &app_config.romaji_table.rows,
+                        ),
+                        InputMode::Latin => false,
+                    };
                     raw_input.push_str(&text);
                     raw_input = raw_input
                         .chars()
@@ -1304,12 +1450,13 @@ impl TextServiceFactory {
 
                     ipc_service.shrink_text(corresponding_count.clone())?;
                     let text = match mode {
-                        InputMode::Kana => convert_kana_symbol(
+                        InputMode::Kana if should_apply_symbol_fallback => convert_kana_symbol(
                             text,
                             &app_config.general,
                             &app_config.character_width,
                             &app_config.romaji_table.rows,
                         ),
+                        InputMode::Kana => text.to_string(),
                         InputMode::Latin => text.to_string(),
                     };
                     candidates = ipc_service.append_text(text)?;
@@ -1429,5 +1576,59 @@ impl TextServiceFactory {
         composition.temporary_latin_shift_pending = temporary_latin_shift_pending;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TextServiceFactory;
+    use shared::RomajiRule;
+
+    fn row(input: &str, output: &str, next_input: &str) -> RomajiRule {
+        RomajiRule {
+            input: input.to_string(),
+            output: output.to_string(),
+            next_input: next_input.to_string(),
+        }
+    }
+
+    #[test]
+    fn symbol_fallback_is_disabled_in_romaji_context() {
+        let rows = vec![row("z/", "・", "")];
+        let should_apply =
+            TextServiceFactory::should_apply_symbol_fallback("z", "/", &rows);
+        assert!(!should_apply);
+    }
+
+    #[test]
+    fn symbol_fallback_is_enabled_for_standalone_symbol() {
+        let rows = vec![row("z/", "・", "")];
+        let should_apply =
+            TextServiceFactory::should_apply_symbol_fallback("abc", "/", &rows);
+        assert!(should_apply);
+    }
+
+    #[test]
+    fn symbol_fallback_is_disabled_for_non_symbol_input() {
+        let rows = vec![row("ka", "か", "")];
+        let should_apply =
+            TextServiceFactory::should_apply_symbol_fallback("k", "a", &rows);
+        assert!(!should_apply);
+    }
+
+    #[test]
+    fn symbol_fallback_is_enabled_for_non_ascii_symbol_variant() {
+        let rows = vec![row("ka", "か", "")];
+        let should_apply =
+            TextServiceFactory::should_apply_symbol_fallback("", "￥", &rows);
+        assert!(should_apply);
+    }
+
+    #[test]
+    fn symbol_fallback_is_disabled_for_non_ascii_symbol_in_romaji_context() {
+        let rows = vec![row("n\\", "んー", "")];
+        let should_apply =
+            TextServiceFactory::should_apply_symbol_fallback("n", "￥", &rows);
+        assert!(!should_apply);
     }
 }
