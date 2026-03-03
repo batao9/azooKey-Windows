@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { Plus, Save, Trash2 } from "lucide-react";
@@ -45,6 +45,8 @@ export const Dictionary = () => {
     const [entries, setEntries] = useState<DictionaryEntry[]>([]);
     const [isLoading, setIsLoading] = useState(true);
     const [isSaving, setIsSaving] = useState(false);
+    const [pendingFocusIndex, setPendingFocusIndex] = useState<number | null>(null);
+    const readingInputRefs = useRef<Array<HTMLInputElement | null>>([]);
 
     useEffect(() => {
         invoke<any>("get_config")
@@ -60,6 +62,27 @@ export const Dictionary = () => {
                 setIsLoading(false);
             });
     }, []);
+
+    useEffect(() => {
+        if (pendingFocusIndex === null || pendingFocusIndex >= entries.length) {
+            return;
+        }
+
+        const rafId = requestAnimationFrame(() => {
+            const input = readingInputRefs.current[pendingFocusIndex];
+            if (input) {
+                input.focus();
+                input.scrollIntoView({
+                    behavior: "auto",
+                    block: "nearest",
+                    inline: "nearest",
+                });
+            }
+            setPendingFocusIndex(null);
+        });
+
+        return () => cancelAnimationFrame(rafId);
+    }, [entries.length, pendingFocusIndex]);
 
     const setEntryValue = (
         index: number,
@@ -78,7 +101,9 @@ export const Dictionary = () => {
             toast(`ユーザ辞書は最大 ${MAX_ENTRIES} 件までです`);
             return;
         }
+        const nextFocusIndex = entries.length;
         setEntries((prev) => [...prev, { reading: "", word: "" }]);
+        setPendingFocusIndex(nextFocusIndex);
     };
 
     const removeEntry = (index: number) => {
@@ -154,12 +179,17 @@ export const Dictionary = () => {
                     </p>
                 ) : (
                     <div className="overflow-x-auto rounded-md border">
-                        <table className="w-full min-w-[560px] text-sm">
+                        <table className="w-full table-fixed text-sm">
+                            <colgroup>
+                                <col />
+                                <col />
+                                <col className="w-14" />
+                            </colgroup>
                             <thead className="bg-muted/30 text-left text-xs text-muted-foreground">
                                 <tr>
                                     <th className="px-3 py-2 font-medium">読み</th>
                                     <th className="px-3 py-2 font-medium">単語</th>
-                                    <th className="w-20 px-3 py-2 text-right font-medium">操作</th>
+                                    <th className="px-2 py-2 text-center font-medium">操作</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -167,6 +197,9 @@ export const Dictionary = () => {
                                     <tr key={`row-${index}`} className="border-t">
                                         <td className="px-3 py-2">
                                             <Input
+                                                ref={(element) => {
+                                                    readingInputRefs.current[index] = element;
+                                                }}
                                                 value={entry.reading}
                                                 placeholder="よみ"
                                                 onChange={(event) =>
@@ -183,7 +216,7 @@ export const Dictionary = () => {
                                                 }
                                             />
                                         </td>
-                                        <td className="px-3 py-2 text-right">
+                                        <td className="px-2 py-2 text-center">
                                             <Button
                                                 variant="ghost"
                                                 size="icon"
