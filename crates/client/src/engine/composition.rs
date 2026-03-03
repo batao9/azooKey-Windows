@@ -210,18 +210,62 @@ impl TextServiceFactory {
     }
 
     #[inline]
-    fn normalize_single_ascii_symbol(input: &str) -> Option<char> {
+    fn normalize_symbol_variant(c: char) -> Option<char> {
+        match c {
+            'ˆ' | '＾' => Some('^'),
+            '〜' | '～' => Some('~'),
+            '＼' | '￥' | '¥' => Some('\\'),
+            '，' => Some(','),
+            '．' => Some('.'),
+            '”' => Some('"'),
+            '’' => Some('\''),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn single_symbol_candidates(input: &str) -> Option<Vec<char>> {
         let mut chars = input.chars();
         let ch = chars.next()?;
         if chars.next().is_some() {
             return None;
         }
 
+        let mut candidates = Vec::with_capacity(4);
+        let mut push_unique = |candidate: char| {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        };
+
+        if ch.is_ascii_punctuation() {
+            push_unique(ch);
+        }
+
         let halfwidth = Self::to_halfwidth_ascii_char(ch);
         if halfwidth.is_ascii_punctuation() {
-            Some(halfwidth)
-        } else {
+            push_unique(ch);
+            push_unique(halfwidth);
+        }
+
+        if let Some(mapped) = Self::normalize_symbol_variant(ch) {
+            push_unique(ch);
+            push_unique(mapped);
+        }
+
+        let converted = to_halfwidth(&ch.to_string());
+        let mut converted_chars = converted.chars();
+        if let (Some(converted_char), None) = (converted_chars.next(), converted_chars.next()) {
+            if converted_char.is_ascii_punctuation() {
+                push_unique(ch);
+                push_unique(converted_char);
+            }
+        }
+
+        if candidates.is_empty() {
             None
+        } else {
+            Some(candidates)
         }
     }
 
@@ -282,11 +326,13 @@ impl TextServiceFactory {
         input: &str,
         romaji_rows: &[RomajiRule],
     ) -> bool {
-        let Some(symbol) = Self::normalize_single_ascii_symbol(input) else {
+        let Some(symbols) = Self::single_symbol_candidates(input) else {
             return false;
         };
 
-        !Self::has_romaji_table_context(raw_input_before, symbol, romaji_rows)
+        !symbols
+            .iter()
+            .any(|symbol| Self::has_romaji_table_context(raw_input_before, *symbol, romaji_rows))
     }
 
     #[inline]
@@ -1567,6 +1613,22 @@ mod tests {
         let rows = vec![row("ka", "か", "")];
         let should_apply =
             TextServiceFactory::should_apply_symbol_fallback("k", "a", &rows);
+        assert!(!should_apply);
+    }
+
+    #[test]
+    fn symbol_fallback_is_enabled_for_non_ascii_symbol_variant() {
+        let rows = vec![row("ka", "か", "")];
+        let should_apply =
+            TextServiceFactory::should_apply_symbol_fallback("", "￥", &rows);
+        assert!(should_apply);
+    }
+
+    #[test]
+    fn symbol_fallback_is_disabled_for_non_ascii_symbol_in_romaji_context() {
+        let rows = vec![row("n\\", "んー", "")];
+        let should_apply =
+            TextServiceFactory::should_apply_symbol_fallback("n", "￥", &rows);
         assert!(!should_apply);
     }
 }
