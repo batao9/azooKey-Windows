@@ -18,6 +18,7 @@ pub struct TextService {
     pub thread_mgr: Option<ITfThreadMgr>,
     pub context: Option<ITfContext>,
     pub composition: RefCell<Composition>,
+    pub is_updating_pos: bool,
     pub display_attribute_atom: HashMap<GUID, u32>,
     pub mode: InputMode,
     pub this: Option<ITfTextInputProcessor>,
