@@ -77,15 +77,6 @@ private func normalizeReading(_ reading: String) -> String {
     }
 }
 
-private func composingCountToLegacyCount(_ composingCount: ComposingCount) -> Int {
-    switch composingCount {
-    case .inputCount(let value), .surfaceCount(let value):
-        return value
-    case .composite(let lhs, let rhs):
-        return composingCountToLegacyCount(lhs) + composingCountToLegacyCount(rhs)
-    }
-}
-
 @MainActor func getOptions(context: String = "") -> ConvertRequestOptions {
     return ConvertRequestOptions(
         requireJapanesePrediction: true,
@@ -331,10 +322,10 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         let text = strdup(constructCandidateString(candidate: candidate, hiragana: hiragana))
         let hiragana = strdup(hiragana)
         let composingCount = candidate.composingCount
-        let correspondingCount = composingCountToLegacyCount(composingCount)
 
         var afterComposingText = composingText
         afterComposingText.prefixComplete(composingCount: composingCount)
+        let correspondingCount = max(0, composingText.input.count - afterComposingText.input.count)
         let subtext = strdup(afterComposingText.convertTarget)
 
         result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))
@@ -362,10 +353,13 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         let text = strdup(constructCandidateString(candidate: candidate, hiragana: prefixHiragana))
         let hiragana = strdup(hiragana)
         let composingCount = candidate.composingCount
-        let correspondingCount = composingCountToLegacyCount(composingCount)
 
         var remainingPrefixComposingText = prefixComposingText
         remainingPrefixComposingText.prefixComplete(composingCount: composingCount)
+        let correspondingCount = max(
+            0,
+            prefixComposingText.input.count - remainingPrefixComposingText.input.count
+        )
         let subtext = strdup(remainingPrefixComposingText.convertTarget + suffixAfterCursor)
 
         result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))

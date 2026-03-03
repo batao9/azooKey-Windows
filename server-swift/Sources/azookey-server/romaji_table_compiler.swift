@@ -114,6 +114,16 @@ func buildCustomRomajiTableEntries(rows: [RomajiTableRow]) -> [(key: String, val
         let escapedInput = escapeInputTableToken(base.input)
         let escapedOutput = escapeInputTableToken(base.output)
 
+        // If a delayed-commit prefix is followed by a single-character rule
+        // (e.g. "-" -> "ー"), prefer concrete mapping such as "n-" -> "んー".
+        for follow in normalizedRows where follow.input.count == 1 {
+            upsertEntry(
+                rawKey: base.input + follow.input,
+                rawValue: base.output + follow.output + follow.nextInput,
+                source: .generated
+            )
+        }
+
         upsertEntry(
             rawKey: "\(escapedInput){composition-separator}",
             rawValue: escapedOutput,

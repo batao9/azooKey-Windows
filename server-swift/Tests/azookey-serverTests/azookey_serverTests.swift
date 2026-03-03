@@ -41,6 +41,7 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
         row("nn", "ん"),
         row("n'", "ん"),
         row("nya", "にゃ"),
+        row("-", "ー"),
     ])
 
     #expect(map["n"] == nil)
@@ -50,6 +51,7 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
     #expect(map["na"] == "な")
     #expect(map["nn"] == "ん")
     #expect(map["n'"] == "ん")
+    #expect(map["n-"] == "んー")
 }
 
 @Test func explicitRowsOverrideGeneratedRules() async throws {
