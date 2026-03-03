@@ -274,16 +274,32 @@ impl TextServiceFactory {
 
     #[tracing::instrument]
     pub fn update_pos(&self) -> Result<()> {
-        let result: Result<()> = (|| {
-            let text_service = self.borrow()?;
-            let composition = text_service.borrow_composition()?;
+        {
+            let mut text_service = self.borrow_mut()?;
+            if text_service.is_updating_pos {
+                tracing::debug!("Skip re-entrant update_pos call");
+                return Ok(());
+            }
+            text_service.is_updating_pos = true;
+        }
 
-            if let Some(tip_composition) = composition.tip_composition.clone() {
-                edit_session(
+        let result: Result<()> = (|| {
+            let (tid, context, tip_composition) = {
+                let text_service = self.borrow()?;
+                let composition = text_service.borrow_composition()?;
+                (
                     text_service.tid,
-                    text_service.context()?,
+                    text_service.context::<ITfContext>()?,
+                    composition.tip_composition.clone(),
+                )
+            };
+
+            if let Some(tip_composition) = tip_composition {
+                edit_session(
+                    tid,
+                    context.clone(),
                     Rc::new({
-                        let context = text_service.context::<ITfContext>()?;
+                        let context = context.clone();
 
                         move |cookie| unsafe {
                             let view = context.GetActiveView()?;
@@ -312,6 +328,15 @@ impl TextServiceFactory {
 
             Ok(())
         })();
+
+        match self.borrow_mut() {
+            Ok(mut text_service) => {
+                text_service.is_updating_pos = false;
+            }
+            Err(error) => {
+                tracing::warn!("Failed to reset update_pos guard: {error:?}");
+            }
+        }
 
         if let Err(error) = result {
             tracing::warn!("Failed to update composition window position: {error:?}");
