@@ -240,7 +240,7 @@ export const General = () => {
         const rafId = requestAnimationFrame(() => {
             const container = romajiEditorScrollRef.current;
             if (container) {
-                container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+                container.scrollTo({ top: container.scrollHeight, behavior: "auto" });
             }
 
             const lastIndex = romajiDraftRows.length - 1;
