@@ -274,41 +274,47 @@ impl TextServiceFactory {
 
     #[tracing::instrument]
     pub fn update_pos(&self) -> Result<()> {
-        let text_service = self.borrow()?;
-        let composition = text_service.borrow_composition()?;
+        let result: Result<()> = (|| {
+            let text_service = self.borrow()?;
+            let composition = text_service.borrow_composition()?;
 
-        if let Some(tip_composition) = composition.tip_composition.clone() {
-            edit_session(
-                text_service.tid,
-                text_service.context()?,
-                Rc::new({
-                    let context = text_service.context::<ITfContext>()?;
+            if let Some(tip_composition) = composition.tip_composition.clone() {
+                edit_session(
+                    text_service.tid,
+                    text_service.context()?,
+                    Rc::new({
+                        let context = text_service.context::<ITfContext>()?;
 
-                    move |cookie| unsafe {
-                        let view = context.GetActiveView()?;
-                        let range = tip_composition.GetRange()?;
-                        let mut ipc_service = IMEState::get()?
-                            .ipc_service
-                            .clone()
-                            .context("ipc_service is None")?;
+                        move |cookie| unsafe {
+                            let view = context.GetActiveView()?;
+                            let range = tip_composition.GetRange()?;
 
-                        let mut rect = RECT::default();
-                        let mut clipped = false.into();
-                        view.GetTextExt(cookie, &range, &mut rect, &mut clipped)?;
+                            let Some(mut ipc_service) = IMEState::get()?.ipc_service.clone() else {
+                                return Ok(());
+                            };
 
-                        ipc_service.set_window_position(
-                            rect.top,
-                            rect.left,
-                            rect.bottom,
-                            rect.right,
-                        )?;
+                            let mut rect = RECT::default();
+                            let mut clipped = false.into();
+                            view.GetTextExt(cookie, &range, &mut rect, &mut clipped)?;
 
-                        Ok(())
-                    }
-                }),
-            )?;
+                            ipc_service.set_window_position(
+                                rect.top,
+                                rect.left,
+                                rect.bottom,
+                                rect.right,
+                            )?;
 
-            return Ok(());
+                            Ok(())
+                        }
+                    }),
+                )?;
+            }
+
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            tracing::warn!("Failed to update composition window position: {error:?}");
         }
 
         Ok(())
