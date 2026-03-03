@@ -3,7 +3,7 @@
 
 use std::{mem::ManuallyDrop, rc::Rc};
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use windows::{
     core::{IUnknown, Interface},
     Win32::UI::TextServices::{
@@ -106,7 +106,7 @@ impl TextServiceFactory {
     }
 
     pub fn update_context(&self, preview: &str) -> Result<()> {
-        unsafe {
+        let result: Result<()> = (|| unsafe {
             let text_service = self.borrow()?;
 
             let context = text_service.context::<ITfContext>()?;
@@ -129,8 +129,14 @@ impl TextServiceFactory {
                             &mut pfetched,
                         )?;
 
-                        let prange = &pselection[0].range;
-                        let range = prange.as_ref().context("Range not found")?.Clone()?;
+                        if pfetched == 0 {
+                            return Ok(String::new());
+                        }
+
+                        let range = match pselection[0].range.as_ref() {
+                            Some(range) => range.Clone()?,
+                            None => return Ok(String::new()),
+                        };
 
                         let mut preceding_range_shifted = 0;
 
@@ -170,14 +176,23 @@ impl TextServiceFactory {
                 }),
             )?;
 
-            let mut ipc_service = IMEState::get()?
-                .ipc_service
-                .clone()
-                .context("ipc_service is None")?;
+            let Some(preceding_text) = preceding_text else {
+                return Ok(());
+            };
 
-            ipc_service.set_context(preceding_text.context("preceding_text is null")?)?;
+            let Some(mut ipc_service) = IMEState::get()?.ipc_service.clone() else {
+                return Ok(());
+            };
+
+            ipc_service.set_context(preceding_text)?;
 
             Ok(())
+        })();
+
+        if let Err(error) = result {
+            tracing::warn!("Failed to update surrounded text context: {error:?}");
         }
+
+        Ok(())
     }
 }
