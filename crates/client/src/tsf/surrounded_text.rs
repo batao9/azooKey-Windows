@@ -65,16 +65,12 @@ impl TextServiceFactory {
                 Err(_) => return Ok(document_manager),
             };
 
-            // Check if variant is VT_UNKNOWN and not null
-            if variant.as_raw().Anonymous.Anonymous.vt != 13u16 || // VT_UNKNOWN = 13
-               variant.as_raw().Anonymous.Anonymous.Anonymous.punkVal.is_null()
-            {
-                return Ok(document_manager);
-            }
-
-            // Get parent document manager
-            let variant_punk = variant.as_raw().Anonymous.Anonymous.Anonymous.punkVal;
-            let variant_unk: IUnknown = std::mem::transmute(variant_punk);
+            // Use a cloned IUnknown from VARIANT to avoid invalid reference-count handling.
+            // If this is not VT_UNKNOWN (or null), treat it as "parent not available".
+            let variant_unk = match IUnknown::try_from(&variant) {
+                Ok(unk) => unk,
+                Err(_) => return Ok(document_manager),
+            };
 
             match variant_unk.cast::<ITfDocumentMgr>() {
                 Ok(parent_doc_mgr) => Ok(parent_doc_mgr),
