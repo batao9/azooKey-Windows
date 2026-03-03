@@ -4,6 +4,15 @@ on:
   push:
   workflow_dispatch:
 
+env:
+  SWIFT_VERSION: swift-6.1.2-release
+  SWIFT_BUILD: 6.1.2-RELEASE
+  LLAMA_RELEASE_VERSION: b4846
+  LLAMA_CPU_URL: https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-avx-x64.zip
+  LLAMA_CUDA_URL: https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-cuda-cu12.4-x64.zip
+  LLAMA_VULKAN_URL: https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-vulkan-x64.zip
+  ZENZ_MODEL_URL: https://huggingface.co/Miwa-Keita/zenz-v3-small-gguf/resolve/main/ggml-model-Q5_K_M.gguf
+
 jobs:
   build:
     runs-on: windows-latest
@@ -15,12 +24,15 @@ jobs:
 
     - name: Cache Rust
       uses: Swatinem/rust-cache@v2
+      with:
+        cache-bin: true
 
     - name: Install Swift
       uses: compnerd/gha-setup-swift@main
       with:
-        swift-version: swift-6.1.2-release
-        swift-build: 6.1.2-RELEASE
+        swift-version: ${{ env.SWIFT_VERSION }}
+        swift-build: ${{ env.SWIFT_BUILD }}
+        cache: true
 
     - name: Fix swift sdk
       shell: pwsh
@@ -34,17 +46,44 @@ jobs:
     - name: Install Protoc
       uses: arduino/setup-protoc@v3
 
-    - name: Install cargo-make
-      run: cargo install --force cargo-make
+    - name: Setup Node cache
+      uses: actions/setup-node@v4
+      with:
+        cache: npm
+        cache-dependency-path: frontend/package-lock.json
 
-    - name: Download prebuilt llama
+    - name: Install cargo-make (if missing)
+      shell: pwsh
+      run: |
+        if (Get-Command cargo-make -ErrorAction SilentlyContinue) {
+          cargo make --version
+        } else {
+          cargo install --locked cargo-make
+        }
+
+    - name: Cache prebuilt llama and zenz model
+      id: cache-llama-zenz
+      uses: actions/cache@v4
+      with:
+        path: |
+          llama_cpu
+          llama_cuda
+          llama_vulkan
+          zenz.gguf
+        key: ${{ runner.os }}-llama-${{ env.LLAMA_RELEASE_VERSION }}-zenz-v3-small-q5km-${{ hashFiles('.github/workflows/actions.yml') }}
+        restore-keys: |
+          ${{ runner.os }}-llama-${{ env.LLAMA_RELEASE_VERSION }}-zenz-v3-small-q5km-
+
+    - name: Download prebuilt llama and zenz model
+      if: steps.cache-llama-zenz.outputs.cache-hit != 'true'
+      shell: pwsh
       run: |
         function Download-Extract {
           param (
             [string]$url,
             [string]$destFolder
           )
-          $tempZip = Join-Path $env:TEMP "llama_temp.zip"
+          $tempZip = Join-Path $env:TEMP ([System.IO.Path]::GetRandomFileName() + ".zip")
           Invoke-WebRequest -Uri $url -OutFile $tempZip
           New-Item -Path $destFolder -ItemType Directory -Force
           Expand-Archive -Path $tempZip -DestinationPath $destFolder -Force
@@ -58,22 +97,23 @@ jobs:
         New-Item -Path $llamaCpuDir, $llamaCudaDir, $llamaVulkanDir -ItemType Directory -Force
 
         # Download and extract files
-        Download-Extract -url "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-avx-x64.zip" -destFolder $llamaCpuDir
-        Download-Extract -url "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-cuda-cu12.4-x64.zip" -destFolder $llamaCudaDir
-        Download-Extract -url "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-vulkan-x64.zip" -destFolder $llamaVulkanDir
-
-        # Copy llama.lib to server-swift
-        Copy-Item "$llamaCpuDir\llama.lib" -Destination "server-swift\" -Force
+        Download-Extract -url "${{ env.LLAMA_CPU_URL }}" -destFolder $llamaCpuDir
+        Download-Extract -url "${{ env.LLAMA_CUDA_URL }}" -destFolder $llamaCudaDir
+        Download-Extract -url "${{ env.LLAMA_VULKAN_URL }}" -destFolder $llamaVulkanDir
 
         # Download the zenz model
-        $zenzUrl = "https://huggingface.co/Miwa-Keita/zenz-v3-small-gguf/resolve/main/ggml-model-Q5_K_M.gguf"
         $zenzDest = "zenz.gguf"
-        Invoke-WebRequest -Uri $zenzUrl -OutFile $zenzDest
+        Invoke-WebRequest -Uri "${{ env.ZENZ_MODEL_URL }}" -OutFile $zenzDest
+
+    - name: Prepare llama.lib
+      shell: pwsh
+      run: |
+        Copy-Item "llama_cpu\llama.lib" -Destination "server-swift\" -Force
 
     - name: Install node dependencies
       run: |
         cd frontend
-        npm install
+        npm ci --prefer-offline --no-audit
 
     - name: Build
       run: cargo make build --release
