@@ -201,6 +201,7 @@ export const General = () => {
     const [romajiRows, setRomajiRows] = useState<RomajiRow[]>([]);
     const [isRomajiEditorOpen, setIsRomajiEditorOpen] = useState(false);
     const [romajiDraftRows, setRomajiDraftRows] = useState<RomajiRow[]>([]);
+    const [defaultRomajiRows, setDefaultRomajiRows] = useState<RomajiRow[]>([]);
 
     useEffect(() => {
         invoke<any>("get_config")
@@ -217,6 +218,14 @@ export const General = () => {
             })
             .catch(() => {
                 // Keep default values if config fetch fails
+            });
+
+        invoke<any>("get_default_romaji_rows")
+            .then((rows) => {
+                setDefaultRomajiRows(normalizeRomajiRows(rows));
+            })
+            .catch(() => {
+                // Keep empty defaults if fetch fails
             });
     }, []);
 
@@ -321,6 +330,25 @@ export const General = () => {
 
     const addRomajiRow = () => {
         setRomajiDraftRows((prev) => [...prev, { input: "", output: "", next_input: "" }]);
+    };
+
+    const resetRomajiTableDraft = async () => {
+        let rows = defaultRomajiRows;
+        if (rows.length === 0) {
+            try {
+                const fetchedRows = await invoke<any>("get_default_romaji_rows");
+                rows = normalizeRomajiRows(fetchedRows);
+                setDefaultRomajiRows(rows);
+            } catch (_error) {
+                toast("初期テーブルの取得に失敗しました");
+                return;
+            }
+        }
+
+        setRomajiDraftRows(
+            rows.length > 0 ? rows : [{ input: "", output: "", next_input: "" }],
+        );
+        toast("初期テーブルに戻しました（保存で反映されます）");
     };
 
     const saveRomajiTable = async () => {
@@ -627,9 +655,14 @@ export const General = () => {
                         </div>
 
                         <div className="mt-3 flex items-center justify-between gap-2">
-                            <Button variant="secondary" onClick={addRomajiRow}>
-                                行を追加
-                            </Button>
+                            <div className="flex gap-2">
+                                <Button variant="secondary" onClick={addRomajiRow}>
+                                    行を追加
+                                </Button>
+                                <Button variant="outline" onClick={() => void resetRomajiTableDraft()}>
+                                    テーブルを初期化
+                                </Button>
+                            </div>
                             <div className="flex gap-2">
                                 <Button variant="outline" onClick={closeRomajiEditor}>
                                     キャンセル

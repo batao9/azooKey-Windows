@@ -5,6 +5,8 @@ import ffi
 @MainActor let converter = KanaKanjiConverter()
 @MainActor var composingText = ComposingText()
 @MainActor var composingTextSnapshots: [ComposingText] = []
+@MainActor var currentInputStyle: InputStyle = .roman2kana
+@MainActor var customRomajiTableURL: URL?
 
 @MainActor var execURL = URL(filePath: "")
 @MainActor var config: [String : Any] = [
@@ -16,6 +18,7 @@ let maxUserDictionaryEntryCount = 50
 private struct AppSettings: Decodable {
     let zenzai: ZenzaiSettings?
     let user_dictionary: UserDictionarySettings?
+    let romaji_table: RomajiTableSettings?
 }
 
 private struct ZenzaiSettings: Decodable {
@@ -32,8 +35,55 @@ private struct UserDictionaryEntry: Decodable {
     let word: String
 }
 
+private struct RomajiTableSettings: Decodable {
+    let rows: [RomajiTableRow]?
+}
+
 private func normalizeReading(_ reading: String) -> String {
     reading.applyingTransform(.hiraganaToKatakana, reverse: false) ?? reading
+}
+
+@MainActor private func setRoman2KanaInputStyle() {
+    currentInputStyle = .roman2kana
+
+    if let existing = customRomajiTableURL {
+        try? FileManager.default.removeItem(at: existing)
+    }
+
+    customRomajiTableURL = nil
+}
+
+@MainActor private func setCustomRomajiInputStyle(rows: [RomajiTableRow]?) {
+    guard let rows, let content = buildCustomRomajiTableContent(rows: rows) else {
+        setRoman2KanaInputStyle()
+        return
+    }
+
+    let fileURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("azookey-romaji-\(UUID().uuidString).tsv")
+
+    do {
+        try content.write(to: fileURL, atomically: true, encoding: .utf8)
+        let previousURL = customRomajiTableURL
+        currentInputStyle = .mapped(id: .custom(fileURL))
+        customRomajiTableURL = fileURL
+
+        if let previousURL, previousURL != fileURL {
+            try? FileManager.default.removeItem(at: previousURL)
+        }
+    } catch {
+        print("Failed to apply custom romaji table: \(error)")
+        setRoman2KanaInputStyle()
+    }
+}
+
+private func composingCountToLegacyCount(_ composingCount: ComposingCount) -> Int {
+    switch composingCount {
+    case .inputCount(let value), .surfaceCount(let value):
+        return value
+    case .composite(let lhs, let rhs):
+        return composingCountToLegacyCount(lhs) + composingCountToLegacyCount(rhs)
+    }
 }
 
 @MainActor func getOptions(context: String = "") -> ConvertRequestOptions {
@@ -106,6 +156,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 
     config["enable"] = false
     config["profile"] = ""
+    setRoman2KanaInputStyle()
 
     if let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] {
         let settingsPath = URL(filePath: appDataPath).appendingPathComponent("Azookey/settings.json")
@@ -123,6 +174,8 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
                     config["profile"] = profileValue
                 }
             }
+
+            setCustomRomajiInputStyle(rows: settings.romaji_table?.rows)
 
             let sourceEntries = settings.user_dictionary?.entries ?? []
             var seen: Set<String> = []
@@ -177,7 +230,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 
     load_config()
 
-    composingText.insertAtCursorPosition("a", inputStyle: .roman2kana)
+    composingText.insertAtCursorPosition("a", inputStyle: currentInputStyle)
     converter.requestCandidates(composingText, options: getOptions())
     composingText = ComposingText()
     composingTextSnapshots.removeAll()
@@ -189,7 +242,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     cursorPtr: UnsafeMutablePointer<Int>
 ) -> UnsafeMutablePointer<CChar> {
     let inputString = String(cString: input)
-    composingText.insertAtCursorPosition(inputString, inputStyle: .roman2kana)
+    composingText.insertAtCursorPosition(inputString, inputStyle: currentInputStyle)
 
     cursorPtr.pointee = composingText.convertTargetCursorPosition    
     return _strdup(composingText.convertTarget)!
@@ -277,10 +330,11 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 
         let text = strdup(constructCandidateString(candidate: candidate, hiragana: hiragana))
         let hiragana = strdup(hiragana)
-        let correspondingCount = candidate.correspondingCount
+        let composingCount = candidate.composingCount
+        let correspondingCount = composingCountToLegacyCount(composingCount)
 
         var afterComposingText = composingText
-        afterComposingText.prefixComplete(correspondingCount: correspondingCount)
+        afterComposingText.prefixComplete(composingCount: composingCount)
         let subtext = strdup(afterComposingText.convertTarget)
 
         result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))
@@ -307,10 +361,11 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 
         let text = strdup(constructCandidateString(candidate: candidate, hiragana: prefixHiragana))
         let hiragana = strdup(hiragana)
-        let correspondingCount = candidate.correspondingCount
+        let composingCount = candidate.composingCount
+        let correspondingCount = composingCountToLegacyCount(composingCount)
 
         var remainingPrefixComposingText = prefixComposingText
-        remainingPrefixComposingText.prefixComplete(correspondingCount: correspondingCount)
+        remainingPrefixComposingText.prefixComplete(composingCount: composingCount)
         let subtext = strdup(remainingPrefixComposingText.convertTarget + suffixAfterCursor)
 
         result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))
@@ -326,7 +381,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     offset: Int32
 ) -> UnsafeMutablePointer<CChar>  {
     var afterComposingText = composingText
-    afterComposingText.prefixComplete(correspondingCount: Int(offset))
+    afterComposingText.prefixComplete(composingCount: .inputCount(Int(offset)))
     composingText = afterComposingText
 
     return _strdup(composingText.convertTarget)!

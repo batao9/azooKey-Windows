@@ -159,11 +159,6 @@ static HALF_FULL: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(
     ])
 });
 
-const ROMAJI_PRIORITY_KEYS: [&str; 32] = [
-    "!", "\"", "#", "$", "%", "&", "'", "(", ")", "*", "+", ",", "-", ".", "/", ":", ";", "<",
-    "=", ">", "?", "@", "[", "\\", "]", "^", "_", "`", "{", "|", "}", "~",
-];
-
 pub fn to_halfwidth(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -232,17 +227,13 @@ pub fn convert_kana_symbol(
     s: &str,
     general: &GeneralConfig,
     character_width: &CharacterWidthConfig,
-    romaji_rows: &[RomajiRule],
+    _romaji_rows: &[RomajiRule],
 ) -> String {
     let groups = &character_width.groups;
 
     s.chars()
         .map(|c| {
             let key = normalize_input_key(c);
-
-            if let Some(romaji_output) = find_romaji_priority_output(&key, romaji_rows) {
-                return romaji_output;
-            }
 
             let base = apply_basic_setting(&key, general)
                 .map(str::to_string)
@@ -265,17 +256,6 @@ fn normalize_input_key(c: char) -> String {
         '’' => "'".to_string(),
         _ => c.to_string(),
     }
-}
-
-fn find_romaji_priority_output(key: &str, romaji_rows: &[RomajiRule]) -> Option<String> {
-    if !ROMAJI_PRIORITY_KEYS.contains(&key) {
-        return None;
-    }
-
-    romaji_rows
-        .iter()
-        .find(|row| row.input == key && row.input.chars().count() == 1 && !row.output.is_empty())
-        .map(|row| row.output.clone())
 }
 
 fn apply_basic_setting(key: &str, general: &GeneralConfig) -> Option<&'static str> {
@@ -469,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn romaji_rule_has_highest_precedence() {
+    fn symbol_conversion_ignores_romaji_table_rows() {
         let mut config = default_character_width();
         config.groups.question_exclamation = WidthMode::Half;
 
@@ -481,7 +461,7 @@ mod tests {
         }];
 
         let output = convert_kana_symbol("?", &general, &config, &rows);
-        assert_eq!(output, "？");
+        assert_eq!(output, "?");
     }
 
     #[test]
@@ -553,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn romaji_rule_bypasses_width_settings() {
+    fn symbol_conversion_applies_width_settings_even_with_romaji_rows() {
         let mut config = default_character_width();
         config.groups.tilde = WidthMode::Half;
 
@@ -565,7 +545,7 @@ mod tests {
 
         assert_eq!(
             convert_kana_symbol("~", &GeneralConfig::default(), &config, &rows),
-            "〜"
+            "~"
         );
     }
 
