@@ -12,7 +12,12 @@ use windows::{
     },
 };
 
-use std::{cell::Cell, mem::ManuallyDrop, rc::Rc};
+use std::{
+    cell::Cell,
+    mem::ManuallyDrop,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 
@@ -275,12 +280,24 @@ impl TextServiceFactory {
     #[tracing::instrument]
     pub fn update_pos(&self) -> Result<()> {
         {
-            let mut text_service = self.borrow_mut()?;
+            let mut text_service = match self.borrow_mut() {
+                Ok(text_service) => text_service,
+                Err(error) => {
+                    tracing::warn!("Skip update_pos due to borrow conflict: {error:?}");
+                    return Ok(());
+                }
+            };
+
             if text_service.is_updating_pos {
                 tracing::debug!("Skip re-entrant update_pos call");
                 return Ok(());
             }
+
             text_service.is_updating_pos = true;
+            // GetTextExt can trigger a layout-change callback in some apps (e.g. Mery).
+            // Suppress the immediate callback to avoid feedback loops.
+            text_service.suppress_layout_change_until =
+                Some(Instant::now() + Duration::from_millis(200));
         }
 
         let result: Result<()> = (|| {
