@@ -3,7 +3,7 @@
 
 use std::{mem::ManuallyDrop, rc::Rc};
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use windows::{
     core::{IUnknown, Interface},
     Win32::UI::TextServices::{
@@ -65,16 +65,12 @@ impl TextServiceFactory {
                 Err(_) => return Ok(document_manager),
             };
 
-            // Check if variant is VT_UNKNOWN and not null
-            if variant.as_raw().Anonymous.Anonymous.vt != 13u16 || // VT_UNKNOWN = 13
-               variant.as_raw().Anonymous.Anonymous.Anonymous.punkVal.is_null()
-            {
-                return Ok(document_manager);
-            }
-
-            // Get parent document manager
-            let variant_punk = variant.as_raw().Anonymous.Anonymous.Anonymous.punkVal;
-            let variant_unk: IUnknown = std::mem::transmute(variant_punk);
+            // Use a cloned IUnknown from VARIANT to avoid invalid reference-count handling.
+            // If this is not VT_UNKNOWN (or null), treat it as "parent not available".
+            let variant_unk = match IUnknown::try_from(&variant) {
+                Ok(unk) => unk,
+                Err(_) => return Ok(document_manager),
+            };
 
             match variant_unk.cast::<ITfDocumentMgr>() {
                 Ok(parent_doc_mgr) => Ok(parent_doc_mgr),
@@ -110,7 +106,7 @@ impl TextServiceFactory {
     }
 
     pub fn update_context(&self, preview: &str) -> Result<()> {
-        unsafe {
+        let result: Result<()> = (|| unsafe {
             let text_service = self.borrow()?;
 
             let context = text_service.context::<ITfContext>()?;
@@ -133,8 +129,14 @@ impl TextServiceFactory {
                             &mut pfetched,
                         )?;
 
-                        let prange = &pselection[0].range;
-                        let range = prange.as_ref().context("Range not found")?.Clone()?;
+                        if pfetched == 0 {
+                            return Ok(String::new());
+                        }
+
+                        let range = match pselection[0].range.as_ref() {
+                            Some(range) => range.Clone()?,
+                            None => return Ok(String::new()),
+                        };
 
                         let mut preceding_range_shifted = 0;
 
@@ -174,14 +176,23 @@ impl TextServiceFactory {
                 }),
             )?;
 
-            let mut ipc_service = IMEState::get()?
-                .ipc_service
-                .clone()
-                .context("ipc_service is None")?;
+            let Some(preceding_text) = preceding_text else {
+                return Ok(());
+            };
 
-            ipc_service.set_context(preceding_text.context("preceding_text is null")?)?;
+            let Some(mut ipc_service) = IMEState::get()?.ipc_service.clone() else {
+                return Ok(());
+            };
+
+            ipc_service.set_context(preceding_text)?;
 
             Ok(())
+        })();
+
+        if let Err(error) = result {
+            tracing::warn!("Failed to update surrounded text context: {error:?}");
         }
+
+        Ok(())
     }
 }

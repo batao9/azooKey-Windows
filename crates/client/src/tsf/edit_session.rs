@@ -12,7 +12,12 @@ use windows::{
     },
 };
 
-use std::{cell::Cell, mem::ManuallyDrop, rc::Rc};
+use std::{
+    cell::Cell,
+    mem::ManuallyDrop,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 
@@ -274,41 +279,84 @@ impl TextServiceFactory {
 
     #[tracing::instrument]
     pub fn update_pos(&self) -> Result<()> {
-        let text_service = self.borrow()?;
-        let composition = text_service.borrow_composition()?;
+        {
+            let mut text_service = match self.borrow_mut() {
+                Ok(text_service) => text_service,
+                Err(error) => {
+                    tracing::warn!("Skip update_pos due to borrow conflict: {error:?}");
+                    return Ok(());
+                }
+            };
 
-        if let Some(tip_composition) = composition.tip_composition.clone() {
-            edit_session(
-                text_service.tid,
-                text_service.context()?,
-                Rc::new({
-                    let context = text_service.context::<ITfContext>()?;
+            if text_service.is_updating_pos {
+                tracing::debug!("Skip re-entrant update_pos call");
+                return Ok(());
+            }
 
-                    move |cookie| unsafe {
-                        let view = context.GetActiveView()?;
-                        let range = tip_composition.GetRange()?;
-                        let mut ipc_service = IMEState::get()?
-                            .ipc_service
-                            .clone()
-                            .context("ipc_service is None")?;
+            text_service.is_updating_pos = true;
+            // GetTextExt can trigger a layout-change callback in some apps (e.g. Mery).
+            // Suppress the immediate callback to avoid feedback loops.
+            text_service.suppress_layout_change_until =
+                Some(Instant::now() + Duration::from_millis(200));
+        }
 
-                        let mut rect = RECT::default();
-                        let mut clipped = false.into();
-                        view.GetTextExt(cookie, &range, &mut rect, &mut clipped)?;
+        let result: Result<()> = (|| {
+            let (tid, context, tip_composition) = {
+                let text_service = self.borrow()?;
+                let composition = text_service.borrow_composition()?;
+                (
+                    text_service.tid,
+                    text_service.context::<ITfContext>()?,
+                    composition.tip_composition.clone(),
+                )
+            };
 
-                        ipc_service.set_window_position(
-                            rect.top,
-                            rect.left,
-                            rect.bottom,
-                            rect.right,
-                        )?;
+            if let Some(tip_composition) = tip_composition {
+                edit_session(
+                    tid,
+                    context.clone(),
+                    Rc::new({
+                        let context = context.clone();
 
-                        Ok(())
-                    }
-                }),
-            )?;
+                        move |cookie| unsafe {
+                            let view = context.GetActiveView()?;
+                            let range = tip_composition.GetRange()?;
 
-            return Ok(());
+                            let Some(mut ipc_service) = IMEState::get()?.ipc_service.clone() else {
+                                return Ok(());
+                            };
+
+                            let mut rect = RECT::default();
+                            let mut clipped = false.into();
+                            view.GetTextExt(cookie, &range, &mut rect, &mut clipped)?;
+
+                            ipc_service.set_window_position(
+                                rect.top,
+                                rect.left,
+                                rect.bottom,
+                                rect.right,
+                            )?;
+
+                            Ok(())
+                        }
+                    }),
+                )?;
+            }
+
+            Ok(())
+        })();
+
+        match self.borrow_mut() {
+            Ok(mut text_service) => {
+                text_service.is_updating_pos = false;
+            }
+            Err(error) => {
+                tracing::warn!("Failed to reset update_pos guard: {error:?}");
+            }
+        }
+
+        if let Err(error) = result {
+            tracing::warn!("Failed to update composition window position: {error:?}");
         }
 
         Ok(())

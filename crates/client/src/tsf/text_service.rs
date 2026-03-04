@@ -1,6 +1,7 @@
 use std::{
     cell::{Ref, RefCell, RefMut},
     collections::HashMap,
+    time::Instant,
 };
 
 use windows::{
@@ -18,6 +19,8 @@ pub struct TextService {
     pub thread_mgr: Option<ITfThreadMgr>,
     pub context: Option<ITfContext>,
     pub composition: RefCell<Composition>,
+    pub is_updating_pos: bool,
+    pub suppress_layout_change_until: Option<Instant>,
     pub display_attribute_atom: HashMap<GUID, u32>,
     pub mode: InputMode,
     pub this: Option<ITfTextInputProcessor>,
