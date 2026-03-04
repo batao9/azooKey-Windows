@@ -169,7 +169,9 @@ fn group_mode_from_legacy(
     }
 }
 
-fn legacy_groups_from_symbol_fullwidth(symbol_fullwidth: &HashMap<String, bool>) -> CharacterWidthGroups {
+fn legacy_groups_from_symbol_fullwidth(
+    symbol_fullwidth: &HashMap<String, bool>,
+) -> CharacterWidthGroups {
     let defaults = CharacterWidthGroups::default();
     CharacterWidthGroups {
         alphabet: defaults.alphabet,
@@ -237,7 +239,7 @@ impl Default for GeneralConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct RomajiRule {
     pub input: String,
     pub output: String,
@@ -253,12 +255,12 @@ struct LegacyCharacterWidthConfig {
 
 fn is_legacy_removed_default_row(row: &RomajiRule) -> bool {
     matches!(
-        (row.input.as_str(), row.output.as_str(), row.next_input.as_str()),
-        ("~", "〜", "")
-            | (".", "。", "")
-            | (",", "、", "")
-            | ("[", "「", "")
-            | ("]", "」", "")
+        (
+            row.input.as_str(),
+            row.output.as_str(),
+            row.next_input.as_str()
+        ),
+        ("~", "〜", "") | (".", "。", "") | (",", "、", "") | ("[", "「", "") | ("]", "」", "")
     )
 }
 
@@ -292,9 +294,16 @@ pub fn get_default_romaji_rows() -> Vec<RomajiRule> {
     default_romaji_rows()
 }
 
+fn is_default_romaji_rows(rows: &Vec<RomajiRule>) -> bool {
+    rows.as_slice() == default_romaji_rows().as_slice()
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RomajiTableConfig {
-    #[serde(default = "default_romaji_rows")]
+    #[serde(
+        default = "default_romaji_rows",
+        skip_serializing_if = "is_default_romaji_rows"
+    )]
     pub rows: Vec<RomajiRule>,
 }
 
@@ -478,5 +487,40 @@ impl AppConfig {
         let config = AppConfig::read();
         config.write();
         config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn default_app_config_omits_default_romaji_rows() {
+        let value = serde_json::to_value(AppConfig::default()).expect("serialize config");
+        assert!(value["romaji_table"].get("rows").is_none());
+    }
+
+    #[test]
+    fn custom_romaji_rows_are_serialized() {
+        let mut config = AppConfig::default();
+        config.romaji_table.rows.push(RomajiRule {
+            input: "la".to_string(),
+            output: "ぁ".to_string(),
+            next_input: String::new(),
+        });
+
+        let value = serde_json::to_value(config).expect("serialize config");
+        assert!(value["romaji_table"].get("rows").is_some());
+    }
+
+    #[test]
+    fn explicit_default_romaji_rows_are_normalized_on_serialize() {
+        let mut value = serde_json::to_value(AppConfig::default()).expect("serialize config");
+        value["romaji_table"] = json!({ "rows": default_romaji_rows() });
+
+        let config: AppConfig = serde_json::from_value(value).expect("deserialize config");
+        let normalized = serde_json::to_value(config).expect("serialize config");
+        assert!(normalized["romaji_table"].get("rows").is_none());
     }
 }
