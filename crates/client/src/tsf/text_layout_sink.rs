@@ -24,10 +24,15 @@ impl ITfTextLayoutSink_Impl for TextServiceFactory_Impl {
         _lcode: TfLayoutCode,
         _pview: Option<&ITfContextView>,
     ) -> Result<()> {
+        let now = Instant::now();
         let should_skip = match self.borrow_mut() {
-            Ok(mut text_service) => match text_service.suppress_layout_change_until.take() {
-                Some(until) if Instant::now() <= until => true,
-                Some(_) | None => false,
+            Ok(mut text_service) => match text_service.suppress_layout_change_until {
+                Some(until) if now <= until => true,
+                Some(_) => {
+                    text_service.suppress_layout_change_until = None;
+                    false
+                }
+                None => false,
             },
             Err(error) => {
                 tracing::warn!("Skip OnLayoutChange due to borrow conflict: {error:?}");
