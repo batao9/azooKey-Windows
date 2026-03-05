@@ -21,9 +21,21 @@
 ## 開発フロー
 
 1. `master` から `dev/<feature>` を作成する。
-2. 実装して `origin/dev/<feature>` に push し、CI で検証する。
-3. `origin/master` へ PR を出す。
+2. VMによってビルドを行い、動作を検証する。
+3. 動作確認後 `origin/dev/<feature>` に push し、CI で検証する。
+4. `origin/master` へ PR を出す。
 
 ## ビルド / 検証
 
 - `origin` に push して GitHub CI でビルドする。
+
+## ローカルVMビルド（任意）
+
+- 正式なビルド判定は GitHub CI とする。
+- push 前の事前確認として、可能であればローカル VM でのビルドを実行する。
+- ローカル VM ビルドの実行インターフェースは `.local/vm_build_master.sh <branch>` とする。
+- ローカル VM ビルドスクリプトは、少なくとも以下を満たすこと。
+  - 指定ブランチと現在ブランチが一致しない場合は失敗させる。
+  - 作業ツリーがクリーンでない場合は失敗させる。
+  - 成果物は `.local/artifacts/` に回収する。
+  - 成功時・失敗時ともに、終了時に既定スナップショットへ復元してクリーン状態へ戻す。
