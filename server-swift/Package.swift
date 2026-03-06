@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.1
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
@@ -19,7 +19,8 @@ let package = Package(
         // .package(url: /* package url */, from: "1.0.0"),
         .package(
             url: "https://github.com/azookey/AzooKeyKanaKanjiConverter",
-            revision: "884456d9d077f9e2136d273e0bfbd39b05374f7f"
+            revision: "884456d9d077f9e2136d273e0bfbd39b05374f7f",
+            traits: ["Zenzai"]
         )
     ],
     targets: [

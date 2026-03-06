@@ -11,8 +11,7 @@ description = "Build the swift code"
 script_runner = "@shell"
 script = """
 cd server-swift
-# KanaKanjiConverterModule の Zenzai 実装を有効にしてビルドする
-swift build -c release --traits Zenzai
+swift build -c release
 cp .build/release/azookey-server.lib ../
 """
 
