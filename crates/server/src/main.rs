@@ -27,7 +27,66 @@ const INPUT_STYLE_DIRECT: i32 = 1;
 const SERVER_LOG_FILE_NAME: &str = "server.log";
 
 static SERVER_LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+static SERVER_LOG_LEVEL: OnceLock<ServerLogLevel> = OnceLock::new();
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum ServerLogLevel {
+    Off = 0,
+    Error = 1,
+    Warn = 2,
+    Info = 3,
+    Debug = 4,
+}
+
+impl ServerLogLevel {
+    fn from_label(label: &str) -> Self {
+        if label.eq_ignore_ascii_case("off") {
+            Self::Off
+        } else if label.eq_ignore_ascii_case("error") || label.eq_ignore_ascii_case("panic") {
+            Self::Error
+        } else if label.eq_ignore_ascii_case("warn") || label.eq_ignore_ascii_case("warning") {
+            Self::Warn
+        } else if label.eq_ignore_ascii_case("debug") {
+            Self::Debug
+        } else {
+            Self::Info
+        }
+    }
+
+    fn from_environment() -> Self {
+        std::env::var("AZOOKEY_SERVER_LOG_LEVEL")
+            .map(|value| Self::from_label(&value))
+            .unwrap_or(Self::Warn)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Error => "ERROR",
+            Self::Warn => "WARN",
+            Self::Info => "INFO",
+            Self::Debug => "DEBUG",
+        }
+    }
+}
+
+fn current_server_log_level() -> ServerLogLevel {
+    *SERVER_LOG_LEVEL.get_or_init(ServerLogLevel::from_environment)
+}
+
+fn should_log(level: ServerLogLevel) -> bool {
+    level <= current_server_log_level()
+}
+
+macro_rules! log_event_lazy {
+    ($level:expr, $($arg:tt)*) => {{
+        let level = $level;
+        if should_log(level) {
+            log_event(level, &format!($($arg)*));
+        }
+    }};
+}
 
 struct RawComposingText {
     text: String,
@@ -105,8 +164,17 @@ fn init_server_log_file() -> PathBuf {
     log_path
 }
 
-fn log_event(level: &str, message: &str) {
-    let line = format!("[{}] [{}] {}", now_timestamp_millis(), level, message);
+fn log_event(level: ServerLogLevel, message: &str) {
+    if !should_log(level) {
+        return;
+    }
+
+    let line = format!(
+        "[{}] [{}] {}",
+        now_timestamp_millis(),
+        level.as_str(),
+        message
+    );
     eprintln!("{line}");
 
     if let Some(slot) = SERVER_LOG_FILE.get() {
@@ -144,7 +212,7 @@ fn install_panic_hook() {
 
         let backtrace = Backtrace::force_capture();
         log_event(
-            "PANIC",
+            ServerLogLevel::Error,
             &format!("payload={payload}; location={location}; backtrace={backtrace}"),
         );
 
@@ -170,7 +238,10 @@ fn ffi_text_result(scope: &str, result: *mut c_char) -> Result<String, String> {
 
 fn i8_offset_from_i32(scope: &str, raw: i32) -> Result<i8, Status> {
     i8::try_from(raw).map_err(|_| {
-        log_event("WARN", &format!("[{scope}] offset out of range: {raw}"));
+        log_event(
+            ServerLogLevel::Warn,
+            &format!("[{scope}] offset out of range: {raw}"),
+        );
         Status::invalid_argument("offset out of range")
     })
 }
@@ -181,7 +252,7 @@ fn cursor_from_c_int(scope: &str, cursor: c_int) -> i8 {
         Err(_) => {
             let clamped = cursor.clamp(i8::MIN as c_int, i8::MAX as c_int) as i8;
             log_event(
-                "WARN",
+                ServerLogLevel::Warn,
                 &format!("[{scope}] cursor out of range: {cursor}, clamped to {clamped}"),
             );
             clamped
@@ -190,7 +261,7 @@ fn cursor_from_c_int(scope: &str, cursor: c_int) -> i8 {
 }
 
 fn status_from_error(scope: &str, error: String) -> Status {
-    log_event("ERROR", &error);
+    log_event(ServerLogLevel::Error, &error);
     Status::internal(format!("{scope} failed"))
 }
 
@@ -290,13 +361,16 @@ fn get_composed_text(use_cursor_prefix: bool) -> Result<Vec<Suggestion>, String>
         }
 
         let mut suggestions = Vec::with_capacity(length);
-        log_event("DEBUG", &format!("[{call_name}] candidate_count={length}"));
+        log_event_lazy!(
+            ServerLogLevel::Debug,
+            "[{call_name}] candidate_count={length}"
+        );
 
         for index in 0..length {
             let candidate_ptr = *result.add(index);
             if candidate_ptr.is_null() {
                 log_event(
-                    "WARN",
+                    ServerLogLevel::Warn,
                     &format!("[{call_name}] candidate[{index}] is null and skipped"),
                 );
                 continue;
@@ -305,7 +379,7 @@ fn get_composed_text(use_cursor_prefix: bool) -> Result<Vec<Suggestion>, String>
             let candidate = (*candidate_ptr).clone();
             if candidate.text.is_null() || candidate.subtext.is_null() {
                 log_event(
-                    "WARN",
+                    ServerLogLevel::Warn,
                     &format!(
                         "[{call_name}] candidate[{index}] has null text/subtext pointer and was skipped"
                     ),
@@ -362,15 +436,12 @@ impl AzookeyService for MyAzookeyService {
         let request_id = next_request_id();
         let request = request.into_inner();
         let input = request.text_to_append;
-        log_event(
-            "INFO",
-            &format!(
-                "[append_text:{request_id}] start input_len={} input_style={}",
-                input.chars().count(),
-                request.input_style
-            ),
+        log_event_lazy!(
+            ServerLogLevel::Info,
+            "[append_text:{request_id}] start input_len={} input_style={}",
+            input.chars().count(),
+            request.input_style
         );
-
         let composing_text = if request.input_style == INPUT_STYLE_DIRECT {
             add_text_direct(&input).map_err(|error| status_from_error("append_text", error))?
         } else {
@@ -379,14 +450,12 @@ impl AzookeyService for MyAzookeyService {
         let suggestions =
             get_composed_text(false).map_err(|error| status_from_error("append_text", error))?;
 
-        log_event(
-            "INFO",
-            &format!(
-                "[append_text:{request_id}] success cursor={} hiragana_len={} suggestions={}",
-                composing_text.cursor,
-                composing_text.text.chars().count(),
-                suggestions.len()
-            ),
+        log_event_lazy!(
+            ServerLogLevel::Info,
+            "[append_text:{request_id}] success cursor={} hiragana_len={} suggestions={}",
+            composing_text.cursor,
+            composing_text.text.chars().count(),
+            suggestions.len()
         );
 
         Ok(Response::new(AppendTextResponse {
@@ -402,21 +471,19 @@ impl AzookeyService for MyAzookeyService {
         _: Request<RemoveTextRequest>,
     ) -> Result<Response<RemoveTextResponse>, Status> {
         let request_id = next_request_id();
-        log_event("INFO", &format!("[remove_text:{request_id}] start"));
+        log_event_lazy!(ServerLogLevel::Info, "[remove_text:{request_id}] start");
 
         let composing_text =
             remove_text().map_err(|error| status_from_error("remove_text", error))?;
         let suggestions =
             get_composed_text(false).map_err(|error| status_from_error("remove_text", error))?;
 
-        log_event(
-            "INFO",
-            &format!(
-                "[remove_text:{request_id}] success cursor={} hiragana_len={} suggestions={}",
-                composing_text.cursor,
-                composing_text.text.chars().count(),
-                suggestions.len()
-            ),
+        log_event_lazy!(
+            ServerLogLevel::Info,
+            "[remove_text:{request_id}] success cursor={} hiragana_len={} suggestions={}",
+            composing_text.cursor,
+            composing_text.text.chars().count(),
+            suggestions.len()
         );
 
         Ok(Response::new(RemoveTextResponse {
@@ -433,9 +500,9 @@ impl AzookeyService for MyAzookeyService {
     ) -> Result<Response<MoveCursorResponse>, Status> {
         let request_id = next_request_id();
         let raw_offset = request.into_inner().offset;
-        log_event(
-            "INFO",
-            &format!("[move_cursor:{request_id}] start offset={raw_offset}"),
+        log_event_lazy!(
+            ServerLogLevel::Info,
+            "[move_cursor:{request_id}] start offset={raw_offset}"
         );
 
         let offset = i8_offset_from_i32("move_cursor", raw_offset)?;
@@ -445,14 +512,12 @@ impl AzookeyService for MyAzookeyService {
         let suggestions = get_composed_text(use_cursor_prefix)
             .map_err(|error| status_from_error("move_cursor", error))?;
 
-        log_event(
-            "INFO",
-            &format!(
-                "[move_cursor:{request_id}] success cursor={} hiragana_len={} suggestions={} use_cursor_prefix={use_cursor_prefix}",
-                composing_text.cursor,
-                composing_text.text.chars().count(),
-                suggestions.len()
-            ),
+        log_event_lazy!(
+            ServerLogLevel::Info,
+            "[move_cursor:{request_id}] success cursor={} hiragana_len={} suggestions={} use_cursor_prefix={use_cursor_prefix}",
+            composing_text.cursor,
+            composing_text.text.chars().count(),
+            suggestions.len()
         );
 
         Ok(Response::new(MoveCursorResponse {
@@ -468,9 +533,9 @@ impl AzookeyService for MyAzookeyService {
         _: Request<ClearTextRequest>,
     ) -> Result<Response<ClearTextResponse>, Status> {
         let request_id = next_request_id();
-        log_event("INFO", &format!("[clear_text:{request_id}] start"));
+        log_event_lazy!(ServerLogLevel::Info, "[clear_text:{request_id}] start");
         clear_text();
-        log_event("INFO", &format!("[clear_text:{request_id}] success"));
+        log_event_lazy!(ServerLogLevel::Info, "[clear_text:{request_id}] success");
         Ok(Response::new(ClearTextResponse {}))
     }
 
@@ -480,9 +545,9 @@ impl AzookeyService for MyAzookeyService {
     ) -> Result<Response<ShrinkTextResponse>, Status> {
         let request_id = next_request_id();
         let raw_offset = request.into_inner().offset;
-        log_event(
-            "INFO",
-            &format!("[shrink_text:{request_id}] start offset={raw_offset}"),
+        log_event_lazy!(
+            ServerLogLevel::Info,
+            "[shrink_text:{request_id}] start offset={raw_offset}"
         );
 
         let offset = i8_offset_from_i32("shrink_text", raw_offset)?;
@@ -491,13 +556,11 @@ impl AzookeyService for MyAzookeyService {
         let suggestions =
             get_composed_text(false).map_err(|error| status_from_error("shrink_text", error))?;
 
-        log_event(
-            "INFO",
-            &format!(
-                "[shrink_text:{request_id}] success hiragana_len={} suggestions={}",
-                composing_text.text.chars().count(),
-                suggestions.len()
-            ),
+        log_event_lazy!(
+            ServerLogLevel::Info,
+            "[shrink_text:{request_id}] success hiragana_len={} suggestions={}",
+            composing_text.text.chars().count(),
+            suggestions.len()
         );
 
         Ok(Response::new(ShrinkTextResponse {
@@ -519,20 +582,18 @@ impl AzookeyService for MyAzookeyService {
             .filter(|s| !s.is_empty())
             .last()
             .unwrap_or_default();
-        log_event(
-            "INFO",
-            &format!(
-                "[set_context:{request_id}] start original_len={} trimmed_len={}",
-                context.chars().count(),
-                trimmed_context.chars().count()
-            ),
+        log_event_lazy!(
+            ServerLogLevel::Info,
+            "[set_context:{request_id}] start original_len={} trimmed_len={}",
+            context.chars().count(),
+            trimmed_context.chars().count()
         );
 
         let context = cstring_from_input("SetContext.context", trimmed_context)
             .map_err(|error| status_from_error("set_context", error))?;
 
         unsafe { SetContext(context.as_ptr()) };
-        log_event("INFO", &format!("[set_context:{request_id}] success"));
+        log_event_lazy!(ServerLogLevel::Info, "[set_context:{request_id}] success");
         Ok(Response::new(shared::proto::SetContextResponse {}))
     }
 
@@ -541,9 +602,9 @@ impl AzookeyService for MyAzookeyService {
         _: Request<shared::proto::UpdateConfigRequest>,
     ) -> Result<Response<shared::proto::UpdateConfigResponse>, Status> {
         let request_id = next_request_id();
-        log_event("INFO", &format!("[update_config:{request_id}] start"));
+        log_event_lazy!(ServerLogLevel::Info, "[update_config:{request_id}] start");
         unsafe { LoadConfig() };
-        log_event("INFO", &format!("[update_config:{request_id}] success"));
+        log_event_lazy!(ServerLogLevel::Info, "[update_config:{request_id}] success");
         Ok(Response::new(shared::proto::UpdateConfigResponse {}))
     }
 }
@@ -552,9 +613,10 @@ impl AzookeyService for MyAzookeyService {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log_path = init_server_log_file();
     install_panic_hook();
-    log_event(
-        "INFO",
-        &format!("AzookeyServer started (log_path={})", log_path.display()),
+    log_event_lazy!(
+        ServerLogLevel::Info,
+        "AzookeyServer started (log_path={})",
+        log_path.display()
     );
 
     let current_exe = std::env::current_exe()?;
@@ -568,7 +630,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let service = MyAzookeyService::default();
 
-    log_event("INFO", "AzookeyServer listening");
+    log_event_lazy!(ServerLogLevel::Info, "AzookeyServer listening");
     let reflection_service = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(shared::proto::FILE_DESCRIPTOR_SET)
         .build_v1()
@@ -581,7 +643,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(|error| {
             log_event(
-                "ERROR",
+                ServerLogLevel::Error,
                 &format!("AzookeyServer terminated with error: {error}"),
             );
             std::io::Error::other(error)

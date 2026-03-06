@@ -19,6 +19,38 @@ let minInputCountForZenzaiCandidates = 4
 let minHiraganaCountForZenzaiCandidates = 2
 let serverLogFileName = "server.log"
 
+private enum ServerLogLevel: Int {
+    case off = 0
+    case error = 1
+    case warn = 2
+    case info = 3
+    case debug = 4
+
+    init(label: String) {
+        switch label.lowercased() {
+        case "off":
+            self = .off
+        case "error", "panic":
+            self = .error
+        case "warn", "warning":
+            self = .warn
+        case "debug":
+            self = .debug
+        default:
+            self = .info
+        }
+    }
+
+    static func fromEnvironment() -> Self {
+        guard let rawValue = ProcessInfo.processInfo.environment["AZOOKEY_SERVER_LOG_LEVEL"] else {
+            return .warn
+        }
+        return .init(label: rawValue)
+    }
+}
+
+private let serverLogThreshold = ServerLogLevel.fromEnvironment()
+
 private func serverLogPath() -> URL {
     if let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] {
         return URL(filePath: appDataPath)
@@ -37,8 +69,14 @@ private func serverLogTimestampMillis() -> UInt64 {
     UInt64(Date().timeIntervalSince1970 * 1000)
 }
 
-private func serverLog(_ level: String = "INFO", _ message: String) {
-    let line = "[\(serverLogTimestampMillis())] [SWIFT/\(level)] \(message)"
+private func serverLog(_ level: String = "INFO", _ message: @autoclosure () -> String) {
+    let resolvedLevel = ServerLogLevel(label: level)
+    guard resolvedLevel.rawValue <= serverLogThreshold.rawValue else {
+        return
+    }
+
+    let resolvedMessage = message()
+    let line = "[\(serverLogTimestampMillis())] [SWIFT/\(level)] \(resolvedMessage)"
     fputs("\(line)\n", stderr)
 
     let logPath = serverLogPath()
