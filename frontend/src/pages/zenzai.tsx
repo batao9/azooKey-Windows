@@ -140,6 +140,10 @@ export const Zenzai = () => {
                         <p className="text-xs text-muted-foreground">
                             Zenzaiを有効にして、変換精度を向上させます
                         </p>
+                        <p className="text-xs text-muted-foreground">
+                            ON中はカスタムローマ字テーブルを一時的に無効化し、組み込み
+                            `roman2kana` を使用します
+                        </p>
                     </div>
                     <Switch checked={value.enable} onCheckedChange={handleZenzaiChange} />
                 </div>

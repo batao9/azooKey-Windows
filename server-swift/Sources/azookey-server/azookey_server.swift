@@ -14,6 +14,8 @@ import ffi
     "profile": "",
 ]
 let maxUserDictionaryEntryCount = 50
+let minInputCountForZenzaiCandidates = 4
+let minHiraganaCountForZenzaiCandidates = 2
 
 private struct AppSettings: Decodable {
     let zenzai: ZenzaiSettings?
@@ -39,8 +41,38 @@ private struct RomajiTableSettings: Decodable {
     let rows: [RomajiTableRow]?
 }
 
+enum RomajiInputStyleSelection: Equatable {
+    case roman2kana
+    case custom
+}
+
 private func normalizeReading(_ reading: String) -> String {
     reading.applyingTransform(.hiraganaToKatakana, reverse: false) ?? reading
+}
+
+func resolveRomajiInputStyleSelection(
+    rows: [RomajiTableRow]?,
+    isZenzaiEnabled: Bool
+) -> RomajiInputStyleSelection {
+    if isZenzaiEnabled {
+        return .roman2kana
+    }
+
+    guard let rows, buildCustomRomajiTableContent(rows: rows) != nil else {
+        return .roman2kana
+    }
+
+    return .custom
+}
+
+func effectiveZenzaiEnabledForCandidates(
+    isConfigured: Bool,
+    inputCount: Int,
+    hiraganaCount: Int
+) -> Bool {
+    isConfigured
+        && inputCount >= minInputCountForZenzaiCandidates
+        && hiraganaCount >= minHiraganaCountForZenzaiCandidates
 }
 
 @MainActor private func setRoman2KanaInputStyle() {
@@ -77,7 +109,29 @@ private func normalizeReading(_ reading: String) -> String {
     }
 }
 
+@MainActor private func applyRomajiInputStyle(
+    rows: [RomajiTableRow]?,
+    isZenzaiEnabled: Bool
+) {
+    switch resolveRomajiInputStyleSelection(
+        rows: rows,
+        isZenzaiEnabled: isZenzaiEnabled
+    ) {
+    case .roman2kana:
+        setRoman2KanaInputStyle()
+    case .custom:
+        setCustomRomajiInputStyle(rows: rows)
+    }
+}
+
 @MainActor func getOptions(context: String = "") -> ConvertRequestOptions {
+    getOptions(context: context, zenzaiEnabled: (config["enable"] as? Bool) ?? false)
+}
+
+@MainActor func getOptions(
+    context: String = "",
+    zenzaiEnabled: Bool
+) -> ConvertRequestOptions {
     return ConvertRequestOptions(
         requireJapanesePrediction: true,
         requireEnglishPrediction: false,
@@ -90,7 +144,7 @@ private func normalizeReading(_ reading: String) -> String {
             return execURL.appendingPathComponent("EmojiDictionary").appendingPathComponent("emoji_all_E15.1.txt")
         },
         // zenzai
-        zenzaiMode: config["enable"] as! Bool ? .on(
+        zenzaiMode: zenzaiEnabled ? .on(
             weight: execURL.appendingPathComponent("zenz.gguf"),
             inferenceLimit: 1,
             requestRichCandidates: true,
@@ -140,6 +194,9 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 
 @_silgen_name("LoadConfig")
 @MainActor public func load_config() {
+    let previousZenzaiEnabled = (config["enable"] as? Bool) ?? false
+    let previousProfile = (config["profile"] as? String) ?? ""
+    let previousUsedCustomRomajiTable = customRomajiTableURL != nil
     var dynamicUserDictionary: [DicdataElement] = []
     defer {
         converter.sendToDicdataStore(.importDynamicUserDict(dynamicUserDictionary))
@@ -166,7 +223,11 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
                 }
             }
 
-            setCustomRomajiInputStyle(rows: settings.romaji_table?.rows)
+            let isZenzaiEnabled = (config["enable"] as? Bool) ?? false
+            applyRomajiInputStyle(
+                rows: settings.romaji_table?.rows,
+                isZenzaiEnabled: isZenzaiEnabled
+            )
 
             let sourceEntries = settings.user_dictionary?.entries ?? []
             var seen: Set<String> = []
@@ -209,6 +270,18 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
             print("Failed to read settings: \(error)")
         }
     }
+
+    let currentZenzaiEnabled = (config["enable"] as? Bool) ?? false
+    let currentProfile = (config["profile"] as? String) ?? ""
+    let currentUsedCustomRomajiTable = customRomajiTableURL != nil
+    if previousZenzaiEnabled != currentZenzaiEnabled
+        || previousProfile != currentProfile
+        || previousUsedCustomRomajiTable != currentUsedCustomRomajiTable
+    {
+        converter.stopComposition()
+        composingText = ComposingText()
+        composingTextSnapshots.removeAll()
+    }
 }
 
 @_silgen_name("Initialize")
@@ -222,7 +295,15 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     load_config()
 
     composingText.insertAtCursorPosition("a", inputStyle: currentInputStyle)
-    converter.requestCandidates(composingText, options: getOptions())
+    let useZenzaiForWarmup = effectiveZenzaiEnabledForCandidates(
+        isConfigured: (config["enable"] as? Bool) ?? false,
+        inputCount: composingText.input.count,
+        hiraganaCount: composingText.convertTarget.count
+    )
+    converter.requestCandidates(
+        composingText,
+        options: getOptions(zenzaiEnabled: useZenzaiForWarmup)
+    )
     composingText = ComposingText()
     composingTextSnapshots.removeAll()
 }
@@ -312,7 +393,12 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 @MainActor public func get_composed_text(lengthPtr: UnsafeMutablePointer<Int>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
     let hiragana = composingText.convertTarget
     let contextString = (config["context"] as? String) ?? ""
-    let options = getOptions(context: contextString)
+    let useZenzai = effectiveZenzaiEnabledForCandidates(
+        isConfigured: (config["enable"] as? Bool) ?? false,
+        inputCount: composingText.input.count,
+        hiraganaCount: hiragana.count
+    )
+    let options = getOptions(context: contextString, zenzaiEnabled: useZenzai)
     let converted = converter.requestCandidates(composingText, options: options)
     var result: [FFICandidate] = []
 
@@ -343,7 +429,12 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     let prefixComposingText = composingText.prefixToCursorPosition()
     let prefixHiragana = prefixComposingText.convertTarget
     let contextString = (config["context"] as? String) ?? ""
-    let options = getOptions(context: contextString)
+    let useZenzai = effectiveZenzaiEnabledForCandidates(
+        isConfigured: (config["enable"] as? Bool) ?? false,
+        inputCount: prefixComposingText.input.count,
+        hiraganaCount: prefixHiragana.count
+    )
+    let options = getOptions(context: contextString, zenzaiEnabled: useZenzai)
     let converted = converter.requestCandidates(prefixComposingText, options: options)
     var result: [FFICandidate] = []
 
