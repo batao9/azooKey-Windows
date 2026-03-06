@@ -68,7 +68,7 @@ fn check_capability() -> Capability {
     // vulkan-1.dllの存在確認
 
     let mut capability = Capability {
-        cpu: true,
+        cpu: shared::zenzai_cpu_backend_supported(),
         cuda: false,
         vulkan: false,
     };

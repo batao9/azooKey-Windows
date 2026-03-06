@@ -84,6 +84,14 @@ impl IPCService {
 
 // implement methods to interact with kkc server
 impl IPCService {
+    fn reconnect(&mut self) -> anyhow::Result<()> {
+        let refreshed = Self::new()?;
+        self.azookey_client = refreshed.azookey_client;
+        self.window_client = refreshed.window_client;
+        self.runtime = refreshed.runtime;
+        Ok(())
+    }
+
     #[tracing::instrument]
     pub fn append_text(&mut self, text: String) -> anyhow::Result<Candidates> {
         self.append_text_with_style(text, INPUT_STYLE_ROMAN2KANA)
@@ -95,16 +103,64 @@ impl IPCService {
     }
 
     #[tracing::instrument]
-    fn append_text_with_style(&mut self, text: String, input_style: i32) -> anyhow::Result<Candidates> {
-        let request = tonic::Request::new(shared::proto::AppendTextRequest {
-            text_to_append: text,
-            input_style,
-        });
+    fn append_text_with_style(
+        &mut self,
+        text: String,
+        input_style: i32,
+    ) -> anyhow::Result<Candidates> {
+        let send = |this: &mut Self| -> anyhow::Result<
+            tonic::Response<shared::proto::AppendTextResponse>,
+        > {
+            let request = tonic::Request::new(shared::proto::AppendTextRequest {
+                text_to_append: text.clone(),
+                input_style,
+            });
 
-        let response = self
-            .runtime
-            .clone()
-            .block_on(self.azookey_client.append_text(request))?;
+            let response = this
+                .runtime
+                .clone()
+                .block_on(this.azookey_client.append_text(request))?;
+            Ok(response)
+        };
+
+        let response = match send(self) {
+            Ok(response) => response,
+            Err(first_error) => {
+                tracing::warn!(
+                    "append_text first attempt failed (style={input_style}, text_len={}), reconnecting IPC: {first_error:?}",
+                    text.chars().count()
+                );
+
+                match self.reconnect() {
+                    Ok(()) => {
+                        tracing::info!(
+                            "append_text IPC reconnect succeeded (style={input_style}), retrying"
+                        );
+                    }
+                    Err(reconnect_error) => {
+                        tracing::error!(
+                            "append_text IPC reconnect failed (style={input_style}): {reconnect_error:?}"
+                        );
+                        return Err(reconnect_error);
+                    }
+                }
+
+                match send(self) {
+                    Ok(response) => {
+                        tracing::info!(
+                            "append_text retry succeeded after reconnect (style={input_style})"
+                        );
+                        response
+                    }
+                    Err(retry_error) => {
+                        tracing::error!(
+                            "append_text retry failed after reconnect (style={input_style}): {retry_error:?}"
+                        );
+                        return Err(retry_error);
+                    }
+                }
+            }
+        };
         let composing_text = response.into_inner().composing_text;
 
         let candidates = if let Some(composing_text) = composing_text {

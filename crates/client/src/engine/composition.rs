@@ -365,7 +365,11 @@ impl TextServiceFactory {
             text: candidates.texts.get(index).cloned().unwrap_or_default(),
             sub_text: candidates.sub_texts.get(index).cloned().unwrap_or_default(),
             hiragana: candidates.hiragana.clone(),
-            corresponding_count: candidates.corresponding_count.get(index).copied().unwrap_or(0),
+            corresponding_count: candidates
+                .corresponding_count
+                .get(index)
+                .copied()
+                .unwrap_or(0),
         })
     }
 
@@ -434,7 +438,9 @@ impl TextServiceFactory {
     }
 
     #[inline]
-    fn commit_current_clause_actions(composition: &Composition) -> (CompositionState, Vec<ClientAction>) {
+    fn commit_current_clause_actions(
+        composition: &Composition,
+    ) -> (CompositionState, Vec<ClientAction>) {
         if composition.suffix.is_empty() {
             (CompositionState::None, vec![ClientAction::EndComposition])
         } else {
@@ -446,7 +452,9 @@ impl TextServiceFactory {
     }
 
     #[inline]
-    fn commit_first_clause_actions(composition: &Composition) -> (CompositionState, Vec<ClientAction>) {
+    fn commit_first_clause_actions(
+        composition: &Composition,
+    ) -> (CompositionState, Vec<ClientAction>) {
         let mut actions = Vec::with_capacity(composition.clause_snapshots.len() + 1);
 
         for _ in 0..composition.clause_snapshots.len() {
@@ -491,11 +499,7 @@ impl TextServiceFactory {
         let app_config = AppConfig::read();
 
         // check shortcut keys
-        if is_ctrl_pressed
-            && !is_ctrl_space
-            && !is_alt_backquote
-            && !is_ctrl_enter
-            && !is_ctrl_down
+        if is_ctrl_pressed && !is_ctrl_space && !is_alt_backquote && !is_ctrl_enter && !is_ctrl_down
         {
             self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(wparam))?;
             return Ok(None);
@@ -569,11 +573,9 @@ impl TextServiceFactory {
                     (CompositionState::Composing, actions)
                 }
                 UserAction::NumpadSymbol(symbol) if mode == InputMode::Kana => {
-                    let Some(text) = Self::numpad_text_for_mode(
-                        symbol,
-                        app_config.general.numpad_input,
-                        true,
-                    ) else {
+                    let Some(text) =
+                        Self::numpad_text_for_mode(symbol, app_config.general.numpad_input, true)
+                    else {
                         self.clear_temporary_latin_shift_pending_if_needed(
                             should_clear_shift_pending,
                         )?;
@@ -582,7 +584,10 @@ impl TextServiceFactory {
 
                     (
                         CompositionState::Composing,
-                        vec![ClientAction::StartComposition, ClientAction::AppendTextRaw(text)],
+                        vec![
+                            ClientAction::StartComposition,
+                            ClientAction::AppendTextRaw(text),
+                        ],
                     )
                 }
                 UserAction::Input(char) if mode == InputMode::Kana => (
@@ -597,11 +602,9 @@ impl TextServiceFactory {
                     is_numpad: true,
                 } if mode == InputMode::Kana => {
                     let digit = char::from_digit(value as u32, 10).unwrap_or('0');
-                    let Some(text) = Self::numpad_text_for_mode(
-                        digit,
-                        app_config.general.numpad_input,
-                        true,
-                    ) else {
+                    let Some(text) =
+                        Self::numpad_text_for_mode(digit, app_config.general.numpad_input, true)
+                    else {
                         self.clear_temporary_latin_shift_pending_if_needed(
                             should_clear_shift_pending,
                         )?;
@@ -610,23 +613,25 @@ impl TextServiceFactory {
 
                     (
                         CompositionState::Composing,
-                        vec![ClientAction::StartComposition, ClientAction::AppendTextRaw(text)],
+                        vec![
+                            ClientAction::StartComposition,
+                            ClientAction::AppendTextRaw(text),
+                        ],
                     )
                 }
                 UserAction::Number {
                     value,
                     is_numpad: false,
-                } if mode == InputMode::Kana => {
-                    (
-                        CompositionState::Composing,
-                        vec![
-                            ClientAction::StartComposition,
-                            ClientAction::AppendText(value.to_string()),
-                        ],
-                    )
-                }
+                } if mode == InputMode::Kana => (
+                    CompositionState::Composing,
+                    vec![
+                        ClientAction::StartComposition,
+                        ClientAction::AppendText(value.to_string()),
+                    ],
+                ),
                 UserAction::Space if mode == InputMode::Kana => {
-                    let mut use_halfwidth = matches!(app_config.general.space_input, SpaceInputMode::AlwaysHalf);
+                    let mut use_halfwidth =
+                        matches!(app_config.general.space_input, SpaceInputMode::AlwaysHalf);
                     if is_shift_pressed {
                         use_halfwidth = !use_halfwidth;
                     }
@@ -679,12 +684,9 @@ impl TextServiceFactory {
                     (CompositionState::Composing, actions)
                 }
                 UserAction::NumpadSymbol(symbol) if mode == InputMode::Kana => {
-                    let text = Self::numpad_text_for_mode(
-                        symbol,
-                        app_config.general.numpad_input,
-                        false,
-                    )
-                    .unwrap_or_else(|| symbol.to_string());
+                    let text =
+                        Self::numpad_text_for_mode(symbol, app_config.general.numpad_input, false)
+                            .unwrap_or_else(|| symbol.to_string());
                     (
                         CompositionState::Composing,
                         vec![ClientAction::AppendTextRaw(text)],
@@ -699,12 +701,9 @@ impl TextServiceFactory {
                     is_numpad: true,
                 } if mode == InputMode::Kana => {
                     let digit = char::from_digit(value as u32, 10).unwrap_or('0');
-                    let text = Self::numpad_text_for_mode(
-                        digit,
-                        app_config.general.numpad_input,
-                        false,
-                    )
-                    .unwrap_or_else(|| digit.to_string());
+                    let text =
+                        Self::numpad_text_for_mode(digit, app_config.general.numpad_input, false)
+                            .unwrap_or_else(|| digit.to_string());
                     (
                         CompositionState::Composing,
                         vec![ClientAction::AppendTextRaw(text)],
@@ -827,12 +826,9 @@ impl TextServiceFactory {
                     (CompositionState::Composing, actions)
                 }
                 UserAction::NumpadSymbol(symbol) if mode == InputMode::Kana => {
-                    let text = Self::numpad_text_for_mode(
-                        symbol,
-                        app_config.general.numpad_input,
-                        false,
-                    )
-                    .unwrap_or_else(|| symbol.to_string());
+                    let text =
+                        Self::numpad_text_for_mode(symbol, app_config.general.numpad_input, false)
+                            .unwrap_or_else(|| symbol.to_string());
                     (
                         CompositionState::Composing,
                         vec![ClientAction::ShrinkTextRaw(text)],
@@ -847,12 +843,9 @@ impl TextServiceFactory {
                     is_numpad: true,
                 } if mode == InputMode::Kana => {
                     let digit = char::from_digit(value as u32, 10).unwrap_or('0');
-                    let text = Self::numpad_text_for_mode(
-                        digit,
-                        app_config.general.numpad_input,
-                        false,
-                    )
-                    .unwrap_or_else(|| digit.to_string());
+                    let text =
+                        Self::numpad_text_for_mode(digit, app_config.general.numpad_input, false)
+                            .unwrap_or_else(|| digit.to_string());
                     (
                         CompositionState::Composing,
                         vec![ClientAction::ShrinkTextRaw(text)],
@@ -976,9 +969,9 @@ impl TextServiceFactory {
                 });
 
             if (should_reset_on_confirm || should_reset_on_end)
-                && !actions
-                    .iter()
-                    .any(|current_action| matches!(current_action, ClientAction::SetTemporaryLatin(false)))
+                && !actions.iter().any(|current_action| {
+                    matches!(current_action, ClientAction::SetTemporaryLatin(false))
+                })
             {
                 actions.insert(0, ClientAction::SetTemporaryLatin(false));
             }
@@ -1034,19 +1027,29 @@ impl TextServiceFactory {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<bool> {
-        if let Some(context) = context {
-            self.borrow_mut()?.context = Some(context.clone());
-        } else {
-            return Ok(false);
-        };
+        let result: Result<bool> = (|| {
+            if let Some(context) = context {
+                self.borrow_mut()?.context = Some(context.clone());
+            } else {
+                return Ok(false);
+            };
 
-        if let Some((actions, transition)) = self.process_key(context, wparam, lparam)? {
-            self.handle_action(&actions, transition)?;
-        } else {
-            return Ok(false);
+            if let Some((actions, transition)) = self.process_key(context, wparam, lparam)? {
+                self.handle_action(&actions, transition)?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })();
+
+        match result {
+            Ok(handled) => Ok(handled),
+            Err(error) => {
+                tracing::error!("handle_key failed: {error:?}");
+                self.recover_after_key_error();
+                Ok(false)
+            }
         }
-
-        Ok(true)
     }
 
     #[tracing::instrument]
@@ -1056,18 +1059,48 @@ impl TextServiceFactory {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<bool> {
-        if let Some(context) = context {
-            self.borrow_mut()?.context = Some(context.clone());
-        } else {
-            return Ok(false);
-        };
+        let result: Result<bool> = (|| {
+            if let Some(context) = context {
+                self.borrow_mut()?.context = Some(context.clone());
+            } else {
+                return Ok(false);
+            };
 
-        if let Some((actions, transition)) = self.process_key_up(context, wparam, lparam)? {
-            self.handle_action(&actions, transition)?;
-            return Ok(true);
+            if let Some((actions, transition)) = self.process_key_up(context, wparam, lparam)? {
+                self.handle_action(&actions, transition)?;
+                return Ok(true);
+            }
+
+            Ok(false)
+        })();
+
+        match result {
+            Ok(handled) => Ok(handled),
+            Err(error) => {
+                tracing::error!("handle_key_up failed: {error:?}");
+                self.recover_after_key_error();
+                Ok(false)
+            }
+        }
+    }
+
+    fn recover_after_key_error(&self) {
+        let _ = self.end_composition();
+
+        if let Ok(text_service) = self.borrow() {
+            if let Ok(mut composition) = text_service.borrow_mut_composition() {
+                *composition = Composition::default();
+            }
         }
 
-        Ok(false)
+        if let Ok(mut ime_state) = IMEState::get() {
+            if let Some(mut ipc_service) = ime_state.ipc_service.clone() {
+                let _ = ipc_service.hide_window();
+                let _ = ipc_service.set_candidates(vec![]);
+                let _ = ipc_service.clear_text();
+                ime_state.ipc_service = Some(ipc_service);
+            }
+        }
     }
 
     #[tracing::instrument]
@@ -1290,10 +1323,12 @@ impl TextServiceFactory {
                             .collect();
                         fixed_prefix.push_str(&current_clause_preview);
 
-                        if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
+                        if let Some(selected) = Self::select_candidate(&candidates, selection_index)
+                        {
                             selection_index = selected.index;
                             corresponding_count = selected.corresponding_count;
-                            preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
+                            preview =
+                                Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
                             suffix = selected.sub_text.clone();
                             raw_hiragana = selected.hiragana;
 
@@ -1575,6 +1610,15 @@ impl TextServiceFactory {
         composition.temporary_latin = temporary_latin;
         composition.temporary_latin_shift_pending = temporary_latin_shift_pending;
 
+        drop(composition);
+        drop(text_service);
+
+        if let Ok(mut ime_state) = IMEState::get() {
+            ime_state.ipc_service = Some(ipc_service);
+        } else {
+            tracing::warn!("Failed to persist updated IPC service into IMEState");
+        }
+
         Ok(())
     }
 }
@@ -1595,40 +1639,35 @@ mod tests {
     #[test]
     fn symbol_fallback_is_disabled_in_romaji_context() {
         let rows = vec![row("z/", "・", "")];
-        let should_apply =
-            TextServiceFactory::should_apply_symbol_fallback("z", "/", &rows);
+        let should_apply = TextServiceFactory::should_apply_symbol_fallback("z", "/", &rows);
         assert!(!should_apply);
     }
 
     #[test]
     fn symbol_fallback_is_enabled_for_standalone_symbol() {
         let rows = vec![row("z/", "・", "")];
-        let should_apply =
-            TextServiceFactory::should_apply_symbol_fallback("abc", "/", &rows);
+        let should_apply = TextServiceFactory::should_apply_symbol_fallback("abc", "/", &rows);
         assert!(should_apply);
     }
 
     #[test]
     fn symbol_fallback_is_disabled_for_non_symbol_input() {
         let rows = vec![row("ka", "か", "")];
-        let should_apply =
-            TextServiceFactory::should_apply_symbol_fallback("k", "a", &rows);
+        let should_apply = TextServiceFactory::should_apply_symbol_fallback("k", "a", &rows);
         assert!(!should_apply);
     }
 
     #[test]
     fn symbol_fallback_is_enabled_for_non_ascii_symbol_variant() {
         let rows = vec![row("ka", "か", "")];
-        let should_apply =
-            TextServiceFactory::should_apply_symbol_fallback("", "￥", &rows);
+        let should_apply = TextServiceFactory::should_apply_symbol_fallback("", "￥", &rows);
         assert!(should_apply);
     }
 
     #[test]
     fn symbol_fallback_is_disabled_for_non_ascii_symbol_in_romaji_context() {
         let rows = vec![row("n\\", "んー", "")];
-        let should_apply =
-            TextServiceFactory::should_apply_symbol_fallback("n", "￥", &rows);
+        let should_apply = TextServiceFactory::should_apply_symbol_fallback("n", "￥", &rows);
         assert!(!should_apply);
     }
 }

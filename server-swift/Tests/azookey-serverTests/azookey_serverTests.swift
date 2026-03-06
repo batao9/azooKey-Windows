@@ -110,6 +110,26 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
     #expect(useZenzai)
 }
 
+@Test func cpuBackendIsDisabledWhenAvxIsUnavailable() async throws {
+    let enabled = effectiveZenzaiRuntimeEnabled(
+        isConfigured: true,
+        backend: "cpu",
+        cpuBackendSupported: false
+    )
+
+    #expect(enabled == false)
+}
+
+@Test func nonCpuBackendRemainsAvailableWithoutCpuAvx() async throws {
+    let enabled = effectiveZenzaiRuntimeEnabled(
+        isConfigured: true,
+        backend: "vulkan",
+        cpuBackendSupported: false
+    )
+
+    #expect(enabled)
+}
+
 @Test func legacyCorrespondingCountFlattensCompositeCounts() async throws {
     let count = legacyCorrespondingCount(
         from: .composite(

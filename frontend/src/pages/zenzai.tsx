@@ -144,6 +144,10 @@ export const Zenzai = () => {
                             ON中はカスタムローマ字テーブルを一時的に無効化し、組み込み
                             `roman2kana` を使用します
                         </p>
+                        <p className="text-xs text-muted-foreground">
+                            CPUバックエンドは AVX 対応 CPU が必要です。未対応環境では
+                            標準変換へ自動フォールバックします
+                        </p>
                     </div>
                     <Switch checked={value.enable} onCheckedChange={handleZenzaiChange} />
                 </div>
@@ -176,7 +180,7 @@ export const Zenzai = () => {
                             <SelectValue placeholder="バックエンドを選択" />
                         </SelectTrigger>
                         <SelectContent className="flex flex-col">
-                            <ToolTipSelectItem name="CPU (非推奨)" value="cpu" disabled={!capability.cpu} tooltip="" />
+                            <ToolTipSelectItem name="CPU (非推奨)" value="cpu" disabled={!capability.cpu} tooltip="AVX 対応 CPU が必要です" />
                             <ToolTipSelectItem name="CUDA (NVIDIA GPU)" value="cuda" disabled={!capability.cuda} tooltip="CUDA Toolkit 12をインストールする必要があります" />
                             <ToolTipSelectItem name="Vulkan" value="vulkan" disabled={!capability.vulkan} tooltip="お使いのPCはVulkanに対応していません" />
                         </SelectContent>

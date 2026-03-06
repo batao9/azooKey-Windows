@@ -1,10 +1,15 @@
-use shared::AppConfig;
+use shared::{zenzai_cpu_backend_supported, AppConfig};
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::{env, thread};
 
 fn main() -> anyhow::Result<()> {
     let config = AppConfig::new();
+    let cpu_backend_supported = zenzai_cpu_backend_supported();
+    env::set_var(
+        "AZOOKEY_ZENZAI_CPU_SUPPORTED",
+        if cpu_backend_supported { "1" } else { "0" },
+    );
 
     let exe_path = env::current_exe()?.parent().unwrap().to_path_buf();
     let backend_dir = match config.zenzai.backend.as_str() {
@@ -20,6 +25,10 @@ fn main() -> anyhow::Result<()> {
     let mut new_path = env::var("PATH").unwrap_or_else(|_| String::new());
     new_path = format!("{};{}", backend_path_str, new_path);
     env::set_var("PATH", &new_path);
+
+    if config.zenzai.enable && config.zenzai.backend == "cpu" && !cpu_backend_supported {
+        eprintln!("[launcher] CPU backend requires AVX support. Zenzai will fall back to standard conversion.");
+    }
 
     let server_process = start_process("azookey-server.exe", "[server]");
     let ui_process = start_process("ui.exe", "[ui]");

@@ -169,7 +169,9 @@ fn group_mode_from_legacy(
     }
 }
 
-fn legacy_groups_from_symbol_fullwidth(symbol_fullwidth: &HashMap<String, bool>) -> CharacterWidthGroups {
+fn legacy_groups_from_symbol_fullwidth(
+    symbol_fullwidth: &HashMap<String, bool>,
+) -> CharacterWidthGroups {
     let defaults = CharacterWidthGroups::default();
     CharacterWidthGroups {
         alphabet: defaults.alphabet,
@@ -253,12 +255,12 @@ struct LegacyCharacterWidthConfig {
 
 fn is_legacy_removed_default_row(row: &RomajiRule) -> bool {
     matches!(
-        (row.input.as_str(), row.output.as_str(), row.next_input.as_str()),
-        ("~", "〜", "")
-            | (".", "。", "")
-            | (",", "、", "")
-            | ("[", "「", "")
-            | ("]", "」", "")
+        (
+            row.input.as_str(),
+            row.output.as_str(),
+            row.next_input.as_str()
+        ),
+        ("~", "〜", "") | (".", "。", "") | (",", "、", "") | ("[", "「", "") | ("]", "」", "")
     )
 }
 
@@ -290,6 +292,18 @@ fn default_romaji_rows() -> Vec<RomajiRule> {
 
 pub fn get_default_romaji_rows() -> Vec<RomajiRule> {
     default_romaji_rows()
+}
+
+pub fn zenzai_cpu_backend_supported() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        std::is_x86_feature_detected!("avx")
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        false
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

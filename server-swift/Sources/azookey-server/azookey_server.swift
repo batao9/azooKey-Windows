@@ -12,6 +12,7 @@ import ffi
 @MainActor var config: [String : Any] = [
     "enable": false,
     "profile": "",
+    "backend": "cpu",
 ]
 let maxUserDictionaryEntryCount = 50
 let minInputCountForZenzaiCandidates = 4
@@ -26,6 +27,7 @@ private struct AppSettings: Decodable {
 private struct ZenzaiSettings: Decodable {
     let enable: Bool?
     let profile: String?
+    let backend: String?
 }
 
 private struct UserDictionarySettings: Decodable {
@@ -73,6 +75,30 @@ func effectiveZenzaiEnabledForCandidates(
     isConfigured
         && inputCount >= minInputCountForZenzaiCandidates
         && hiraganaCount >= minHiraganaCountForZenzaiCandidates
+}
+
+func effectiveZenzaiRuntimeEnabled(
+    isConfigured: Bool,
+    backend: String?,
+    cpuBackendSupported: Bool
+) -> Bool {
+    guard isConfigured else {
+        return false
+    }
+
+    let normalizedBackend = (backend ?? "cpu")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+
+    if normalizedBackend.isEmpty || normalizedBackend == "cpu" {
+        return cpuBackendSupported
+    }
+
+    return true
+}
+
+private func cpuZenzaiBackendSupportedFromEnvironment() -> Bool {
+    ProcessInfo.processInfo.environment["AZOOKEY_ZENZAI_CPU_SUPPORTED"] != "0"
 }
 
 @MainActor private func setRoman2KanaInputStyle() {
@@ -202,13 +228,21 @@ func legacyCorrespondingCount(from composingCount: ComposingCount) -> Int {
 }
 
 @MainActor func getOptions(context: String = "") -> ConvertRequestOptions {
-    getOptions(context: context, zenzaiEnabled: (config["enable"] as? Bool) ?? false)
+    getOptions(
+        context: context,
+        zenzaiEnabled: effectiveZenzaiRuntimeEnabled(
+            isConfigured: (config["enable"] as? Bool) ?? false,
+            backend: config["backend"] as? String,
+            cpuBackendSupported: cpuZenzaiBackendSupportedFromEnvironment()
+        )
+    )
 }
 
 @MainActor func getOptions(
     context: String = "",
     zenzaiEnabled: Bool
 ) -> ConvertRequestOptions {
+    let profile = (config["profile"] as? String) ?? ""
     return ConvertRequestOptions(
         requireJapanesePrediction: true,
         requireEnglishPrediction: false,
@@ -228,7 +262,7 @@ func legacyCorrespondingCount(from composingCount: ComposingCount) -> Int {
             personalizationMode: nil,
             versionDependentMode: .v3(
                 .init(
-                    profile: config["profile"] as! String,
+                    profile: profile,
                     leftSideContext: context
                 )
             )
@@ -273,6 +307,12 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 @MainActor public func load_config() {
     let previousZenzaiEnabled = (config["enable"] as? Bool) ?? false
     let previousProfile = (config["profile"] as? String) ?? ""
+    let previousBackend = (config["backend"] as? String) ?? "cpu"
+    let previousEffectiveZenzaiEnabled = effectiveZenzaiRuntimeEnabled(
+        isConfigured: previousZenzaiEnabled,
+        backend: previousBackend,
+        cpuBackendSupported: cpuZenzaiBackendSupportedFromEnvironment()
+    )
     let previousUsedCustomRomajiTable = customRomajiTableURL != nil
     var dynamicUserDictionary: [DicdataElement] = []
     defer {
@@ -281,6 +321,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 
     config["enable"] = false
     config["profile"] = ""
+    config["backend"] = "cpu"
     setRoman2KanaInputStyle()
 
     if let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] {
@@ -298,9 +339,17 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
                 if let profileValue = zenzai.profile {
                     config["profile"] = profileValue
                 }
+
+                if let backendValue = zenzai.backend {
+                    config["backend"] = backendValue
+                }
             }
 
-            let isZenzaiEnabled = (config["enable"] as? Bool) ?? false
+            let isZenzaiEnabled = effectiveZenzaiRuntimeEnabled(
+                isConfigured: (config["enable"] as? Bool) ?? false,
+                backend: config["backend"] as? String,
+                cpuBackendSupported: cpuZenzaiBackendSupportedFromEnvironment()
+            )
             applyRomajiInputStyle(
                 rows: settings.romaji_table?.rows,
                 isZenzaiEnabled: isZenzaiEnabled
@@ -350,8 +399,14 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 
     let currentZenzaiEnabled = (config["enable"] as? Bool) ?? false
     let currentProfile = (config["profile"] as? String) ?? ""
+    let currentBackend = (config["backend"] as? String) ?? "cpu"
+    let currentEffectiveZenzaiEnabled = effectiveZenzaiRuntimeEnabled(
+        isConfigured: currentZenzaiEnabled,
+        backend: currentBackend,
+        cpuBackendSupported: cpuZenzaiBackendSupportedFromEnvironment()
+    )
     let currentUsedCustomRomajiTable = customRomajiTableURL != nil
-    if previousZenzaiEnabled != currentZenzaiEnabled
+    if previousEffectiveZenzaiEnabled != currentEffectiveZenzaiEnabled
         || previousProfile != currentProfile
         || previousUsedCustomRomajiTable != currentUsedCustomRomajiTable
     {
@@ -373,7 +428,11 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 
     composingText.insertAtCursorPosition("a", inputStyle: currentInputStyle)
     let useZenzaiForWarmup = effectiveZenzaiEnabledForCandidates(
-        isConfigured: (config["enable"] as? Bool) ?? false,
+        isConfigured: effectiveZenzaiRuntimeEnabled(
+            isConfigured: (config["enable"] as? Bool) ?? false,
+            backend: config["backend"] as? String,
+            cpuBackendSupported: cpuZenzaiBackendSupportedFromEnvironment()
+        ),
         inputCount: composingText.input.count,
         hiraganaCount: composingText.convertTarget.count
     )
@@ -471,7 +530,11 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     let hiragana = composingText.convertTarget
     let contextString = (config["context"] as? String) ?? ""
     let useZenzai = effectiveZenzaiEnabledForCandidates(
-        isConfigured: (config["enable"] as? Bool) ?? false,
+        isConfigured: effectiveZenzaiRuntimeEnabled(
+            isConfigured: (config["enable"] as? Bool) ?? false,
+            backend: config["backend"] as? String,
+            cpuBackendSupported: cpuZenzaiBackendSupportedFromEnvironment()
+        ),
         inputCount: composingText.input.count,
         hiraganaCount: hiragana.count
     )
@@ -513,7 +576,11 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     let prefixHiragana = prefixComposingText.convertTarget
     let contextString = (config["context"] as? String) ?? ""
     let useZenzai = effectiveZenzaiEnabledForCandidates(
-        isConfigured: (config["enable"] as? Bool) ?? false,
+        isConfigured: effectiveZenzaiRuntimeEnabled(
+            isConfigured: (config["enable"] as? Bool) ?? false,
+            backend: config["backend"] as? String,
+            cpuBackendSupported: cpuZenzaiBackendSupportedFromEnvironment()
+        ),
         inputCount: prefixComposingText.input.count,
         hiraganaCount: prefixHiragana.count
     )
