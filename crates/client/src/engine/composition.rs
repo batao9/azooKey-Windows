@@ -13,7 +13,9 @@ use super::{
     text_util::{to_half_katakana, to_katakana},
     user_action::{Function, Navigation},
 };
-use shared::{AppConfig, NumpadInputMode, RomajiRule, SpaceInputMode};
+use shared::{
+    zenzai_cpu_backend_supported, AppConfig, NumpadInputMode, RomajiRule, SpaceInputMode,
+};
 use windows::Win32::{
     Foundation::{LPARAM, WPARAM},
     UI::{
@@ -333,6 +335,80 @@ impl TextServiceFactory {
         !symbols
             .iter()
             .any(|symbol| Self::has_romaji_table_context(raw_input_before, *symbol, romaji_rows))
+    }
+
+    #[inline]
+    fn effective_zenzai_runtime_enabled(app_config: &AppConfig) -> bool {
+        if !app_config.zenzai.enable {
+            return false;
+        }
+
+        let backend = app_config.zenzai.backend.trim().to_ascii_lowercase();
+        if backend.is_empty() || backend == "cpu" {
+            return zenzai_cpu_backend_supported();
+        }
+
+        true
+    }
+
+    #[inline]
+    fn single_symbol_romaji_output(input: &str, romaji_rows: &[RomajiRule]) -> Option<String> {
+        let symbols = Self::single_symbol_candidates(input)?;
+
+        romaji_rows.iter().find_map(|row| {
+            if !row.next_input.trim().is_empty() || row.output.is_empty() {
+                return None;
+            }
+
+            let trimmed = row.input.trim();
+            let mut chars = trimmed.chars();
+            let symbol = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+
+            symbols.contains(&symbol).then(|| row.output.clone())
+        })
+    }
+
+    #[inline]
+    fn resolve_symbol_input_text(
+        raw_input_before: &str,
+        input: &str,
+        app_config: &AppConfig,
+    ) -> Option<String> {
+        let is_zenzai_enabled = Self::effective_zenzai_runtime_enabled(app_config);
+        if is_zenzai_enabled {
+            if let Some(mapped) =
+                Self::single_symbol_romaji_output(input, &app_config.romaji_table.rows)
+            {
+                return Some(mapped);
+            }
+
+            return Self::single_symbol_candidates(input).map(|_| {
+                convert_kana_symbol(
+                    input,
+                    &app_config.general,
+                    &app_config.character_width,
+                    &app_config.romaji_table.rows,
+                )
+            });
+        }
+
+        if Self::should_apply_symbol_fallback(
+            raw_input_before,
+            input,
+            &app_config.romaji_table.rows,
+        ) {
+            return Some(convert_kana_symbol(
+                input,
+                &app_config.general,
+                &app_config.character_width,
+                &app_config.romaji_table.rows,
+            ));
+        }
+
+        None
     }
 
     #[inline]
@@ -1162,24 +1238,16 @@ impl TextServiceFactory {
                 }
                 ClientAction::AppendText(text) => {
                     Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
-                    let should_apply_symbol_fallback = match mode {
-                        InputMode::Kana => Self::should_apply_symbol_fallback(
-                            &raw_input,
-                            text,
-                            &app_config.romaji_table.rows,
-                        ),
-                        InputMode::Latin => false,
+                    let resolved_symbol_text = match mode {
+                        InputMode::Kana => {
+                            Self::resolve_symbol_input_text(&raw_input, text, &app_config)
+                        }
+                        InputMode::Latin => None,
                     };
                     raw_input.push_str(&text);
 
                     let text = match mode {
-                        InputMode::Kana if should_apply_symbol_fallback => convert_kana_symbol(
-                            text,
-                            &app_config.general,
-                            &app_config.character_width,
-                            &app_config.romaji_table.rows,
-                        ),
-                        InputMode::Kana => text.to_string(),
+                        InputMode::Kana => resolved_symbol_text.unwrap_or_else(|| text.to_string()),
                         InputMode::Latin => text.to_string(),
                     };
 
@@ -1469,13 +1537,11 @@ impl TextServiceFactory {
                         .chars()
                         .skip(corresponding_count.max(0) as usize)
                         .collect();
-                    let should_apply_symbol_fallback = match mode {
-                        InputMode::Kana => Self::should_apply_symbol_fallback(
-                            &shrunk_raw_input,
-                            text,
-                            &app_config.romaji_table.rows,
-                        ),
-                        InputMode::Latin => false,
+                    let resolved_symbol_text = match mode {
+                        InputMode::Kana => {
+                            Self::resolve_symbol_input_text(&shrunk_raw_input, text, &app_config)
+                        }
+                        InputMode::Latin => None,
                     };
                     raw_input.push_str(&text);
                     raw_input = raw_input
@@ -1485,13 +1551,7 @@ impl TextServiceFactory {
 
                     ipc_service.shrink_text(corresponding_count.clone())?;
                     let text = match mode {
-                        InputMode::Kana if should_apply_symbol_fallback => convert_kana_symbol(
-                            text,
-                            &app_config.general,
-                            &app_config.character_width,
-                            &app_config.romaji_table.rows,
-                        ),
-                        InputMode::Kana => text.to_string(),
+                        InputMode::Kana => resolved_symbol_text.unwrap_or_else(|| text.to_string()),
                         InputMode::Latin => text.to_string(),
                     };
                     candidates = ipc_service.append_text(text)?;
@@ -1626,7 +1686,7 @@ impl TextServiceFactory {
 #[cfg(test)]
 mod tests {
     use super::TextServiceFactory;
-    use shared::RomajiRule;
+    use shared::{AppConfig, RomajiRule, WidthMode};
 
     fn row(input: &str, output: &str, next_input: &str) -> RomajiRule {
         RomajiRule {
@@ -1669,5 +1729,42 @@ mod tests {
         let rows = vec![row("n\\", "んー", "")];
         let should_apply = TextServiceFactory::should_apply_symbol_fallback("n", "￥", &rows);
         assert!(!should_apply);
+    }
+
+    #[test]
+    fn single_symbol_romaji_output_matches_exact_symbol_rule() {
+        let rows = vec![row("-", "ー", "")];
+        let output = TextServiceFactory::single_symbol_romaji_output("-", &rows);
+        assert_eq!(output, Some("ー".to_string()));
+    }
+
+    #[test]
+    fn single_symbol_romaji_output_ignores_multi_character_rule() {
+        let rows = vec![row("z/", "・", "")];
+        let output = TextServiceFactory::single_symbol_romaji_output("/", &rows);
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn zenzai_symbol_input_prefers_explicit_single_symbol_rule() {
+        let mut app_config = AppConfig::default();
+        app_config.zenzai.enable = true;
+        app_config.zenzai.backend = "vulkan".to_string();
+        app_config.character_width.groups.math_symbol = WidthMode::Half;
+        app_config.romaji_table.rows = vec![row("-", "ー", "")];
+
+        let output = TextServiceFactory::resolve_symbol_input_text("", "-", &app_config);
+        assert_eq!(output, Some("ー".to_string()));
+    }
+
+    #[test]
+    fn zenzai_symbol_input_falls_back_to_width_setting_without_symbol_rule() {
+        let mut app_config = AppConfig::default();
+        app_config.zenzai.enable = true;
+        app_config.zenzai.backend = "vulkan".to_string();
+        app_config.character_width.groups.math_symbol = WidthMode::Half;
+
+        let output = TextServiceFactory::resolve_symbol_input_text("", "-", &app_config);
+        assert_eq!(output, Some("-".to_string()));
     }
 }
