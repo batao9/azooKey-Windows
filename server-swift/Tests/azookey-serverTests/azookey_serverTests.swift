@@ -109,3 +109,14 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
 
     #expect(useZenzai)
 }
+
+@Test func legacyCorrespondingCountFlattensCompositeCounts() async throws {
+    let count = legacyCorrespondingCount(
+        from: .composite(
+            .inputCount(2),
+            .composite(.surfaceCount(1), .inputCount(1))
+        )
+    )
+
+    #expect(count == 4)
+}

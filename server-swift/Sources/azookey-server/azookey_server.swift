@@ -124,6 +124,83 @@ func effectiveZenzaiEnabledForCandidates(
     }
 }
 
+private func clampedCorrespondingCount(
+    composingText: ComposingText,
+    rawCount: Int
+) -> Int {
+    min(composingText.input.count, max(0, rawCount))
+}
+
+func legacyCorrespondingCount(from composingCount: ComposingCount) -> Int {
+    var stack: [ComposingCount] = [composingCount]
+    var total = 0
+
+    while let current = stack.popLast() {
+        switch current {
+        case .inputCount(let count):
+            total += max(0, count)
+        case .surfaceCount(let count):
+            total += max(0, count)
+        case .composite(let left, let right):
+            stack.append(left)
+            stack.append(right)
+        }
+    }
+
+    return max(0, total)
+}
+
+@MainActor private func resolveCorrespondingCount(
+    composingText: ComposingText,
+    candidateComposingCount: ComposingCount,
+    isZenzaiEnabled: Bool
+) -> Int {
+    if isZenzaiEnabled {
+        return clampedCorrespondingCount(
+            composingText: composingText,
+            rawCount: legacyCorrespondingCount(from: candidateComposingCount)
+        )
+    }
+
+    var afterComposingText = composingText
+    afterComposingText.prefixComplete(composingCount: candidateComposingCount)
+    return clampedCorrespondingCount(
+        composingText: composingText,
+        rawCount: composingText.input.count - afterComposingText.input.count
+    )
+}
+
+@MainActor private func resolveSubtext(
+    composingText: ComposingText,
+    correspondingCount: Int,
+    isZenzaiEnabled: Bool
+) -> String {
+    if isZenzaiEnabled {
+        return ""
+    }
+
+    var afterComposingText = composingText
+    afterComposingText.prefixComplete(composingCount: .inputCount(correspondingCount))
+    return afterComposingText.convertTarget
+}
+
+@MainActor private func resolveCursorPrefixSubtext(
+    prefixComposingText: ComposingText,
+    suffixAfterCursor: String,
+    correspondingCount: Int,
+    isZenzaiEnabled: Bool
+) -> String {
+    if isZenzaiEnabled {
+        return suffixAfterCursor
+    }
+
+    var remainingPrefixComposingText = prefixComposingText
+    remainingPrefixComposingText.prefixComplete(
+        composingCount: .inputCount(correspondingCount)
+    )
+    return remainingPrefixComposingText.convertTarget + suffixAfterCursor
+}
+
 @MainActor func getOptions(context: String = "") -> ConvertRequestOptions {
     getOptions(context: context, zenzaiEnabled: (config["enable"] as? Bool) ?? false)
 }
@@ -147,7 +224,7 @@ func effectiveZenzaiEnabledForCandidates(
         zenzaiMode: zenzaiEnabled ? .on(
             weight: execURL.appendingPathComponent("zenz.gguf"),
             inferenceLimit: 1,
-            requestRichCandidates: true,
+            requestRichCandidates: false,
             personalizationMode: nil,
             versionDependentMode: .v3(
                 .init(
@@ -407,12 +484,18 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 
         let text = strdup(constructCandidateString(candidate: candidate, hiragana: hiragana))
         let hiragana = strdup(hiragana)
-        let composingCount = candidate.composingCount
-
-        var afterComposingText = composingText
-        afterComposingText.prefixComplete(composingCount: composingCount)
-        let correspondingCount = max(0, composingText.input.count - afterComposingText.input.count)
-        let subtext = strdup(afterComposingText.convertTarget)
+        let correspondingCount = resolveCorrespondingCount(
+            composingText: composingText,
+            candidateComposingCount: candidate.composingCount,
+            isZenzaiEnabled: useZenzai
+        )
+        let subtext = strdup(
+            resolveSubtext(
+                composingText: composingText,
+                correspondingCount: correspondingCount,
+                isZenzaiEnabled: useZenzai
+            )
+        )
 
         result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))
     }
@@ -443,15 +526,19 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 
         let text = strdup(constructCandidateString(candidate: candidate, hiragana: prefixHiragana))
         let hiragana = strdup(hiragana)
-        let composingCount = candidate.composingCount
-
-        var remainingPrefixComposingText = prefixComposingText
-        remainingPrefixComposingText.prefixComplete(composingCount: composingCount)
-        let correspondingCount = max(
-            0,
-            prefixComposingText.input.count - remainingPrefixComposingText.input.count
+        let correspondingCount = resolveCorrespondingCount(
+            composingText: prefixComposingText,
+            candidateComposingCount: candidate.composingCount,
+            isZenzaiEnabled: useZenzai
         )
-        let subtext = strdup(remainingPrefixComposingText.convertTarget + suffixAfterCursor)
+        let subtext = strdup(
+            resolveCursorPrefixSubtext(
+                prefixComposingText: prefixComposingText,
+                suffixAfterCursor: suffixAfterCursor,
+                correspondingCount: correspondingCount,
+                isZenzaiEnabled: useZenzai
+            )
+        )
 
         result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))
     }
