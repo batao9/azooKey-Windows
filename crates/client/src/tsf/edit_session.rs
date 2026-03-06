@@ -66,6 +66,59 @@ impl<'a, T> ITfEditSession_Impl for EditSession_Impl<'a, T> {
 }
 
 impl TextServiceFactory {
+    fn close_composition(&self, discard_text: bool) -> Result<()> {
+        let text_service = self.borrow()?;
+
+        if let Some(composition) = text_service.borrow_composition()?.tip_composition.clone() {
+            edit_session(
+                text_service.tid,
+                text_service.context()?,
+                Rc::new({
+                    let context = text_service.context::<ITfContext>()?;
+
+                    move |cookie| unsafe {
+                        let range: ITfRange = composition.GetRange()?;
+
+                        if discard_text {
+                            range.SetText(cookie, TF_ST_CORRECTION, &[])?;
+                        } else {
+                            let mut text = vec![0; 1024];
+                            let mut text_len = 1024;
+
+                            let range_new = range.Clone()?;
+                            range_new.GetText(cookie, TF_TF_MOVESTART, &mut text, &mut text_len)?;
+
+                            text = text[..text_len as usize].to_vec();
+                            range.SetText(cookie, TF_ST_CORRECTION, &text)?;
+                        }
+
+                        let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
+                        prop.Clear(cookie, &range)?;
+
+                        range.Collapse(cookie, TF_ANCHOR_END)?;
+                        let selection = TF_SELECTION {
+                            range: ManuallyDrop::new(Some(range.clone())),
+                            style: TF_SELECTIONSTYLE {
+                                ase: TF_AE_NONE,
+                                fInterimChar: false.into(),
+                            },
+                        };
+
+                        context.SetSelection(cookie, &[selection])?;
+                        composition.EndComposition(cookie)?;
+                        Ok(())
+                    }
+                }),
+            )?;
+        } else {
+            tracing::warn!("Composition is not started");
+        }
+
+        text_service.borrow_mut_composition()?.tip_composition = None;
+
+        Ok(())
+    }
+
     #[tracing::instrument]
     pub fn start_composition(&self) -> Result<()> {
         tracing::debug!("start_composition");
@@ -109,56 +162,13 @@ impl TextServiceFactory {
     #[tracing::instrument]
     pub fn end_composition(&self) -> Result<()> {
         tracing::debug!("end_composition");
-        let text_service = self.borrow()?;
+        self.close_composition(false)
+    }
 
-        if let Some(composition) = text_service.borrow_composition()?.tip_composition.clone() {
-            edit_session(
-                text_service.tid,
-                text_service.context()?,
-                Rc::new({
-                    let context = text_service.context::<ITfContext>()?;
-
-                    move |cookie| unsafe {
-                        // clear display attribute first
-                        let range: ITfRange = composition.GetRange()?;
-
-                        // set existing text to the composition
-                        let mut text = vec![0; 1024];
-                        let mut text_len = 1024;
-
-                        let range_new = range.Clone()?;
-                        range_new.GetText(cookie, TF_TF_MOVESTART, &mut text, &mut text_len)?;
-
-                        text = text[..text_len as usize].to_vec();
-                        range.SetText(cookie, TF_ST_CORRECTION, &text)?;
-
-                        let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
-                        prop.Clear(cookie, &range)?;
-
-                        // shift the start of the composition
-                        range.Collapse(cookie, TF_ANCHOR_END)?;
-                        let selection = TF_SELECTION {
-                            range: ManuallyDrop::new(Some(range.clone())),
-                            style: TF_SELECTIONSTYLE {
-                                ase: TF_AE_NONE,
-                                fInterimChar: false.into(),
-                            },
-                        };
-
-                        context.SetSelection(cookie, &[selection])?;
-
-                        composition.EndComposition(cookie)?;
-                        Ok(())
-                    }
-                }),
-            )?;
-        } else {
-            tracing::warn!("Composition is not started");
-        }
-
-        text_service.borrow_mut_composition()?.tip_composition = None;
-
-        Ok(())
+    #[tracing::instrument]
+    pub fn abort_composition(&self) -> Result<()> {
+        tracing::debug!("abort_composition");
+        self.close_composition(true)
     }
 
     #[tracing::instrument]

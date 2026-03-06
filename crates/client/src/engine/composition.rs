@@ -338,6 +338,57 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn has_multi_character_romaji_context(
+        raw_input_before: &str,
+        symbol: char,
+        romaji_rows: &[RomajiRule],
+    ) -> bool {
+        if romaji_rows.is_empty() {
+            return false;
+        }
+
+        let mut combined = String::with_capacity(raw_input_before.len() + symbol.len_utf8());
+        combined.push_str(raw_input_before);
+        combined.push(symbol);
+
+        let combined_chars: Vec<char> = combined.chars().collect();
+        let max_row_len = romaji_rows
+            .iter()
+            .map(|row| row.input.chars().count())
+            .max()
+            .unwrap_or(0);
+
+        if max_row_len <= 1 {
+            return false;
+        }
+
+        let start_index = combined_chars.len().saturating_sub(max_row_len);
+        for suffix_start in start_index..combined_chars.len() {
+            let suffix: String = combined_chars[suffix_start..].iter().collect();
+            if suffix.is_empty() {
+                continue;
+            }
+
+            if romaji_rows
+                .iter()
+                .filter_map(|row| {
+                    let trimmed = row.input.trim();
+                    if trimmed.is_empty() || trimmed.chars().count() <= 1 {
+                        None
+                    } else {
+                        Some(trimmed)
+                    }
+                })
+                .any(|input| input.starts_with(&suffix))
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    #[inline]
     fn effective_zenzai_runtime_enabled(app_config: &AppConfig) -> bool {
         if !app_config.zenzai.enable {
             return false;
@@ -377,22 +428,31 @@ impl TextServiceFactory {
         input: &str,
         app_config: &AppConfig,
     ) -> Option<String> {
+        let symbols = Self::single_symbol_candidates(input)?;
         let is_zenzai_enabled = Self::effective_zenzai_runtime_enabled(app_config);
         if is_zenzai_enabled {
+            if symbols.iter().any(|symbol| {
+                Self::has_multi_character_romaji_context(
+                    raw_input_before,
+                    *symbol,
+                    &app_config.romaji_table.rows,
+                )
+            }) {
+                return None;
+            }
+
             if let Some(mapped) =
                 Self::single_symbol_romaji_output(input, &app_config.romaji_table.rows)
             {
                 return Some(mapped);
             }
 
-            return Self::single_symbol_candidates(input).map(|_| {
-                convert_kana_symbol(
-                    input,
-                    &app_config.general,
-                    &app_config.character_width,
-                    &app_config.romaji_table.rows,
-                )
-            });
+            return Some(convert_kana_symbol(
+                input,
+                &app_config.general,
+                &app_config.character_width,
+                &app_config.romaji_table.rows,
+            ));
         }
 
         if Self::should_apply_symbol_fallback(
@@ -1161,7 +1221,7 @@ impl TextServiceFactory {
     }
 
     fn recover_after_key_error(&self) {
-        let _ = self.end_composition();
+        let _ = self.abort_composition();
 
         if let Ok(text_service) = self.borrow() {
             if let Ok(mut composition) = text_service.borrow_mut_composition() {
@@ -1686,7 +1746,7 @@ impl TextServiceFactory {
 #[cfg(test)]
 mod tests {
     use super::TextServiceFactory;
-    use shared::{AppConfig, RomajiRule, WidthMode};
+    use shared::{get_default_romaji_rows, AppConfig, RomajiRule, WidthMode};
 
     fn row(input: &str, output: &str, next_input: &str) -> RomajiRule {
         RomajiRule {
@@ -1766,5 +1826,49 @@ mod tests {
 
         let output = TextServiceFactory::resolve_symbol_input_text("", "-", &app_config);
         assert_eq!(output, Some("-".to_string()));
+    }
+
+    #[test]
+    fn zenzai_symbol_input_keeps_default_multi_character_dash_sequence() {
+        let mut app_config = AppConfig::default();
+        app_config.zenzai.enable = true;
+        app_config.zenzai.backend = "vulkan".to_string();
+        app_config.romaji_table.rows = get_default_romaji_rows();
+
+        let output = TextServiceFactory::resolve_symbol_input_text("z", "-", &app_config);
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn zenzai_symbol_input_keeps_default_multi_character_symbol_sequence() {
+        let mut app_config = AppConfig::default();
+        app_config.zenzai.enable = true;
+        app_config.zenzai.backend = "vulkan".to_string();
+        app_config.romaji_table.rows = get_default_romaji_rows();
+
+        let output = TextServiceFactory::resolve_symbol_input_text("z", "/", &app_config);
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn zenzai_symbol_input_keeps_default_n_apostrophe_sequence() {
+        let mut app_config = AppConfig::default();
+        app_config.zenzai.enable = true;
+        app_config.zenzai.backend = "vulkan".to_string();
+        app_config.romaji_table.rows = get_default_romaji_rows();
+
+        let output = TextServiceFactory::resolve_symbol_input_text("n", "'", &app_config);
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn zenzai_symbol_input_still_applies_standalone_symbol_rule_without_multi_character_context() {
+        let mut app_config = AppConfig::default();
+        app_config.zenzai.enable = true;
+        app_config.zenzai.backend = "vulkan".to_string();
+        app_config.romaji_table.rows = get_default_romaji_rows();
+
+        let output = TextServiceFactory::resolve_symbol_input_text("a", "-", &app_config);
+        assert_eq!(output, Some("ー".to_string()));
     }
 }
