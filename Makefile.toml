@@ -11,7 +11,7 @@ description = "Build the swift code"
 script_runner = "@shell"
 script = """
 cd server-swift
-swift build -c release
+swift build -c release -Xcc -D_CRT_USE_C_COMPLEX_H -Xcxx -D_CRT_USE_C_COMPLEX_H
 cp .build/release/azookey-server.lib ../
 """
 
