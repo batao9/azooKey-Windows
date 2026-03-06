@@ -252,74 +252,20 @@ private func clampedCorrespondingCount(
     min(composingText.input.count, max(0, rawCount))
 }
 
-func legacyCorrespondingCount(from composingCount: ComposingCount) -> Int {
-    var stack: [ComposingCount] = [composingCount]
-    var total = 0
-
-    while let current = stack.popLast() {
-        switch current {
-        case .inputCount(let count):
-            total += max(0, count)
-        case .surfaceCount(let count):
-            total += max(0, count)
-        case .composite(let left, let right):
-            stack.append(left)
-            stack.append(right)
-        }
-    }
-
-    return max(0, total)
-}
-
-@MainActor private func resolveCorrespondingCount(
+@MainActor func resolveCandidateComposition(
     composingText: ComposingText,
-    candidateComposingCount: ComposingCount,
-    isZenzaiEnabled: Bool
-) -> Int {
-    if isZenzaiEnabled {
-        return clampedCorrespondingCount(
+    candidateComposingCount: ComposingCount
+) -> (correspondingCount: Int, remainingConvertTarget: String) {
+    var remainingComposingText = composingText
+    remainingComposingText.prefixComplete(composingCount: candidateComposingCount)
+
+    return (
+        correspondingCount: clampedCorrespondingCount(
             composingText: composingText,
-            rawCount: legacyCorrespondingCount(from: candidateComposingCount)
-        )
-    }
-
-    var afterComposingText = composingText
-    afterComposingText.prefixComplete(composingCount: candidateComposingCount)
-    return clampedCorrespondingCount(
-        composingText: composingText,
-        rawCount: composingText.input.count - afterComposingText.input.count
+            rawCount: composingText.input.count - remainingComposingText.input.count
+        ),
+        remainingConvertTarget: remainingComposingText.convertTarget
     )
-}
-
-@MainActor private func resolveSubtext(
-    composingText: ComposingText,
-    correspondingCount: Int,
-    isZenzaiEnabled: Bool
-) -> String {
-    if isZenzaiEnabled {
-        return ""
-    }
-
-    var afterComposingText = composingText
-    afterComposingText.prefixComplete(composingCount: .inputCount(correspondingCount))
-    return afterComposingText.convertTarget
-}
-
-@MainActor private func resolveCursorPrefixSubtext(
-    prefixComposingText: ComposingText,
-    suffixAfterCursor: String,
-    correspondingCount: Int,
-    isZenzaiEnabled: Bool
-) -> String {
-    if isZenzaiEnabled {
-        return suffixAfterCursor
-    }
-
-    var remainingPrefixComposingText = prefixComposingText
-    remainingPrefixComposingText.prefixComplete(
-        composingCount: .inputCount(correspondingCount)
-    )
-    return remainingPrefixComposingText.convertTarget + suffixAfterCursor
 }
 
 @MainActor private func debugLogResolvedCorrespondingCount(
@@ -703,11 +649,11 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         let text = strdup(constructCandidateString(candidate: candidate, hiragana: hiragana))
         serverLog("DEBUG", "GetComposedText: candidate[\(i + 1)] textReady")
         let hiragana = strdup(hiragana)
-        let correspondingCount = resolveCorrespondingCount(
+        let resolvedCandidate = resolveCandidateComposition(
             composingText: composingText,
-            candidateComposingCount: candidate.composingCount,
-            isZenzaiEnabled: useZenzai
+            candidateComposingCount: candidate.composingCount
         )
+        let correspondingCount = resolvedCandidate.correspondingCount
         debugLogResolvedCorrespondingCount(
             scope: "GetComposedText",
             candidateIndex: i,
@@ -717,13 +663,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
             inputCount: composingText.input.count,
             isZenzaiEnabled: useZenzai
         )
-        let subtext = strdup(
-            resolveSubtext(
-                composingText: composingText,
-                correspondingCount: correspondingCount,
-                isZenzaiEnabled: useZenzai
-            )
-        )
+        let subtext = strdup(resolvedCandidate.remainingConvertTarget)
         serverLog("DEBUG", "GetComposedText: candidate[\(i + 1)] subtextReady")
 
         result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))
@@ -769,11 +709,11 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         let text = strdup(constructCandidateString(candidate: candidate, hiragana: prefixHiragana))
         serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)] textReady")
         let hiragana = strdup(hiragana)
-        let correspondingCount = resolveCorrespondingCount(
+        let resolvedCandidate = resolveCandidateComposition(
             composingText: prefixComposingText,
-            candidateComposingCount: candidate.composingCount,
-            isZenzaiEnabled: useZenzai
+            candidateComposingCount: candidate.composingCount
         )
+        let correspondingCount = resolvedCandidate.correspondingCount
         debugLogResolvedCorrespondingCount(
             scope: "GetComposedTextForCursorPrefix",
             candidateIndex: i,
@@ -783,14 +723,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
             inputCount: prefixComposingText.input.count,
             isZenzaiEnabled: useZenzai
         )
-        let subtext = strdup(
-            resolveCursorPrefixSubtext(
-                prefixComposingText: prefixComposingText,
-                suffixAfterCursor: suffixAfterCursor,
-                correspondingCount: correspondingCount,
-                isZenzaiEnabled: useZenzai
-            )
-        )
+        let subtext = strdup(resolvedCandidate.remainingConvertTarget + suffixAfterCursor)
         serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)] subtextReady")
 
         result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))

@@ -130,13 +130,30 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
     #expect(enabled)
 }
 
-@Test func legacyCorrespondingCountFlattensCompositeCounts() async throws {
-    let count = legacyCorrespondingCount(
-        from: .composite(
-            .inputCount(2),
-            .composite(.surfaceCount(1), .inputCount(1))
+@Test func surfaceCountTracksUnderlyingRomanInputLength() async throws {
+    let resolved = await MainActor.run {
+        var composingText = ComposingText()
+        composingText.insertAtCursorPosition("kato", inputStyle: .roman2kana)
+        return resolveCandidateComposition(
+            composingText: composingText,
+            candidateComposingCount: .surfaceCount(1)
         )
-    )
+    }
 
-    #expect(count == 4)
+    #expect(resolved.correspondingCount == 2)
+    #expect(resolved.remainingConvertTarget == "と")
+}
+
+@Test func compositeSurfaceCountPreservesClauseOffset() async throws {
+    let resolved = await MainActor.run {
+        var composingText = ComposingText()
+        composingText.insertAtCursorPosition("kato", inputStyle: .roman2kana)
+        return resolveCandidateComposition(
+            composingText: composingText,
+            candidateComposingCount: .composite(.inputCount(0), .surfaceCount(1))
+        )
+    }
+
+    #expect(resolved.correspondingCount == 2)
+    #expect(resolved.remainingConvertTarget == "と")
 }
