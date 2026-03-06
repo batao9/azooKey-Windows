@@ -3,6 +3,10 @@
 
 import PackageDescription
 
+let swiftSettings: [SwiftSetting] = [
+    .interoperabilityMode(.Cxx)
+]
+
 let package = Package(
     name: "azookey-server",
     products: [
@@ -32,11 +36,13 @@ let package = Package(
             dependencies: [
                 .product(name: "KanaKanjiConverterModule", package: "azookeykanakanjiconverter"),
                 "ffi"
-            ]
+            ],
+            swiftSettings: swiftSettings
         ),
         .testTarget(
             name: "azookey-serverTests",
-            dependencies: ["azookey-server"]
+            dependencies: ["azookey-server"],
+            swiftSettings: swiftSettings
         ),
     ]
 )
