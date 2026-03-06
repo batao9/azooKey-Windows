@@ -69,7 +69,7 @@ begin
   Dependency_AddVC2015To2022x64;
   Dependency_AddVC2015To2022x86;
   Dependency_Add('Azookey_0.1.0_x64-setup.exe',
-    '/q',
+    '/S',
     'Azookey',
     '', '', True, False);
 
