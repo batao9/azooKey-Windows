@@ -1,15 +1,24 @@
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
+
 use windows::{
-    core::{IUnknown, Interface as _, BSTR, GUID, PCWSTR},
+    core::{w, IUnknown, Interface as _, BSTR, GUID, PCWSTR},
     Win32::{
-        Foundation::{BOOL, E_INVALIDARG, POINT, RECT},
+        Foundation::{BOOL, E_INVALIDARG, LPARAM, POINT, RECT, WPARAM},
         System::Ole::CONNECT_E_CANNOTCONNECT,
         UI::{
             TextServices::{
                 ITfLangBarItemButton_Impl, ITfLangBarItemSink, ITfLangBarItem_Impl, ITfMenu,
                 ITfSource_Impl, TfLBIClick, GUID_LBI_INPUTMODE, TF_LANGBARITEMINFO,
-                TF_LBI_STYLE_BTN_BUTTON,
+                TF_LBI_CLK_LEFT, TF_LBI_CLK_RIGHT, TF_LBI_STYLE_BTN_BUTTON,
             },
-            WindowsAndMessaging::{LoadImageW, HICON, IMAGE_ICON, LR_DEFAULTCOLOR},
+            WindowsAndMessaging::{
+                AppendMenuW, CreatePopupMenu, DestroyMenu, GetForegroundWindow, LoadImageW,
+                PostMessageW, SetForegroundWindow, TrackPopupMenu, HICON, HMENU, IMAGE_ICON,
+                LR_DEFAULTCOLOR, MF_STRING, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
+            },
         },
     },
 };
@@ -34,8 +43,44 @@ const INFO: TF_LANGBARITEMINFO = TF_LANGBARITEMINFO {
     szDescription: [0; 32],
 };
 
+const SETTINGS_MENU_ID: usize = 1;
+const SETTINGS_APP_FILENAME: &str = "Azookey.exe";
+
 // you need to implement these three interfaces to create a language bar item
 // if not, you will get E_FAIL error in ITfLangBarItemMgr::AddItem
+
+impl TextServiceFactory_Impl {
+    fn toggle_input_mode(&self) -> Result<()> {
+        let mode = {
+            let ime_mode = &IMEState::get()?.input_mode;
+            match ime_mode {
+                InputMode::Latin => InputMode::Kana,
+                InputMode::Kana => InputMode::Latin,
+            }
+        };
+
+        let actions = vec![ClientAction::SetIMEMode(mode)];
+        self.handle_action(&actions, CompositionState::None)?;
+
+        Ok(())
+    }
+
+    fn handle_right_click(&self, pt: &POINT) -> Result<()> {
+        match show_settings_menu(pt) {
+            Ok(Some(command)) if command == SETTINGS_MENU_ID as u32 => {
+                if let Err(error) = launch_settings_app() {
+                    tracing::warn!(?error, "Failed to launch settings app");
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(?error, "Failed to show settings menu");
+            }
+        }
+
+        Ok(())
+    }
+}
 
 impl ITfLangBarItem_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
@@ -65,17 +110,12 @@ impl ITfLangBarItem_Impl for TextServiceFactory_Impl {
 
 impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
-    fn OnClick(&self, _click: TfLBIClick, _pt: &POINT, _prcarea: *const RECT) -> Result<()> {
-        let mode = {
-            let ime_mode = &IMEState::get()?.input_mode;
-            match ime_mode {
-                InputMode::Latin => InputMode::Kana,
-                InputMode::Kana => InputMode::Latin,
-            }
-        };
-
-        let actions = vec![ClientAction::SetIMEMode(mode)];
-        self.handle_action(&actions, CompositionState::None)?;
+    fn OnClick(&self, click: TfLBIClick, pt: &POINT, _prcarea: *const RECT) -> Result<()> {
+        match click {
+            TF_LBI_CLK_LEFT => self.toggle_input_mode()?,
+            TF_LBI_CLK_RIGHT => self.handle_right_click(pt)?,
+            _ => {}
+        }
 
         Ok(())
     }
@@ -136,6 +176,78 @@ impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
     }
 }
 
+fn show_settings_menu(pt: &POINT) -> Result<Option<u32>> {
+    struct PopupMenu(HMENU);
+
+    impl Drop for PopupMenu {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyMenu(self.0);
+            }
+        }
+    }
+
+    unsafe {
+        let menu = PopupMenu(CreatePopupMenu()?);
+        AppendMenuW(menu.0, MF_STRING, SETTINGS_MENU_ID, w!("設定"))?;
+
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return Ok(None);
+        }
+
+        let _ = SetForegroundWindow(hwnd);
+
+        let selected = TrackPopupMenu(
+            menu.0,
+            TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+            pt.x,
+            pt.y,
+            0,
+            hwnd,
+            None,
+        )
+        .0 as u32;
+
+        let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+
+        if selected == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(selected))
+        }
+    }
+}
+
+fn launch_settings_app() -> Result<()> {
+    let dll_path = PathBuf::from(DllModule::get_path()?);
+    let settings_path = resolve_settings_app_path(&dll_path)?;
+    let install_dir = settings_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .context("Settings app directory not found")?;
+
+    if !settings_path.is_file() {
+        anyhow::bail!("Settings app not found: {}", settings_path.display());
+    }
+
+    Command::new(&settings_path)
+        .current_dir(install_dir)
+        .spawn()
+        .with_context(|| format!("Failed to spawn {}", settings_path.display()))?;
+
+    Ok(())
+}
+
+fn resolve_settings_app_path(dll_path: &Path) -> Result<PathBuf> {
+    let install_dir = dll_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .context("DLL parent directory not found")?;
+
+    Ok(install_dir.join(SETTINGS_APP_FILENAME))
+}
+
 impl ITfSource_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     fn AdviseSink(&self, riid: *const GUID, punk: Option<&IUnknown>) -> Result<u32> {
@@ -165,5 +277,32 @@ impl ITfSource_Impl for TextServiceFactory_Impl {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_settings_app_path;
+    use std::path::Path;
+
+    #[test]
+    fn resolve_settings_app_path_uses_dll_parent_directory() {
+        let dll_path = Path::new("C:/Users/test/AppData/Roaming/Azookey/azookey.dll");
+
+        let resolved = resolve_settings_app_path(dll_path).expect("path should resolve");
+
+        assert_eq!(
+            resolved,
+            Path::new("C:/Users/test/AppData/Roaming/Azookey/Azookey.exe")
+        );
+    }
+
+    #[test]
+    fn resolve_settings_app_path_rejects_dll_path_without_parent() {
+        let dll_path = Path::new("azookey.dll");
+
+        let result = resolve_settings_app_path(dll_path);
+
+        assert!(result.is_err());
     }
 }
