@@ -1,4 +1,5 @@
 use std::{
+    env,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -44,7 +45,8 @@ const INFO: TF_LANGBARITEMINFO = TF_LANGBARITEMINFO {
 };
 
 const SETTINGS_MENU_ID: usize = 1;
-const SETTINGS_APP_FILENAME: &str = "Azookey.exe";
+const SETTINGS_APP_DIRNAME: &str = "Azookey";
+const SETTINGS_APP_FILENAME: &str = "frontend.exe";
 
 // you need to implement these three interfaces to create a language bar item
 // if not, you will get E_FAIL error in ITfLangBarItemMgr::AddItem
@@ -220,8 +222,8 @@ fn show_settings_menu(pt: &POINT) -> Result<Option<u32>> {
 }
 
 fn launch_settings_app() -> Result<()> {
-    let dll_path = PathBuf::from(DllModule::get_path()?);
-    let settings_path = resolve_settings_app_path(&dll_path)?;
+    let local_app_data = env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?;
+    let settings_path = resolve_settings_app_path(Path::new(&local_app_data))?;
     let install_dir = settings_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -239,13 +241,14 @@ fn launch_settings_app() -> Result<()> {
     Ok(())
 }
 
-fn resolve_settings_app_path(dll_path: &Path) -> Result<PathBuf> {
-    let install_dir = dll_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .context("DLL parent directory not found")?;
+fn resolve_settings_app_path(local_app_data: &Path) -> Result<PathBuf> {
+    if local_app_data.as_os_str().is_empty() {
+        anyhow::bail!("LOCALAPPDATA path is empty");
+    }
 
-    Ok(install_dir.join(SETTINGS_APP_FILENAME))
+    Ok(local_app_data
+        .join(SETTINGS_APP_DIRNAME)
+        .join(SETTINGS_APP_FILENAME))
 }
 
 impl ITfSource_Impl for TextServiceFactory_Impl {
@@ -286,22 +289,20 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn resolve_settings_app_path_uses_dll_parent_directory() {
-        let dll_path = Path::new("C:/Users/test/AppData/Roaming/Azookey/azookey.dll");
+    fn resolve_settings_app_path_uses_local_app_data_directory() {
+        let local_app_data = Path::new("C:/Users/test/AppData/Local");
 
-        let resolved = resolve_settings_app_path(dll_path).expect("path should resolve");
+        let resolved = resolve_settings_app_path(local_app_data).expect("path should resolve");
 
         assert_eq!(
             resolved,
-            Path::new("C:/Users/test/AppData/Roaming/Azookey/Azookey.exe")
+            Path::new("C:/Users/test/AppData/Local/Azookey/frontend.exe")
         );
     }
 
     #[test]
-    fn resolve_settings_app_path_rejects_dll_path_without_parent() {
-        let dll_path = Path::new("azookey.dll");
-
-        let result = resolve_settings_app_path(dll_path);
+    fn resolve_settings_app_path_rejects_empty_local_app_data_path() {
+        let result = resolve_settings_app_path(Path::new(""));
 
         assert!(result.is_err());
     }
