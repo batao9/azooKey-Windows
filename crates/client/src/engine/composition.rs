@@ -240,12 +240,12 @@ impl TextServiceFactory {
             }
         };
 
-        if ch.is_ascii_punctuation() {
+        if ch.is_ascii_punctuation() || ch.is_ascii_digit() {
             push_unique(ch);
         }
 
         let halfwidth = Self::to_halfwidth_ascii_char(ch);
-        if halfwidth.is_ascii_punctuation() {
+        if halfwidth.is_ascii_punctuation() || halfwidth.is_ascii_digit() {
             push_unique(ch);
             push_unique(halfwidth);
         }
@@ -258,7 +258,7 @@ impl TextServiceFactory {
         let converted = to_halfwidth(&ch.to_string());
         let mut converted_chars = converted.chars();
         if let (Some(converted_char), None) = (converted_chars.next(), converted_chars.next()) {
-            if converted_char.is_ascii_punctuation() {
+            if converted_char.is_ascii_punctuation() || converted_char.is_ascii_digit() {
                 push_unique(ch);
                 push_unique(converted_char);
             }
@@ -271,13 +271,6 @@ impl TextServiceFactory {
         }
     }
 
-    #[inline]
-    fn is_single_numeric_input(input: &str) -> bool {
-        let mut chars = input.chars();
-        matches!(chars.next(), Some('0'..='9' | '０'..='９')) && chars.next().is_none()
-    }
-
-    #[inline]
     fn has_romaji_table_context(
         raw_input_before: &str,
         symbol: char,
@@ -434,15 +427,6 @@ impl TextServiceFactory {
         input: &str,
         app_config: &AppConfig,
     ) -> Option<String> {
-        if Self::is_single_numeric_input(input) {
-            return Some(convert_kana_symbol(
-                input,
-                &app_config.general,
-                &app_config.character_width,
-                &app_config.romaji_table.rows,
-            ));
-        }
-
         let symbols = Self::single_symbol_candidates(input)?;
         let is_zenzai_enabled = Self::effective_zenzai_runtime_enabled(app_config);
         if is_zenzai_enabled {
@@ -1914,5 +1898,39 @@ mod tests {
 
         let output = TextServiceFactory::resolve_symbol_input_text("", "1", &app_config);
         assert_eq!(output, Some("１".to_string()));
+    }
+
+    #[test]
+    fn top_row_digit_input_preserves_single_digit_romaji_rule_when_zenzai_is_disabled() {
+        let mut app_config = AppConfig::default();
+        app_config.character_width.groups.number = WidthMode::Full;
+        app_config.romaji_table.rows = vec![row("1", "一", "")];
+
+        let output = TextServiceFactory::resolve_symbol_input_text("", "1", &app_config);
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn top_row_digit_input_preserves_single_digit_romaji_rule_when_zenzai_is_enabled() {
+        let mut app_config = AppConfig::default();
+        app_config.zenzai.enable = true;
+        app_config.zenzai.backend = "vulkan".to_string();
+        app_config.character_width.groups.number = WidthMode::Full;
+        app_config.romaji_table.rows = vec![row("1", "一", "")];
+
+        let output = TextServiceFactory::resolve_symbol_input_text("", "1", &app_config);
+        assert_eq!(output, Some("一".to_string()));
+    }
+
+    #[test]
+    fn top_row_digit_input_preserves_multi_character_romaji_context_when_zenzai_is_enabled() {
+        let mut app_config = AppConfig::default();
+        app_config.zenzai.enable = true;
+        app_config.zenzai.backend = "vulkan".to_string();
+        app_config.character_width.groups.number = WidthMode::Full;
+        app_config.romaji_table.rows = vec![row("z1", "座布団", "")];
+
+        let output = TextServiceFactory::resolve_symbol_input_text("z", "1", &app_config);
+        assert_eq!(output, None);
     }
 }
