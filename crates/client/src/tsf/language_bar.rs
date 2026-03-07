@@ -7,9 +7,18 @@ use std::{
 use windows::{
     core::{w, IUnknown, Interface as _, BSTR, GUID, PCWSTR},
     Win32::{
-        Foundation::{BOOL, E_INVALIDARG, HWND, LPARAM, POINT, RECT, WPARAM},
+        Foundation::{
+            BOOL, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, E_INVALIDARG, HWND,
+            LPARAM, POINT, RECT, WPARAM,
+        },
         Graphics::Gdi::HBITMAP,
-        System::Ole::CONNECT_E_CANNOTCONNECT,
+        System::{
+            Ole::CONNECT_E_CANNOTCONNECT,
+            Registry::{
+                RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_ROUTINE_FLAGS,
+                REG_VALUE_TYPE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY,
+            },
+        },
         UI::{
             TextServices::{
                 ITfLangBarItemButton_Impl, ITfLangBarItemSink, ITfLangBarItem_Impl, ITfMenu,
@@ -49,6 +58,10 @@ const INFO: TF_LANGBARITEMINFO = TF_LANGBARITEMINFO {
 const SETTINGS_MENU_ID: usize = 1;
 const SETTINGS_APP_DIRNAME: &str = "Azookey";
 const SETTINGS_APP_FILENAME: &str = "frontend.exe";
+const SETTINGS_APP_UNINSTALL_SUBKEY: PCWSTR =
+    w!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Azookey");
+const SETTINGS_APP_INSTALL_LOCATION_VALUE: PCWSTR = w!("InstallLocation");
+const SETTINGS_APP_MAIN_BINARY_NAME_VALUE: PCWSTR = w!("MainBinaryName");
 
 // you need to implement these three interfaces to create a language bar item
 // if not, you will get E_FAIL error in ITfLangBarItemMgr::AddItem
@@ -267,8 +280,7 @@ fn resolve_menu_owner_window(pt: POINT) -> HWND {
 }
 
 fn launch_settings_app() -> Result<()> {
-    let local_app_data = env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?;
-    let settings_path = resolve_settings_app_path(Path::new(&local_app_data))?;
+    let settings_path = resolve_settings_app_path()?;
     let install_dir = settings_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -286,14 +298,148 @@ fn launch_settings_app() -> Result<()> {
     Ok(())
 }
 
-fn resolve_settings_app_path(local_app_data: &Path) -> Result<PathBuf> {
-    if local_app_data.as_os_str().is_empty() {
-        anyhow::bail!("LOCALAPPDATA path is empty");
+fn resolve_settings_app_path() -> Result<PathBuf> {
+    if let Some(settings_path) = resolve_settings_app_path_from_registry()? {
+        return Ok(settings_path);
     }
 
-    Ok(local_app_data
-        .join(SETTINGS_APP_DIRNAME)
-        .join(SETTINGS_APP_FILENAME))
+    let local_app_data = env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?;
+    let fallback_install_location = Path::new(&local_app_data).join(SETTINGS_APP_DIRNAME);
+    let fallback_install_location = fallback_install_location.to_string_lossy();
+
+    resolve_settings_app_path_from_install_location(
+        fallback_install_location.as_ref(),
+        SETTINGS_APP_FILENAME,
+    )
+}
+
+fn resolve_settings_app_path_from_registry() -> Result<Option<PathBuf>> {
+    for (hkey, flags) in [
+        (HKEY_CURRENT_USER, REG_ROUTINE_FLAGS(0)),
+        (HKEY_LOCAL_MACHINE, REG_ROUTINE_FLAGS(0)),
+        (HKEY_LOCAL_MACHINE, RRF_SUBKEY_WOW6464KEY),
+    ] {
+        match resolve_settings_app_path_from_uninstall_key(hkey, flags) {
+            Ok(Some(settings_path)) => return Ok(Some(settings_path)),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(?error, "Skip invalid settings app install metadata");
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn resolve_settings_app_path_from_uninstall_key(
+    hkey: HKEY,
+    flags: REG_ROUTINE_FLAGS,
+) -> Result<Option<PathBuf>> {
+    let install_location = match read_registry_string(
+        hkey,
+        SETTINGS_APP_UNINSTALL_SUBKEY,
+        SETTINGS_APP_INSTALL_LOCATION_VALUE,
+        flags,
+    )? {
+        Some(install_location) => install_location,
+        None => return Ok(None),
+    };
+
+    let main_binary_name = read_registry_string(
+        hkey,
+        SETTINGS_APP_UNINSTALL_SUBKEY,
+        SETTINGS_APP_MAIN_BINARY_NAME_VALUE,
+        flags,
+    )?
+    .unwrap_or_else(|| SETTINGS_APP_FILENAME.to_string());
+
+    let settings_path =
+        resolve_settings_app_path_from_install_location(&install_location, &main_binary_name)?;
+
+    Ok(Some(settings_path))
+}
+
+fn resolve_settings_app_path_from_install_location(
+    install_location: &str,
+    main_binary_name: &str,
+) -> Result<PathBuf> {
+    let install_location = trim_registry_string(install_location);
+    let main_binary_name = trim_registry_string(main_binary_name);
+
+    if install_location.is_empty() {
+        anyhow::bail!("Settings app install location is empty");
+    }
+
+    if main_binary_name.is_empty() {
+        anyhow::bail!("Settings app main binary name is empty");
+    }
+
+    Ok(Path::new(install_location).join(main_binary_name))
+}
+
+fn trim_registry_string(value: &str) -> &str {
+    value.trim().trim_matches('"')
+}
+
+fn read_registry_string(
+    hkey: HKEY,
+    subkey: PCWSTR,
+    value: PCWSTR,
+    flags: REG_ROUTINE_FLAGS,
+) -> Result<Option<String>> {
+    let flags = flags | RRF_RT_REG_SZ;
+    let mut value_type = REG_VALUE_TYPE::default();
+    let mut data_size = 0u32;
+
+    let status = unsafe {
+        RegGetValueW(
+            hkey,
+            subkey,
+            value,
+            flags,
+            Some(&mut value_type),
+            None,
+            Some(&mut data_size),
+        )
+    };
+
+    if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
+        return Ok(None);
+    }
+
+    if status != ERROR_SUCCESS {
+        anyhow::bail!("Failed to read registry value: {:?}", status);
+    }
+
+    if data_size == 0 {
+        return Ok(Some(String::new()));
+    }
+
+    let mut data = vec![0u16; ((data_size + 1) / 2) as usize];
+    let status = unsafe {
+        RegGetValueW(
+            hkey,
+            subkey,
+            value,
+            flags,
+            Some(&mut value_type),
+            Some(data.as_mut_ptr().cast()),
+            Some(&mut data_size),
+        )
+    };
+
+    if status != ERROR_SUCCESS {
+        anyhow::bail!("Failed to read registry value data: {:?}", status);
+    }
+
+    let mut len = (data_size as usize) / 2;
+    if data.get(len.saturating_sub(1)) == Some(&0) {
+        len = len.saturating_sub(1);
+    }
+
+    let value = String::from_utf16(&data[..len]).context("Registry value is not valid UTF-16")?;
+
+    Ok(Some(value))
 }
 
 impl ITfSource_Impl for TextServiceFactory_Impl {
@@ -330,25 +476,41 @@ impl ITfSource_Impl for TextServiceFactory_Impl {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_settings_app_path;
-    use std::path::Path;
+    use super::{resolve_settings_app_path_from_install_location, trim_registry_string};
+    use std::path::PathBuf;
 
     #[test]
-    fn resolve_settings_app_path_uses_local_app_data_directory() {
-        let local_app_data = Path::new("C:/Users/test/AppData/Local");
+    fn resolve_settings_app_path_from_install_location_uses_recorded_install_root() {
+        let resolved =
+            resolve_settings_app_path_from_install_location("D:/Apps/Azookey", "frontend.exe")
+                .expect("path should resolve");
 
-        let resolved = resolve_settings_app_path(local_app_data).expect("path should resolve");
+        assert_eq!(resolved, PathBuf::from("D:/Apps/Azookey/frontend.exe"));
+    }
+
+    #[test]
+    fn resolve_settings_app_path_from_install_location_rejects_empty_path() {
+        let result = resolve_settings_app_path_from_install_location("", "frontend.exe");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_settings_app_path_from_install_location_trims_registry_quotes() {
+        let resolved = resolve_settings_app_path_from_install_location(
+            "\"C:/Users/test/AppData/Local/Azookey\"",
+            "\"frontend.exe\"",
+        )
+        .expect("quoted path should resolve");
 
         assert_eq!(
             resolved,
-            Path::new("C:/Users/test/AppData/Local/Azookey/frontend.exe")
+            PathBuf::from("C:/Users/test/AppData/Local/Azookey/frontend.exe")
         );
     }
 
     #[test]
-    fn resolve_settings_app_path_rejects_empty_local_app_data_path() {
-        let result = resolve_settings_app_path(Path::new(""));
-
-        assert!(result.is_err());
+    fn trim_registry_string_removes_wrapping_quotes_only() {
+        assert_eq!(trim_registry_string("  \"Azookey\"  "), "Azookey");
     }
 }
