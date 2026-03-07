@@ -14,20 +14,23 @@
   - 例: `AGENTS.md`, `.github/workflows`, `.gitignore`, ローカル運用スクリプト。
 - `pr-base`
   - `upstream/master` 同期専用。直接開発しない。
-- `dev/<feature>`
+- `feature/<feature>`
   - 機能開発用ブランチ。`master` から切る。
-  - `origin` に push して CI ビルドを回す。
+- `fix/<issue>`
+  - バグ修正用ブランチ。
 
 ## 開発フロー
 
-1. `master` から `dev/<feature>` を作成する。
-2. VMによってビルドを行い、動作を検証する。
-3. 動作確認後 `origin/dev/<feature>` に push し、CI で検証する。
+1. `master` から `feature/<feature>` を作成する。
+2. VM によってビルドを行い、 VM で動作を検証する。
+3. 動作確認後 `origin/feature/<feature>` に push し、CI で検証する。
+4. CIでのビルドを実機にインストールして動作を確認する。
 4. `origin/master` へ PR を出す。
 
 ## ビルド / 検証
 
-- `origin` に push して GitHub CI でビルドする。
+- VM によってビルドを行い、 VM で動作を検証する。
+- 検証後 `origin` に push して GitHub CI でビルドする。
 
 ## ローカルVMビルド（任意）
 
