@@ -22,7 +22,7 @@ pub struct IPCService {
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Candidates {
     pub texts: Vec<String>,
     pub sub_texts: Vec<String>,
@@ -125,8 +125,30 @@ impl IPCService {
     }
 
     #[tracing::instrument]
+    pub fn append_text_with_context(
+        &mut self,
+        text: String,
+        previous_candidates: &Candidates,
+    ) -> anyhow::Result<Candidates> {
+        self.append_text_with_style_and_context(
+            text,
+            INPUT_STYLE_ROMAN2KANA,
+            Some(previous_candidates),
+        )
+    }
+
+    #[tracing::instrument]
     pub fn append_text_direct(&mut self, text: String) -> anyhow::Result<Candidates> {
         self.append_text_with_style(text, INPUT_STYLE_DIRECT)
+    }
+
+    #[tracing::instrument]
+    pub fn append_text_direct_with_context(
+        &mut self,
+        text: String,
+        previous_candidates: &Candidates,
+    ) -> anyhow::Result<Candidates> {
+        self.append_text_with_style_and_context(text, INPUT_STYLE_DIRECT, Some(previous_candidates))
     }
 
     #[tracing::instrument]
@@ -134,6 +156,24 @@ impl IPCService {
         &mut self,
         text: String,
         input_style: i32,
+    ) -> anyhow::Result<Candidates> {
+        self.append_text_with_style_and_context(text, input_style, None)
+    }
+
+    #[inline]
+    fn should_retry_append_after_refresh(
+        previous_candidates: Option<&Candidates>,
+        refreshed_candidates: &Candidates,
+    ) -> bool {
+        previous_candidates.is_some_and(|previous| previous == refreshed_candidates)
+    }
+
+    #[tracing::instrument]
+    fn append_text_with_style_and_context(
+        &mut self,
+        text: String,
+        input_style: i32,
+        previous_candidates: Option<&Candidates>,
     ) -> anyhow::Result<Candidates> {
         let send = |this: &mut Self| -> anyhow::Result<
             tonic::Response<shared::proto::AppendTextResponse>,
@@ -174,8 +214,19 @@ impl IPCService {
 
                 match self.move_cursor(0) {
                     Ok(candidates) => {
+                        if Self::should_retry_append_after_refresh(previous_candidates, &candidates)
+                        {
+                            tracing::warn!(
+                                "append_text recovered unchanged composition after reconnect (style={input_style}), retrying original input"
+                            );
+                            let retry_response = send(self)?;
+                            return Self::candidates_from_composing_text(
+                                retry_response.into_inner().composing_text,
+                            );
+                        }
+
                         tracing::info!(
-                            "append_text recovered current composition after reconnect (style={input_style})"
+                            "append_text recovered changed composition after reconnect (style={input_style}), reusing server state"
                         );
                         return Ok(candidates);
                     }
@@ -318,5 +369,41 @@ impl IPCService {
             .block_on(self.window_client.set_input_mode(request))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Candidates, IPCService};
+
+    #[test]
+    fn append_retry_is_enabled_when_server_state_is_unchanged() {
+        let previous = Candidates {
+            texts: vec!["か".to_string()],
+            sub_texts: vec![String::new()],
+            hiragana: "か".to_string(),
+            corresponding_count: vec![1],
+        };
+
+        assert!(IPCService::should_retry_append_after_refresh(
+            Some(&previous),
+            &previous
+        ));
+    }
+
+    #[test]
+    fn append_retry_is_disabled_when_server_state_has_changed() {
+        let previous = Candidates::default();
+        let refreshed = Candidates {
+            texts: vec!["か".to_string()],
+            sub_texts: vec![String::new()],
+            hiragana: "か".to_string(),
+            corresponding_count: vec![1],
+        };
+
+        assert!(!IPCService::should_retry_append_after_refresh(
+            Some(&previous),
+            &refreshed
+        ));
     }
 }

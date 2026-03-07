@@ -1304,14 +1304,13 @@ impl TextServiceFactory {
                         }
                         InputMode::Latin => None,
                     };
-                    raw_input.push_str(&text);
-
                     let text = match mode {
                         InputMode::Kana => resolved_symbol_text.unwrap_or_else(|| text.to_string()),
                         InputMode::Latin => text.to_string(),
                     };
 
-                    candidates = ipc_service.append_text(text.clone())?;
+                    candidates = ipc_service.append_text_with_context(text.clone(), &candidates)?;
+                    raw_input.push_str(&text);
                     if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
                         selection_index = selected.index;
                         corresponding_count = selected.corresponding_count;
@@ -1326,9 +1325,8 @@ impl TextServiceFactory {
                 }
                 ClientAction::AppendTextRaw(text) => {
                     Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
-                    raw_input.push_str(&text);
-
-                    candidates = ipc_service.append_text(text.clone())?;
+                    candidates = ipc_service.append_text_with_context(text.clone(), &candidates)?;
+                    raw_input.push_str(text);
                     if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
                         selection_index = selected.index;
                         corresponding_count = selected.corresponding_count;
@@ -1343,9 +1341,9 @@ impl TextServiceFactory {
                 }
                 ClientAction::AppendTextDirect(text) => {
                     Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
-                    raw_input.push_str(&text);
-
-                    candidates = ipc_service.append_text_direct(text.clone())?;
+                    candidates =
+                        ipc_service.append_text_direct_with_context(text.clone(), &candidates)?;
+                    raw_input.push_str(text);
                     if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
                         selection_index = selected.index;
                         corresponding_count = selected.corresponding_count;
@@ -1603,18 +1601,16 @@ impl TextServiceFactory {
                         }
                         InputMode::Latin => None,
                     };
-                    raw_input.push_str(&text);
-                    raw_input = raw_input
-                        .chars()
-                        .skip(corresponding_count.max(0) as usize)
-                        .collect();
+                    let mut updated_raw_input = shrunk_raw_input.clone();
+                    updated_raw_input.push_str(text);
 
-                    ipc_service.shrink_text(corresponding_count.clone())?;
+                    let shrunk_candidates = ipc_service.shrink_text(corresponding_count)?;
                     let text = match mode {
                         InputMode::Kana => resolved_symbol_text.unwrap_or_else(|| text.to_string()),
                         InputMode::Latin => text.to_string(),
                     };
-                    candidates = ipc_service.append_text(text)?;
+                    candidates = ipc_service.append_text_with_context(text, &shrunk_candidates)?;
+                    raw_input = updated_raw_input;
                     selection_index = 0;
 
                     if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
@@ -1636,14 +1632,16 @@ impl TextServiceFactory {
                 ClientAction::ShrinkTextRaw(text) => {
                     fixed_prefix.clear();
                     Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
-                    raw_input.push_str(&text);
-                    raw_input = raw_input
+                    let mut updated_raw_input: String = raw_input
                         .chars()
                         .skip(corresponding_count.max(0) as usize)
                         .collect();
+                    updated_raw_input.push_str(text);
 
-                    ipc_service.shrink_text(corresponding_count.clone())?;
-                    candidates = ipc_service.append_text(text.clone())?;
+                    let shrunk_candidates = ipc_service.shrink_text(corresponding_count)?;
+                    candidates =
+                        ipc_service.append_text_with_context(text.clone(), &shrunk_candidates)?;
+                    raw_input = updated_raw_input;
                     selection_index = 0;
 
                     if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
@@ -1665,14 +1663,16 @@ impl TextServiceFactory {
                 ClientAction::ShrinkTextDirect(text) => {
                     fixed_prefix.clear();
                     Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
-                    raw_input.push_str(&text);
-                    raw_input = raw_input
+                    let mut updated_raw_input: String = raw_input
                         .chars()
                         .skip(corresponding_count.max(0) as usize)
                         .collect();
+                    updated_raw_input.push_str(text);
 
-                    ipc_service.shrink_text(corresponding_count)?;
-                    candidates = ipc_service.append_text_direct(text.clone())?;
+                    let shrunk_candidates = ipc_service.shrink_text(corresponding_count)?;
+                    candidates = ipc_service
+                        .append_text_direct_with_context(text.clone(), &shrunk_candidates)?;
+                    raw_input = updated_raw_input;
                     selection_index = 0;
 
                     if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
