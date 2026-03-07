@@ -43,7 +43,7 @@ private enum ServerLogLevel: Int {
 
     static func fromEnvironment() -> Self {
         guard let rawValue = ProcessInfo.processInfo.environment["AZOOKEY_SERVER_LOG_LEVEL"] else {
-            return .warn
+            return .info
         }
         return .init(label: rawValue)
     }
@@ -638,8 +638,10 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     )
     let options = getOptions(context: contextString, zenzaiEnabled: useZenzai)
     serverLog("INFO", "GetComposedText: requestCandidates begin useZenzai=\(useZenzai)")
+    let requestStart = ProcessInfo.processInfo.systemUptime
     let converted = converter.requestCandidates(composingText, options: options)
-    serverLog("INFO", "GetComposedText: requestCandidates returned candidateCount=\(converted.mainResults.count)")
+    let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
+    serverLog("INFO", "GetComposedText: requestCandidates returned candidateCount=\(converted.mainResults.count) elapsed_ms=\(requestMs)")
     var result: [FFICandidate] = []
 
     for i in 0..<converted.mainResults.count {
@@ -698,8 +700,10 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     )
     let options = getOptions(context: contextString, zenzaiEnabled: useZenzai)
     serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates begin useZenzai=\(useZenzai)")
+    let requestStart = ProcessInfo.processInfo.systemUptime
     let converted = converter.requestCandidates(prefixComposingText, options: options)
-    serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates returned candidateCount=\(converted.mainResults.count)")
+    let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
+    serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates returned candidateCount=\(converted.mainResults.count) elapsed_ms=\(requestMs)")
     var result: [FFICandidate] = []
 
     for i in 0..<converted.mainResults.count {
