@@ -272,6 +272,12 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn is_single_numeric_input(input: &str) -> bool {
+        let mut chars = input.chars();
+        matches!(chars.next(), Some('0'..='9' | '０'..='９')) && chars.next().is_none()
+    }
+
+    #[inline]
     fn has_romaji_table_context(
         raw_input_before: &str,
         symbol: char,
@@ -428,6 +434,15 @@ impl TextServiceFactory {
         input: &str,
         app_config: &AppConfig,
     ) -> Option<String> {
+        if Self::is_single_numeric_input(input) {
+            return Some(convert_kana_symbol(
+                input,
+                &app_config.general,
+                &app_config.character_width,
+                &app_config.romaji_table.rows,
+            ));
+        }
+
         let symbols = Self::single_symbol_candidates(input)?;
         let is_zenzai_enabled = Self::effective_zenzai_runtime_enabled(app_config);
         if is_zenzai_enabled {
@@ -1870,5 +1885,34 @@ mod tests {
 
         let output = TextServiceFactory::resolve_symbol_input_text("a", "-", &app_config);
         assert_eq!(output, Some("ー".to_string()));
+    }
+
+    #[test]
+    fn top_row_digit_input_uses_number_width_setting_when_zenzai_is_disabled() {
+        let mut app_config = AppConfig::default();
+        app_config.character_width.groups.number = WidthMode::Full;
+
+        let output = TextServiceFactory::resolve_symbol_input_text("", "1", &app_config);
+        assert_eq!(output, Some("１".to_string()));
+    }
+
+    #[test]
+    fn top_row_digit_input_uses_number_width_setting_with_existing_raw_input() {
+        let mut app_config = AppConfig::default();
+        app_config.character_width.groups.number = WidthMode::Full;
+
+        let output = TextServiceFactory::resolve_symbol_input_text("a", "1", &app_config);
+        assert_eq!(output, Some("１".to_string()));
+    }
+
+    #[test]
+    fn top_row_digit_input_uses_number_width_setting_when_zenzai_is_enabled() {
+        let mut app_config = AppConfig::default();
+        app_config.zenzai.enable = true;
+        app_config.zenzai.backend = "vulkan".to_string();
+        app_config.character_width.groups.number = WidthMode::Full;
+
+        let output = TextServiceFactory::resolve_symbol_input_text("", "1", &app_config);
+        assert_eq!(output, Some("１".to_string()));
     }
 }
