@@ -7,18 +7,20 @@ use std::{
 use windows::{
     core::{w, IUnknown, Interface as _, BSTR, GUID, PCWSTR},
     Win32::{
-        Foundation::{BOOL, E_INVALIDARG, LPARAM, POINT, RECT, WPARAM},
+        Foundation::{BOOL, E_INVALIDARG, HWND, LPARAM, POINT, RECT, WPARAM},
+        Graphics::Gdi::HBITMAP,
         System::Ole::CONNECT_E_CANNOTCONNECT,
         UI::{
             TextServices::{
                 ITfLangBarItemButton_Impl, ITfLangBarItemSink, ITfLangBarItem_Impl, ITfMenu,
                 ITfSource_Impl, TfLBIClick, GUID_LBI_INPUTMODE, TF_LANGBARITEMINFO,
-                TF_LBI_CLK_LEFT, TF_LBI_CLK_RIGHT, TF_LBI_STYLE_BTN_BUTTON,
+                TF_LBI_CLK_LEFT, TF_LBI_CLK_RIGHT, TF_LBI_STYLE_BTN_BUTTON, TF_LBI_STYLE_BTN_MENU,
             },
             WindowsAndMessaging::{
-                AppendMenuW, CreatePopupMenu, DestroyMenu, GetForegroundWindow, LoadImageW,
-                PostMessageW, SetForegroundWindow, TrackPopupMenu, HICON, HMENU, IMAGE_ICON,
-                LR_DEFAULTCOLOR, MF_STRING, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
+                AppendMenuW, CreatePopupMenu, DestroyMenu, GetAncestor, GetForegroundWindow,
+                LoadImageW, PostMessageW, SetForegroundWindow, TrackPopupMenu, WindowFromPoint,
+                GA_ROOT, HICON, HMENU, IMAGE_ICON, LR_DEFAULTCOLOR, MF_STRING, TPM_NONOTIFY,
+                TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
             },
         },
     },
@@ -39,7 +41,7 @@ use super::factory::TextServiceFactory_Impl;
 const INFO: TF_LANGBARITEMINFO = TF_LANGBARITEMINFO {
     clsidService: GUID_TEXT_SERVICE,
     guidItem: GUID_LBI_INPUTMODE,
-    dwStyle: TF_LBI_STYLE_BTN_BUTTON,
+    dwStyle: TF_LBI_STYLE_BTN_BUTTON | TF_LBI_STYLE_BTN_MENU,
     ulSort: 0,
     szDescription: [0; 32],
 };
@@ -70,9 +72,7 @@ impl TextServiceFactory_Impl {
     fn handle_right_click(&self, pt: &POINT) -> Result<()> {
         match show_settings_menu(pt) {
             Ok(Some(command)) if command == SETTINGS_MENU_ID as u32 => {
-                if let Err(error) = launch_settings_app() {
-                    tracing::warn!(?error, "Failed to launch settings app");
-                }
+                launch_settings_app_with_logging();
             }
             Ok(_) => {}
             Err(error) => {
@@ -122,15 +122,21 @@ impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
         Ok(())
     }
 
-    // this method should not be called
     #[macros::anyhow]
-    fn InitMenu(&self, _pmenu: Option<&ITfMenu>) -> Result<()> {
+    fn InitMenu(&self, pmenu: Option<&ITfMenu>) -> Result<()> {
+        if let Some(menu) = pmenu {
+            add_settings_menu_item(menu)?;
+        }
+
         Ok(())
     }
 
-    // this method should not be called
     #[macros::anyhow]
-    fn OnMenuSelect(&self, _w_id: u32) -> Result<()> {
+    fn OnMenuSelect(&self, w_id: u32) -> Result<()> {
+        if w_id == SETTINGS_MENU_ID as u32 {
+            launch_settings_app_with_logging();
+        }
+
         Ok(())
     }
 
@@ -178,6 +184,29 @@ impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
     }
 }
 
+fn launch_settings_app_with_logging() {
+    if let Err(error) = launch_settings_app() {
+        tracing::warn!(?error, "Failed to launch settings app");
+    }
+}
+
+fn add_settings_menu_item(menu: &ITfMenu) -> Result<()> {
+    let text: Vec<u16> = "設定".encode_utf16().collect();
+
+    unsafe {
+        menu.AddMenuItem(
+            SETTINGS_MENU_ID as u32,
+            0,
+            HBITMAP::default(),
+            HBITMAP::default(),
+            &text,
+            std::ptr::null_mut(),
+        )?;
+    }
+
+    Ok(())
+}
+
 fn show_settings_menu(pt: &POINT) -> Result<Option<u32>> {
     struct PopupMenu(HMENU);
 
@@ -193,7 +222,7 @@ fn show_settings_menu(pt: &POINT) -> Result<Option<u32>> {
         let menu = PopupMenu(CreatePopupMenu()?);
         AppendMenuW(menu.0, MF_STRING, SETTINGS_MENU_ID, w!("設定"))?;
 
-        let hwnd = GetForegroundWindow();
+        let hwnd = resolve_menu_owner_window(*pt);
         if hwnd.0.is_null() {
             return Ok(None);
         }
@@ -218,6 +247,22 @@ fn show_settings_menu(pt: &POINT) -> Result<Option<u32>> {
         } else {
             Ok(Some(selected))
         }
+    }
+}
+
+fn resolve_menu_owner_window(pt: POINT) -> HWND {
+    unsafe {
+        let hwnd = WindowFromPoint(pt);
+        if !hwnd.0.is_null() {
+            let root = GetAncestor(hwnd, GA_ROOT);
+            if !root.0.is_null() {
+                return root;
+            }
+
+            return hwnd;
+        }
+
+        GetForegroundWindow()
     }
 }
 
