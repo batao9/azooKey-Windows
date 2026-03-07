@@ -22,7 +22,7 @@ pub struct IPCService {
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Candidates {
     pub texts: Vec<String>,
     pub sub_texts: Vec<String>,
@@ -84,31 +84,11 @@ impl IPCService {
 
 // implement methods to interact with kkc server
 impl IPCService {
-    #[tracing::instrument]
-    pub fn append_text(&mut self, text: String) -> anyhow::Result<Candidates> {
-        self.append_text_with_style(text, INPUT_STYLE_ROMAN2KANA)
-    }
-
-    #[tracing::instrument]
-    pub fn append_text_direct(&mut self, text: String) -> anyhow::Result<Candidates> {
-        self.append_text_with_style(text, INPUT_STYLE_DIRECT)
-    }
-
-    #[tracing::instrument]
-    fn append_text_with_style(&mut self, text: String, input_style: i32) -> anyhow::Result<Candidates> {
-        let request = tonic::Request::new(shared::proto::AppendTextRequest {
-            text_to_append: text,
-            input_style,
-        });
-
-        let response = self
-            .runtime
-            .clone()
-            .block_on(self.azookey_client.append_text(request))?;
-        let composing_text = response.into_inner().composing_text;
-
-        let candidates = if let Some(composing_text) = composing_text {
-            Candidates {
+    fn candidates_from_composing_text(
+        composing_text: Option<shared::proto::ComposingText>,
+    ) -> anyhow::Result<Candidates> {
+        if let Some(composing_text) = composing_text {
+            Ok(Candidates {
                 texts: composing_text
                     .suggestions
                     .iter()
@@ -125,12 +105,141 @@ impl IPCService {
                     .iter()
                     .map(|s| s.corresponding_count)
                     .collect(),
-            }
+            })
         } else {
             anyhow::bail!("composing_text is None");
+        }
+    }
+
+    fn reconnect(&mut self) -> anyhow::Result<()> {
+        let refreshed = Self::new()?;
+        self.azookey_client = refreshed.azookey_client;
+        self.window_client = refreshed.window_client;
+        self.runtime = refreshed.runtime;
+        Ok(())
+    }
+
+    #[tracing::instrument]
+    pub fn append_text(&mut self, text: String) -> anyhow::Result<Candidates> {
+        self.append_text_with_style(text, INPUT_STYLE_ROMAN2KANA)
+    }
+
+    #[tracing::instrument]
+    pub fn append_text_with_context(
+        &mut self,
+        text: String,
+        previous_candidates: &Candidates,
+    ) -> anyhow::Result<Candidates> {
+        self.append_text_with_style_and_context(
+            text,
+            INPUT_STYLE_ROMAN2KANA,
+            Some(previous_candidates),
+        )
+    }
+
+    #[tracing::instrument]
+    pub fn append_text_direct(&mut self, text: String) -> anyhow::Result<Candidates> {
+        self.append_text_with_style(text, INPUT_STYLE_DIRECT)
+    }
+
+    #[tracing::instrument]
+    pub fn append_text_direct_with_context(
+        &mut self,
+        text: String,
+        previous_candidates: &Candidates,
+    ) -> anyhow::Result<Candidates> {
+        self.append_text_with_style_and_context(text, INPUT_STYLE_DIRECT, Some(previous_candidates))
+    }
+
+    #[tracing::instrument]
+    fn append_text_with_style(
+        &mut self,
+        text: String,
+        input_style: i32,
+    ) -> anyhow::Result<Candidates> {
+        self.append_text_with_style_and_context(text, input_style, None)
+    }
+
+    #[inline]
+    fn should_retry_append_after_refresh(
+        previous_candidates: Option<&Candidates>,
+        refreshed_candidates: &Candidates,
+    ) -> bool {
+        previous_candidates.is_some_and(|previous| previous == refreshed_candidates)
+    }
+
+    #[tracing::instrument]
+    fn append_text_with_style_and_context(
+        &mut self,
+        text: String,
+        input_style: i32,
+        previous_candidates: Option<&Candidates>,
+    ) -> anyhow::Result<Candidates> {
+        let send = |this: &mut Self| -> anyhow::Result<
+            tonic::Response<shared::proto::AppendTextResponse>,
+        > {
+            let request = tonic::Request::new(shared::proto::AppendTextRequest {
+                text_to_append: text.clone(),
+                input_style,
+            });
+
+            let response = this
+                .runtime
+                .clone()
+                .block_on(this.azookey_client.append_text(request))?;
+            Ok(response)
         };
 
-        Ok(candidates)
+        let response = match send(self) {
+            Ok(response) => response,
+            Err(first_error) => {
+                tracing::warn!(
+                    "append_text first attempt failed (style={input_style}, text_len={}), reconnecting IPC: {first_error:?}",
+                    text.chars().count()
+                );
+
+                match self.reconnect() {
+                    Ok(()) => {
+                        tracing::info!(
+                            "append_text IPC reconnect succeeded (style={input_style}), refreshing current composition"
+                        );
+                    }
+                    Err(reconnect_error) => {
+                        tracing::error!(
+                            "append_text IPC reconnect failed (style={input_style}): {reconnect_error:?}"
+                        );
+                        return Err(reconnect_error);
+                    }
+                }
+
+                match self.move_cursor(0) {
+                    Ok(candidates) => {
+                        if Self::should_retry_append_after_refresh(previous_candidates, &candidates)
+                        {
+                            tracing::warn!(
+                                "append_text recovered unchanged composition after reconnect (style={input_style}), retrying original input"
+                            );
+                            let retry_response = send(self)?;
+                            return Self::candidates_from_composing_text(
+                                retry_response.into_inner().composing_text,
+                            );
+                        }
+
+                        tracing::info!(
+                            "append_text recovered changed composition after reconnect (style={input_style}), reusing server state"
+                        );
+                        return Ok(candidates);
+                    }
+                    Err(refresh_error) => {
+                        tracing::error!(
+                            "append_text refresh failed after reconnect (style={input_style}): {refresh_error:?}"
+                        );
+                        return Err(refresh_error);
+                    }
+                }
+            }
+        };
+        Self::candidates_from_composing_text(response.into_inner().composing_text)
     }
 
     #[tracing::instrument]
@@ -140,32 +249,7 @@ impl IPCService {
             .runtime
             .clone()
             .block_on(self.azookey_client.remove_text(request))?;
-        let composing_text = response.into_inner().composing_text;
-
-        let candidates = if let Some(composing_text) = composing_text {
-            Candidates {
-                texts: composing_text
-                    .suggestions
-                    .iter()
-                    .map(|s| s.text.clone())
-                    .collect(),
-                sub_texts: composing_text
-                    .suggestions
-                    .iter()
-                    .map(|s| s.subtext.clone())
-                    .collect(),
-                hiragana: composing_text.hiragana,
-                corresponding_count: composing_text
-                    .suggestions
-                    .iter()
-                    .map(|s| s.corresponding_count)
-                    .collect(),
-            }
-        } else {
-            anyhow::bail!("composing_text is None");
-        };
-
-        Ok(candidates)
+        Self::candidates_from_composing_text(response.into_inner().composing_text)
     }
 
     #[tracing::instrument]
@@ -186,32 +270,7 @@ impl IPCService {
             .runtime
             .clone()
             .block_on(self.azookey_client.shrink_text(request))?;
-        let composing_text = response.into_inner().composing_text;
-
-        let candidates = if let Some(composing_text) = composing_text {
-            Candidates {
-                texts: composing_text
-                    .suggestions
-                    .iter()
-                    .map(|s| s.text.clone())
-                    .collect(),
-                sub_texts: composing_text
-                    .suggestions
-                    .iter()
-                    .map(|s| s.subtext.clone())
-                    .collect(),
-                hiragana: composing_text.hiragana,
-                corresponding_count: composing_text
-                    .suggestions
-                    .iter()
-                    .map(|s| s.corresponding_count)
-                    .collect(),
-            }
-        } else {
-            anyhow::bail!("composing_text is None");
-        };
-
-        Ok(candidates)
+        Self::candidates_from_composing_text(response.into_inner().composing_text)
     }
 
     #[tracing::instrument]
@@ -221,32 +280,7 @@ impl IPCService {
             .runtime
             .clone()
             .block_on(self.azookey_client.move_cursor(request))?;
-        let composing_text = response.into_inner().composing_text;
-
-        let candidates = if let Some(composing_text) = composing_text {
-            Candidates {
-                texts: composing_text
-                    .suggestions
-                    .iter()
-                    .map(|s| s.text.clone())
-                    .collect(),
-                sub_texts: composing_text
-                    .suggestions
-                    .iter()
-                    .map(|s| s.subtext.clone())
-                    .collect(),
-                hiragana: composing_text.hiragana,
-                corresponding_count: composing_text
-                    .suggestions
-                    .iter()
-                    .map(|s| s.corresponding_count)
-                    .collect(),
-            }
-        } else {
-            anyhow::bail!("composing_text is None");
-        };
-
-        Ok(candidates)
+        Self::candidates_from_composing_text(response.into_inner().composing_text)
     }
 
     pub fn set_context(&mut self, context: String) -> anyhow::Result<()> {
@@ -335,5 +369,41 @@ impl IPCService {
             .block_on(self.window_client.set_input_mode(request))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Candidates, IPCService};
+
+    #[test]
+    fn append_retry_is_enabled_when_server_state_is_unchanged() {
+        let previous = Candidates {
+            texts: vec!["か".to_string()],
+            sub_texts: vec![String::new()],
+            hiragana: "か".to_string(),
+            corresponding_count: vec![1],
+        };
+
+        assert!(IPCService::should_retry_append_after_refresh(
+            Some(&previous),
+            &previous
+        ));
+    }
+
+    #[test]
+    fn append_retry_is_disabled_when_server_state_has_changed() {
+        let previous = Candidates::default();
+        let refreshed = Candidates {
+            texts: vec!["か".to_string()],
+            sub_texts: vec![String::new()],
+            hiragana: "か".to_string(),
+            corresponding_count: vec![1],
+        };
+
+        assert!(!IPCService::should_retry_append_after_refresh(
+            Some(&previous),
+            &refreshed
+        ));
     }
 }

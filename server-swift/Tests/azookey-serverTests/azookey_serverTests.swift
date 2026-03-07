@@ -71,3 +71,89 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
 
     #expect(map["{lbracket}a"] == "{rbracket}")
 }
+
+@Test func zenzaiForcesBuiltinRoman2KanaEvenWithCustomRows() async throws {
+    let selection = resolveRomajiInputStyleSelection(
+        rows: [row("qa", "くぁ")],
+        isZenzaiEnabled: true
+    )
+
+    #expect(selection == .roman2kana)
+}
+
+@Test func customRowsAreUsedWhenZenzaiIsDisabled() async throws {
+    let selection = resolveRomajiInputStyleSelection(
+        rows: [row("qa", "くぁ")],
+        isZenzaiEnabled: false
+    )
+
+    #expect(selection == .custom)
+}
+
+@Test func zenzaiCandidateGateRejectsShortInput() async throws {
+    let useZenzai = effectiveZenzaiEnabledForCandidates(
+        isConfigured: true,
+        inputCount: 2,
+        hiraganaCount: 1
+    )
+
+    #expect(useZenzai == false)
+}
+
+@Test func zenzaiCandidateGateAcceptsLongEnoughInput() async throws {
+    let useZenzai = effectiveZenzaiEnabledForCandidates(
+        isConfigured: true,
+        inputCount: 4,
+        hiraganaCount: 2
+    )
+
+    #expect(useZenzai)
+}
+
+@Test func cpuBackendIsDisabledWhenAvxIsUnavailable() async throws {
+    let enabled = effectiveZenzaiRuntimeEnabled(
+        isConfigured: true,
+        backend: "cpu",
+        cpuBackendSupported: false
+    )
+
+    #expect(enabled == false)
+}
+
+@Test func nonCpuBackendRemainsAvailableWithoutCpuAvx() async throws {
+    let enabled = effectiveZenzaiRuntimeEnabled(
+        isConfigured: true,
+        backend: "vulkan",
+        cpuBackendSupported: false
+    )
+
+    #expect(enabled)
+}
+
+@Test func surfaceCountTracksUnderlyingRomanInputLength() async throws {
+    let resolved = await MainActor.run {
+        var composingText = ComposingText()
+        composingText.insertAtCursorPosition("kato", inputStyle: .roman2kana)
+        return resolveCandidateComposition(
+            composingText: composingText,
+            candidateComposingCount: .surfaceCount(1)
+        )
+    }
+
+    #expect(resolved.correspondingCount == 2)
+    #expect(resolved.remainingConvertTarget == "と")
+}
+
+@Test func compositeSurfaceCountPreservesClauseOffset() async throws {
+    let resolved = await MainActor.run {
+        var composingText = ComposingText()
+        composingText.insertAtCursorPosition("kato", inputStyle: .roman2kana)
+        return resolveCandidateComposition(
+            composingText: composingText,
+            candidateComposingCount: .composite(.inputCount(0), .surfaceCount(1))
+        )
+    }
+
+    #expect(resolved.correspondingCount == 2)
+    #expect(resolved.remainingConvertTarget == "と")
+}

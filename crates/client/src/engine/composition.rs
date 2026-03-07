@@ -13,7 +13,9 @@ use super::{
     text_util::{to_half_katakana, to_katakana},
     user_action::{Function, Navigation},
 };
-use shared::{AppConfig, NumpadInputMode, RomajiRule, SpaceInputMode};
+use shared::{
+    zenzai_cpu_backend_supported, AppConfig, NumpadInputMode, RomajiRule, SpaceInputMode,
+};
 use windows::Win32::{
     Foundation::{LPARAM, WPARAM},
     UI::{
@@ -336,6 +338,140 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn has_multi_character_romaji_context(
+        raw_input_before: &str,
+        symbol: char,
+        romaji_rows: &[RomajiRule],
+    ) -> bool {
+        if romaji_rows.is_empty() {
+            return false;
+        }
+
+        let mut combined = String::with_capacity(raw_input_before.len() + symbol.len_utf8());
+        combined.push_str(raw_input_before);
+        combined.push(symbol);
+
+        let combined_chars: Vec<char> = combined.chars().collect();
+        let max_row_len = romaji_rows
+            .iter()
+            .map(|row| row.input.chars().count())
+            .max()
+            .unwrap_or(0);
+
+        if max_row_len <= 1 {
+            return false;
+        }
+
+        let start_index = combined_chars.len().saturating_sub(max_row_len);
+        for suffix_start in start_index..combined_chars.len() {
+            let suffix: String = combined_chars[suffix_start..].iter().collect();
+            if suffix.is_empty() {
+                continue;
+            }
+
+            if romaji_rows
+                .iter()
+                .filter_map(|row| {
+                    let trimmed = row.input.trim();
+                    if trimmed.is_empty() || trimmed.chars().count() <= 1 {
+                        None
+                    } else {
+                        Some(trimmed)
+                    }
+                })
+                .any(|input| input.starts_with(&suffix))
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    #[inline]
+    fn effective_zenzai_runtime_enabled(app_config: &AppConfig) -> bool {
+        if !app_config.zenzai.enable {
+            return false;
+        }
+
+        let backend = app_config.zenzai.backend.trim().to_ascii_lowercase();
+        if backend.is_empty() || backend == "cpu" {
+            return zenzai_cpu_backend_supported();
+        }
+
+        true
+    }
+
+    #[inline]
+    fn single_symbol_romaji_output(input: &str, romaji_rows: &[RomajiRule]) -> Option<String> {
+        let symbols = Self::single_symbol_candidates(input)?;
+
+        romaji_rows.iter().find_map(|row| {
+            if !row.next_input.trim().is_empty() || row.output.is_empty() {
+                return None;
+            }
+
+            let trimmed = row.input.trim();
+            let mut chars = trimmed.chars();
+            let symbol = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+
+            symbols.contains(&symbol).then(|| row.output.clone())
+        })
+    }
+
+    #[inline]
+    fn resolve_symbol_input_text(
+        raw_input_before: &str,
+        input: &str,
+        app_config: &AppConfig,
+    ) -> Option<String> {
+        let symbols = Self::single_symbol_candidates(input)?;
+        let is_zenzai_enabled = Self::effective_zenzai_runtime_enabled(app_config);
+        if is_zenzai_enabled {
+            if symbols.iter().any(|symbol| {
+                Self::has_multi_character_romaji_context(
+                    raw_input_before,
+                    *symbol,
+                    &app_config.romaji_table.rows,
+                )
+            }) {
+                return None;
+            }
+
+            if let Some(mapped) =
+                Self::single_symbol_romaji_output(input, &app_config.romaji_table.rows)
+            {
+                return Some(mapped);
+            }
+
+            return Some(convert_kana_symbol(
+                input,
+                &app_config.general,
+                &app_config.character_width,
+                &app_config.romaji_table.rows,
+            ));
+        }
+
+        if Self::should_apply_symbol_fallback(
+            raw_input_before,
+            input,
+            &app_config.romaji_table.rows,
+        ) {
+            return Some(convert_kana_symbol(
+                input,
+                &app_config.general,
+                &app_config.character_width,
+                &app_config.romaji_table.rows,
+            ));
+        }
+
+        None
+    }
+
+    #[inline]
     fn clear_temporary_latin_shift_pending_if_needed(
         &self,
         should_clear_shift_pending: bool,
@@ -365,7 +501,11 @@ impl TextServiceFactory {
             text: candidates.texts.get(index).cloned().unwrap_or_default(),
             sub_text: candidates.sub_texts.get(index).cloned().unwrap_or_default(),
             hiragana: candidates.hiragana.clone(),
-            corresponding_count: candidates.corresponding_count.get(index).copied().unwrap_or(0),
+            corresponding_count: candidates
+                .corresponding_count
+                .get(index)
+                .copied()
+                .unwrap_or(0),
         })
     }
 
@@ -434,7 +574,9 @@ impl TextServiceFactory {
     }
 
     #[inline]
-    fn commit_current_clause_actions(composition: &Composition) -> (CompositionState, Vec<ClientAction>) {
+    fn commit_current_clause_actions(
+        composition: &Composition,
+    ) -> (CompositionState, Vec<ClientAction>) {
         if composition.suffix.is_empty() {
             (CompositionState::None, vec![ClientAction::EndComposition])
         } else {
@@ -446,7 +588,9 @@ impl TextServiceFactory {
     }
 
     #[inline]
-    fn commit_first_clause_actions(composition: &Composition) -> (CompositionState, Vec<ClientAction>) {
+    fn commit_first_clause_actions(
+        composition: &Composition,
+    ) -> (CompositionState, Vec<ClientAction>) {
         let mut actions = Vec::with_capacity(composition.clause_snapshots.len() + 1);
 
         for _ in 0..composition.clause_snapshots.len() {
@@ -491,11 +635,7 @@ impl TextServiceFactory {
         let app_config = AppConfig::read();
 
         // check shortcut keys
-        if is_ctrl_pressed
-            && !is_ctrl_space
-            && !is_alt_backquote
-            && !is_ctrl_enter
-            && !is_ctrl_down
+        if is_ctrl_pressed && !is_ctrl_space && !is_alt_backquote && !is_ctrl_enter && !is_ctrl_down
         {
             self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(wparam))?;
             return Ok(None);
@@ -569,11 +709,9 @@ impl TextServiceFactory {
                     (CompositionState::Composing, actions)
                 }
                 UserAction::NumpadSymbol(symbol) if mode == InputMode::Kana => {
-                    let Some(text) = Self::numpad_text_for_mode(
-                        symbol,
-                        app_config.general.numpad_input,
-                        true,
-                    ) else {
+                    let Some(text) =
+                        Self::numpad_text_for_mode(symbol, app_config.general.numpad_input, true)
+                    else {
                         self.clear_temporary_latin_shift_pending_if_needed(
                             should_clear_shift_pending,
                         )?;
@@ -582,7 +720,10 @@ impl TextServiceFactory {
 
                     (
                         CompositionState::Composing,
-                        vec![ClientAction::StartComposition, ClientAction::AppendTextRaw(text)],
+                        vec![
+                            ClientAction::StartComposition,
+                            ClientAction::AppendTextRaw(text),
+                        ],
                     )
                 }
                 UserAction::Input(char) if mode == InputMode::Kana => (
@@ -597,11 +738,9 @@ impl TextServiceFactory {
                     is_numpad: true,
                 } if mode == InputMode::Kana => {
                     let digit = char::from_digit(value as u32, 10).unwrap_or('0');
-                    let Some(text) = Self::numpad_text_for_mode(
-                        digit,
-                        app_config.general.numpad_input,
-                        true,
-                    ) else {
+                    let Some(text) =
+                        Self::numpad_text_for_mode(digit, app_config.general.numpad_input, true)
+                    else {
                         self.clear_temporary_latin_shift_pending_if_needed(
                             should_clear_shift_pending,
                         )?;
@@ -610,23 +749,25 @@ impl TextServiceFactory {
 
                     (
                         CompositionState::Composing,
-                        vec![ClientAction::StartComposition, ClientAction::AppendTextRaw(text)],
+                        vec![
+                            ClientAction::StartComposition,
+                            ClientAction::AppendTextRaw(text),
+                        ],
                     )
                 }
                 UserAction::Number {
                     value,
                     is_numpad: false,
-                } if mode == InputMode::Kana => {
-                    (
-                        CompositionState::Composing,
-                        vec![
-                            ClientAction::StartComposition,
-                            ClientAction::AppendText(value.to_string()),
-                        ],
-                    )
-                }
+                } if mode == InputMode::Kana => (
+                    CompositionState::Composing,
+                    vec![
+                        ClientAction::StartComposition,
+                        ClientAction::AppendText(value.to_string()),
+                    ],
+                ),
                 UserAction::Space if mode == InputMode::Kana => {
-                    let mut use_halfwidth = matches!(app_config.general.space_input, SpaceInputMode::AlwaysHalf);
+                    let mut use_halfwidth =
+                        matches!(app_config.general.space_input, SpaceInputMode::AlwaysHalf);
                     if is_shift_pressed {
                         use_halfwidth = !use_halfwidth;
                     }
@@ -679,12 +820,9 @@ impl TextServiceFactory {
                     (CompositionState::Composing, actions)
                 }
                 UserAction::NumpadSymbol(symbol) if mode == InputMode::Kana => {
-                    let text = Self::numpad_text_for_mode(
-                        symbol,
-                        app_config.general.numpad_input,
-                        false,
-                    )
-                    .unwrap_or_else(|| symbol.to_string());
+                    let text =
+                        Self::numpad_text_for_mode(symbol, app_config.general.numpad_input, false)
+                            .unwrap_or_else(|| symbol.to_string());
                     (
                         CompositionState::Composing,
                         vec![ClientAction::AppendTextRaw(text)],
@@ -699,12 +837,9 @@ impl TextServiceFactory {
                     is_numpad: true,
                 } if mode == InputMode::Kana => {
                     let digit = char::from_digit(value as u32, 10).unwrap_or('0');
-                    let text = Self::numpad_text_for_mode(
-                        digit,
-                        app_config.general.numpad_input,
-                        false,
-                    )
-                    .unwrap_or_else(|| digit.to_string());
+                    let text =
+                        Self::numpad_text_for_mode(digit, app_config.general.numpad_input, false)
+                            .unwrap_or_else(|| digit.to_string());
                     (
                         CompositionState::Composing,
                         vec![ClientAction::AppendTextRaw(text)],
@@ -827,12 +962,9 @@ impl TextServiceFactory {
                     (CompositionState::Composing, actions)
                 }
                 UserAction::NumpadSymbol(symbol) if mode == InputMode::Kana => {
-                    let text = Self::numpad_text_for_mode(
-                        symbol,
-                        app_config.general.numpad_input,
-                        false,
-                    )
-                    .unwrap_or_else(|| symbol.to_string());
+                    let text =
+                        Self::numpad_text_for_mode(symbol, app_config.general.numpad_input, false)
+                            .unwrap_or_else(|| symbol.to_string());
                     (
                         CompositionState::Composing,
                         vec![ClientAction::ShrinkTextRaw(text)],
@@ -847,12 +979,9 @@ impl TextServiceFactory {
                     is_numpad: true,
                 } if mode == InputMode::Kana => {
                     let digit = char::from_digit(value as u32, 10).unwrap_or('0');
-                    let text = Self::numpad_text_for_mode(
-                        digit,
-                        app_config.general.numpad_input,
-                        false,
-                    )
-                    .unwrap_or_else(|| digit.to_string());
+                    let text =
+                        Self::numpad_text_for_mode(digit, app_config.general.numpad_input, false)
+                            .unwrap_or_else(|| digit.to_string());
                     (
                         CompositionState::Composing,
                         vec![ClientAction::ShrinkTextRaw(text)],
@@ -976,9 +1105,9 @@ impl TextServiceFactory {
                 });
 
             if (should_reset_on_confirm || should_reset_on_end)
-                && !actions
-                    .iter()
-                    .any(|current_action| matches!(current_action, ClientAction::SetTemporaryLatin(false)))
+                && !actions.iter().any(|current_action| {
+                    matches!(current_action, ClientAction::SetTemporaryLatin(false))
+                })
             {
                 actions.insert(0, ClientAction::SetTemporaryLatin(false));
             }
@@ -1034,19 +1163,29 @@ impl TextServiceFactory {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<bool> {
-        if let Some(context) = context {
-            self.borrow_mut()?.context = Some(context.clone());
-        } else {
-            return Ok(false);
-        };
+        let result: Result<bool> = (|| {
+            if let Some(context) = context {
+                self.borrow_mut()?.context = Some(context.clone());
+            } else {
+                return Ok(false);
+            };
 
-        if let Some((actions, transition)) = self.process_key(context, wparam, lparam)? {
-            self.handle_action(&actions, transition)?;
-        } else {
-            return Ok(false);
+            if let Some((actions, transition)) = self.process_key(context, wparam, lparam)? {
+                self.handle_action(&actions, transition)?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })();
+
+        match result {
+            Ok(handled) => Ok(handled),
+            Err(error) => {
+                tracing::error!("handle_key failed: {error:?}");
+                self.recover_after_key_error();
+                Ok(false)
+            }
         }
-
-        Ok(true)
     }
 
     #[tracing::instrument]
@@ -1056,18 +1195,48 @@ impl TextServiceFactory {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<bool> {
-        if let Some(context) = context {
-            self.borrow_mut()?.context = Some(context.clone());
-        } else {
-            return Ok(false);
-        };
+        let result: Result<bool> = (|| {
+            if let Some(context) = context {
+                self.borrow_mut()?.context = Some(context.clone());
+            } else {
+                return Ok(false);
+            };
 
-        if let Some((actions, transition)) = self.process_key_up(context, wparam, lparam)? {
-            self.handle_action(&actions, transition)?;
-            return Ok(true);
+            if let Some((actions, transition)) = self.process_key_up(context, wparam, lparam)? {
+                self.handle_action(&actions, transition)?;
+                return Ok(true);
+            }
+
+            Ok(false)
+        })();
+
+        match result {
+            Ok(handled) => Ok(handled),
+            Err(error) => {
+                tracing::error!("handle_key_up failed: {error:?}");
+                self.recover_after_key_error();
+                Ok(false)
+            }
+        }
+    }
+
+    fn recover_after_key_error(&self) {
+        let _ = self.abort_composition();
+
+        if let Ok(text_service) = self.borrow() {
+            if let Ok(mut composition) = text_service.borrow_mut_composition() {
+                *composition = Composition::default();
+            }
         }
 
-        Ok(false)
+        if let Ok(mut ime_state) = IMEState::get() {
+            if let Some(mut ipc_service) = ime_state.ipc_service.clone() {
+                let _ = ipc_service.hide_window();
+                let _ = ipc_service.set_candidates(vec![]);
+                let _ = ipc_service.clear_text();
+                ime_state.ipc_service = Some(ipc_service);
+            }
+        }
     }
 
     #[tracing::instrument]
@@ -1129,28 +1298,19 @@ impl TextServiceFactory {
                 }
                 ClientAction::AppendText(text) => {
                     Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
-                    let should_apply_symbol_fallback = match mode {
-                        InputMode::Kana => Self::should_apply_symbol_fallback(
-                            &raw_input,
-                            text,
-                            &app_config.romaji_table.rows,
-                        ),
-                        InputMode::Latin => false,
+                    let resolved_symbol_text = match mode {
+                        InputMode::Kana => {
+                            Self::resolve_symbol_input_text(&raw_input, text, &app_config)
+                        }
+                        InputMode::Latin => None,
                     };
-                    raw_input.push_str(&text);
-
                     let text = match mode {
-                        InputMode::Kana if should_apply_symbol_fallback => convert_kana_symbol(
-                            text,
-                            &app_config.general,
-                            &app_config.character_width,
-                            &app_config.romaji_table.rows,
-                        ),
-                        InputMode::Kana => text.to_string(),
+                        InputMode::Kana => resolved_symbol_text.unwrap_or_else(|| text.to_string()),
                         InputMode::Latin => text.to_string(),
                     };
 
-                    candidates = ipc_service.append_text(text.clone())?;
+                    candidates = ipc_service.append_text_with_context(text.clone(), &candidates)?;
+                    raw_input.push_str(&text);
                     if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
                         selection_index = selected.index;
                         corresponding_count = selected.corresponding_count;
@@ -1165,9 +1325,8 @@ impl TextServiceFactory {
                 }
                 ClientAction::AppendTextRaw(text) => {
                     Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
-                    raw_input.push_str(&text);
-
-                    candidates = ipc_service.append_text(text.clone())?;
+                    candidates = ipc_service.append_text_with_context(text.clone(), &candidates)?;
+                    raw_input.push_str(text);
                     if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
                         selection_index = selected.index;
                         corresponding_count = selected.corresponding_count;
@@ -1182,9 +1341,9 @@ impl TextServiceFactory {
                 }
                 ClientAction::AppendTextDirect(text) => {
                     Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
-                    raw_input.push_str(&text);
-
-                    candidates = ipc_service.append_text_direct(text.clone())?;
+                    candidates =
+                        ipc_service.append_text_direct_with_context(text.clone(), &candidates)?;
+                    raw_input.push_str(text);
                     if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
                         selection_index = selected.index;
                         corresponding_count = selected.corresponding_count;
@@ -1290,10 +1449,12 @@ impl TextServiceFactory {
                             .collect();
                         fixed_prefix.push_str(&current_clause_preview);
 
-                        if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
+                        if let Some(selected) = Self::select_candidate(&candidates, selection_index)
+                        {
                             selection_index = selected.index;
                             corresponding_count = selected.corresponding_count;
-                            preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
+                            preview =
+                                Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
                             suffix = selected.sub_text.clone();
                             raw_hiragana = selected.hiragana;
 
@@ -1434,32 +1595,22 @@ impl TextServiceFactory {
                         .chars()
                         .skip(corresponding_count.max(0) as usize)
                         .collect();
-                    let should_apply_symbol_fallback = match mode {
-                        InputMode::Kana => Self::should_apply_symbol_fallback(
-                            &shrunk_raw_input,
-                            text,
-                            &app_config.romaji_table.rows,
-                        ),
-                        InputMode::Latin => false,
+                    let resolved_symbol_text = match mode {
+                        InputMode::Kana => {
+                            Self::resolve_symbol_input_text(&shrunk_raw_input, text, &app_config)
+                        }
+                        InputMode::Latin => None,
                     };
-                    raw_input.push_str(&text);
-                    raw_input = raw_input
-                        .chars()
-                        .skip(corresponding_count.max(0) as usize)
-                        .collect();
+                    let mut updated_raw_input = shrunk_raw_input.clone();
+                    updated_raw_input.push_str(text);
 
-                    ipc_service.shrink_text(corresponding_count.clone())?;
+                    let shrunk_candidates = ipc_service.shrink_text(corresponding_count)?;
                     let text = match mode {
-                        InputMode::Kana if should_apply_symbol_fallback => convert_kana_symbol(
-                            text,
-                            &app_config.general,
-                            &app_config.character_width,
-                            &app_config.romaji_table.rows,
-                        ),
-                        InputMode::Kana => text.to_string(),
+                        InputMode::Kana => resolved_symbol_text.unwrap_or_else(|| text.to_string()),
                         InputMode::Latin => text.to_string(),
                     };
-                    candidates = ipc_service.append_text(text)?;
+                    candidates = ipc_service.append_text_with_context(text, &shrunk_candidates)?;
+                    raw_input = updated_raw_input;
                     selection_index = 0;
 
                     if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
@@ -1481,14 +1632,16 @@ impl TextServiceFactory {
                 ClientAction::ShrinkTextRaw(text) => {
                     fixed_prefix.clear();
                     Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
-                    raw_input.push_str(&text);
-                    raw_input = raw_input
+                    let mut updated_raw_input: String = raw_input
                         .chars()
                         .skip(corresponding_count.max(0) as usize)
                         .collect();
+                    updated_raw_input.push_str(text);
 
-                    ipc_service.shrink_text(corresponding_count.clone())?;
-                    candidates = ipc_service.append_text(text.clone())?;
+                    let shrunk_candidates = ipc_service.shrink_text(corresponding_count)?;
+                    candidates =
+                        ipc_service.append_text_with_context(text.clone(), &shrunk_candidates)?;
+                    raw_input = updated_raw_input;
                     selection_index = 0;
 
                     if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
@@ -1510,14 +1663,16 @@ impl TextServiceFactory {
                 ClientAction::ShrinkTextDirect(text) => {
                     fixed_prefix.clear();
                     Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
-                    raw_input.push_str(&text);
-                    raw_input = raw_input
+                    let mut updated_raw_input: String = raw_input
                         .chars()
                         .skip(corresponding_count.max(0) as usize)
                         .collect();
+                    updated_raw_input.push_str(text);
 
-                    ipc_service.shrink_text(corresponding_count)?;
-                    candidates = ipc_service.append_text_direct(text.clone())?;
+                    let shrunk_candidates = ipc_service.shrink_text(corresponding_count)?;
+                    candidates = ipc_service
+                        .append_text_direct_with_context(text.clone(), &shrunk_candidates)?;
+                    raw_input = updated_raw_input;
                     selection_index = 0;
 
                     if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
@@ -1575,6 +1730,15 @@ impl TextServiceFactory {
         composition.temporary_latin = temporary_latin;
         composition.temporary_latin_shift_pending = temporary_latin_shift_pending;
 
+        drop(composition);
+        drop(text_service);
+
+        if let Ok(mut ime_state) = IMEState::get() {
+            ime_state.ipc_service = Some(ipc_service);
+        } else {
+            tracing::warn!("Failed to persist updated IPC service into IMEState");
+        }
+
         Ok(())
     }
 }
@@ -1582,7 +1746,7 @@ impl TextServiceFactory {
 #[cfg(test)]
 mod tests {
     use super::TextServiceFactory;
-    use shared::RomajiRule;
+    use shared::{get_default_romaji_rows, AppConfig, RomajiRule, WidthMode};
 
     fn row(input: &str, output: &str, next_input: &str) -> RomajiRule {
         RomajiRule {
@@ -1595,40 +1759,116 @@ mod tests {
     #[test]
     fn symbol_fallback_is_disabled_in_romaji_context() {
         let rows = vec![row("z/", "・", "")];
-        let should_apply =
-            TextServiceFactory::should_apply_symbol_fallback("z", "/", &rows);
+        let should_apply = TextServiceFactory::should_apply_symbol_fallback("z", "/", &rows);
         assert!(!should_apply);
     }
 
     #[test]
     fn symbol_fallback_is_enabled_for_standalone_symbol() {
         let rows = vec![row("z/", "・", "")];
-        let should_apply =
-            TextServiceFactory::should_apply_symbol_fallback("abc", "/", &rows);
+        let should_apply = TextServiceFactory::should_apply_symbol_fallback("abc", "/", &rows);
         assert!(should_apply);
     }
 
     #[test]
     fn symbol_fallback_is_disabled_for_non_symbol_input() {
         let rows = vec![row("ka", "か", "")];
-        let should_apply =
-            TextServiceFactory::should_apply_symbol_fallback("k", "a", &rows);
+        let should_apply = TextServiceFactory::should_apply_symbol_fallback("k", "a", &rows);
         assert!(!should_apply);
     }
 
     #[test]
     fn symbol_fallback_is_enabled_for_non_ascii_symbol_variant() {
         let rows = vec![row("ka", "か", "")];
-        let should_apply =
-            TextServiceFactory::should_apply_symbol_fallback("", "￥", &rows);
+        let should_apply = TextServiceFactory::should_apply_symbol_fallback("", "￥", &rows);
         assert!(should_apply);
     }
 
     #[test]
     fn symbol_fallback_is_disabled_for_non_ascii_symbol_in_romaji_context() {
         let rows = vec![row("n\\", "んー", "")];
-        let should_apply =
-            TextServiceFactory::should_apply_symbol_fallback("n", "￥", &rows);
+        let should_apply = TextServiceFactory::should_apply_symbol_fallback("n", "￥", &rows);
         assert!(!should_apply);
+    }
+
+    #[test]
+    fn single_symbol_romaji_output_matches_exact_symbol_rule() {
+        let rows = vec![row("-", "ー", "")];
+        let output = TextServiceFactory::single_symbol_romaji_output("-", &rows);
+        assert_eq!(output, Some("ー".to_string()));
+    }
+
+    #[test]
+    fn single_symbol_romaji_output_ignores_multi_character_rule() {
+        let rows = vec![row("z/", "・", "")];
+        let output = TextServiceFactory::single_symbol_romaji_output("/", &rows);
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn zenzai_symbol_input_prefers_explicit_single_symbol_rule() {
+        let mut app_config = AppConfig::default();
+        app_config.zenzai.enable = true;
+        app_config.zenzai.backend = "vulkan".to_string();
+        app_config.character_width.groups.math_symbol = WidthMode::Half;
+        app_config.romaji_table.rows = vec![row("-", "ー", "")];
+
+        let output = TextServiceFactory::resolve_symbol_input_text("", "-", &app_config);
+        assert_eq!(output, Some("ー".to_string()));
+    }
+
+    #[test]
+    fn zenzai_symbol_input_falls_back_to_width_setting_without_symbol_rule() {
+        let mut app_config = AppConfig::default();
+        app_config.zenzai.enable = true;
+        app_config.zenzai.backend = "vulkan".to_string();
+        app_config.character_width.groups.math_symbol = WidthMode::Half;
+
+        let output = TextServiceFactory::resolve_symbol_input_text("", "-", &app_config);
+        assert_eq!(output, Some("-".to_string()));
+    }
+
+    #[test]
+    fn zenzai_symbol_input_keeps_default_multi_character_dash_sequence() {
+        let mut app_config = AppConfig::default();
+        app_config.zenzai.enable = true;
+        app_config.zenzai.backend = "vulkan".to_string();
+        app_config.romaji_table.rows = get_default_romaji_rows();
+
+        let output = TextServiceFactory::resolve_symbol_input_text("z", "-", &app_config);
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn zenzai_symbol_input_keeps_default_multi_character_symbol_sequence() {
+        let mut app_config = AppConfig::default();
+        app_config.zenzai.enable = true;
+        app_config.zenzai.backend = "vulkan".to_string();
+        app_config.romaji_table.rows = get_default_romaji_rows();
+
+        let output = TextServiceFactory::resolve_symbol_input_text("z", "/", &app_config);
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn zenzai_symbol_input_keeps_default_n_apostrophe_sequence() {
+        let mut app_config = AppConfig::default();
+        app_config.zenzai.enable = true;
+        app_config.zenzai.backend = "vulkan".to_string();
+        app_config.romaji_table.rows = get_default_romaji_rows();
+
+        let output = TextServiceFactory::resolve_symbol_input_text("n", "'", &app_config);
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn zenzai_symbol_input_still_applies_standalone_symbol_rule_without_multi_character_context() {
+        let mut app_config = AppConfig::default();
+        app_config.zenzai.enable = true;
+        app_config.zenzai.backend = "vulkan".to_string();
+        app_config.romaji_table.rows = get_default_romaji_rows();
+
+        let output = TextServiceFactory::resolve_symbol_input_text("a", "-", &app_config);
+        assert_eq!(output, Some("ー".to_string()));
     }
 }
