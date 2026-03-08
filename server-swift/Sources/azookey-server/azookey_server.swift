@@ -43,7 +43,7 @@ private enum ServerLogLevel: Int {
 
     static func fromEnvironment() -> Self {
         guard let rawValue = ProcessInfo.processInfo.environment["AZOOKEY_SERVER_LOG_LEVEL"] else {
-            return .info
+            return .warn
         }
         return .init(label: rawValue)
     }
@@ -329,6 +329,20 @@ private func clampedCorrespondingCount(
     )
 }
 
+@MainActor private func currentRuntimeZenzaiEnabled() -> Bool {
+    effectiveZenzaiRuntimeEnabled(
+        isConfigured: (config["enable"] as? Bool) ?? false,
+        backend: config["backend"] as? String,
+        cpuBackendSupported: cpuZenzaiBackendSupportedFromEnvironment()
+    )
+}
+
+@MainActor private func makeWarmupComposingText() -> ComposingText {
+    var warmupComposingText = ComposingText()
+    warmupComposingText.insertAtCursorPosition("a", inputStyle: currentInputStyle)
+    return warmupComposingText
+}
+
 class SimpleComposingText {
     init(text: String, cursor: Int) {
         self.text = UnsafeMutablePointer<CChar>(mutating: text.utf8String)!
@@ -493,13 +507,9 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 
     load_config()
 
-    composingText.insertAtCursorPosition("a", inputStyle: currentInputStyle)
+    composingText = makeWarmupComposingText()
     let useZenzaiForWarmup = effectiveZenzaiEnabledForCandidates(
-        isConfigured: effectiveZenzaiRuntimeEnabled(
-            isConfigured: (config["enable"] as? Bool) ?? false,
-            backend: config["backend"] as? String,
-            cpuBackendSupported: cpuZenzaiBackendSupportedFromEnvironment()
-        ),
+        isConfigured: currentRuntimeZenzaiEnabled(),
         inputCount: composingText.input.count,
         hiraganaCount: composingText.convertTarget.count
     )
@@ -513,6 +523,31 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
         "INFO",
         "Initialize: completed inputStyle=\(String(describing: currentInputStyle)) warmupUseZenzai=\(useZenzaiForWarmup)"
     )
+}
+
+@_silgen_name("Warmup")
+@MainActor public func warmup() {
+    let contextString = (config["context"] as? String) ?? ""
+    let warmupComposingText = makeWarmupComposingText()
+    let useZenzai = effectiveZenzaiEnabledForCandidates(
+        isConfigured: currentRuntimeZenzaiEnabled(),
+        inputCount: warmupComposingText.input.count,
+        hiraganaCount: warmupComposingText.convertTarget.count
+    )
+    serverLog(
+        "DEBUG",
+        "Warmup: start hiraganaLength=\(warmupComposingText.convertTarget.count) inputCount=\(warmupComposingText.input.count) contextLength=\(contextString.count) useZenzai=\(useZenzai)"
+    )
+    _ = converter.requestCandidates(
+        warmupComposingText,
+        options: getOptions(context: contextString, zenzaiEnabled: useZenzai)
+    )
+    serverLog("DEBUG", "Warmup: completed")
+}
+
+@_silgen_name("HasActiveComposition")
+@MainActor public func has_active_composition() -> Bool {
+    !composingText.input.isEmpty
 }
 
 @_silgen_name("AppendText")
@@ -622,11 +657,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 @MainActor public func get_composed_text(lengthPtr: UnsafeMutablePointer<Int>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
     let hiragana = composingText.convertTarget
     let contextString = (config["context"] as? String) ?? ""
-    let runtimeZenzaiEnabled = effectiveZenzaiRuntimeEnabled(
-        isConfigured: (config["enable"] as? Bool) ?? false,
-        backend: config["backend"] as? String,
-        cpuBackendSupported: cpuZenzaiBackendSupportedFromEnvironment()
-    )
+    let runtimeZenzaiEnabled = currentRuntimeZenzaiEnabled()
     serverLog(
         "INFO",
         "GetComposedText: start hiraganaLength=\(hiragana.count) inputCount=\(composingText.input.count) contextLength=\(contextString.count) runtimeZenzaiEnabled=\(runtimeZenzaiEnabled)"
@@ -684,11 +715,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     let prefixComposingText = composingText.prefixToCursorPosition()
     let prefixHiragana = prefixComposingText.convertTarget
     let contextString = (config["context"] as? String) ?? ""
-    let runtimeZenzaiEnabled = effectiveZenzaiRuntimeEnabled(
-        isConfigured: (config["enable"] as? Bool) ?? false,
-        backend: config["backend"] as? String,
-        cpuBackendSupported: cpuZenzaiBackendSupportedFromEnvironment()
-    )
+    let runtimeZenzaiEnabled = currentRuntimeZenzaiEnabled()
     serverLog(
         "INFO",
         "GetComposedTextForCursorPrefix: start prefixLength=\(prefixHiragana.count) suffixLength=\(suffixAfterCursor.count) inputCount=\(prefixComposingText.input.count) contextLength=\(contextString.count) runtimeZenzaiEnabled=\(runtimeZenzaiEnabled)"

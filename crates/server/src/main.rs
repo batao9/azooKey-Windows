@@ -26,14 +26,13 @@ use std::{
 const USE_ZENZAI: bool = true;
 const INPUT_STYLE_DIRECT: i32 = 1;
 const SERVER_LOG_FILE_NAME: &str = "server.log";
-
-/// アイドル時にSwiftランタイムをウォームな状態に保つためのKeepAlive間隔（秒）。
-/// この値を変更することで挙動を調整できる。
-const KEEPALIVE_INTERVAL_SECS: u64 = 30;
+const WARMUP_INTERVAL_SECS: u64 = 30;
 
 static SERVER_LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 static SERVER_LOG_LEVEL: OnceLock<ServerLogLevel> = OnceLock::new();
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static HAS_ACTIVE_COMPOSITION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum ServerLogLevel {
@@ -62,7 +61,7 @@ impl ServerLogLevel {
     fn from_environment() -> Self {
         std::env::var("AZOOKEY_SERVER_LOG_LEVEL")
             .map(|value| Self::from_label(&value))
-            .unwrap_or(Self::Info)
+            .unwrap_or(Self::Warn)
     }
 
     fn as_str(self) -> &'static str {
@@ -116,6 +115,8 @@ unsafe extern "C" {
     fn MoveCursor(offset: c_int, cursorPtr: *mut c_int) -> *mut c_char;
     fn ShrinkText(offset: c_int) -> *mut c_char;
     fn ClearText();
+    fn Warmup();
+    fn HasActiveComposition() -> bool;
     fn GetComposedText(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
     fn GetComposedTextForCursorPrefix(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
     fn LoadConfig();
@@ -341,6 +342,24 @@ fn clear_text() {
     }
 }
 
+fn warmup() {
+    unsafe {
+        Warmup();
+    }
+}
+
+fn query_active_composition_state() -> bool {
+    unsafe { HasActiveComposition() }
+}
+
+fn has_active_composition() -> bool {
+    HAS_ACTIVE_COMPOSITION.load(Ordering::Relaxed)
+}
+
+fn update_active_composition_state(text: &str) {
+    HAS_ACTIVE_COMPOSITION.store(!text.is_empty(), Ordering::Relaxed);
+}
+
 fn get_composed_text(use_cursor_prefix: bool) -> Result<Vec<Suggestion>, String> {
     unsafe {
         let mut length: c_int = 0;
@@ -468,6 +487,7 @@ impl AzookeyService for MyAzookeyService {
             "[append_text:{request_id}] get_composed_text elapsed_ms={}",
             t2.saturating_sub(t1)
         );
+        update_active_composition_state(&composing_text.text);
 
         log_event_lazy!(
             ServerLogLevel::Info,
@@ -511,6 +531,7 @@ impl AzookeyService for MyAzookeyService {
             "[remove_text:{request_id}] get_composed_text elapsed_ms={}",
             t2.saturating_sub(t1)
         );
+        update_active_composition_state(&composing_text.text);
 
         log_event_lazy!(
             ServerLogLevel::Info,
@@ -560,6 +581,7 @@ impl AzookeyService for MyAzookeyService {
             "[move_cursor:{request_id}] get_composed_text elapsed_ms={}",
             t2.saturating_sub(t1)
         );
+        update_active_composition_state(&composing_text.text);
 
         log_event_lazy!(
             ServerLogLevel::Info,
@@ -594,6 +616,7 @@ impl AzookeyService for MyAzookeyService {
             t1.saturating_sub(t0),
             t1.saturating_sub(handler_start)
         );
+        HAS_ACTIVE_COMPOSITION.store(false, Ordering::Relaxed);
         Ok(Response::new(ClearTextResponse {}))
     }
 
@@ -627,6 +650,7 @@ impl AzookeyService for MyAzookeyService {
             "[shrink_text:{request_id}] get_composed_text elapsed_ms={}",
             t2.saturating_sub(t1)
         );
+        update_active_composition_state(&composing_text.text);
 
         log_event_lazy!(
             ServerLogLevel::Info,
@@ -688,10 +712,17 @@ impl AzookeyService for MyAzookeyService {
         let t0 = now_timestamp_millis();
         unsafe { LoadConfig() };
         let t1 = now_timestamp_millis();
+        let has_active_composition = query_active_composition_state();
         log_event_lazy!(
             ServerLogLevel::Info,
-            "[update_config:{request_id}] success load_config_elapsed_ms={} total_elapsed_ms={}",
-            t1.saturating_sub(t0),
+            "[update_config:{request_id}] load_config_elapsed_ms={}",
+            t1.saturating_sub(t0)
+        );
+        HAS_ACTIVE_COMPOSITION.store(has_active_composition, Ordering::Relaxed);
+        log_event_lazy!(
+            ServerLogLevel::Info,
+            "[update_config:{request_id}] success active_composition={} total_elapsed_ms={}",
+            has_active_composition,
             t1.saturating_sub(handler_start)
         );
         Ok(Response::new(shared::proto::UpdateConfigResponse {}))
@@ -727,15 +758,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let service = MyAzookeyService::default();
 
-    // KeepAliveタイマー: Swiftスレッドをスリープさせないための定期的なClearText呼び出し
     tokio::spawn(async {
         let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
-        interval.tick().await; // 最初のtickは即時実行なのでスキップ
+            tokio::time::interval(std::time::Duration::from_secs(WARMUP_INTERVAL_SECS));
+        interval.tick().await;
+
         loop {
             interval.tick().await;
-            log_event_lazy!(ServerLogLevel::Debug, "[keepalive] ClearText ping");
-            clear_text();
+            if has_active_composition() {
+                log_event_lazy!(
+                    ServerLogLevel::Debug,
+                    "[warmup] skipped because composition is active"
+                );
+                continue;
+            }
+
+            log_event_lazy!(ServerLogLevel::Debug, "[warmup] start");
+            warmup();
+            log_event_lazy!(ServerLogLevel::Debug, "[warmup] done");
         }
     });
 
