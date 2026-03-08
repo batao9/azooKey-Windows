@@ -1,6 +1,7 @@
 use azookey_server::TonicNamedPipeServer;
 use tonic::{transport::Server, Request, Response, Status};
 use tonic_reflection::server::Builder as ReflectionBuilder;
+use windows::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass, HIGH_PRIORITY_CLASS};
 
 use shared::proto::azookey_service_server::{AzookeyService, AzookeyServiceServer};
 use shared::proto::{
@@ -25,6 +26,10 @@ use std::{
 const USE_ZENZAI: bool = true;
 const INPUT_STYLE_DIRECT: i32 = 1;
 const SERVER_LOG_FILE_NAME: &str = "server.log";
+
+/// アイドル時にSwiftランタイムをウォームな状態に保つためのKeepAlive間隔（秒）。
+/// この値を変更することで挙動を調整できる。
+const KEEPALIVE_INTERVAL_SECS: u64 = 30;
 
 static SERVER_LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 static SERVER_LOG_LEVEL: OnceLock<ServerLogLevel> = OnceLock::new();
@@ -703,6 +708,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_path.display()
     );
 
+    // プロセス優先度を HIGH_PRIORITY_CLASS に引き上げ（放置後のOSスケジューリング遅延を抑制）
+    unsafe {
+        match SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS) {
+            Ok(()) => log_event_lazy!(ServerLogLevel::Info, "process priority set to HIGH"),
+            Err(e) => log_event_lazy!(ServerLogLevel::Info, "SetPriorityClass failed: {e}"),
+        }
+    }
+
     let current_exe = std::env::current_exe()?;
     let parent_dir = current_exe
         .parent()
@@ -713,6 +726,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     initialize(parent_dir_str).map_err(std::io::Error::other)?;
 
     let service = MyAzookeyService::default();
+
+    // KeepAliveタイマー: Swiftスレッドをスリープさせないための定期的なClearText呼び出し
+    tokio::spawn(async {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
+        interval.tick().await; // 最初のtickは即時実行なのでスキップ
+        loop {
+            interval.tick().await;
+            log_event_lazy!(ServerLogLevel::Debug, "[keepalive] ClearText ping");
+            clear_text();
+        }
+    });
 
     log_event_lazy!(ServerLogLevel::Info, "AzookeyServer listening");
     let reflection_service = ReflectionBuilder::configure()
