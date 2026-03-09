@@ -138,13 +138,7 @@ export const Zenzai = () => {
                             Zenzaiを有効化
                         </p>
                         <p className="text-xs text-muted-foreground">
-                            Zenzaiを有効にして、変換精度を向上させます
-                        </p>
-                        <p className="text-xs text-muted-foreground">
-                            ON中もカスタムローマ字テーブルはそのまま適用されます
-                        </p>
-                        <p className="text-xs text-muted-foreground">
-                            複数文字ルールや `next_input` を含む変換も利用できます
+                            Zenzaiを有効にして、変換精度を向上させます。
                         </p>
                         <p className="text-xs text-muted-foreground">
                             CPUバックエンドは AVX 対応 CPU が必要です。未対応環境では
