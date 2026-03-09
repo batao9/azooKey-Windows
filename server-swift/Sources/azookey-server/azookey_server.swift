@@ -268,6 +268,70 @@ private func clampedCorrespondingCount(
     )
 }
 
+@MainActor func makeCandidatePreviewComposingText(
+    from composingText: ComposingText
+) -> (composingText: ComposingText, syntheticEndOfText: Bool) {
+    guard composingText.convertTarget.last == "n" else {
+        return (composingText: composingText, syntheticEndOfText: false)
+    }
+
+    guard let trailingElement = composingText.input.last else {
+        return (composingText: composingText, syntheticEndOfText: false)
+    }
+
+    switch trailingElement.piece {
+    case .character:
+        guard trailingElement.inputStyle != .direct else {
+            return (composingText: composingText, syntheticEndOfText: false)
+        }
+    case .endOfText:
+        return (composingText: composingText, syntheticEndOfText: false)
+    }
+
+    var previewComposingText = composingText
+    let originalConvertTarget = previewComposingText.convertTarget
+    previewComposingText.insertAtCursorPosition([
+        .init(piece: .endOfText, inputStyle: trailingElement.inputStyle)
+    ])
+
+    guard previewComposingText.convertTarget != originalConvertTarget else {
+        return (composingText: composingText, syntheticEndOfText: false)
+    }
+
+    return (composingText: previewComposingText, syntheticEndOfText: true)
+}
+
+@MainActor func makeCandidatePreviewComposingTextForCursorPrefix(
+    prefixComposingText: ComposingText,
+    suffixAfterCursor: String
+) -> (composingText: ComposingText, syntheticEndOfText: Bool) {
+    guard suffixAfterCursor.isEmpty else {
+        return (composingText: prefixComposingText, syntheticEndOfText: false)
+    }
+
+    return makeCandidatePreviewComposingText(from: prefixComposingText)
+}
+
+@MainActor func resolveCandidateCompositionForDisplay(
+    originalComposingText: ComposingText,
+    previewComposingText: ComposingText,
+    candidateComposingCount: ComposingCount
+) -> (correspondingCount: Int, remainingConvertTarget: String) {
+    let originalResolution = resolveCandidateComposition(
+        composingText: originalComposingText,
+        candidateComposingCount: candidateComposingCount
+    )
+    let previewResolution = resolveCandidateComposition(
+        composingText: previewComposingText,
+        candidateComposingCount: candidateComposingCount
+    )
+
+    return (
+        correspondingCount: originalResolution.correspondingCount,
+        remainingConvertTarget: previewResolution.remainingConvertTarget
+    )
+}
+
 @MainActor private func debugLogResolvedCorrespondingCount(
     scope: String,
     candidateIndex: Int,
@@ -655,22 +719,25 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 
 @_silgen_name("GetComposedText")
 @MainActor public func get_composed_text(lengthPtr: UnsafeMutablePointer<Int>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
-    let hiragana = composingText.convertTarget
+    let originalHiragana = composingText.convertTarget
     let contextString = (config["context"] as? String) ?? ""
     let runtimeZenzaiEnabled = currentRuntimeZenzaiEnabled()
+    let previewState = makeCandidatePreviewComposingText(from: composingText)
+    let previewComposingText = previewState.composingText
+    let previewHiragana = previewComposingText.convertTarget
     serverLog(
         "INFO",
-        "GetComposedText: start hiraganaLength=\(hiragana.count) inputCount=\(composingText.input.count) contextLength=\(contextString.count) runtimeZenzaiEnabled=\(runtimeZenzaiEnabled)"
+        "GetComposedText: start hiraganaLength=\(originalHiragana.count) previewHiraganaLength=\(previewHiragana.count) inputCount=\(composingText.input.count) contextLength=\(contextString.count) runtimeZenzaiEnabled=\(runtimeZenzaiEnabled) syntheticEndOfText=\(previewState.syntheticEndOfText)"
     )
     let useZenzai = effectiveZenzaiEnabledForCandidates(
         isConfigured: runtimeZenzaiEnabled,
         inputCount: composingText.input.count,
-        hiraganaCount: hiragana.count
+        hiraganaCount: originalHiragana.count
     )
     let options = getOptions(context: contextString, zenzaiEnabled: useZenzai)
-    serverLog("INFO", "GetComposedText: requestCandidates begin useZenzai=\(useZenzai)")
+    serverLog("INFO", "GetComposedText: requestCandidates begin useZenzai=\(useZenzai) syntheticEndOfText=\(previewState.syntheticEndOfText)")
     let requestStart = ProcessInfo.processInfo.systemUptime
-    let converted = converter.requestCandidates(composingText, options: options)
+    let converted = converter.requestCandidates(previewComposingText, options: options)
     let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
     serverLog("INFO", "GetComposedText: requestCandidates returned candidateCount=\(converted.mainResults.count) elapsed_ms=\(requestMs)")
     var result: [FFICandidate] = []
@@ -679,11 +746,12 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         let candidate = converted.mainResults[i]
         serverLog("DEBUG", "GetComposedText: candidate[\(i + 1)/\(converted.mainResults.count)] start")
 
-        let text = strdup(constructCandidateString(candidate: candidate, hiragana: hiragana))
+        let text = strdup(constructCandidateString(candidate: candidate, hiragana: previewHiragana))
         serverLog("DEBUG", "GetComposedText: candidate[\(i + 1)] textReady")
-        let hiragana = strdup(hiragana)
-        let resolvedCandidate = resolveCandidateComposition(
-            composingText: composingText,
+        let hiragana = strdup(previewHiragana)
+        let resolvedCandidate = resolveCandidateCompositionForDisplay(
+            originalComposingText: composingText,
+            previewComposingText: previewComposingText,
             candidateComposingCount: candidate.composingCount
         )
         let correspondingCount = resolvedCandidate.correspondingCount
@@ -713,12 +781,18 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     let hiragana = composingText.convertTarget
     let suffixAfterCursor = String(hiragana.dropFirst(composingText.convertTargetCursorPosition))
     let prefixComposingText = composingText.prefixToCursorPosition()
+    let previewState = makeCandidatePreviewComposingTextForCursorPrefix(
+        prefixComposingText: prefixComposingText,
+        suffixAfterCursor: suffixAfterCursor
+    )
+    let previewPrefixComposingText = previewState.composingText
     let prefixHiragana = prefixComposingText.convertTarget
+    let previewPrefixHiragana = previewPrefixComposingText.convertTarget
     let contextString = (config["context"] as? String) ?? ""
     let runtimeZenzaiEnabled = currentRuntimeZenzaiEnabled()
     serverLog(
         "INFO",
-        "GetComposedTextForCursorPrefix: start prefixLength=\(prefixHiragana.count) suffixLength=\(suffixAfterCursor.count) inputCount=\(prefixComposingText.input.count) contextLength=\(contextString.count) runtimeZenzaiEnabled=\(runtimeZenzaiEnabled)"
+        "GetComposedTextForCursorPrefix: start prefixLength=\(prefixHiragana.count) previewPrefixLength=\(previewPrefixHiragana.count) suffixLength=\(suffixAfterCursor.count) inputCount=\(prefixComposingText.input.count) contextLength=\(contextString.count) runtimeZenzaiEnabled=\(runtimeZenzaiEnabled) syntheticEndOfText=\(previewState.syntheticEndOfText)"
     )
     let useZenzai = effectiveZenzaiEnabledForCandidates(
         isConfigured: runtimeZenzaiEnabled,
@@ -726,9 +800,9 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         hiraganaCount: prefixHiragana.count
     )
     let options = getOptions(context: contextString, zenzaiEnabled: useZenzai)
-    serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates begin useZenzai=\(useZenzai)")
+    serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates begin useZenzai=\(useZenzai) syntheticEndOfText=\(previewState.syntheticEndOfText)")
     let requestStart = ProcessInfo.processInfo.systemUptime
-    let converted = converter.requestCandidates(prefixComposingText, options: options)
+    let converted = converter.requestCandidates(previewPrefixComposingText, options: options)
     let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
     serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates returned candidateCount=\(converted.mainResults.count) elapsed_ms=\(requestMs)")
     var result: [FFICandidate] = []
@@ -737,11 +811,12 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         let candidate = converted.mainResults[i]
         serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)/\(converted.mainResults.count)] start")
 
-        let text = strdup(constructCandidateString(candidate: candidate, hiragana: prefixHiragana))
+        let text = strdup(constructCandidateString(candidate: candidate, hiragana: previewPrefixHiragana))
         serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)] textReady")
-        let hiragana = strdup(hiragana)
-        let resolvedCandidate = resolveCandidateComposition(
-            composingText: prefixComposingText,
+        let hiragana = strdup(previewPrefixHiragana + suffixAfterCursor)
+        let resolvedCandidate = resolveCandidateCompositionForDisplay(
+            originalComposingText: prefixComposingText,
+            previewComposingText: previewPrefixComposingText,
             candidateComposingCount: candidate.composingCount
         )
         let correspondingCount = resolvedCandidate.correspondingCount
