@@ -89,22 +89,26 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
     #expect(map["{lbracket}a"] == "{rbracket}")
 }
 
-@Test func zenzaiForcesBuiltinRoman2KanaEvenWithCustomRows() async throws {
+@Test func customRowsAreUsedWhenZenzaiIsEnabled() async throws {
     let selection = resolveRomajiInputStyleSelection(
-        rows: [row("qa", "くぁ")],
-        isZenzaiEnabled: true
+        rows: [row("qa", "くぁ")]
     )
 
-    #expect(selection == .roman2kana)
+    #expect(selection == .custom)
 }
 
 @Test func customRowsAreUsedWhenZenzaiIsDisabled() async throws {
     let selection = resolveRomajiInputStyleSelection(
-        rows: [row("qa", "くぁ")],
-        isZenzaiEnabled: false
+        rows: [row("qa", "くぁ")]
     )
 
     #expect(selection == .custom)
+}
+
+@Test func builtinRoman2KanaIsUsedWhenCustomRowsAreMissing() async throws {
+    let selection = resolveRomajiInputStyleSelection(rows: nil)
+
+    #expect(selection == .roman2kana)
 }
 
 @Test func zenzaiCandidateGateRejectsShortInput() async throws {

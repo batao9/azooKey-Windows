@@ -141,11 +141,10 @@ export const Zenzai = () => {
                             Zenzaiを有効にして、変換精度を向上させます
                         </p>
                         <p className="text-xs text-muted-foreground">
-                            ON中は複数文字のカスタムローマ字テーブルを一時的に無効化し、
-                            組み込み `roman2kana` を使用します
+                            ON中もカスタムローマ字テーブルはそのまま適用されます
                         </p>
                         <p className="text-xs text-muted-foreground">
-                            ただし `- → ー` のような単体記号の明示設定はそのまま有効です
+                            複数文字ルールや `next_input` を含む変換も利用できます
                         </p>
                         <p className="text-xs text-muted-foreground">
                             CPUバックエンドは AVX 対応 CPU が必要です。未対応環境では

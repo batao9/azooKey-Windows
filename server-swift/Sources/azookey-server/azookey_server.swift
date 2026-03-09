@@ -148,13 +148,8 @@ private func normalizeReading(_ reading: String) -> String {
 }
 
 func resolveRomajiInputStyleSelection(
-    rows: [RomajiTableRow]?,
-    isZenzaiEnabled: Bool
+    rows: [RomajiTableRow]?
 ) -> RomajiInputStyleSelection {
-    if isZenzaiEnabled {
-        return .roman2kana
-    }
-
     guard let rows, buildCustomRomajiTableContent(rows: rows) != nil else {
         return .roman2kana
     }
@@ -231,12 +226,10 @@ private func cpuZenzaiBackendSupportedFromEnvironment() -> Bool {
 }
 
 @MainActor private func applyRomajiInputStyle(
-    rows: [RomajiTableRow]?,
-    isZenzaiEnabled: Bool
+    rows: [RomajiTableRow]?
 ) {
     switch resolveRomajiInputStyleSelection(
-        rows: rows,
-        isZenzaiEnabled: isZenzaiEnabled
+        rows: rows
     ) {
     case .roman2kana:
         setRoman2KanaInputStyle()
@@ -482,15 +475,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
                 }
             }
 
-            let isZenzaiEnabled = effectiveZenzaiRuntimeEnabled(
-                isConfigured: (config["enable"] as? Bool) ?? false,
-                backend: config["backend"] as? String,
-                cpuBackendSupported: cpuZenzaiBackendSupportedFromEnvironment()
-            )
-            applyRomajiInputStyle(
-                rows: settings.romaji_table?.rows,
-                isZenzaiEnabled: isZenzaiEnabled
-            )
+            applyRomajiInputStyle(rows: settings.romaji_table?.rows)
 
             let sourceEntries = settings.user_dictionary?.entries ?? []
             var seen: Set<String> = []
