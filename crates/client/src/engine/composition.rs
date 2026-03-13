@@ -50,6 +50,7 @@ pub struct Composition {
     pub selection_index: i32,
     pub candidates: Candidates,
     pub clause_snapshots: Vec<ClauseSnapshot>,
+    pub future_clause_snapshots: Vec<FutureClauseSnapshot>,
 
     pub state: CompositionState,
     pub temporary_latin: bool,
@@ -66,6 +67,20 @@ pub struct ClauseSnapshot {
     fixed_prefix: String,
     corresponding_count: i32,
     selection_index: i32,
+    candidates: Candidates,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FutureClauseSnapshot {
+    clause_preview: String,
+    suffix: String,
+    raw_input: String,
+    raw_hiragana: String,
+    is_conservative: bool,
+    corresponding_count: i32,
+    selection_index: i32,
+    selected_text: String,
+    selected_sub_text: String,
     candidates: Candidates,
 }
 
@@ -518,6 +533,165 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn current_clause_preview(preview: &str, fixed_prefix: &str) -> String {
+        preview
+            .strip_prefix(fixed_prefix)
+            .unwrap_or(preview)
+            .to_string()
+    }
+
+    #[inline]
+    fn build_clause_snapshot(
+        preview: &str,
+        suffix: &str,
+        raw_input: &str,
+        raw_hiragana: &str,
+        fixed_prefix: &str,
+        corresponding_count: i32,
+        selection_index: i32,
+        candidates: &Candidates,
+    ) -> ClauseSnapshot {
+        ClauseSnapshot {
+            preview: preview.to_string(),
+            suffix: suffix.to_string(),
+            raw_input: raw_input.to_string(),
+            raw_hiragana: raw_hiragana.to_string(),
+            fixed_prefix: fixed_prefix.to_string(),
+            corresponding_count,
+            selection_index,
+            candidates: candidates.clone(),
+        }
+    }
+
+    #[inline]
+    fn build_future_clause_snapshot(
+        preview: &str,
+        suffix: &str,
+        raw_input: &str,
+        raw_hiragana: &str,
+        fixed_prefix: &str,
+        corresponding_count: i32,
+        selection_index: i32,
+        candidates: &Candidates,
+    ) -> FutureClauseSnapshot {
+        let selected =
+            Self::select_candidate(candidates, selection_index).unwrap_or(CandidateSelection {
+                index: selection_index.max(0),
+                text: Self::current_clause_preview(preview, fixed_prefix),
+                sub_text: suffix.to_string(),
+                hiragana: raw_hiragana.to_string(),
+                corresponding_count,
+            });
+
+        FutureClauseSnapshot {
+            clause_preview: Self::current_clause_preview(preview, fixed_prefix),
+            suffix: suffix.to_string(),
+            raw_input: raw_input.to_string(),
+            raw_hiragana: raw_hiragana.to_string(),
+            is_conservative: false,
+            corresponding_count,
+            selection_index: selected.index,
+            selected_text: selected.text.clone(),
+            selected_sub_text: selected.sub_text.clone(),
+            candidates: candidates.clone(),
+        }
+    }
+
+    #[inline]
+    fn build_conservative_future_clause_snapshot(
+        clause_preview: &str,
+        suffix: &str,
+        raw_input: &str,
+        raw_hiragana: &str,
+        corresponding_count: i32,
+    ) -> FutureClauseSnapshot {
+        let candidates = Candidates {
+            texts: vec![clause_preview.to_string()],
+            sub_texts: vec![suffix.to_string()],
+            hiragana: raw_hiragana.to_string(),
+            corresponding_count: vec![corresponding_count],
+        };
+        FutureClauseSnapshot {
+            clause_preview: clause_preview.to_string(),
+            suffix: suffix.to_string(),
+            raw_input: raw_input.to_string(),
+            raw_hiragana: raw_hiragana.to_string(),
+            is_conservative: true,
+            corresponding_count,
+            selection_index: 0,
+            selected_text: clause_preview.to_string(),
+            selected_sub_text: suffix.to_string(),
+            candidates,
+        }
+    }
+
+    #[inline]
+    fn future_clause_display(snapshot: &FutureClauseSnapshot) -> String {
+        format!("{}{}", snapshot.clause_preview, snapshot.suffix)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn clause_texts_for_log(
+        preview: &str,
+        fixed_prefix: &str,
+        clause_snapshots: &[ClauseSnapshot],
+        future_clause_snapshots: &[FutureClauseSnapshot],
+    ) -> String {
+        let mut clauses = clause_snapshots
+            .iter()
+            .map(|snapshot| Self::current_clause_preview(&snapshot.preview, &snapshot.fixed_prefix))
+            .collect::<Vec<_>>();
+
+        if !preview.is_empty() {
+            clauses.push(Self::current_clause_preview(preview, fixed_prefix));
+        }
+
+        clauses.extend(
+            future_clause_snapshots
+                .iter()
+                .rev()
+                .map(|snapshot| snapshot.clause_preview.clone()),
+        );
+
+        clauses.join(" / ")
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn clause_raw_preview(raw_hiragana: &str, corresponding_count: i32) -> String {
+        raw_hiragana
+            .chars()
+            .take(corresponding_count.max(0) as usize)
+            .collect()
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn clause_raw_texts_for_log(
+        raw_hiragana: &str,
+        corresponding_count: i32,
+        clause_snapshots: &[ClauseSnapshot],
+        future_clause_snapshots: &[FutureClauseSnapshot],
+    ) -> String {
+        let mut clauses = clause_snapshots
+            .iter()
+            .map(|snapshot| {
+                Self::clause_raw_preview(&snapshot.raw_hiragana, snapshot.corresponding_count)
+            })
+            .collect::<Vec<_>>();
+
+        if !raw_hiragana.is_empty() {
+            clauses.push(Self::clause_raw_preview(raw_hiragana, corresponding_count));
+        }
+
+        clauses.extend(future_clause_snapshots.iter().rev().map(|snapshot| {
+            Self::clause_raw_preview(&snapshot.raw_hiragana, snapshot.corresponding_count)
+        }));
+
+        clauses.join(" / ")
+    }
+
     fn clear_clause_snapshots(
         clause_snapshots: &mut Vec<ClauseSnapshot>,
         ipc_service: &mut IPCService,
@@ -529,6 +703,276 @@ impl TextServiceFactory {
         clause_snapshots.clear();
         let _ = ipc_service.move_cursor(Self::MOVE_CURSOR_CLEAR_CLAUSE_SNAPSHOTS)?;
         Ok(())
+    }
+
+    #[inline]
+    fn clear_future_clause_snapshots(future_clause_snapshots: &mut Vec<FutureClauseSnapshot>) {
+        future_clause_snapshots.clear();
+    }
+
+    #[inline]
+    fn clear_clause_caches(
+        clause_snapshots: &mut Vec<ClauseSnapshot>,
+        future_clause_snapshots: &mut Vec<FutureClauseSnapshot>,
+        ipc_service: &mut IPCService,
+    ) -> Result<()> {
+        Self::clear_future_clause_snapshots(future_clause_snapshots);
+        Self::clear_clause_snapshots(clause_snapshots, ipc_service)
+    }
+
+    #[inline]
+    fn current_raw_suffix(raw_hiragana: &str, corresponding_count: i32) -> String {
+        raw_hiragana
+            .chars()
+            .skip(corresponding_count.max(0) as usize)
+            .collect()
+    }
+
+    #[inline]
+    fn replace_future_suffix_in_sub_text(
+        sub_text: &str,
+        future_snapshot: &FutureClauseSnapshot,
+    ) -> Option<String> {
+        let future_raw = future_snapshot.raw_hiragana.as_str();
+        let future_display = Self::future_clause_display(future_snapshot);
+
+        sub_text
+            .strip_suffix(future_raw)
+            .map(|prefix| format!("{prefix}{future_display}"))
+            .or_else(|| (sub_text == future_raw).then(|| future_display.clone()))
+    }
+
+    #[inline]
+    fn sync_current_clause_future_suffix(
+        candidates: &mut Candidates,
+        selection_index: i32,
+        corresponding_count: i32,
+        future_clause_snapshots: &[FutureClauseSnapshot],
+    ) -> String {
+        let Some(future_snapshot) = future_clause_snapshots.last() else {
+            return candidates
+                .sub_texts
+                .get(selection_index.max(0) as usize)
+                .cloned()
+                .unwrap_or_default();
+        };
+
+        for sub_text in candidates.sub_texts.iter_mut() {
+            if let Some(updated) =
+                Self::replace_future_suffix_in_sub_text(sub_text, future_snapshot)
+            {
+                *sub_text = updated;
+            }
+        }
+
+        candidates
+            .sub_texts
+            .get(selection_index.max(0) as usize)
+            .cloned()
+            .unwrap_or_else(|| Self::current_raw_suffix(&candidates.hiragana, corresponding_count))
+    }
+
+    #[inline]
+    fn push_current_future_clause_snapshot(
+        future_clause_snapshots: &mut Vec<FutureClauseSnapshot>,
+        preview: &str,
+        suffix: &str,
+        raw_input: &str,
+        raw_hiragana: &str,
+        fixed_prefix: &str,
+        corresponding_count: i32,
+        selection_index: i32,
+        candidates: &Candidates,
+    ) {
+        let snapshot = Self::build_future_clause_snapshot(
+            preview,
+            suffix,
+            raw_input,
+            raw_hiragana,
+            fixed_prefix,
+            corresponding_count,
+            selection_index,
+            candidates,
+        );
+        future_clause_snapshots.push(snapshot);
+    }
+
+    #[inline]
+    fn future_snapshot_matches_raw_suffix(
+        future_snapshot: &FutureClauseSnapshot,
+        raw_suffix: &str,
+    ) -> bool {
+        raw_suffix == future_snapshot.raw_hiragana
+            || raw_suffix.ends_with(&future_snapshot.raw_hiragana)
+    }
+
+    #[inline]
+    fn maybe_push_split_future_clause_snapshot(
+        future_clause_snapshots: &mut Vec<FutureClauseSnapshot>,
+        raw_input: &str,
+        raw_hiragana: &str,
+        corresponding_count: i32,
+        raw_suffix_hint: &str,
+    ) {
+        if future_clause_snapshots.is_empty() {
+            return;
+        }
+
+        let raw_suffix = if !raw_suffix_hint.is_empty()
+            && future_clause_snapshots
+                .iter()
+                .rev()
+                .any(|snapshot| Self::future_snapshot_matches_raw_suffix(snapshot, raw_suffix_hint))
+        {
+            raw_suffix_hint.to_string()
+        } else {
+            Self::current_raw_suffix(raw_hiragana, corresponding_count)
+        };
+        if raw_suffix.is_empty() {
+            return;
+        }
+
+        while let Some(snapshot) = future_clause_snapshots.last() {
+            if Self::future_snapshot_matches_raw_suffix(snapshot, &raw_suffix) {
+                break;
+            }
+            future_clause_snapshots.pop();
+        }
+
+        let existing_future = future_clause_snapshots.last().cloned();
+        let raw_input_suffix: String = raw_input
+            .chars()
+            .skip(corresponding_count.max(0) as usize)
+            .collect();
+        let Some(snapshot) = existing_future.as_ref() else {
+            return;
+        };
+
+        if snapshot.is_conservative {
+            let trailing_raw_hiragana = future_clause_snapshots
+                .iter()
+                .rev()
+                .nth(1)
+                .map(|snapshot| snapshot.raw_hiragana.clone())
+                .unwrap_or_default();
+            let trailing_raw_input = future_clause_snapshots
+                .iter()
+                .rev()
+                .nth(1)
+                .map(|snapshot| snapshot.raw_input.clone())
+                .unwrap_or_default();
+            let split_preview = if trailing_raw_hiragana.is_empty() {
+                raw_suffix.clone()
+            } else {
+                raw_suffix
+                    .strip_suffix(&trailing_raw_hiragana)
+                    .unwrap_or(&raw_suffix)
+                    .to_string()
+            };
+            let split_corresponding_count = if trailing_raw_input.is_empty() {
+                raw_input_suffix.chars().count() as i32
+            } else {
+                raw_input_suffix
+                    .strip_suffix(&trailing_raw_input)
+                    .unwrap_or(&raw_input_suffix)
+                    .chars()
+                    .count() as i32
+            };
+            let replaced_snapshot = Self::build_conservative_future_clause_snapshot(
+                &split_preview,
+                &snapshot.suffix,
+                &raw_input_suffix,
+                &raw_suffix,
+                split_corresponding_count,
+            );
+            future_clause_snapshots.pop();
+            future_clause_snapshots.push(replaced_snapshot);
+            return;
+        }
+
+        let Some(split_preview) = raw_suffix.strip_suffix(&snapshot.raw_hiragana) else {
+            return;
+        };
+        if split_preview.is_empty() {
+            return;
+        }
+
+        let split_corresponding_count = raw_input_suffix
+            .strip_suffix(&snapshot.raw_input)
+            .map(|prefix| prefix.chars().count() as i32)
+            .unwrap_or(split_preview.chars().count() as i32);
+        let split_snapshot = Self::build_conservative_future_clause_snapshot(
+            split_preview,
+            &Self::future_clause_display(snapshot),
+            &raw_input_suffix,
+            &raw_suffix,
+            split_corresponding_count,
+        );
+        future_clause_snapshots.push(split_snapshot);
+    }
+
+    #[inline]
+    fn restore_future_clause_snapshot(
+        preview: &mut String,
+        suffix: &mut String,
+        raw_input: &mut String,
+        raw_hiragana: &mut String,
+        corresponding_count: &mut i32,
+        selection_index: &mut i32,
+        candidates: &mut Candidates,
+        fixed_prefix: &str,
+        snapshot: &FutureClauseSnapshot,
+    ) {
+        *preview = Self::merge_preview_with_prefix(fixed_prefix, &snapshot.clause_preview);
+        *suffix = snapshot.suffix.clone();
+        *raw_input = snapshot.raw_input.clone();
+        *raw_hiragana = snapshot.raw_hiragana.clone();
+        *corresponding_count = snapshot.corresponding_count;
+        *selection_index = Self::resolve_selection_index(
+            &snapshot.candidates,
+            &snapshot.selected_text,
+            &snapshot.selected_sub_text,
+            snapshot.corresponding_count,
+            snapshot.selection_index,
+        );
+        *candidates = snapshot.candidates.clone();
+    }
+
+    #[inline]
+    fn resolve_selection_index(
+        candidates: &Candidates,
+        selected_text: &str,
+        selected_sub_text: &str,
+        corresponding_count: i32,
+        fallback_index: i32,
+    ) -> i32 {
+        if let Some(index) = candidates
+            .texts
+            .iter()
+            .zip(candidates.sub_texts.iter())
+            .zip(candidates.corresponding_count.iter())
+            .position(|((text, sub_text), candidate_corresponding_count)| {
+                text == selected_text
+                    && sub_text == selected_sub_text
+                    && *candidate_corresponding_count == corresponding_count
+            })
+        {
+            return index as i32;
+        }
+
+        let max_index = candidates.texts.len().saturating_sub(1) as i32;
+        fallback_index.clamp(0, max_index)
+    }
+
+    #[inline]
+    fn future_snapshot_matches_server(
+        future_clause_snapshots: &[FutureClauseSnapshot],
+        server_candidates: &Candidates,
+    ) -> bool {
+        future_clause_snapshots
+            .last()
+            .map(|snapshot| server_candidates.hiragana == snapshot.raw_hiragana)
+            .unwrap_or(false)
     }
 
     #[inline]
@@ -1261,6 +1705,7 @@ impl TextServiceFactory {
         let mut corresponding_count = composition.corresponding_count.clone();
         let mut candidates = composition.candidates.clone();
         let mut clause_snapshots = composition.clause_snapshots.clone();
+        let mut future_clause_snapshots = composition.future_clause_snapshots.clone();
         let mut selection_index = composition.selection_index;
         let mut temporary_latin = composition.temporary_latin;
         let mut temporary_latin_shift_pending = composition.temporary_latin_shift_pending;
@@ -1291,12 +1736,17 @@ impl TextServiceFactory {
                     raw_hiragana.clear();
                     fixed_prefix.clear();
                     clause_snapshots.clear();
+                    future_clause_snapshots.clear();
                     ipc_service.hide_window()?;
                     ipc_service.set_candidates(vec![])?;
                     ipc_service.clear_text()?;
                 }
                 ClientAction::AppendText(text) => {
-                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
+                    Self::clear_clause_caches(
+                        &mut clause_snapshots,
+                        &mut future_clause_snapshots,
+                        &mut ipc_service,
+                    )?;
                     let resolved_symbol_text = match mode {
                         InputMode::Kana => {
                             Self::resolve_symbol_input_text(&raw_input, text, &app_config)
@@ -1323,7 +1773,11 @@ impl TextServiceFactory {
                     }
                 }
                 ClientAction::AppendTextRaw(text) => {
-                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
+                    Self::clear_clause_caches(
+                        &mut clause_snapshots,
+                        &mut future_clause_snapshots,
+                        &mut ipc_service,
+                    )?;
                     candidates = ipc_service.append_text_with_context(text.clone(), &candidates)?;
                     raw_input.push_str(text);
                     if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
@@ -1339,7 +1793,11 @@ impl TextServiceFactory {
                     }
                 }
                 ClientAction::AppendTextDirect(text) => {
-                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
+                    Self::clear_clause_caches(
+                        &mut clause_snapshots,
+                        &mut future_clause_snapshots,
+                        &mut ipc_service,
+                    )?;
                     candidates =
                         ipc_service.append_text_direct_with_context(text.clone(), &candidates)?;
                     raw_input.push_str(text);
@@ -1356,7 +1814,11 @@ impl TextServiceFactory {
                     }
                 }
                 ClientAction::RemoveText => {
-                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
+                    Self::clear_clause_caches(
+                        &mut clause_snapshots,
+                        &mut future_clause_snapshots,
+                        &mut ipc_service,
+                    )?;
                     raw_input.pop();
                     candidates = ipc_service.remove_text()?;
                     if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
@@ -1384,6 +1846,7 @@ impl TextServiceFactory {
                         raw_input.clear();
                         raw_hiragana.clear();
                         clause_snapshots.clear();
+                        future_clause_snapshots.clear();
 
                         if committed_prefix.is_empty() {
                             self.set_text("", "")?;
@@ -1420,21 +1883,18 @@ impl TextServiceFactory {
                             continue;
                         }
 
-                        let snapshot = ClauseSnapshot {
-                            preview: preview.clone(),
-                            suffix: suffix.clone(),
-                            raw_input: raw_input.clone(),
-                            raw_hiragana: raw_hiragana.clone(),
-                            fixed_prefix: fixed_prefix.clone(),
+                        let snapshot = Self::build_clause_snapshot(
+                            &preview,
+                            &suffix,
+                            &raw_input,
+                            &raw_hiragana,
+                            &fixed_prefix,
                             corresponding_count,
                             selection_index,
-                            candidates: candidates.clone(),
-                        };
-
-                        let current_clause_preview = preview
-                            .strip_prefix(&fixed_prefix)
-                            .unwrap_or(&preview)
-                            .to_string();
+                            &candidates,
+                        );
+                        let current_clause_preview =
+                            Self::current_clause_preview(&preview, &fixed_prefix);
                         let current_corresponding_count = corresponding_count;
 
                         ipc_service.move_cursor(Self::MOVE_CURSOR_PUSH_CLAUSE_SNAPSHOT)?;
@@ -1448,8 +1908,39 @@ impl TextServiceFactory {
                             .collect();
                         fixed_prefix.push_str(&current_clause_preview);
 
-                        if let Some(selected) = Self::select_candidate(&candidates, selection_index)
+                        if Self::future_snapshot_matches_server(
+                            &future_clause_snapshots,
+                            &candidates,
+                        ) {
+                            if let Some(restored_future) = future_clause_snapshots.pop() {
+                                Self::restore_future_clause_snapshot(
+                                    &mut preview,
+                                    &mut suffix,
+                                    &mut raw_input,
+                                    &mut raw_hiragana,
+                                    &mut corresponding_count,
+                                    &mut selection_index,
+                                    &mut candidates,
+                                    &fixed_prefix,
+                                    &restored_future,
+                                );
+                                suffix = Self::sync_current_clause_future_suffix(
+                                    &mut candidates,
+                                    selection_index,
+                                    corresponding_count,
+                                    &future_clause_snapshots,
+                                );
+                                self.set_text(&preview, &suffix)?;
+                                ipc_service.set_candidates(candidates.texts.clone())?;
+                                ipc_service.set_selection(selection_index)?;
+                                self.update_pos()?;
+                            }
+                        } else if let Some(selected) =
+                            Self::select_candidate(&candidates, selection_index)
                         {
+                            if !future_clause_snapshots.is_empty() {
+                                future_clause_snapshots.clear();
+                            }
                             selection_index = selected.index;
                             corresponding_count = selected.corresponding_count;
                             preview =
@@ -1481,6 +1972,17 @@ impl TextServiceFactory {
                         }
                     } else if *direction < 0 {
                         if let Some(restored) = clause_snapshots.pop() {
+                            Self::push_current_future_clause_snapshot(
+                                &mut future_clause_snapshots,
+                                &preview,
+                                &suffix,
+                                &raw_input,
+                                &raw_hiragana,
+                                &fixed_prefix,
+                                corresponding_count,
+                                selection_index,
+                                &candidates,
+                            );
                             ipc_service.move_cursor(Self::MOVE_CURSOR_POP_CLAUSE_SNAPSHOT)?;
 
                             preview = restored.preview;
@@ -1520,8 +2022,20 @@ impl TextServiceFactory {
                         selection_index = selected.index;
                         corresponding_count = selected.corresponding_count;
                         preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
-                        suffix = selected.sub_text.clone();
                         raw_hiragana = selected.hiragana;
+                        Self::maybe_push_split_future_clause_snapshot(
+                            &mut future_clause_snapshots,
+                            &raw_input,
+                            &raw_hiragana,
+                            corresponding_count,
+                            &selected.sub_text,
+                        );
+                        suffix = Self::sync_current_clause_future_suffix(
+                            &mut candidates,
+                            selection_index,
+                            corresponding_count,
+                            &future_clause_snapshots,
+                        );
                         Self::sync_clause_snapshot_suffixes(
                             &mut clause_snapshots,
                             &preview,
@@ -1562,6 +2076,7 @@ impl TextServiceFactory {
                     raw_hiragana.clear();
                     fixed_prefix.clear();
                     clause_snapshots.clear();
+                    future_clause_snapshots.clear();
                     ipc_service.clear_text()?;
                 }
                 ClientAction::SetSelection(selection) => {
@@ -1575,8 +2090,13 @@ impl TextServiceFactory {
                         selection_index = selected.index;
                         corresponding_count = selected.corresponding_count;
                         preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
-                        suffix = selected.sub_text.clone();
                         raw_hiragana = selected.hiragana;
+                        suffix = Self::sync_current_clause_future_suffix(
+                            &mut candidates,
+                            selection_index,
+                            corresponding_count,
+                            &future_clause_snapshots,
+                        );
                         Self::sync_clause_snapshot_suffixes(
                             &mut clause_snapshots,
                             &preview,
@@ -1589,7 +2109,11 @@ impl TextServiceFactory {
                 }
                 ClientAction::ShrinkText(text) => {
                     fixed_prefix.clear();
-                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
+                    Self::clear_clause_caches(
+                        &mut clause_snapshots,
+                        &mut future_clause_snapshots,
+                        &mut ipc_service,
+                    )?;
                     let shrunk_raw_input: String = raw_input
                         .chars()
                         .skip(corresponding_count.max(0) as usize)
@@ -1630,7 +2154,11 @@ impl TextServiceFactory {
                 }
                 ClientAction::ShrinkTextRaw(text) => {
                     fixed_prefix.clear();
-                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
+                    Self::clear_clause_caches(
+                        &mut clause_snapshots,
+                        &mut future_clause_snapshots,
+                        &mut ipc_service,
+                    )?;
                     let mut updated_raw_input: String = raw_input
                         .chars()
                         .skip(corresponding_count.max(0) as usize)
@@ -1661,7 +2189,11 @@ impl TextServiceFactory {
                 }
                 ClientAction::ShrinkTextDirect(text) => {
                     fixed_prefix.clear();
-                    Self::clear_clause_snapshots(&mut clause_snapshots, &mut ipc_service)?;
+                    Self::clear_clause_caches(
+                        &mut clause_snapshots,
+                        &mut future_clause_snapshots,
+                        &mut ipc_service,
+                    )?;
                     let mut updated_raw_input: String = raw_input
                         .chars()
                         .skip(corresponding_count.max(0) as usize)
@@ -1724,6 +2256,7 @@ impl TextServiceFactory {
         composition.fixed_prefix = fixed_prefix.clone();
         composition.candidates = candidates;
         composition.clause_snapshots = clause_snapshots;
+        composition.future_clause_snapshots = future_clause_snapshots;
         composition.suffix = suffix.clone();
         composition.corresponding_count = corresponding_count;
         composition.temporary_latin = temporary_latin;
@@ -1744,7 +2277,7 @@ impl TextServiceFactory {
 
 #[cfg(test)]
 mod tests {
-    use super::TextServiceFactory;
+    use super::{Candidates, TextServiceFactory};
     use shared::{get_default_romaji_rows, AppConfig, RomajiRule, WidthMode};
 
     fn row(input: &str, output: &str, next_input: &str) -> RomajiRule {
@@ -1753,6 +2286,327 @@ mod tests {
             output: output.to_string(),
             next_input: next_input.to_string(),
         }
+    }
+
+    fn candidates(
+        texts: &[&str],
+        sub_texts: &[&str],
+        hiragana: &str,
+        corresponding_count: &[i32],
+    ) -> Candidates {
+        Candidates {
+            texts: texts.iter().map(|value| (*value).to_string()).collect(),
+            sub_texts: sub_texts.iter().map(|value| (*value).to_string()).collect(),
+            hiragana: hiragana.to_string(),
+            corresponding_count: corresponding_count.to_vec(),
+        }
+    }
+
+    fn actual_future_snapshot(
+        clause_preview: &str,
+        suffix: &str,
+        raw_input: &str,
+        raw_hiragana: &str,
+        corresponding_count: i32,
+    ) -> super::FutureClauseSnapshot {
+        TextServiceFactory::build_future_clause_snapshot(
+            clause_preview,
+            suffix,
+            raw_input,
+            raw_hiragana,
+            "",
+            corresponding_count,
+            0,
+            &candidates(
+                &[clause_preview],
+                &[suffix],
+                raw_hiragana,
+                &[corresponding_count],
+            ),
+        )
+    }
+
+    #[test]
+    fn future_clause_snapshot_uses_relative_clause_preview() {
+        let snapshot = TextServiceFactory::build_future_clause_snapshot(
+            "いいかげん",
+            "とういつしろ",
+            "kagentouitusiro",
+            "かげんとういつしろ",
+            "いい",
+            4,
+            0,
+            &candidates(&["かげん"], &["とういつしろ"], "かげんとういつしろ", &[4]),
+        );
+
+        assert_eq!(snapshot.clause_preview, "かげん");
+        assert_eq!(snapshot.selected_text, "かげん");
+    }
+
+    #[test]
+    fn move_clause_left_pushes_current_clause_into_future_cache() {
+        let mut future = vec![
+            TextServiceFactory::build_conservative_future_clause_snapshot(
+                "しろ", "", "siro", "しろ", 2,
+            ),
+        ];
+
+        TextServiceFactory::push_current_future_clause_snapshot(
+            &mut future,
+            "いいかげん",
+            "とういつしろ",
+            "kagentouitusiro",
+            "かげんとういつしろ",
+            "いい",
+            4,
+            0,
+            &candidates(&["かげん"], &["とういつしろ"], "かげんとういつしろ", &[4]),
+        );
+
+        assert_eq!(future.len(), 2);
+        assert_eq!(
+            future
+                .last()
+                .map(|snapshot| snapshot.clause_preview.as_str()),
+            Some("かげん")
+        );
+        assert_eq!(
+            TextServiceFactory::clause_texts_for_log("", "", &[], &future),
+            "かげん / しろ"
+        );
+    }
+
+    #[test]
+    fn move_clause_right_restores_future_clause_without_dropping_following_clauses() {
+        let trailing = TextServiceFactory::build_conservative_future_clause_snapshot(
+            "しろ", "", "siro", "しろ", 2,
+        );
+        let restored = TextServiceFactory::build_future_clause_snapshot(
+            "いいかげんとういつ",
+            "しろ",
+            "touitusiro",
+            "とういつしろ",
+            "いいかげん",
+            4,
+            0,
+            &candidates(&["とういつ"], &["しろ"], "とういつしろ", &[4]),
+        );
+        let mut future = vec![trailing, restored];
+
+        let restored = future.pop().expect("restored future snapshot");
+        let mut preview = String::new();
+        let mut suffix = String::new();
+        let mut raw_input = String::new();
+        let mut raw_hiragana = String::new();
+        let mut corresponding_count = 0;
+        let mut selection_index = 0;
+        let mut restored_candidates = Candidates::default();
+        TextServiceFactory::restore_future_clause_snapshot(
+            &mut preview,
+            &mut suffix,
+            &mut raw_input,
+            &mut raw_hiragana,
+            &mut corresponding_count,
+            &mut selection_index,
+            &mut restored_candidates,
+            "いいかげん",
+            &restored,
+        );
+        suffix = TextServiceFactory::sync_current_clause_future_suffix(
+            &mut restored_candidates,
+            selection_index,
+            corresponding_count,
+            &future,
+        );
+
+        assert_eq!(preview, "いいかげんとういつ");
+        assert_eq!(suffix, "しろ");
+        assert_eq!(
+            TextServiceFactory::clause_texts_for_log(&preview, "いいかげん", &[], &future),
+            "とういつ / しろ"
+        );
+    }
+
+    #[test]
+    fn adjust_boundary_split_keeps_future_clause_sequence() {
+        let mut future = vec![
+            actual_future_snapshot("しろ", "", "siro", "しろ", 2),
+            actual_future_snapshot("とういつ", "しろ", "touitusiro", "とういつしろ", 4),
+        ];
+
+        TextServiceFactory::maybe_push_split_future_clause_snapshot(
+            &mut future,
+            "kagentouitusiro",
+            "かげんとういつしろ",
+            4,
+            "んとういつしろ",
+        );
+
+        assert_eq!(
+            future
+                .last()
+                .map(|snapshot| snapshot.clause_preview.as_str()),
+            Some("ん")
+        );
+        assert_eq!(
+            future.last().map(|snapshot| snapshot.raw_input.as_str()),
+            Some("ntouitusiro")
+        );
+        assert_eq!(
+            TextServiceFactory::clause_raw_texts_for_log("", 0, &[], &future),
+            "ん / とういつ / しろ"
+        );
+    }
+
+    #[test]
+    fn adjust_boundary_without_existing_future_cache_does_not_capture_split_clause() {
+        let mut future = Vec::new();
+
+        TextServiceFactory::maybe_push_split_future_clause_snapshot(
+            &mut future,
+            "iikagentouitusiro",
+            "いいかげんとういつしろ",
+            1,
+            "いかげんとういつしろ",
+        );
+
+        assert!(future.is_empty());
+    }
+
+    #[test]
+    fn adjust_boundary_replaces_existing_conservative_future_clause() {
+        let mut future = vec![
+            actual_future_snapshot("しろ", "", "siro", "しろ", 2),
+            TextServiceFactory::build_conservative_future_clause_snapshot(
+                "つ",
+                "しろ",
+                "tusiro",
+                "つしろ",
+                2,
+            ),
+        ];
+
+        TextServiceFactory::maybe_push_split_future_clause_snapshot(
+            &mut future,
+            "touitusiro",
+            "とういつしろ",
+            3,
+            "いつしろ",
+        );
+
+        assert_eq!(
+            future
+                .last()
+                .map(|snapshot| snapshot.clause_preview.as_str()),
+            Some("いつ")
+        );
+        assert_eq!(
+            future.last().map(|snapshot| snapshot.suffix.as_str()),
+            Some("しろ")
+        );
+        assert_eq!(
+            future.last().map(|snapshot| snapshot.raw_input.as_str()),
+            Some("itusiro")
+        );
+        assert_eq!(
+            future.last().map(|snapshot| snapshot.raw_hiragana.as_str()),
+            Some("いつしろ")
+        );
+    }
+
+    #[test]
+    fn adjust_boundary_trim_drops_stale_split_snapshot_before_rejoin() {
+        let mut future = vec![
+            actual_future_snapshot("しろ", "", "siro", "しろ", 2),
+            actual_future_snapshot(
+                "かげん",
+                "とういつしろ",
+                "kagentouitusiro",
+                "かげんとういつしろ",
+                5,
+            ),
+        ];
+
+        TextServiceFactory::maybe_push_split_future_clause_snapshot(
+            &mut future,
+            "iikagentouitusiro",
+            "いかげんとういつしろ",
+            1,
+            "いかげんとういつしろ",
+        );
+        TextServiceFactory::maybe_push_split_future_clause_snapshot(
+            &mut future,
+            "iikagentouitusiro",
+            "かげんとういつしろ",
+            2,
+            "かげんとういつしろ",
+        );
+
+        assert_eq!(future.len(), 2);
+        assert_eq!(
+            future
+                .last()
+                .map(|snapshot| snapshot.clause_preview.as_str()),
+            Some("かげん")
+        );
+    }
+
+    #[test]
+    fn restore_selection_prefers_exact_match_then_fallback() {
+        let restored_candidates = candidates(
+            &["候補A", "候補B", "候補C"],
+            &["残り", "残り", "別"],
+            "こうほ",
+            &[2, 2, 1],
+        );
+
+        assert_eq!(
+            TextServiceFactory::resolve_selection_index(
+                &restored_candidates,
+                "候補B",
+                "残り",
+                2,
+                0,
+            ),
+            1
+        );
+        assert_eq!(
+            TextServiceFactory::resolve_selection_index(
+                &restored_candidates,
+                "候補X",
+                "残り",
+                2,
+                2,
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn adjust_boundary_prefers_hint_over_corresponding_count_suffix() {
+        let mut future = vec![
+            actual_future_snapshot("しろ", "", "siro", "しろ", 2),
+            actual_future_snapshot("とういつ", "しろ", "touitusiro", "とういつしろ", 4),
+        ];
+
+        TextServiceFactory::maybe_push_split_future_clause_snapshot(
+            &mut future,
+            "iikagentouitusiro",
+            "いいかげんとういつしろ",
+            6,
+            "んとういつしろ",
+        );
+
+        assert_eq!(
+            future
+                .last()
+                .map(|snapshot| snapshot.clause_preview.as_str()),
+            Some("ん")
+        );
+        assert_eq!(
+            future.last().map(|snapshot| snapshot.raw_hiragana.as_str()),
+            Some("んとういつしろ")
+        );
     }
 
     #[test]
