@@ -3441,6 +3441,7 @@ impl TextServiceFactory {
                     );
 
                     preview = Self::merge_preview_with_prefix(&fixed_prefix, &converted_clause);
+                    Self::sync_clause_snapshot_suffixes(&mut clause_snapshots, &preview, &suffix);
                     self.set_text(&preview, &suffix)?;
                 }
             }
@@ -5679,6 +5680,11 @@ mod tests {
                         &harness.fixed_prefix,
                         &converted_clause,
                     );
+                    TextServiceFactory::sync_clause_snapshot_suffixes(
+                        &mut harness.clause_snapshots,
+                        &harness.preview,
+                        &harness.suffix,
+                    );
                 }
                 unsupported => panic!(
                     "unsupported client action in harness: {unsupported:?}, history: {}",
@@ -6145,6 +6151,34 @@ mod tests {
             );
             assert_eq!(harness.state, CompositionState::Composing);
         }
+    }
+
+    #[test]
+    fn clause_integration_logged_baseline_f7_keeps_future_display_when_moving_left() {
+        let extra = vec![
+            HarnessUserAction::Left,
+            HarnessUserAction::SetTextType(SetTextType::Katakana),
+            HarnessUserAction::Left,
+        ];
+        let (harness, _, history) = run_from_logged_baseline(&extra);
+
+        assert_eq!(
+            harness_visible_clauses(&harness),
+            "いい / 加減 / トウイツ / しろ",
+            "history: {}\nraw clauses: {}\nclause_snapshots: {}\nfuture_clause_snapshots: {}\npreview={} fixed_prefix={} suffix={}",
+            history_string(&history),
+            harness_raw_clauses(&harness),
+            TextServiceFactory::debug_clause_snapshots(&harness.clause_snapshots),
+            TextServiceFactory::debug_future_clause_snapshots(&harness.future_clause_snapshots),
+            harness.preview,
+            harness.fixed_prefix,
+            harness.suffix,
+        );
+        assert_eq!(
+            TextServiceFactory::current_clause_preview(&harness.preview, &harness.fixed_prefix),
+            "加減"
+        );
+        assert_eq!(harness.suffix, "トウイツしろ");
     }
 
     #[test]
