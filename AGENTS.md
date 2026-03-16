@@ -32,6 +32,13 @@
 - VM によってビルドを行い、 VM で動作を検証する。
 - 検証後 `origin` に push して GitHub CI でビルドする。
 
+## テスト方針
+
+- 変更に応じて必要な test を実装する。バグ修正では、まず再現 test や回帰 test の追加を優先する。
+- 実装変更後は、変更範囲に対応する test を実行し、pass を確認してから次の段階へ進む。
+- `client` クレートの composition / clause adjustment / stateful test に関わる変更では、可能なら `.local/vm_test_client_composition.sh <branch> [test-filter]` を実行して Windows VM 上で確認する。
+- push 前の事前確認として、可能なら `.local/vm_build_master.sh <branch>` を実行し、ビルド成功を確認する。
+
 ## ローカルVMビルド（任意）
 
 - 正式なビルド判定は GitHub CI とする。
