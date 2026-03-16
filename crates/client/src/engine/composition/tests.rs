@@ -1,6 +1,6 @@
 use super::{
-    Candidates, ClauseActionBackend, ClauseActionStateMut, Composition, CompositionState,
-    TextServiceFactory,
+    Candidates, ClauseActionBackend, ClauseActionStateMut, ClauseSnapshot, Composition,
+    CompositionState, FutureClauseSnapshot, TextServiceFactory,
 };
 use crate::engine::{
     client_action::{ClientAction, SetTextType},
@@ -36,7 +36,7 @@ pub(super) fn actual_future_snapshot(
     raw_input: &str,
     raw_hiragana: &str,
     corresponding_count: i32,
-) -> super::FutureClauseSnapshot {
+) -> FutureClauseSnapshot {
     TextServiceFactory::build_future_clause_snapshot(
         clause_preview,
         suffix,

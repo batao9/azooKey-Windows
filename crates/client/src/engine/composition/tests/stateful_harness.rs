@@ -118,8 +118,8 @@ pub(super) struct ClauseHarness {
     pub(super) current_clause_has_split_left_neighbor: bool,
     pub(super) current_clause_split_group_id: Option<u64>,
     pub(super) candidates: Candidates,
-    pub(super) clause_snapshots: Vec<super::ClauseSnapshot>,
-    pub(super) future_clause_snapshots: Vec<super::FutureClauseSnapshot>,
+    pub(super) clause_snapshots: Vec<ClauseSnapshot>,
+    pub(super) future_clause_snapshots: Vec<FutureClauseSnapshot>,
     pub(super) next_split_group_id: u64,
 }
 
@@ -439,10 +439,7 @@ fn split_units_by_offset(units: &[SimUnit], offset: i32) -> Option<(Vec<SimUnit>
     (split_found && !consumed.is_empty() && !remainder.is_empty()).then_some((consumed, remainder))
 }
 
-fn build_clause_snapshot_from_spec(
-    spec: &SimSpecState,
-    clause_index: usize,
-) -> super::ClauseSnapshot {
+fn build_clause_snapshot_from_spec(spec: &SimSpecState, clause_index: usize) -> ClauseSnapshot {
     let fixed_prefix = spec_join_display(&spec.clauses[..clause_index]);
     let clause = &spec.clauses[clause_index];
     let preview =
@@ -472,7 +469,7 @@ fn build_clause_snapshot_from_spec(
 fn build_future_snapshot_from_spec(
     spec: &SimSpecState,
     clause_index: usize,
-) -> super::FutureClauseSnapshot {
+) -> FutureClauseSnapshot {
     let fixed_prefix = spec_join_display(&spec.clauses[..clause_index]);
     let clause = &spec.clauses[clause_index];
     let preview =
@@ -846,7 +843,7 @@ fn harness_as_composition(harness: &ClauseHarness) -> Composition {
 }
 
 fn committed_clause_from_snapshot(
-    snapshot: &super::ClauseSnapshot,
+    snapshot: &ClauseSnapshot,
     next_raw_hiragana: Option<&str>,
 ) -> SimCommittedClause {
     SimCommittedClause {
