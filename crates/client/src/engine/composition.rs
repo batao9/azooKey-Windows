@@ -758,6 +758,69 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn clause_raw_input_preview(
+        raw_input: &str,
+        next_raw_input: Option<&str>,
+        corresponding_count: i32,
+    ) -> String {
+        next_raw_input
+            .and_then(|next_raw| raw_input.strip_suffix(next_raw))
+            .filter(|prefix| !prefix.is_empty())
+            .map(|prefix| prefix.to_string())
+            .unwrap_or_else(|| {
+                raw_input
+                    .chars()
+                    .take(corresponding_count.max(0) as usize)
+                    .collect()
+            })
+    }
+
+    #[inline]
+    fn current_clause_raw_input_preview(
+        raw_input: &str,
+        corresponding_count: i32,
+        future_clause_snapshots: &[FutureClauseSnapshot],
+    ) -> String {
+        Self::clause_raw_input_preview(
+            raw_input,
+            future_clause_snapshots
+                .last()
+                .map(|snapshot| snapshot.raw_input.as_str()),
+            corresponding_count,
+        )
+    }
+
+    #[inline]
+    fn current_clause_raw_hiragana_preview(
+        raw_hiragana: &str,
+        corresponding_count: i32,
+        future_clause_snapshots: &[FutureClauseSnapshot],
+    ) -> String {
+        Self::clause_raw_preview(
+            raw_hiragana,
+            future_clause_snapshots
+                .last()
+                .map(|snapshot| snapshot.raw_hiragana.as_str()),
+            corresponding_count,
+        )
+    }
+
+    #[inline]
+    fn converted_clause_preview_text(
+        set_type: &SetTextType,
+        raw_input: &str,
+        raw_hiragana: &str,
+    ) -> String {
+        match set_type {
+            SetTextType::Hiragana => raw_hiragana.to_string(),
+            SetTextType::Katakana => to_katakana(raw_hiragana),
+            SetTextType::HalfKatakana => to_half_katakana(raw_hiragana),
+            SetTextType::FullLatin => to_fullwidth(raw_input, true),
+            SetTextType::HalfLatin => to_halfwidth(raw_input),
+        }
+    }
+
+    #[inline]
     fn clause_raw_texts_for_log(
         raw_hiragana: &str,
         corresponding_count: i32,
@@ -3361,15 +3424,24 @@ impl TextServiceFactory {
                     temporary_latin_shift_pending = *is_shift_pending;
                 }
                 ClientAction::SetTextWithType(set_type) => {
-                    let text = match set_type {
-                        SetTextType::Hiragana => raw_hiragana.clone(),
-                        SetTextType::Katakana => to_katakana(&raw_hiragana),
-                        SetTextType::HalfKatakana => to_half_katakana(&raw_hiragana),
-                        SetTextType::FullLatin => to_fullwidth(&raw_input, true),
-                        SetTextType::HalfLatin => to_halfwidth(&raw_input),
-                    };
+                    let clause_raw_input = Self::current_clause_raw_input_preview(
+                        &raw_input,
+                        corresponding_count,
+                        &future_clause_snapshots,
+                    );
+                    let clause_raw_hiragana = Self::current_clause_raw_hiragana_preview(
+                        &raw_hiragana,
+                        corresponding_count,
+                        &future_clause_snapshots,
+                    );
+                    let converted_clause = Self::converted_clause_preview_text(
+                        set_type,
+                        &clause_raw_input,
+                        &clause_raw_hiragana,
+                    );
 
-                    self.set_text(&text, "")?;
+                    preview = Self::merge_preview_with_prefix(&fixed_prefix, &converted_clause);
+                    self.set_text(&preview, &suffix)?;
                 }
             }
         }
@@ -3419,8 +3491,8 @@ mod tests {
         TextServiceFactory,
     };
     use crate::engine::{
-        client_action::ClientAction,
-        user_action::{Navigation, UserAction},
+        client_action::{ClientAction, SetTextType},
+        user_action::{Function, Navigation, UserAction},
     };
     use shared::{get_default_romaji_rows, AppConfig, RomajiRule, WidthMode};
 
@@ -4007,10 +4079,18 @@ mod tests {
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    struct SimCommittedClause {
+        display: String,
+        raw_hiragana: String,
+        corresponding_count: i32,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     struct SimClause {
         units: Vec<SimUnit>,
         selected_candidate: usize,
         pending_remainder: bool,
+        display_override: Option<SetTextType>,
     }
 
     impl SimClause {
@@ -4056,12 +4136,25 @@ mod tests {
             }
         }
 
-        fn selected_text(&self) -> String {
+        fn candidate_selected_text(&self) -> String {
             let candidate_texts = self.candidate_texts();
             candidate_texts
                 .get(self.selected_candidate)
                 .cloned()
                 .unwrap_or_else(|| candidate_texts.first().cloned().unwrap_or_default())
+        }
+
+        fn selected_text(&self) -> String {
+            self.display_override
+                .as_ref()
+                .map(|set_type| {
+                    TextServiceFactory::converted_clause_preview_text(
+                        set_type,
+                        &self.raw_input(),
+                        &self.raw_hiragana(),
+                    )
+                })
+                .unwrap_or_else(|| self.candidate_selected_text())
         }
 
         fn clamp_selection(&mut self) {
@@ -4072,12 +4165,14 @@ mod tests {
 
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     struct SimSpecState {
+        committed_clauses: Vec<SimCommittedClause>,
         clauses: Vec<SimClause>,
         current_index: usize,
     }
 
     #[derive(Clone, Debug)]
     struct ClauseHarness {
+        committed_clauses: Vec<SimCommittedClause>,
         state: CompositionState,
         preview: String,
         suffix: String,
@@ -4102,6 +4197,8 @@ mod tests {
         Right,
         ShiftLeft,
         Space,
+        Enter,
+        SetTextType(SetTextType),
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -4121,6 +4218,7 @@ mod tests {
         candidates: String,
         clause_snapshots: String,
         future_clause_snapshots: String,
+        committed_clauses: String,
         clauses: String,
         clauses_raw: String,
     }
@@ -4158,6 +4256,7 @@ mod tests {
             units,
             selected_candidate: 0,
             pending_remainder: false,
+            display_override: None,
         }
     }
 
@@ -4166,6 +4265,7 @@ mod tests {
             units,
             selected_candidate,
             pending_remainder: false,
+            display_override: None,
         }
     }
 
@@ -4174,11 +4274,13 @@ mod tests {
             units,
             selected_candidate: 0,
             pending_remainder: true,
+            display_override: None,
         }
     }
 
     fn baseline_spec_state() -> SimSpecState {
         SimSpecState {
+            committed_clauses: Vec::new(),
             clauses: vec![
                 clause(vec![unit("い", "i", "い", 0), unit("い", "i", "い", 0)]),
                 clause_with_selection(
@@ -4206,6 +4308,7 @@ mod tests {
 
     fn single_clause_spec_state() -> SimSpecState {
         SimSpecState {
+            committed_clauses: Vec::new(),
             clauses: vec![clause(vec![
                 unit("い", "i", "い", 0),
                 unit("い", "i", "い", 0),
@@ -4219,6 +4322,32 @@ mod tests {
                 unit("し", "si", "し", 3),
                 unit("ろ", "ro", "ろ", 3),
             ])],
+            current_index: 0,
+        }
+    }
+
+    fn fkey_two_clause_spec_state() -> SimSpecState {
+        SimSpecState {
+            committed_clauses: Vec::new(),
+            clauses: vec![
+                clause_with_selection(
+                    vec![
+                        unit("か", "ka", "か", 1),
+                        unit("げ", "ge", "げ", 1),
+                        unit("ん", "n", "ん", 1),
+                    ],
+                    0,
+                ),
+                clause_with_selection(
+                    vec![
+                        unit("と", "to", "と", 2),
+                        unit("う", "u", "う", 2),
+                        unit("い", "i", "い", 2),
+                        unit("つ", "tu", "つ", 2),
+                    ],
+                    0,
+                ),
+            ],
             current_index: 0,
         }
     }
@@ -4262,25 +4391,32 @@ mod tests {
     }
 
     fn spec_display(spec: &SimSpecState) -> String {
-        spec.clauses
+        spec.committed_clauses
             .iter()
-            .map(SimClause::selected_text)
+            .map(|clause| clause.display.clone())
+            .chain(spec.clauses.iter().map(SimClause::selected_text))
             .collect::<Vec<_>>()
             .join(" / ")
     }
 
     fn spec_display_raw(spec: &SimSpecState) -> String {
-        spec.clauses
+        spec.committed_clauses
             .iter()
-            .map(SimClause::raw_hiragana)
+            .map(|clause| clause.raw_hiragana.clone())
+            .chain(spec.clauses.iter().map(SimClause::raw_hiragana))
             .collect::<Vec<_>>()
             .join(" / ")
     }
 
     fn spec_clause_input_lengths(spec: &SimSpecState) -> String {
-        spec.clauses
+        spec.committed_clauses
             .iter()
-            .map(|clause| clause.corresponding_count().to_string())
+            .map(|clause| clause.corresponding_count.to_string())
+            .chain(
+                spec.clauses
+                    .iter()
+                    .map(|clause| clause.corresponding_count().to_string()),
+            )
             .collect::<Vec<_>>()
             .join(" / ")
     }
@@ -4460,6 +4596,7 @@ mod tests {
             + 1;
 
         ClauseHarness {
+            committed_clauses: spec.committed_clauses.clone(),
             state,
             preview,
             suffix,
@@ -4537,6 +4674,7 @@ mod tests {
         third_snapshot.split_group_id = Some(1);
 
         ClauseHarness {
+            committed_clauses: spec.committed_clauses.clone(),
             state,
             preview: "いい加減統一しろ".to_string(),
             suffix: String::new(),
@@ -4563,6 +4701,11 @@ mod tests {
     }
 
     fn harness_visible_clauses(harness: &ClauseHarness) -> String {
+        let mut clauses = harness
+            .committed_clauses
+            .iter()
+            .map(|clause| clause.display.clone())
+            .collect::<Vec<_>>();
         let base = TextServiceFactory::clause_texts_for_log(
             &harness.preview,
             &harness.fixed_prefix,
@@ -4570,12 +4713,15 @@ mod tests {
             &harness.future_clause_snapshots,
         );
         if !harness.future_clause_snapshots.is_empty() || harness.suffix.is_empty() {
-            return base;
+            if !base.is_empty() {
+                clauses.extend(base.split(" / ").map(str::to_string));
+            }
+            return clauses.join(" / ");
         }
 
         if harness.current_clause_is_direct_split_remainder {
             if harness.clause_snapshots.is_empty() {
-                return format!(
+                let current = format!(
                     "{}{}",
                     TextServiceFactory::current_clause_preview(
                         &harness.preview,
@@ -4583,30 +4729,43 @@ mod tests {
                     ),
                     harness.suffix
                 );
+                clauses.push(current);
+                return clauses.join(" / ");
             }
 
             let mut parts: Vec<_> = base.split(" / ").map(str::to_string).collect();
             if let Some(last) = parts.last_mut() {
                 last.push_str(&harness.suffix);
             }
-            return parts.join(" / ");
+            clauses.extend(parts);
+            return clauses.join(" / ");
         }
 
         if base.is_empty() {
-            harness.suffix.clone()
+            clauses.push(harness.suffix.clone());
         } else {
-            format!("{base} / {}", harness.suffix)
+            clauses.extend(base.split(" / ").map(str::to_string));
+            clauses.push(harness.suffix.clone());
         }
+        clauses.join(" / ")
     }
 
     fn harness_clause_input_lengths(harness: &ClauseHarness) -> String {
+        let mut clause_lengths = harness
+            .committed_clauses
+            .iter()
+            .map(|clause| clause.corresponding_count.to_string())
+            .collect::<Vec<_>>();
         let base = TextServiceFactory::clause_input_lengths_for_log(
             harness.corresponding_count,
             &harness.clause_snapshots,
             &harness.future_clause_snapshots,
         );
         if !harness.future_clause_snapshots.is_empty() || harness.suffix.is_empty() {
-            return base;
+            if !base.is_empty() {
+                clause_lengths.extend(base.split(" / ").map(str::to_string));
+            }
+            return clause_lengths.join(" / ");
         }
 
         let raw_input_suffix: String = harness
@@ -4622,7 +4781,9 @@ mod tests {
 
         if harness.current_clause_is_direct_split_remainder {
             if harness.clause_snapshots.is_empty() {
-                return (harness.corresponding_count + trailing_len as i32).to_string();
+                clause_lengths
+                    .push((harness.corresponding_count + trailing_len as i32).to_string());
+                return clause_lengths.join(" / ");
             }
 
             let mut parts: Vec<_> = base.split(" / ").map(str::to_string).collect();
@@ -4630,17 +4791,25 @@ mod tests {
                 let current = last.parse::<i32>().unwrap_or_default();
                 *last = (current + trailing_len as i32).to_string();
             }
-            return parts.join(" / ");
+            clause_lengths.extend(parts);
+            return clause_lengths.join(" / ");
         }
 
         if base.is_empty() {
-            trailing_len.to_string()
+            clause_lengths.push(trailing_len.to_string());
         } else {
-            format!("{base} / {trailing_len}")
+            clause_lengths.extend(base.split(" / ").map(str::to_string));
+            clause_lengths.push(trailing_len.to_string());
         }
+        clause_lengths.join(" / ")
     }
 
     fn harness_raw_clauses(harness: &ClauseHarness) -> String {
+        let mut clauses = harness
+            .committed_clauses
+            .iter()
+            .map(|clause| clause.raw_hiragana.clone())
+            .collect::<Vec<_>>();
         let base = TextServiceFactory::clause_raw_texts_for_log(
             &harness.raw_hiragana,
             harness.corresponding_count,
@@ -4648,7 +4817,10 @@ mod tests {
             &harness.future_clause_snapshots,
         );
         if !harness.future_clause_snapshots.is_empty() || harness.suffix.is_empty() {
-            return base;
+            if !base.is_empty() {
+                clauses.extend(base.split(" / ").map(str::to_string));
+            }
+            return clauses.join(" / ");
         }
 
         let trailing = harness.suffix.clone();
@@ -4659,14 +4831,16 @@ mod tests {
             .to_string();
         if harness.current_clause_is_direct_split_remainder {
             if harness.clause_snapshots.is_empty() {
-                return format!("{current_raw}{trailing}");
+                clauses.push(format!("{current_raw}{trailing}"));
+                return clauses.join(" / ");
             }
 
             let mut parts: Vec<_> = base.split(" / ").map(str::to_string).collect();
             if let Some(last) = parts.last_mut() {
                 *last = format!("{current_raw}{trailing}");
             }
-            return parts.join(" / ");
+            clauses.extend(parts);
+            return clauses.join(" / ");
         }
         let adjusted_base = if harness.clause_snapshots.is_empty() {
             current_raw
@@ -4679,10 +4853,12 @@ mod tests {
         };
 
         if adjusted_base.is_empty() {
-            trailing
+            clauses.push(trailing);
         } else {
-            format!("{adjusted_base} / {trailing}")
+            clauses.extend(adjusted_base.split(" / ").map(str::to_string));
+            clauses.push(trailing);
         }
+        clauses.join(" / ")
     }
 
     fn harness_key(harness: &ClauseHarness) -> HarnessStateKey {
@@ -4713,6 +4889,17 @@ mod tests {
             future_clause_snapshots: TextServiceFactory::debug_future_clause_snapshots(
                 &harness.future_clause_snapshots,
             ),
+            committed_clauses: harness
+                .committed_clauses
+                .iter()
+                .map(|clause| {
+                    format!(
+                        "{}|{}|{}",
+                        clause.display, clause.raw_hiragana, clause.corresponding_count
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ; "),
             clauses: harness_visible_clauses(harness),
             clauses_raw: harness_raw_clauses(harness),
         }
@@ -4738,6 +4925,39 @@ mod tests {
             next_split_group_id: harness.next_split_group_id,
             state: harness.state.clone(),
             ..Composition::default()
+        }
+    }
+
+    fn committed_clause_from_snapshot(
+        snapshot: &super::ClauseSnapshot,
+        next_raw_hiragana: Option<&str>,
+    ) -> SimCommittedClause {
+        SimCommittedClause {
+            display: TextServiceFactory::current_clause_preview(
+                &snapshot.preview,
+                &snapshot.fixed_prefix,
+            ),
+            raw_hiragana: TextServiceFactory::clause_raw_preview(
+                &snapshot.raw_hiragana,
+                next_raw_hiragana,
+                snapshot.corresponding_count,
+            ),
+            corresponding_count: snapshot.corresponding_count,
+        }
+    }
+
+    fn committed_current_clause_from_harness(harness: &ClauseHarness) -> SimCommittedClause {
+        SimCommittedClause {
+            display: TextServiceFactory::current_clause_preview(
+                &harness.preview,
+                &harness.fixed_prefix,
+            ),
+            raw_hiragana: TextServiceFactory::current_clause_raw_hiragana_preview(
+                &harness.raw_hiragana,
+                harness.corresponding_count,
+                &harness.future_clause_snapshots,
+            ),
+            corresponding_count: harness.corresponding_count,
         }
     }
 
@@ -4774,8 +4994,12 @@ mod tests {
         fn sync_current_selection(&mut self, selection_index: i32) {
             if let Some(current) = self.spec.clauses.get_mut(self.spec.current_index) {
                 let max_index = current.candidate_texts().len().saturating_sub(1) as i32;
+                let previous = current.selected_candidate;
                 current.selected_candidate = selection_index.clamp(0, max_index) as usize;
                 current.clamp_selection();
+                if current.selected_candidate != previous {
+                    current.display_override = None;
+                }
             }
         }
 
@@ -4798,6 +5022,7 @@ mod tests {
                 .pop()
                 .expect("split source unit");
             self.spec.clauses[current_index].selected_candidate = 0;
+            self.spec.clauses[current_index].display_override = None;
             self.spec.clauses[current_index].clamp_selection();
 
             if let Some(next_clause) = self.spec.clauses.get_mut(current_index + 1) {
@@ -4879,7 +5104,36 @@ mod tests {
             let max_index = current.candidate_texts().len().saturating_sub(1) as i32;
             let next = (current.selected_candidate as i32 + delta).clamp(0, max_index) as usize;
             current.selected_candidate = next;
+            current.display_override = None;
             current.clamp_selection();
+        }
+
+        fn commit_spec_current_clause(&mut self) {
+            if self.spec.clauses.is_empty() || self.spec.current_index >= self.spec.clauses.len() {
+                return;
+            }
+
+            let committed = self
+                .spec
+                .clauses
+                .drain(..=self.spec.current_index)
+                .collect::<Vec<_>>();
+            self.spec
+                .committed_clauses
+                .extend(committed.into_iter().map(|clause| SimCommittedClause {
+                    display: clause.selected_text(),
+                    raw_hiragana: clause.raw_hiragana(),
+                    corresponding_count: clause.corresponding_count(),
+                }));
+
+            if self.spec.clauses.is_empty() {
+                self.spec.current_index = 0;
+            } else {
+                self.spec.current_index = 0;
+                if let Some(current) = self.spec.clauses.get_mut(0) {
+                    current.pending_remainder = false;
+                }
+            }
         }
 
         fn apply_expected_user_action(&mut self, op: HarnessUserAction) {
@@ -4888,6 +5142,12 @@ mod tests {
                 HarnessUserAction::Right => self.move_spec_right(),
                 HarnessUserAction::ShiftLeft => self.split_spec_left(),
                 HarnessUserAction::Space => {}
+                HarnessUserAction::Enter => self.commit_spec_current_clause(),
+                HarnessUserAction::SetTextType(set_type) => {
+                    if let Some(current) = self.spec.clauses.get_mut(self.spec.current_index) {
+                        current.display_override = Some(set_type);
+                    }
+                }
             }
         }
     }
@@ -4961,6 +5221,12 @@ mod tests {
             HarnessUserAction::Right => "Right",
             HarnessUserAction::ShiftLeft => "ShiftLeft",
             HarnessUserAction::Space => "Space",
+            HarnessUserAction::Enter => "Enter",
+            HarnessUserAction::SetTextType(SetTextType::Hiragana) => "F6",
+            HarnessUserAction::SetTextType(SetTextType::Katakana) => "F7",
+            HarnessUserAction::SetTextType(SetTextType::HalfKatakana) => "F8",
+            HarnessUserAction::SetTextType(SetTextType::FullLatin) => "F9",
+            HarnessUserAction::SetTextType(SetTextType::HalfLatin) => "F10",
         }
     }
 
@@ -4978,6 +5244,22 @@ mod tests {
             HarnessUserAction::Right => UserAction::Navigation(Navigation::Right),
             HarnessUserAction::ShiftLeft => UserAction::AdjustClauseBoundary(-1),
             HarnessUserAction::Space => UserAction::Space,
+            HarnessUserAction::Enter => UserAction::Enter,
+            HarnessUserAction::SetTextType(SetTextType::Hiragana) => {
+                UserAction::Function(Function::Six)
+            }
+            HarnessUserAction::SetTextType(SetTextType::Katakana) => {
+                UserAction::Function(Function::Seven)
+            }
+            HarnessUserAction::SetTextType(SetTextType::HalfKatakana) => {
+                UserAction::Function(Function::Eight)
+            }
+            HarnessUserAction::SetTextType(SetTextType::FullLatin) => {
+                UserAction::Function(Function::Nine)
+            }
+            HarnessUserAction::SetTextType(SetTextType::HalfLatin) => {
+                UserAction::Function(Function::Ten)
+            }
         }
     }
 
@@ -5028,7 +5310,7 @@ mod tests {
         );
         assert_eq!(
             harness_raw_clauses(harness).replace(" / ", ""),
-            spec_join_raw_hiragana(&spec.clauses),
+            spec_display_raw(spec).replace(" / ", ""),
             "history: {}\nharness clauses: {}\nexpected clauses: {}\nharness raw clauses: {}\nexpected raw clauses: {}\nharness lengths: {}\nexpected lengths: {}\nclause_snapshots: {}\nfuture_clause_snapshots: {}\npreview={} fixed_prefix={} suffix={} raw_input={} raw_hiragana={} corresponding_count={} selection_index={}",
             history_string(history),
             harness_visible_clauses(harness),
@@ -5047,44 +5329,46 @@ mod tests {
             harness.corresponding_count,
             harness.selection_index,
         );
-        assert_eq!(
-            TextServiceFactory::current_clause_preview(&harness.preview, &harness.fixed_prefix),
-            spec.clauses[spec.current_index].selected_text(),
-            "history: {}\nharness clauses: {}\nexpected clauses: {}\nharness lengths: {}\nexpected lengths: {}\nclause_snapshots: {}\nfuture_clause_snapshots: {}\npreview={} fixed_prefix={} suffix={} raw_input={} raw_hiragana={} corresponding_count={} selection_index={}",
-            history_string(history),
-            harness_visible_clauses(harness),
-            spec_display(spec),
-            harness_clause_input_lengths(harness),
-            spec_clause_input_lengths(spec),
-            TextServiceFactory::debug_clause_snapshots(&harness.clause_snapshots),
-            TextServiceFactory::debug_future_clause_snapshots(&harness.future_clause_snapshots),
-            harness.preview,
-            harness.fixed_prefix,
-            harness.suffix,
-            harness.raw_input,
-            harness.raw_hiragana,
-            harness.corresponding_count,
-            harness.selection_index,
-        );
-        assert_eq!(
-            harness.selection_index,
-            spec.clauses[spec.current_index].selected_candidate as i32,
-            "history: {}\nharness clauses: {}\nexpected clauses: {}\nharness lengths: {}\nexpected lengths: {}\nclause_snapshots: {}\nfuture_clause_snapshots: {}\npreview={} fixed_prefix={} suffix={} raw_input={} raw_hiragana={} corresponding_count={} selection_index={}",
-            history_string(history),
-            harness_visible_clauses(harness),
-            spec_display(spec),
-            harness_clause_input_lengths(harness),
-            spec_clause_input_lengths(spec),
-            TextServiceFactory::debug_clause_snapshots(&harness.clause_snapshots),
-            TextServiceFactory::debug_future_clause_snapshots(&harness.future_clause_snapshots),
-            harness.preview,
-            harness.fixed_prefix,
-            harness.suffix,
-            harness.raw_input,
-            harness.raw_hiragana,
-            harness.corresponding_count,
-            harness.selection_index,
-        );
+        if let Some(current_clause) = spec.clauses.get(spec.current_index) {
+            assert_eq!(
+                TextServiceFactory::current_clause_preview(&harness.preview, &harness.fixed_prefix),
+                current_clause.selected_text(),
+                "history: {}\nharness clauses: {}\nexpected clauses: {}\nharness lengths: {}\nexpected lengths: {}\nclause_snapshots: {}\nfuture_clause_snapshots: {}\npreview={} fixed_prefix={} suffix={} raw_input={} raw_hiragana={} corresponding_count={} selection_index={}",
+                history_string(history),
+                harness_visible_clauses(harness),
+                spec_display(spec),
+                harness_clause_input_lengths(harness),
+                spec_clause_input_lengths(spec),
+                TextServiceFactory::debug_clause_snapshots(&harness.clause_snapshots),
+                TextServiceFactory::debug_future_clause_snapshots(&harness.future_clause_snapshots),
+                harness.preview,
+                harness.fixed_prefix,
+                harness.suffix,
+                harness.raw_input,
+                harness.raw_hiragana,
+                harness.corresponding_count,
+                harness.selection_index,
+            );
+            assert_eq!(
+                harness.selection_index,
+                current_clause.selected_candidate as i32,
+                "history: {}\nharness clauses: {}\nexpected clauses: {}\nharness lengths: {}\nexpected lengths: {}\nclause_snapshots: {}\nfuture_clause_snapshots: {}\npreview={} fixed_prefix={} suffix={} raw_input={} raw_hiragana={} corresponding_count={} selection_index={}",
+                history_string(history),
+                harness_visible_clauses(harness),
+                spec_display(spec),
+                harness_clause_input_lengths(harness),
+                spec_clause_input_lengths(spec),
+                TextServiceFactory::debug_clause_snapshots(&harness.clause_snapshots),
+                TextServiceFactory::debug_future_clause_snapshots(&harness.future_clause_snapshots),
+                harness.preview,
+                harness.fixed_prefix,
+                harness.suffix,
+                harness.raw_input,
+                harness.raw_hiragana,
+                harness.corresponding_count,
+                harness.selection_index,
+            );
+        }
     }
 
     fn apply_user_action(
@@ -5273,7 +5557,128 @@ mod tests {
                     harness.state = CompositionState::Composing;
                 }
                 ClientAction::EndComposition => {
+                    let snapshot_count = harness.clause_snapshots.len();
+                    for index in 0..snapshot_count {
+                        let next_raw_hiragana = harness
+                            .clause_snapshots
+                            .get(index + 1)
+                            .map(|next| next.raw_hiragana.as_str())
+                            .or_else(|| {
+                                (!harness.raw_hiragana.is_empty())
+                                    .then_some(harness.raw_hiragana.as_str())
+                            });
+                        harness
+                            .committed_clauses
+                            .push(committed_clause_from_snapshot(
+                                &harness.clause_snapshots[index],
+                                next_raw_hiragana,
+                            ));
+                    }
+                    if !harness.preview.is_empty() {
+                        harness
+                            .committed_clauses
+                            .push(committed_current_clause_from_harness(harness));
+                    }
+                    harness.preview.clear();
+                    harness.suffix.clear();
+                    harness.raw_input.clear();
+                    harness.raw_hiragana.clear();
+                    harness.fixed_prefix.clear();
+                    harness.corresponding_count = 0;
+                    harness.selection_index = 0;
+                    harness.candidates = Candidates::default();
+                    harness.clause_snapshots.clear();
+                    harness.future_clause_snapshots.clear();
+                    harness.current_clause_is_split_derived = false;
+                    harness.current_clause_is_direct_split_remainder = false;
+                    harness.current_clause_has_split_left_neighbor = false;
+                    harness.current_clause_split_group_id = None;
                     harness.state = CompositionState::None;
+                }
+                ClientAction::ShrinkText(text) => {
+                    assert!(
+                        text.is_empty(),
+                        "unsupported non-empty ShrinkText in harness: {text:?}, history: {}",
+                        history_string(history)
+                    );
+                    backend.sync_current_selection(harness.selection_index);
+
+                    let snapshot_count = harness.clause_snapshots.len();
+                    for index in 0..snapshot_count {
+                        let next_raw_hiragana = harness
+                            .clause_snapshots
+                            .get(index + 1)
+                            .map(|next| next.raw_hiragana.as_str())
+                            .or_else(|| {
+                                (!harness.raw_hiragana.is_empty())
+                                    .then_some(harness.raw_hiragana.as_str())
+                            });
+                        harness
+                            .committed_clauses
+                            .push(committed_clause_from_snapshot(
+                                &harness.clause_snapshots[index],
+                                next_raw_hiragana,
+                            ));
+                    }
+                    harness
+                        .committed_clauses
+                        .push(committed_current_clause_from_harness(harness));
+
+                    harness.fixed_prefix.clear();
+                    harness.clause_snapshots.clear();
+                    harness.future_clause_snapshots.clear();
+                    harness.current_clause_is_split_derived = false;
+                    harness.current_clause_is_direct_split_remainder = false;
+                    harness.current_clause_has_split_left_neighbor = false;
+                    harness.current_clause_split_group_id = None;
+                    harness.raw_input = harness
+                        .raw_input
+                        .chars()
+                        .skip(harness.corresponding_count.max(0) as usize)
+                        .collect();
+
+                    harness.candidates = backend
+                        .shrink_text(harness.corresponding_count)
+                        .expect("harness shrink_text");
+                    harness.selection_index = 0;
+
+                    if let Some(selected) = TextServiceFactory::select_candidate(
+                        &harness.candidates,
+                        harness.selection_index,
+                    ) {
+                        harness.selection_index = selected.index;
+                        harness.corresponding_count = selected.corresponding_count;
+                        harness.preview = selected.text.clone();
+                        harness.suffix = selected.sub_text.clone();
+                        harness.raw_hiragana = selected.hiragana;
+                    } else {
+                        harness.preview.clear();
+                        harness.suffix.clear();
+                        harness.raw_hiragana.clear();
+                        harness.corresponding_count = 0;
+                    }
+                }
+                ClientAction::SetTextWithType(set_type) => {
+                    let clause_raw_input = TextServiceFactory::current_clause_raw_input_preview(
+                        &harness.raw_input,
+                        harness.corresponding_count,
+                        &harness.future_clause_snapshots,
+                    );
+                    let clause_raw_hiragana =
+                        TextServiceFactory::current_clause_raw_hiragana_preview(
+                            &harness.raw_hiragana,
+                            harness.corresponding_count,
+                            &harness.future_clause_snapshots,
+                        );
+                    let converted_clause = TextServiceFactory::converted_clause_preview_text(
+                        &set_type,
+                        &clause_raw_input,
+                        &clause_raw_hiragana,
+                    );
+                    harness.preview = TextServiceFactory::merge_preview_with_prefix(
+                        &harness.fixed_prefix,
+                        &converted_clause,
+                    );
                 }
                 unsupported => panic!(
                     "unsupported client action in harness: {unsupported:?}, history: {}",
@@ -5298,6 +5703,14 @@ mod tests {
         let harness =
             build_logged_baseline_harness(&baseline_spec_state(), CompositionState::Composing);
         let backend = ScenarioBackend::from_baseline_fixture();
+        let history = Vec::new();
+        (harness, backend, history)
+    }
+
+    fn run_to_fkey_baseline() -> (ClauseHarness, ScenarioBackend, Vec<HarnessUserAction>) {
+        let spec = fkey_two_clause_spec_state();
+        let harness = build_harness_from_spec(&spec, CompositionState::Composing);
+        let backend = ScenarioBackend::new(spec);
         let history = Vec::new();
         (harness, backend, history)
     }
@@ -5327,6 +5740,31 @@ mod tests {
         (harness, backend, history)
     }
 
+    fn run_from_fkey_baseline(
+        extra_actions: &[HarnessUserAction],
+    ) -> (ClauseHarness, ScenarioBackend, Vec<HarnessUserAction>) {
+        let (mut harness, mut backend, mut history) = run_to_fkey_baseline();
+        assert_harness_matches_spec(&harness, &backend.spec, &history);
+
+        for op in extra_actions {
+            history.push(*op);
+            apply_user_action(&mut harness, &mut backend, *op, &history);
+            assert_harness_matches_spec(&harness, &backend.spec, &history);
+        }
+
+        (harness, backend, history)
+    }
+
+    fn fkey_cases() -> [(SetTextType, &'static str); 5] {
+        [
+            (SetTextType::Hiragana, "かげん"),
+            (SetTextType::Katakana, "カゲン"),
+            (SetTextType::HalfKatakana, "ｶｹﾞﾝ"),
+            (SetTextType::FullLatin, "ｋａｇｅｎ"),
+            (SetTextType::HalfLatin, "kagen"),
+        ]
+    }
+
     fn is_available(harness: &ClauseHarness, spec: &SimSpecState, op: HarnessUserAction) -> bool {
         match op {
             HarnessUserAction::Left => spec.current_index > 0,
@@ -5338,6 +5776,18 @@ mod tests {
                     CompositionState::Composing | CompositionState::Previewing
                 ) && harness.selection_index
                     < harness.candidates.texts.len().saturating_sub(1) as i32
+            }
+            HarnessUserAction::Enter => {
+                matches!(
+                    harness.state,
+                    CompositionState::Composing | CompositionState::Previewing
+                ) && !spec.clauses.is_empty()
+            }
+            HarnessUserAction::SetTextType(_) => {
+                matches!(
+                    harness.state,
+                    CompositionState::Composing | CompositionState::Previewing
+                ) && !spec.clauses.is_empty()
             }
         }
     }
@@ -5620,6 +6070,81 @@ mod tests {
             harness_raw_clauses(&harness),
             TextServiceFactory::debug_future_clause_snapshots(&harness.future_clause_snapshots),
         );
+    }
+
+    #[test]
+    fn clause_integration_fkeys_change_only_current_clause_display() {
+        for (set_type, converted_clause) in fkey_cases() {
+            let extra = vec![HarnessUserAction::SetTextType(set_type)];
+            let (harness, _, history) = run_from_fkey_baseline(&extra);
+
+            assert_eq!(
+                harness_visible_clauses(&harness),
+                format!("{converted_clause} / 統一"),
+                "history: {}\nraw clauses: {}\nfuture_clause_snapshots: {}",
+                history_string(&history),
+                harness_raw_clauses(&harness),
+                TextServiceFactory::debug_future_clause_snapshots(&harness.future_clause_snapshots),
+            );
+            assert_eq!(harness.state, CompositionState::Previewing);
+            assert_eq!(harness_raw_clauses(&harness), "かげん / とういつ");
+        }
+    }
+
+    #[test]
+    fn clause_integration_fkeys_preserve_display_when_moving_right() {
+        for (set_type, converted_clause) in fkey_cases() {
+            let extra = vec![
+                HarnessUserAction::SetTextType(set_type),
+                HarnessUserAction::Right,
+            ];
+            let (harness, _, history) = run_from_fkey_baseline(&extra);
+
+            assert_eq!(
+                harness_visible_clauses(&harness),
+                format!("{converted_clause} / 統一"),
+                "history: {}\nraw clauses: {}\nclause_snapshots: {}\nfuture_clause_snapshots: {}",
+                history_string(&history),
+                harness_raw_clauses(&harness),
+                TextServiceFactory::debug_clause_snapshots(&harness.clause_snapshots),
+                TextServiceFactory::debug_future_clause_snapshots(&harness.future_clause_snapshots),
+            );
+            assert_eq!(harness_raw_clauses(&harness), "かげん / とういつ");
+            assert_eq!(harness_clause_input_lengths(&harness), "5 / 6");
+            assert_eq!(
+                TextServiceFactory::current_clause_preview(&harness.preview, &harness.fixed_prefix),
+                "統一"
+            );
+        }
+    }
+
+    #[test]
+    fn clause_integration_fkeys_preserve_display_when_committing_current_clause() {
+        for (set_type, converted_clause) in fkey_cases() {
+            let extra = vec![
+                HarnessUserAction::SetTextType(set_type),
+                HarnessUserAction::Enter,
+            ];
+            let (harness, _, history) = run_from_fkey_baseline(&extra);
+
+            assert_eq!(
+                harness_visible_clauses(&harness),
+                format!("{converted_clause} / 統一"),
+                "history: {}\nraw clauses: {}\nclause_snapshots: {}\nfuture_clause_snapshots: {}",
+                history_string(&history),
+                harness_raw_clauses(&harness),
+                TextServiceFactory::debug_clause_snapshots(&harness.clause_snapshots),
+                TextServiceFactory::debug_future_clause_snapshots(&harness.future_clause_snapshots),
+            );
+            assert_eq!(harness_raw_clauses(&harness), "かげん / とういつ");
+            assert_eq!(harness_clause_input_lengths(&harness), "5 / 6");
+            assert_eq!(harness.committed_clauses.len(), 1);
+            assert_eq!(
+                TextServiceFactory::current_clause_preview(&harness.preview, &harness.fixed_prefix),
+                "統一"
+            );
+            assert_eq!(harness.state, CompositionState::Composing);
+        }
     }
 
     #[test]

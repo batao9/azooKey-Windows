@@ -32,7 +32,7 @@ pub enum SetSelectionType {
     Number(i32),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SetTextType {
     Hiragana,     // F6
     Katakana,     // F7
