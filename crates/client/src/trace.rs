@@ -10,7 +10,6 @@ use crate::globals::DllModule;
 use crate::tracing_chrome::{ChromeLayerBuilder, EventOrSpan};
 
 const LOG_FOLDER: &str = "D:/azookey-windows/logs";
-
 pub struct StringVisitor<'a> {
     string: &'a mut String,
 }
@@ -24,7 +23,10 @@ impl<'a> Visit for StringVisitor<'a> {
     }
 }
 
+pub fn diagnostic_log(_message: impl AsRef<str>) {}
+
 pub fn setup_logger() -> anyhow::Result<()> {
+    diagnostic_log("setup_logger called");
     #[cfg(not(debug_assertions))]
     {
         return Ok(());
