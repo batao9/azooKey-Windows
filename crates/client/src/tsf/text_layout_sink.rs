@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use windows::{
     core::Interface as _,
     Win32::UI::TextServices::{
@@ -24,16 +22,10 @@ impl ITfTextLayoutSink_Impl for TextServiceFactory_Impl {
         _lcode: TfLayoutCode,
         _pview: Option<&ITfContextView>,
     ) -> Result<()> {
-        let now = Instant::now();
         let should_skip = match self.borrow_mut() {
-            Ok(mut text_service) => match text_service.suppress_layout_change_until {
-                Some(until) if now <= until => true,
-                Some(_) => {
-                    text_service.suppress_layout_change_until = None;
-                    false
-                }
-                None => false,
-            },
+            Ok(mut text_service) => text_service
+                .update_pos_state
+                .should_skip_layout_change(std::time::Instant::now()),
             Err(error) => {
                 tracing::warn!("Skip OnLayoutChange due to borrow conflict: {error:?}");
                 true

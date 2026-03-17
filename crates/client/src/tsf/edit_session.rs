@@ -12,12 +12,7 @@ use windows::{
     },
 };
 
-use std::{
-    cell::Cell,
-    mem::ManuallyDrop,
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{cell::Cell, mem::ManuallyDrop, rc::Rc, time::Instant};
 
 use anyhow::{Context, Result};
 
@@ -298,16 +293,13 @@ impl TextServiceFactory {
                 }
             };
 
-            if text_service.is_updating_pos {
+            if !text_service
+                .update_pos_state
+                .try_begin_update(Instant::now())
+            {
                 tracing::debug!("Skip re-entrant update_pos call");
                 return Ok(());
             }
-
-            text_service.is_updating_pos = true;
-            // GetTextExt can trigger a layout-change callback in some apps (e.g. Mery).
-            // Suppress the immediate callback to avoid feedback loops.
-            text_service.suppress_layout_change_until =
-                Some(Instant::now() + Duration::from_millis(200));
         }
 
         let result: Result<()> = (|| {
@@ -358,7 +350,7 @@ impl TextServiceFactory {
 
         match self.borrow_mut() {
             Ok(mut text_service) => {
-                text_service.is_updating_pos = false;
+                text_service.update_pos_state.finish_update(Instant::now());
             }
             Err(error) => {
                 tracing::warn!("Failed to reset update_pos guard: {error:?}");
