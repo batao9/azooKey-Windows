@@ -295,6 +295,7 @@ fn candidates_owned(
         sub_texts,
         hiragana,
         corresponding_count,
+        clauses: Vec::new(),
     }
 }
 
@@ -860,6 +861,21 @@ fn committed_clause_from_snapshot(
     }
 }
 
+fn committed_clause_from_future_snapshot(
+    snapshot: &FutureClauseSnapshot,
+    next_raw_hiragana: Option<&str>,
+) -> SimCommittedClause {
+    SimCommittedClause {
+        display: snapshot.clause_preview.clone(),
+        raw_hiragana: TextServiceFactory::clause_raw_preview(
+            &snapshot.raw_hiragana,
+            next_raw_hiragana,
+            snapshot.corresponding_count,
+        ),
+        corresponding_count: snapshot.corresponding_count,
+    }
+}
+
 fn committed_current_clause_from_harness(harness: &ClauseHarness) -> SimCommittedClause {
     SimCommittedClause {
         display: TextServiceFactory::current_clause_preview(
@@ -1021,16 +1037,12 @@ impl ScenarioBackend {
         current.clamp_selection();
     }
 
-    fn commit_spec_current_clause(&mut self) {
+    fn commit_spec_all_clauses(&mut self) {
         if self.spec.clauses.is_empty() || self.spec.current_index >= self.spec.clauses.len() {
             return;
         }
 
-        let committed = self
-            .spec
-            .clauses
-            .drain(..=self.spec.current_index)
-            .collect::<Vec<_>>();
+        let committed = self.spec.clauses.drain(..).collect::<Vec<_>>();
         self.spec
             .committed_clauses
             .extend(committed.into_iter().map(|clause| SimCommittedClause {
@@ -1055,7 +1067,7 @@ impl ScenarioBackend {
             HarnessUserAction::Right => self.move_spec_right(),
             HarnessUserAction::ShiftLeft => self.split_spec_left(),
             HarnessUserAction::Space => {}
-            HarnessUserAction::Enter => self.commit_spec_current_clause(),
+            HarnessUserAction::Enter => self.commit_spec_all_clauses(),
             HarnessUserAction::SetTextType(set_type) => {
                 if let Some(current) = self.spec.clauses.get_mut(self.spec.current_index) {
                     current.display_override = Some(set_type);
@@ -1488,6 +1500,22 @@ fn apply_user_action(
                     harness
                         .committed_clauses
                         .push(committed_current_clause_from_harness(harness));
+                }
+                let ordered_future = harness
+                    .future_clause_snapshots
+                    .iter()
+                    .rev()
+                    .collect::<Vec<_>>();
+                for (index, snapshot) in ordered_future.iter().enumerate() {
+                    let next_raw_hiragana = ordered_future
+                        .get(index + 1)
+                        .map(|next| next.raw_hiragana.as_str());
+                    harness
+                        .committed_clauses
+                        .push(committed_clause_from_future_snapshot(
+                            snapshot,
+                            next_raw_hiragana,
+                        ));
                 }
                 harness.preview.clear();
                 harness.suffix.clear();

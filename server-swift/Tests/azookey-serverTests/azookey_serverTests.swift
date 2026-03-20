@@ -179,6 +179,75 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
     #expect(resolved.remainingConvertTarget == "と")
 }
 
+@Test func clausePayloadsPreserveRomanInputCountsPerClause() async throws {
+    let clauses = await MainActor.run {
+        var composingText = ComposingText()
+        composingText.insertAtCursorPosition("katoujunnichi", inputStyle: .roman2kana)
+        let candidate = Candidate(
+            text: "加藤純一",
+            value: 0,
+            composingCount: .surfaceCount(7),
+            lastMid: 0,
+            data: [
+                DicdataElement(word: "加藤", ruby: "かとう", cid: 1, mid: 0, value: 0),
+                DicdataElement(word: "純一", ruby: "じゅんいち", cid: 1, mid: 0, value: 0),
+            ]
+        )
+        return debugClausePayloads(
+            candidate: candidate,
+            originalComposingText: composingText
+        )
+    }
+
+    #expect(clauses.count == 2)
+    #expect(clauses[0].text == "加藤")
+    #expect(clauses[0].rawHiragana == "かとう")
+    #expect(clauses[0].correspondingCount == 5)
+    #expect(clauses[1].text == "純一")
+    #expect(clauses[1].rawHiragana == "じゅんいち")
+    #expect(clauses[1].correspondingCount == 7)
+}
+
+@Test func clausePayloadsKeepMultipleBootstrapClauses() async throws {
+    let clauses = await MainActor.run {
+        var composingText = ComposingText()
+        composingText.insertAtCursorPosition("aaabbbcccdddeee", inputStyle: .direct)
+        let candidate = Candidate(
+            text: "文節モード見選択時の左右キー操作を初回だけ自動で設定しそのまま分節移動できるようにしました",
+            value: 0,
+            composingCount: .surfaceCount(15),
+            lastMid: 0,
+            data: [
+                DicdataElement(word: "文節", ruby: "aaa", cid: 1, mid: 0, value: 0),
+                DicdataElement(word: "モード", ruby: "bbb", cid: 1, mid: 0, value: 0),
+                DicdataElement(word: "見選択時の", ruby: "ccc", cid: 1, mid: 0, value: 0),
+                DicdataElement(word: "左右キー操作を", ruby: "ddd", cid: 1, mid: 0, value: 0),
+                DicdataElement(
+                    word: "初回だけ自動で設定しそのまま分節移動できるようにしました",
+                    ruby: "eee",
+                    cid: 1,
+                    mid: 0,
+                    value: 0
+                ),
+            ]
+        )
+        return debugClausePayloads(
+            candidate: candidate,
+            originalComposingText: composingText
+        )
+    }
+
+    #expect(clauses.map(\.text) == [
+        "文節",
+        "モード",
+        "見選択時の",
+        "左右キー操作を",
+        "初回だけ自動で設定しそのまま分節移動できるようにしました",
+    ])
+    #expect(clauses.map(\.rawHiragana) == ["aaa", "bbb", "ccc", "ddd", "eee"])
+    #expect(clauses.map(\.correspondingCount) == [3, 3, 3, 3, 3])
+}
+
 @Test func trailingNPreviewFinalizesRoman2KanaOnlyInPreview() async throws {
     let result = await MainActor.run {
         var source = ComposingText()

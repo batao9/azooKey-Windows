@@ -5,8 +5,8 @@ use windows::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass, HIG
 
 use shared::proto::azookey_service_server::{AzookeyService, AzookeyServiceServer};
 use shared::proto::{
-    AppendTextRequest, AppendTextResponse, ClearTextRequest, ClearTextResponse, ComposingText,
-    MoveCursorRequest, MoveCursorResponse, RemoveTextRequest, RemoveTextResponse,
+    AppendTextRequest, AppendTextResponse, Clause, ClearTextRequest, ClearTextResponse,
+    ComposingText, MoveCursorRequest, MoveCursorResponse, RemoveTextRequest, RemoveTextResponse,
     ShrinkTextRequest, ShrinkTextResponse, Suggestion,
 };
 
@@ -106,6 +106,14 @@ struct FFICandidate {
     corresponding_count: c_int,
 }
 
+#[derive(Debug, Clone)]
+#[repr(C)]
+struct FFIClause {
+    text: *mut c_char,
+    raw_hiragana: *mut c_char,
+    corresponding_count: c_int,
+}
+
 unsafe extern "C" {
     fn Initialize(path: *const c_char, use_zenzai: bool);
     fn SetContext(context: *const c_char);
@@ -119,6 +127,7 @@ unsafe extern "C" {
     fn HasActiveComposition() -> bool;
     fn GetComposedText(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
     fn GetComposedTextForCursorPrefix(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
+    fn GetCurrentClauses(lengthPtr: *mut c_int) -> *mut *mut FFIClause;
     fn LoadConfig();
 }
 
@@ -438,6 +447,57 @@ fn get_composed_text(use_cursor_prefix: bool) -> Result<Vec<Suggestion>, String>
     }
 }
 
+fn get_current_clauses() -> Result<Vec<Clause>, String> {
+    unsafe {
+        let mut length: c_int = 0;
+        let result = GetCurrentClauses(&mut length);
+        let call_name = "GetCurrentClauses";
+        if length < 0 {
+            return Err(format!("[{call_name}] invalid negative length: {length}"));
+        }
+
+        let length = length as usize;
+        if length > 0 && result.is_null() {
+            return Err(format!(
+                "[{call_name}] null clause list pointer (length={length})"
+            ));
+        }
+
+        let mut clauses = Vec::with_capacity(length);
+        for index in 0..length {
+            let clause_ptr = *result.add(index);
+            if clause_ptr.is_null() {
+                log_event(
+                    ServerLogLevel::Warn,
+                    &format!("[{call_name}] clause[{index}] is null and skipped"),
+                );
+                continue;
+            }
+
+            let clause = (*clause_ptr).clone();
+            if clause.text.is_null() || clause.raw_hiragana.is_null() {
+                log_event(
+                    ServerLogLevel::Warn,
+                    &format!(
+                        "[{call_name}] clause[{index}] has null text/raw_hiragana pointer and was skipped"
+                    ),
+                );
+                continue;
+            }
+
+            clauses.push(Clause {
+                text: CStr::from_ptr(clause.text).to_string_lossy().into_owned(),
+                raw_hiragana: CStr::from_ptr(clause.raw_hiragana)
+                    .to_string_lossy()
+                    .into_owned(),
+                corresponding_count: clause.corresponding_count,
+            });
+        }
+
+        Ok(clauses)
+    }
+}
+
 fn shrink_text(offset: i8) -> Result<RawComposingText, String> {
     unsafe {
         let offset = c_int::from(offset);
@@ -481,6 +541,8 @@ impl AzookeyService for MyAzookeyService {
         );
         let suggestions =
             get_composed_text(false).map_err(|error| status_from_error("append_text", error))?;
+        let clauses =
+            get_current_clauses().map_err(|error| status_from_error("append_text", error))?;
         let t2 = now_timestamp_millis();
         log_event_lazy!(
             ServerLogLevel::Info,
@@ -502,6 +564,7 @@ impl AzookeyService for MyAzookeyService {
             composing_text: Some(ComposingText {
                 hiragana: composing_text.text,
                 suggestions,
+                clauses,
             }),
         }))
     }
@@ -525,6 +588,8 @@ impl AzookeyService for MyAzookeyService {
         );
         let suggestions =
             get_composed_text(false).map_err(|error| status_from_error("remove_text", error))?;
+        let clauses =
+            get_current_clauses().map_err(|error| status_from_error("remove_text", error))?;
         let t2 = now_timestamp_millis();
         log_event_lazy!(
             ServerLogLevel::Info,
@@ -546,6 +611,7 @@ impl AzookeyService for MyAzookeyService {
             composing_text: Some(ComposingText {
                 hiragana: composing_text.text,
                 suggestions,
+                clauses,
             }),
         }))
     }
@@ -575,6 +641,11 @@ impl AzookeyService for MyAzookeyService {
         );
         let suggestions = get_composed_text(use_cursor_prefix)
             .map_err(|error| status_from_error("move_cursor", error))?;
+        let clauses = if use_cursor_prefix {
+            Vec::new()
+        } else {
+            get_current_clauses().map_err(|error| status_from_error("move_cursor", error))?
+        };
         let t2 = now_timestamp_millis();
         log_event_lazy!(
             ServerLogLevel::Info,
@@ -596,6 +667,7 @@ impl AzookeyService for MyAzookeyService {
             composing_text: Some(ComposingText {
                 hiragana: composing_text.text,
                 suggestions,
+                clauses,
             }),
         }))
     }
@@ -644,6 +716,8 @@ impl AzookeyService for MyAzookeyService {
         );
         let suggestions =
             get_composed_text(false).map_err(|error| status_from_error("shrink_text", error))?;
+        let clauses =
+            get_current_clauses().map_err(|error| status_from_error("shrink_text", error))?;
         let t2 = now_timestamp_millis();
         log_event_lazy!(
             ServerLogLevel::Info,
@@ -664,6 +738,7 @@ impl AzookeyService for MyAzookeyService {
             composing_text: Some(ComposingText {
                 hiragana: composing_text.text,
                 suggestions,
+                clauses,
             }),
         }))
     }

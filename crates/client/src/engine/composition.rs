@@ -9,7 +9,7 @@ use super::{
     client_action::{ClientAction, SetSelectionType, SetTextType},
     full_width::{convert_kana_symbol, to_fullwidth, to_halfwidth},
     input_mode::InputMode,
-    ipc_service::{Candidates, IPCService},
+    ipc_service::{Candidates, ClauseHint, IPCService},
     state::IMEState,
     text_util::{to_half_katakana, to_katakana},
     user_action::{Function, Navigation},
@@ -689,6 +689,7 @@ impl TextServiceFactory {
             sub_texts: vec![suffix.to_string()],
             hiragana: raw_hiragana.to_string(),
             corresponding_count: vec![corresponding_count],
+            clauses: Vec::new(),
         };
         FutureClauseSnapshot {
             clause_preview: clause_preview.to_string(),
@@ -706,6 +707,109 @@ impl TextServiceFactory {
             selected_sub_text: suffix.to_string(),
             candidates,
         }
+    }
+
+    #[inline]
+    fn clause_bootstrap_hints(state: &ClauseActionStateMut<'_>) -> Option<Vec<ClauseHint>> {
+        if *state.selection_index != 0 || state.candidates.clauses.len() < 2 {
+            return None;
+        }
+
+        let total_input_count = state.raw_input.chars().count() as i32;
+        let hinted_input_count: i32 = state
+            .candidates
+            .clauses
+            .iter()
+            .map(|clause| clause.corresponding_count.max(0))
+            .sum();
+        if hinted_input_count != total_input_count {
+            return None;
+        }
+
+        let hinted_raw_hiragana =
+            state
+                .candidates
+                .clauses
+                .iter()
+                .fold(String::new(), |mut acc, clause| {
+                    acc.push_str(&clause.raw_hiragana);
+                    acc
+                });
+        if hinted_raw_hiragana != state.raw_hiragana.as_str() {
+            return None;
+        }
+
+        Some(state.candidates.clauses.clone())
+    }
+
+    #[inline]
+    fn raw_input_suffix_from_count(raw_input: &str, consumed_count: i32) -> String {
+        raw_input
+            .chars()
+            .skip(consumed_count.max(0) as usize)
+            .collect()
+    }
+
+    #[inline]
+    fn build_future_clause_snapshots_from_hints(
+        raw_input: &str,
+        clause_hints: &[ClauseHint],
+        split_group_id: Option<u64>,
+    ) -> Vec<FutureClauseSnapshot> {
+        let clause_count = clause_hints.len();
+        if clause_count <= 1 {
+            return Vec::new();
+        }
+
+        let mut display_suffixes = vec![String::new(); clause_count];
+        let mut raw_hiragana_suffixes = vec![String::new(); clause_count];
+        let mut trailing_display = String::new();
+        let mut trailing_raw_hiragana = String::new();
+        for index in (0..clause_count).rev() {
+            display_suffixes[index] = trailing_display.clone();
+            trailing_display = format!("{}{}", clause_hints[index].text, trailing_display);
+            trailing_raw_hiragana = format!(
+                "{}{}",
+                clause_hints[index].raw_hiragana, trailing_raw_hiragana
+            );
+            raw_hiragana_suffixes[index] = trailing_raw_hiragana.clone();
+        }
+
+        let mut consumed_input_count = 0;
+        let mut raw_input_suffixes = Vec::with_capacity(clause_count);
+        for clause_hint in clause_hints {
+            raw_input_suffixes.push(Self::raw_input_suffix_from_count(
+                raw_input,
+                consumed_input_count,
+            ));
+            consumed_input_count += clause_hint.corresponding_count.max(0);
+        }
+
+        let mut snapshots = Vec::with_capacity(clause_count - 1);
+        for index in (1..clause_count).rev() {
+            let clause_hint = &clause_hints[index];
+            let mut snapshot = Self::build_conservative_future_clause_snapshot(
+                &clause_hint.text,
+                &display_suffixes[index],
+                &raw_input_suffixes[index],
+                &raw_hiragana_suffixes[index],
+                clause_hint.corresponding_count,
+            );
+            if index == 1 {
+                snapshot.is_split_derived = true;
+                snapshot.is_direct_split_remainder = true;
+                snapshot.has_split_left_neighbor = true;
+                snapshot.split_group_id = split_group_id;
+            } else {
+                snapshot.is_split_derived = false;
+                snapshot.is_direct_split_remainder = false;
+                snapshot.has_split_left_neighbor = false;
+                snapshot.split_group_id = None;
+            }
+            snapshots.push(snapshot);
+        }
+
+        snapshots
     }
 
     #[inline]
@@ -818,6 +922,213 @@ impl TextServiceFactory {
             SetTextType::FullLatin => to_fullwidth(raw_input, true),
             SetTextType::HalfLatin => to_halfwidth(raw_input),
         }
+    }
+
+    #[inline]
+    fn infer_preview_set_text_type(
+        preview: &str,
+        selected_text: &str,
+        raw_input: &str,
+        raw_hiragana: &str,
+    ) -> Option<SetTextType> {
+        if preview == selected_text {
+            return None;
+        }
+
+        [
+            SetTextType::Hiragana,
+            SetTextType::Katakana,
+            SetTextType::HalfKatakana,
+            SetTextType::FullLatin,
+            SetTextType::HalfLatin,
+        ]
+        .into_iter()
+        .find(|set_type| {
+            preview == Self::converted_clause_preview_text(set_type, raw_input, raw_hiragana)
+        })
+    }
+
+    #[inline]
+    fn select_bootstrap_display_candidate_path(
+        target_display: &str,
+        current_candidates: &Candidates,
+        future_clause_snapshots: &[FutureClauseSnapshot],
+    ) -> Option<Vec<CandidateSelection>> {
+        let mut clause_candidates = Vec::with_capacity(1 + future_clause_snapshots.len());
+        clause_candidates.push(current_candidates.clone());
+        clause_candidates.extend(
+            future_clause_snapshots
+                .iter()
+                .rev()
+                .map(|snapshot| snapshot.candidates.clone()),
+        );
+        Self::select_display_candidate_path(target_display, &clause_candidates)
+    }
+
+    fn select_display_candidate_path(
+        target_display: &str,
+        clause_candidates: &[Candidates],
+    ) -> Option<Vec<CandidateSelection>> {
+        if clause_candidates.is_empty() {
+            return target_display.is_empty().then(Vec::new);
+        }
+
+        for index in 0..clause_candidates[0].texts.len() {
+            let Some(selected) = Self::select_candidate(&clause_candidates[0], index as i32) else {
+                continue;
+            };
+            let Some(remaining_display) = target_display.strip_prefix(&selected.text) else {
+                continue;
+            };
+            let Some(mut remaining_path) =
+                Self::select_display_candidate_path(remaining_display, &clause_candidates[1..])
+            else {
+                continue;
+            };
+
+            let mut path = Vec::with_capacity(remaining_path.len() + 1);
+            path.push(selected);
+            path.append(&mut remaining_path);
+            return Some(path);
+        }
+
+        None
+    }
+
+    #[inline]
+    fn preserve_bootstrap_selected_display(
+        state: &mut ClauseActionStateMut<'_>,
+        target_display: &str,
+    ) -> bool {
+        let Some(path) = Self::select_bootstrap_display_candidate_path(
+            target_display,
+            state.candidates,
+            state.future_clause_snapshots,
+        ) else {
+            return false;
+        };
+
+        let Some((current_selection, future_selections)) = path.split_first() else {
+            return false;
+        };
+
+        *state.selection_index = current_selection.index;
+        *state.corresponding_count = current_selection.corresponding_count;
+        *state.preview =
+            Self::merge_preview_with_prefix(state.fixed_prefix, &current_selection.text);
+
+        let mut future_suffixes = vec![String::new(); future_selections.len()];
+        let mut trailing_display = String::new();
+        for index in (0..future_selections.len()).rev() {
+            future_suffixes[index] = trailing_display.clone();
+            trailing_display = format!("{}{}", future_selections[index].text, trailing_display);
+        }
+
+        for (snapshot, (selection, suffix)) in state
+            .future_clause_snapshots
+            .iter_mut()
+            .rev()
+            .zip(future_selections.iter().zip(future_suffixes.iter()))
+        {
+            snapshot.selection_index = selection.index;
+            snapshot.corresponding_count = selection.corresponding_count;
+            snapshot.clause_preview = selection.text.clone();
+            snapshot.suffix = suffix.clone();
+            snapshot.selected_text = selection.text.clone();
+            snapshot.selected_sub_text = selection.sub_text.clone();
+        }
+
+        Self::sync_current_clause_and_snapshot_suffixes(state);
+        true
+    }
+
+    #[inline]
+    fn apply_preview_set_text_type_to_future_snapshots(
+        set_type: SetTextType,
+        future_clause_snapshots: &mut [FutureClauseSnapshot],
+    ) {
+        if future_clause_snapshots.is_empty() {
+            return;
+        }
+
+        let raw_inputs = future_clause_snapshots
+            .iter()
+            .map(|snapshot| snapshot.raw_input.clone())
+            .collect::<Vec<_>>();
+        let raw_hiraganas = future_clause_snapshots
+            .iter()
+            .map(|snapshot| snapshot.raw_hiragana.clone())
+            .collect::<Vec<_>>();
+        let mut trailing_display = String::new();
+
+        for (index, snapshot) in future_clause_snapshots.iter_mut().enumerate() {
+            let next_raw_input = index
+                .checked_sub(1)
+                .and_then(|previous| raw_inputs.get(previous).map(String::as_str));
+            let next_raw_hiragana = index
+                .checked_sub(1)
+                .and_then(|previous| raw_hiraganas.get(previous).map(String::as_str));
+            let clause_raw_input = Self::clause_raw_input_preview(
+                &raw_inputs[index],
+                next_raw_input,
+                snapshot.corresponding_count,
+            );
+            let clause_raw_hiragana = Self::clause_raw_preview(
+                &raw_hiraganas[index],
+                next_raw_hiragana,
+                snapshot.corresponding_count,
+            );
+            let clause_preview = Self::converted_clause_preview_text(
+                &set_type,
+                &clause_raw_input,
+                &clause_raw_hiragana,
+            );
+
+            snapshot.clause_preview = clause_preview.clone();
+            snapshot.suffix = trailing_display.clone();
+            trailing_display = format!("{clause_preview}{trailing_display}");
+        }
+    }
+
+    #[inline]
+    fn preserve_bootstrap_preview_conversion(
+        state: &mut ClauseActionStateMut<'_>,
+        set_type: SetTextType,
+    ) {
+        Self::apply_preview_set_text_type_to_future_snapshots(
+            set_type,
+            state.future_clause_snapshots,
+        );
+
+        let current_raw_input = Self::current_clause_raw_input_preview(
+            state.raw_input,
+            *state.corresponding_count,
+            state.future_clause_snapshots,
+        );
+        let current_raw_hiragana = Self::current_clause_raw_hiragana_preview(
+            state.raw_hiragana,
+            *state.corresponding_count,
+            state.future_clause_snapshots,
+        );
+        let current_preview = Self::converted_clause_preview_text(
+            &set_type,
+            &current_raw_input,
+            &current_raw_hiragana,
+        );
+
+        *state.preview = Self::merge_preview_with_prefix(state.fixed_prefix, &current_preview);
+        Self::sync_current_clause_and_snapshot_suffixes(state);
+    }
+
+    #[inline]
+    fn sync_current_clause_and_snapshot_suffixes(state: &mut ClauseActionStateMut<'_>) {
+        *state.suffix = Self::sync_current_clause_future_suffix(
+            state.candidates,
+            *state.selection_index,
+            *state.corresponding_count,
+            state.future_clause_snapshots,
+        );
+        Self::sync_clause_snapshot_suffixes(state.clause_snapshots, state.preview, state.suffix);
     }
 
     #[inline]
@@ -1104,11 +1415,131 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn bootstrap_clause_navigation<B: ClauseActionBackend>(
+        state: &mut ClauseActionStateMut<'_>,
+        backend: &mut B,
+    ) -> Result<bool> {
+        let original_preview = Self::current_clause_preview(state.preview, state.fixed_prefix);
+        let preview_set_type = Self::select_candidate(state.candidates, *state.selection_index)
+            .and_then(|selected| {
+                Self::infer_preview_set_text_type(
+                    &original_preview,
+                    &selected.text,
+                    state.raw_input,
+                    state.raw_hiragana,
+                )
+            });
+
+        if !state.suffix.is_empty()
+            || !state.clause_snapshots.is_empty()
+            || !state.future_clause_snapshots.is_empty()
+        {
+            return Ok(false);
+        }
+
+        let clause_bootstrap_hints = Self::clause_bootstrap_hints(state);
+        let move_steps = if let Some(clause_hints) = clause_bootstrap_hints.as_ref() {
+            let first_clause = clause_hints
+                .first()
+                .map(|clause| clause.raw_hiragana.chars().count());
+            let total_clause_chars: usize = clause_hints
+                .iter()
+                .map(|clause| clause.raw_hiragana.chars().count())
+                .sum();
+            first_clause
+                .and_then(|first_clause_chars| total_clause_chars.checked_sub(first_clause_chars))
+                .unwrap_or(0)
+        } else {
+            let Some(selected) =
+                Self::select_split_left_candidate(state.candidates, *state.corresponding_count)
+            else {
+                return Ok(false);
+            };
+            selected.sub_text.chars().count()
+        };
+        if move_steps == 0 {
+            return Ok(false);
+        }
+
+        let mut moved_steps = 0;
+        for _ in 0..move_steps {
+            if let Err(err) = backend.move_cursor(-1) {
+                for _ in 0..moved_steps {
+                    let _ = backend.move_cursor(1).ok();
+                }
+                return Err(err);
+            }
+            moved_steps += 1;
+        }
+
+        let boundary_candidates = match backend.move_cursor(0) {
+            Ok(candidates) => candidates,
+            Err(err) => {
+                for _ in 0..moved_steps {
+                    let _ = backend.move_cursor(1).ok();
+                }
+                return Err(err);
+            }
+        };
+        if boundary_candidates.texts.is_empty() {
+            for _ in 0..moved_steps {
+                let _ = backend.move_cursor(1).ok();
+            }
+            return Ok(false);
+        }
+
+        *state.candidates = boundary_candidates;
+        if let Some(selected) = Self::select_candidate(state.candidates, 0) {
+            let applied = Self::apply_boundary_candidate_selection(state, selected).applied;
+            if applied && !state.suffix.is_empty() {
+                if let Some(clause_hints) = clause_bootstrap_hints.as_ref().filter(|clause_hints| {
+                    clause_hints.first().is_some_and(|first_clause| {
+                        first_clause.corresponding_count == *state.corresponding_count
+                    })
+                }) {
+                    *state.future_clause_snapshots = Self::build_future_clause_snapshots_from_hints(
+                        state.raw_input,
+                        clause_hints,
+                        *state.current_clause_split_group_id,
+                    );
+                } else if let Err(err) =
+                    Self::rebuild_future_clause_snapshots_from_backend(state, backend)
+                {
+                    tracing::warn!(
+                        "failed to rebuild future clause snapshots during bootstrap: {err:?}"
+                    );
+                }
+                Self::sync_current_clause_and_snapshot_suffixes(state);
+            }
+            if applied {
+                if !Self::preserve_bootstrap_selected_display(state, &original_preview) {
+                    if let Some(set_type) = preview_set_type {
+                        Self::preserve_bootstrap_preview_conversion(state, set_type);
+                    }
+                } else if let Some(set_type) = preview_set_type {
+                    Self::preserve_bootstrap_preview_conversion(state, set_type);
+                }
+            }
+            return Ok(applied);
+        }
+
+        for _ in 0..moved_steps {
+            let _ = backend.move_cursor(1).ok();
+        }
+        Ok(false)
+    }
+
+    #[inline]
     fn apply_move_clause<B: ClauseActionBackend>(
         state: &mut ClauseActionStateMut<'_>,
         backend: &mut B,
         direction: i32,
     ) -> Result<ClauseActionEffect> {
+        let bootstrapped = Self::bootstrap_clause_navigation(state, backend)?;
+        if bootstrapped && direction > 0 {
+            return Ok(ClauseActionEffect::applied(true));
+        }
+
         if direction > 0 {
             if state.suffix.is_empty() {
                 return Ok(ClauseActionEffect::skipped());
@@ -1215,6 +1646,16 @@ impl TextServiceFactory {
 
             Ok(ClauseActionEffect::skipped())
         } else if direction < 0 {
+            if bootstrapped {
+                while !state.suffix.is_empty() {
+                    let effect = Self::apply_move_clause(state, backend, 1)?;
+                    if !effect.applied {
+                        break;
+                    }
+                }
+                return Ok(ClauseActionEffect::applied(true));
+            }
+
             if let Some(restored) = state.clause_snapshots.pop() {
                 Self::push_current_future_clause_snapshot(
                     state.future_clause_snapshots,
@@ -1265,6 +1706,7 @@ impl TextServiceFactory {
             return Ok(ClauseActionEffect::skipped());
         }
 
+        let _ = Self::bootstrap_clause_navigation(state, backend)?;
         let fallback_candidates = state.candidates.clone();
         if !state.suffix.is_empty() || !state.future_clause_snapshots.is_empty() {
             Self::sync_backend_current_clause_to_target(
@@ -1364,13 +1806,7 @@ impl TextServiceFactory {
         *state.current_clause_split_group_id = state
             .current_clause_is_split_derived
             .then_some(split_group_id);
-        *state.suffix = Self::sync_current_clause_future_suffix(
-            state.candidates,
-            *state.selection_index,
-            *state.corresponding_count,
-            state.future_clause_snapshots,
-        );
-        Self::sync_clause_snapshot_suffixes(state.clause_snapshots, state.preview, state.suffix);
+        Self::sync_current_clause_and_snapshot_suffixes(state);
 
         ClauseActionEffect::applied(true)
     }
@@ -1864,6 +2300,7 @@ impl TextServiceFactory {
         let mut temp_current_clause_split_group_id = *state.current_clause_split_group_id;
         let mut temp_next_split_group_id = *state.next_split_group_id;
         let mut collected = Vec::new();
+        let mut result: Result<()> = Ok(());
 
         loop {
             let effect = {
@@ -1886,7 +2323,13 @@ impl TextServiceFactory {
                     current_clause_split_group_id: &mut temp_current_clause_split_group_id,
                     next_split_group_id: &mut temp_next_split_group_id,
                 };
-                Self::apply_move_clause(&mut temp_state, backend, 1)?
+                match Self::apply_move_clause(&mut temp_state, backend, 1) {
+                    Ok(effect) => effect,
+                    Err(err) => {
+                        result = Err(err);
+                        break;
+                    }
+                }
             };
             if !effect.applied {
                 break;
@@ -1921,14 +2364,19 @@ impl TextServiceFactory {
         }
 
         for _ in 0..temp_clause_snapshots.len() {
-            let _ = backend.move_cursor(Self::MOVE_CURSOR_POP_CLAUSE_SNAPSHOT)?;
+            let _ = backend
+                .move_cursor(Self::MOVE_CURSOR_POP_CLAUSE_SNAPSHOT)
+                .ok();
         }
 
-        state.future_clause_snapshots.clear();
-        state
-            .future_clause_snapshots
-            .extend(collected.into_iter().rev());
-        Ok(())
+        if result.is_ok() {
+            state.future_clause_snapshots.clear();
+            state
+                .future_clause_snapshots
+                .extend(collected.into_iter().rev());
+        }
+
+        result
     }
 
     #[inline]
@@ -2158,6 +2606,11 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn commit_whole_composition_actions() -> (CompositionState, Vec<ClientAction>) {
+        (CompositionState::None, vec![ClientAction::EndComposition])
+    }
+
+    #[inline]
     fn commit_first_clause_actions(
         composition: &Composition,
     ) -> (CompositionState, Vec<ClientAction>) {
@@ -2333,7 +2786,8 @@ impl TextServiceFactory {
                         Some((CompositionState::Composing, vec![ClientAction::RemoveText]))
                     }
                 }
-                UserAction::Enter | UserAction::CommitAndNextClause => {
+                UserAction::Enter => Some(Self::commit_whole_composition_actions()),
+                UserAction::CommitAndNextClause => {
                     Some(Self::commit_current_clause_actions(composition))
                 }
                 UserAction::CommitFirstClause => {
@@ -2466,7 +2920,8 @@ impl TextServiceFactory {
                         Some((CompositionState::Composing, vec![ClientAction::RemoveText]))
                     }
                 }
-                UserAction::Enter | UserAction::CommitAndNextClause => {
+                UserAction::Enter => Some(Self::commit_whole_composition_actions()),
+                UserAction::CommitAndNextClause => {
                     Some(Self::commit_current_clause_actions(composition))
                 }
                 UserAction::CommitFirstClause => {
@@ -2568,7 +3023,6 @@ impl TextServiceFactory {
         let is_shift_pressed = Self::is_shift_pressed();
         let is_ctrl_space = is_ctrl_pressed && wparam.0 == 0x20;
         let is_ctrl_enter = is_ctrl_pressed && wparam.0 == 0x0D;
-        let is_ctrl_down = is_ctrl_pressed && wparam.0 == 0x28;
         let is_shift_left = is_shift_pressed && wparam.0 == 0x25;
         let is_shift_right = is_shift_pressed && wparam.0 == 0x27;
         let is_shift_key = Self::is_shift_key(wparam);
@@ -2576,8 +3030,7 @@ impl TextServiceFactory {
         let app_config = AppConfig::read();
 
         // check shortcut keys
-        if is_ctrl_pressed && !is_ctrl_space && !is_alt_backquote && !is_ctrl_enter && !is_ctrl_down
-        {
+        if is_ctrl_pressed && !is_ctrl_space && !is_alt_backquote && !is_ctrl_enter {
             self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(wparam))?;
             return Ok(None);
         }
@@ -2618,10 +3071,6 @@ impl TextServiceFactory {
 
         let action = if is_alt_backquote {
             UserAction::ToggleInputMode
-        } else if is_ctrl_enter {
-            UserAction::CommitFirstClause
-        } else if is_ctrl_down {
-            UserAction::CommitAndNextClause
         } else if is_shift_left {
             UserAction::AdjustClauseBoundary(-1)
         } else if is_shift_right {

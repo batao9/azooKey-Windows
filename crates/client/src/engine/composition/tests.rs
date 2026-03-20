@@ -1,5 +1,5 @@
 use super::{
-    Candidates, ClauseActionBackend, ClauseActionStateMut, ClauseSnapshot, Composition,
+    Candidates, ClauseActionBackend, ClauseActionStateMut, ClauseHint, ClauseSnapshot, Composition,
     CompositionState, FutureClauseSnapshot, TextServiceFactory,
 };
 use crate::engine::{
@@ -27,7 +27,19 @@ pub(super) fn candidates(
         sub_texts: sub_texts.iter().map(|value| (*value).to_string()).collect(),
         hiragana: hiragana.to_string(),
         corresponding_count: corresponding_count.to_vec(),
+        clauses: Vec::new(),
     }
+}
+
+pub(super) fn clause_hints(hints: &[(&str, &str, i32)]) -> Vec<ClauseHint> {
+    hints
+        .iter()
+        .map(|(text, raw_hiragana, corresponding_count)| ClauseHint {
+            text: (*text).to_string(),
+            raw_hiragana: (*raw_hiragana).to_string(),
+            corresponding_count: *corresponding_count,
+        })
+        .collect()
 }
 
 pub(super) fn actual_future_snapshot(
@@ -54,6 +66,7 @@ pub(super) fn actual_future_snapshot(
     )
 }
 
+mod bootstrap_navigation;
 mod integration_patterns;
 mod snapshot_restore;
 pub(super) mod stateful_harness;

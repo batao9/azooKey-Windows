@@ -269,7 +269,7 @@ fn clause_integration_fkeys_preserve_display_when_moving_right() {
 }
 
 #[test]
-fn clause_integration_fkeys_preserve_display_when_committing_current_clause() {
+fn clause_integration_fkeys_commit_entire_composition_with_enter() {
     for (set_type, converted_clause) in fkey_cases() {
         let extra = vec![
             HarnessUserAction::SetTextType(set_type),
@@ -288,12 +288,8 @@ fn clause_integration_fkeys_preserve_display_when_committing_current_clause() {
         );
         assert_eq!(harness_raw_clauses(&harness), "かげん / とういつ");
         assert_eq!(harness_clause_input_lengths(&harness), "5 / 6");
-        assert_eq!(harness.committed_clauses.len(), 1);
-        assert_eq!(
-            TextServiceFactory::current_clause_preview(&harness.preview, &harness.fixed_prefix),
-            "統一"
-        );
-        assert_eq!(harness.state, CompositionState::Composing);
+        assert_eq!(harness.committed_clauses.len(), 2);
+        assert_eq!(harness.state, CompositionState::None);
     }
 }
 

@@ -7,6 +7,7 @@ import ffi
 @MainActor var composingTextSnapshots: [ComposingText] = []
 @MainActor var currentInputStyle: InputStyle = .roman2kana
 @MainActor var customRomajiTableURL: URL?
+@MainActor private var currentComposedClauses: [ClausePayload] = []
 
 @MainActor var execURL = URL(filePath: "")
 @MainActor var config: [String : Any] = [
@@ -50,6 +51,12 @@ private enum ServerLogLevel: Int {
 }
 
 private let serverLogThreshold = ServerLogLevel.fromEnvironment()
+
+private struct ClausePayload {
+    let text: String
+    let rawHiragana: String
+    let correspondingCount: Int
+}
 
 private func serverLogPath() -> URL {
     if let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] {
@@ -323,6 +330,127 @@ private func clampedCorrespondingCount(
         correspondingCount: originalResolution.correspondingCount,
         remainingConvertTarget: previewResolution.remainingConvertTarget
     )
+}
+
+private func isClauseBoundary(_ former: Int, _ latter: Int) -> Bool {
+    let latterWordType = DicdataStore.wordTypes[latter]
+    if latterWordType == 3 {
+        return false
+    }
+
+    let formerWordType = DicdataStore.wordTypes[former]
+    if formerWordType == 3 {
+        return false
+    }
+
+    if latterWordType == 0 || latterWordType == 1 {
+        return formerWordType != 0
+    }
+
+    return false
+}
+
+@MainActor private func buildClausePayloads(
+    candidate: Candidate,
+    originalComposingText: ComposingText
+) -> [ClausePayload] {
+    struct ClauseComponent {
+        var text: String
+        var ruby: String
+    }
+
+    var components: [ClauseComponent] = []
+    var currentComponent = ClauseComponent(text: "", ruby: "")
+    var previousRcid: Int?
+
+    for data in candidate.data where !data.word.isEmpty {
+        if let previousRcid,
+           isClauseBoundary(previousRcid, data.lcid),
+           !currentComponent.text.isEmpty || !currentComponent.ruby.isEmpty
+        {
+            components.append(currentComponent)
+            currentComponent = ClauseComponent(text: "", ruby: "")
+        }
+
+        currentComponent.text.append(data.word)
+        currentComponent.ruby.append(data.ruby)
+        previousRcid = data.rcid
+    }
+
+    if !currentComponent.text.isEmpty || !currentComponent.ruby.isEmpty {
+        components.append(currentComponent)
+    }
+
+    guard !components.isEmpty else {
+        guard !candidate.text.isEmpty else {
+            return []
+        }
+
+        return [
+            ClausePayload(
+                text: candidate.text,
+                rawHiragana: originalComposingText.convertTarget,
+                correspondingCount: originalComposingText.input.count
+            )
+        ]
+    }
+
+    var result: [ClausePayload] = []
+    var previousCorrespondingCount = 0
+    var previousRemainingConvertTarget = originalComposingText.convertTarget
+    var cumulativeSurfaceCount = 0
+
+    for component in components {
+        cumulativeSurfaceCount += component.ruby.count
+        let resolution = resolveCandidateComposition(
+            composingText: originalComposingText,
+            candidateComposingCount: .surfaceCount(cumulativeSurfaceCount)
+        )
+        let rawHiragana: String
+        if previousRemainingConvertTarget.hasSuffix(resolution.remainingConvertTarget) {
+            rawHiragana = String(
+                previousRemainingConvertTarget.dropLast(resolution.remainingConvertTarget.count)
+            )
+        } else {
+            rawHiragana = component.ruby
+        }
+        let correspondingCount = max(
+            0,
+            resolution.correspondingCount - previousCorrespondingCount
+        )
+
+        if !component.text.isEmpty && !rawHiragana.isEmpty && correspondingCount > 0 {
+            result.append(
+                ClausePayload(
+                    text: component.text,
+                    rawHiragana: rawHiragana,
+                    correspondingCount: correspondingCount
+                )
+            )
+        }
+
+        previousCorrespondingCount = resolution.correspondingCount
+        previousRemainingConvertTarget = resolution.remainingConvertTarget
+    }
+
+    return result
+}
+
+@MainActor func debugClausePayloads(
+    candidate: Candidate,
+    originalComposingText: ComposingText
+) -> [(text: String, rawHiragana: String, correspondingCount: Int)] {
+    buildClausePayloads(
+        candidate: candidate,
+        originalComposingText: originalComposingText
+    )
+    .map {
+        (
+            text: $0.text,
+            rawHiragana: $0.rawHiragana,
+            correspondingCount: $0.correspondingCount
+        )
+    }
 }
 
 @MainActor private func debugLogResolvedCorrespondingCount(
@@ -690,6 +818,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     serverLog("INFO", "ClearText: start")
     composingText = ComposingText()
     composingTextSnapshots.removeAll()
+    currentComposedClauses.removeAll()
     serverLog("INFO", "ClearText: completed")
 }
 
@@ -698,6 +827,27 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     for (i, item) in list.enumerated() {
         pointer[i] = UnsafeMutablePointer<FFICandidate>.allocate(capacity: 1)
         pointer[i]?.pointee = item
+    }
+    return pointer
+}
+
+private func to_clause_list_pointer(
+    _ list: [ClausePayload]
+) -> UnsafeMutablePointer<UnsafeMutablePointer<FFIClause>?>? {
+    guard !list.isEmpty else {
+        return nil
+    }
+
+    let pointer = UnsafeMutablePointer<UnsafeMutablePointer<FFIClause>?>.allocate(
+        capacity: list.count
+    )
+    for (i, item) in list.enumerated() {
+        pointer[i] = UnsafeMutablePointer<FFIClause>.allocate(capacity: 1)
+        pointer[i]?.pointee = FFIClause(
+            text: strdup(item.text),
+            rawHiragana: strdup(item.rawHiragana),
+            correspondingCount: Int32(item.correspondingCount)
+        )
     }
     return pointer
 }
@@ -725,6 +875,9 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     let converted = converter.requestCandidates(previewComposingText, options: options)
     let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
     serverLog("INFO", "GetComposedText: requestCandidates returned candidateCount=\(converted.mainResults.count) elapsed_ms=\(requestMs)")
+    currentComposedClauses = converted.mainResults.first.map {
+        buildClausePayloads(candidate: $0, originalComposingText: composingText)
+    } ?? []
     var result: [FFICandidate] = []
 
     for i in 0..<converted.mainResults.count {
@@ -761,6 +914,12 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     return to_list_pointer(result)
 }
 
+@_silgen_name("GetCurrentClauses")
+@MainActor public func get_current_clauses(lengthPtr: UnsafeMutablePointer<Int>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFIClause>?>? {
+    lengthPtr.pointee = currentComposedClauses.count
+    return to_clause_list_pointer(currentComposedClauses)
+}
+
 @_silgen_name("GetComposedTextForCursorPrefix")
 @MainActor public func get_composed_text_for_cursor_prefix(lengthPtr: UnsafeMutablePointer<Int>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
     let hiragana = composingText.convertTarget
@@ -790,6 +949,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     let converted = converter.requestCandidates(previewPrefixComposingText, options: options)
     let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
     serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates returned candidateCount=\(converted.mainResults.count) elapsed_ms=\(requestMs)")
+    currentComposedClauses.removeAll()
     var result: [FFICandidate] = []
 
     for i in 0..<converted.mainResults.count {

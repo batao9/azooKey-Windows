@@ -11,3 +11,9 @@ struct FFICandidate {
     char *hiragana;
     int correspondingCount;
 };
+
+struct FFIClause {
+    char *text;
+    char *rawHiragana;
+    int correspondingCount;
+};

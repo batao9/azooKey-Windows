@@ -23,11 +23,19 @@ pub struct IPCService {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClauseHint {
+    pub text: String,
+    pub raw_hiragana: String,
+    pub corresponding_count: i32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Candidates {
     pub texts: Vec<String>,
     pub sub_texts: Vec<String>,
     pub hiragana: String,
     pub corresponding_count: Vec<i32>,
+    pub clauses: Vec<ClauseHint>,
 }
 
 impl IPCService {
@@ -104,6 +112,15 @@ impl IPCService {
                     .suggestions
                     .iter()
                     .map(|s| s.corresponding_count)
+                    .collect(),
+                clauses: composing_text
+                    .clauses
+                    .into_iter()
+                    .map(|clause| ClauseHint {
+                        text: clause.text,
+                        raw_hiragana: clause.raw_hiragana,
+                        corresponding_count: clause.corresponding_count,
+                    })
                     .collect(),
             })
         } else {
@@ -383,6 +400,7 @@ mod tests {
             sub_texts: vec![String::new()],
             hiragana: "か".to_string(),
             corresponding_count: vec![1],
+            clauses: Vec::new(),
         };
 
         assert!(IPCService::should_retry_append_after_refresh(
@@ -399,6 +417,7 @@ mod tests {
             sub_texts: vec![String::new()],
             hiragana: "か".to_string(),
             corresponding_count: vec![1],
+            clauses: Vec::new(),
         };
 
         assert!(!IPCService::should_retry_append_after_refresh(

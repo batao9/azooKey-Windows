@@ -8,10 +8,17 @@ message Suggestion {
   int32 corresponding_count = 3;
 }
 
+message Clause {
+  string text = 1;
+  string raw_hiragana = 2;
+  int32 corresponding_count = 3;
+}
+
 // ComposingText represents the text and its associated suggestions.
 message ComposingText {
   string hiragana = 1; // The main text content.
   repeated Suggestion suggestions = 2; // List of suggestions for the text.
+  repeated Clause clauses = 3;
 }
 
 enum InputStyle {
