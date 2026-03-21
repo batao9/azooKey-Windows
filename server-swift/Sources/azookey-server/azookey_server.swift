@@ -58,6 +58,35 @@ private struct ClausePayload {
     let correspondingCount: Int
 }
 
+private struct ClauseAtom {
+    let text: String
+    let rawHiragana: String
+    let correspondingCount: Int
+    let lcid: Int
+    let rcid: Int
+}
+
+private struct UiClauseSpan {
+    var text: String
+    var rawHiragana: String
+    var correspondingCount: Int
+    var lastRcid: Int
+
+    init(atom: ClauseAtom) {
+        self.text = atom.text
+        self.rawHiragana = atom.rawHiragana
+        self.correspondingCount = atom.correspondingCount
+        self.lastRcid = atom.rcid
+    }
+
+    mutating func merge(with atom: ClauseAtom) {
+        self.text.append(atom.text)
+        self.rawHiragana.append(atom.rawHiragana)
+        self.correspondingCount += atom.correspondingCount
+        self.lastRcid = atom.rcid
+    }
+}
+
 private func serverLogPath() -> URL {
     if let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] {
         return URL(filePath: appDataPath)
@@ -332,56 +361,176 @@ private func clampedCorrespondingCount(
     )
 }
 
-private func isClauseBoundary(_ former: Int, _ latter: Int) -> Bool {
-    let latterWordType = DicdataStore.wordTypes[latter]
-    if latterWordType == 3 {
+private func isASCIIAlphaNumeric(_ text: String) -> Bool {
+    guard !text.isEmpty else {
         return false
     }
 
-    let formerWordType = DicdataStore.wordTypes[former]
-    if formerWordType == 3 {
+    return text.unicodeScalars.allSatisfy {
+        $0.isASCII && CharacterSet.alphanumerics.contains($0)
+    }
+}
+
+private func isKatakana(_ text: String) -> Bool {
+    guard !text.isEmpty else {
         return false
     }
 
-    if latterWordType == 0 || latterWordType == 1 {
-        return formerWordType != 0
+    return text.unicodeScalars.allSatisfy {
+        (0x30A0...0x30FF).contains($0.value) || (0xFF66...0xFF9F).contains($0.value)
+    }
+}
+
+private func isNumericRun(_ text: String) -> Bool {
+    guard !text.isEmpty else {
+        return false
+    }
+
+    return text.allSatisfy(\.isNumber)
+}
+
+@MainActor private func buildClauseAtoms(
+    candidate: Candidate,
+    originalComposingText: ComposingText
+) -> [ClauseAtom] {
+    var result: [ClauseAtom] = []
+    var previousCorrespondingCount = 0
+    var previousRemainingConvertTarget = originalComposingText.convertTarget
+    var cumulativeSurfaceCount = 0
+
+    for data in candidate.data where !data.word.isEmpty {
+        cumulativeSurfaceCount += data.ruby.count
+        let resolution = resolveCandidateComposition(
+            composingText: originalComposingText,
+            candidateComposingCount: .surfaceCount(cumulativeSurfaceCount)
+        )
+        let rawHiragana: String
+        if previousRemainingConvertTarget.hasSuffix(resolution.remainingConvertTarget) {
+            rawHiragana = String(
+                previousRemainingConvertTarget.dropLast(resolution.remainingConvertTarget.count)
+            )
+        } else {
+            rawHiragana = data.ruby
+        }
+        let correspondingCount = max(
+            0,
+            resolution.correspondingCount - previousCorrespondingCount
+        )
+
+        if !rawHiragana.isEmpty && correspondingCount > 0 {
+            result.append(
+                ClauseAtom(
+                    text: data.word,
+                    rawHiragana: rawHiragana,
+                    correspondingCount: correspondingCount,
+                    lcid: data.lcid,
+                    rcid: data.rcid
+                )
+            )
+        }
+
+        previousCorrespondingCount = resolution.correspondingCount
+        previousRemainingConvertTarget = resolution.remainingConvertTarget
+    }
+
+    return result
+}
+
+private func shouldMergeUiClauseSpan(
+    _ lhs: UiClauseSpan,
+    _ rhs: ClauseAtom
+) -> Bool {
+    let lhsWordType = DicdataStore.wordTypes[lhs.lastRcid]
+    let rhsWordType = DicdataStore.wordTypes[rhs.lcid]
+    let lhsRawLength = lhs.rawHiragana.count
+    let rhsRawLength = rhs.rawHiragana.count
+    let combinedRawLength = lhsRawLength + rhsRawLength
+    let lhsIsASCIIAlphaNumeric = isASCIIAlphaNumeric(lhs.text)
+    let rhsIsASCIIAlphaNumeric = isASCIIAlphaNumeric(rhs.text)
+    let lhsIsKatakana = isKatakana(lhs.text)
+    let rhsIsKatakana = isKatakana(rhs.text)
+    let lhsIsNumeric = isNumericRun(lhs.text)
+    let rhsIsNumeric = isNumericRun(rhs.text)
+    let lhsEndsNumeric = lhs.text.last?.isNumber == true
+
+    if rhsWordType == 2 {
+        return true
+    }
+
+    if lhsWordType == 0 {
+        return true
+    }
+
+    if lhsIsASCIIAlphaNumeric && rhsIsASCIIAlphaNumeric {
+        return true
+    }
+
+    if lhsIsKatakana && rhsIsKatakana {
+        return true
+    }
+
+    if lhsIsNumeric && rhsIsNumeric {
+        return true
+    }
+
+    if lhsEndsNumeric && rhsRawLength <= 3 {
+        return true
+    }
+
+    if lhsWordType == 1 && rhsWordType == 1 {
+        if combinedRawLength <= 4 {
+            return true
+        }
+        if combinedRawLength <= 6 && (lhsRawLength <= 2 || rhsRawLength <= 2) {
+            return true
+        }
+    }
+
+    if rhsRawLength == 1 && combinedRawLength <= 6 {
+        return true
     }
 
     return false
+}
+
+private func normalizeClauseAtomsForUI(_ atoms: [ClauseAtom]) -> [ClausePayload] {
+    guard let first = atoms.first else {
+        return []
+    }
+
+    var spans: [UiClauseSpan] = []
+    var current = UiClauseSpan(atom: first)
+
+    for atom in atoms.dropFirst() {
+        if shouldMergeUiClauseSpan(current, atom) {
+            current.merge(with: atom)
+            continue
+        }
+
+        spans.append(current)
+        current = UiClauseSpan(atom: atom)
+    }
+    spans.append(current)
+
+    return spans.map {
+        ClausePayload(
+            text: $0.text,
+            rawHiragana: $0.rawHiragana,
+            correspondingCount: $0.correspondingCount
+        )
+    }
 }
 
 @MainActor private func buildClausePayloads(
     candidate: Candidate,
     originalComposingText: ComposingText
 ) -> [ClausePayload] {
-    struct ClauseComponent {
-        var text: String
-        var ruby: String
-    }
+    let atoms = buildClauseAtoms(
+        candidate: candidate,
+        originalComposingText: originalComposingText
+    )
 
-    var components: [ClauseComponent] = []
-    var currentComponent = ClauseComponent(text: "", ruby: "")
-    var previousRcid: Int?
-
-    for data in candidate.data where !data.word.isEmpty {
-        if let previousRcid,
-           isClauseBoundary(previousRcid, data.lcid),
-           !currentComponent.text.isEmpty || !currentComponent.ruby.isEmpty
-        {
-            components.append(currentComponent)
-            currentComponent = ClauseComponent(text: "", ruby: "")
-        }
-
-        currentComponent.text.append(data.word)
-        currentComponent.ruby.append(data.ruby)
-        previousRcid = data.rcid
-    }
-
-    if !currentComponent.text.isEmpty || !currentComponent.ruby.isEmpty {
-        components.append(currentComponent)
-    }
-
-    guard !components.isEmpty else {
+    guard !atoms.isEmpty else {
         guard !candidate.text.isEmpty else {
             return []
         }
@@ -395,45 +544,21 @@ private func isClauseBoundary(_ former: Int, _ latter: Int) -> Bool {
         ]
     }
 
-    var result: [ClausePayload] = []
-    var previousCorrespondingCount = 0
-    var previousRemainingConvertTarget = originalComposingText.convertTarget
-    var cumulativeSurfaceCount = 0
-
-    for component in components {
-        cumulativeSurfaceCount += component.ruby.count
-        let resolution = resolveCandidateComposition(
-            composingText: originalComposingText,
-            candidateComposingCount: .surfaceCount(cumulativeSurfaceCount)
-        )
-        let rawHiragana: String
-        if previousRemainingConvertTarget.hasSuffix(resolution.remainingConvertTarget) {
-            rawHiragana = String(
-                previousRemainingConvertTarget.dropLast(resolution.remainingConvertTarget.count)
-            )
-        } else {
-            rawHiragana = component.ruby
-        }
-        let correspondingCount = max(
-            0,
-            resolution.correspondingCount - previousCorrespondingCount
-        )
-
-        if !component.text.isEmpty && !rawHiragana.isEmpty && correspondingCount > 0 {
-            result.append(
-                ClausePayload(
-                    text: component.text,
-                    rawHiragana: rawHiragana,
-                    correspondingCount: correspondingCount
-                )
-            )
-        }
-
-        previousCorrespondingCount = resolution.correspondingCount
-        previousRemainingConvertTarget = resolution.remainingConvertTarget
+    let normalized = normalizeClauseAtomsForUI(atoms)
+    let normalizedCount = normalized.reduce(into: 0) { partialResult, payload in
+        partialResult += payload.correspondingCount
+    }
+    if normalizedCount == originalComposingText.input.count && !normalized.isEmpty {
+        return normalized
     }
 
-    return result
+    return atoms.map {
+        ClausePayload(
+            text: $0.text,
+            rawHiragana: $0.rawHiragana,
+            correspondingCount: $0.correspondingCount
+        )
+    }
 }
 
 @MainActor func debugClausePayloads(

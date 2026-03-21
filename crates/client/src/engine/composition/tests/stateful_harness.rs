@@ -121,6 +121,7 @@ pub(super) struct ClauseHarness {
     pub(super) clause_snapshots: Vec<ClauseSnapshot>,
     pub(super) future_clause_snapshots: Vec<FutureClauseSnapshot>,
     pub(super) next_split_group_id: u64,
+    pub(super) clause_navigation_backend_dirty: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -543,6 +544,7 @@ fn build_harness_from_spec(spec: &SimSpecState, state: CompositionState) -> Clau
         clause_snapshots,
         future_clause_snapshots,
         next_split_group_id,
+        clause_navigation_backend_dirty: false,
     }
 }
 
@@ -612,6 +614,7 @@ fn build_logged_baseline_harness(spec: &SimSpecState, state: CompositionState) -
         clause_snapshots: vec![first_snapshot, second_snapshot, third_snapshot],
         future_clause_snapshots: Vec::new(),
         next_split_group_id: 2,
+        clause_navigation_backend_dirty: false,
     }
 }
 
@@ -838,6 +841,7 @@ fn harness_as_composition(harness: &ClauseHarness) -> Composition {
         current_clause_has_split_left_neighbor: harness.current_clause_has_split_left_neighbor,
         current_clause_split_group_id: harness.current_clause_split_group_id,
         next_split_group_id: harness.next_split_group_id,
+        clause_navigation_backend_dirty: harness.clause_navigation_backend_dirty,
         state: harness.state.clone(),
         ..Composition::default()
     }
@@ -1343,6 +1347,8 @@ fn apply_user_action(
                             .current_clause_has_split_left_neighbor,
                         current_clause_split_group_id: &mut harness.current_clause_split_group_id,
                         next_split_group_id: &mut harness.next_split_group_id,
+                        clause_navigation_backend_dirty: &mut harness
+                            .clause_navigation_backend_dirty,
                     };
                     TextServiceFactory::apply_move_clause(&mut state, backend, direction)
                         .expect("apply_move_clause")
@@ -1388,6 +1394,8 @@ fn apply_user_action(
                             .current_clause_has_split_left_neighbor,
                         current_clause_split_group_id: &mut harness.current_clause_split_group_id,
                         next_split_group_id: &mut harness.next_split_group_id,
+                        clause_navigation_backend_dirty: &mut harness
+                            .clause_navigation_backend_dirty,
                     };
                     TextServiceFactory::apply_adjust_boundary(&mut state, backend, direction)
                         .expect("apply_adjust_boundary")
@@ -1451,6 +1459,8 @@ fn apply_user_action(
                             .current_clause_has_split_left_neighbor,
                         current_clause_split_group_id: &mut harness.current_clause_split_group_id,
                         next_split_group_id: &mut harness.next_split_group_id,
+                        clause_navigation_backend_dirty: &mut harness
+                            .clause_navigation_backend_dirty,
                     };
                     TextServiceFactory::apply_set_selection(&mut state, &selection)
                 };

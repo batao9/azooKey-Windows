@@ -268,6 +268,7 @@ struct BootstrapState {
     current_clause_has_split_left_neighbor: bool,
     current_clause_split_group_id: Option<u64>,
     next_split_group_id: u64,
+    clause_navigation_backend_dirty: bool,
 }
 
 impl BootstrapState {
@@ -288,6 +289,7 @@ impl BootstrapState {
             current_clause_has_split_left_neighbor: false,
             current_clause_split_group_id: None,
             next_split_group_id: 1,
+            clause_navigation_backend_dirty: false,
         }
     }
 
@@ -310,6 +312,7 @@ impl BootstrapState {
                 .current_clause_has_split_left_neighbor,
             current_clause_split_group_id: &mut self.current_clause_split_group_id,
             next_split_group_id: &mut self.next_split_group_id,
+            clause_navigation_backend_dirty: &mut self.clause_navigation_backend_dirty,
         }
     }
 }
@@ -333,6 +336,7 @@ fn multi_stage_bootstrap_state() -> BootstrapState {
         current_clause_has_split_left_neighbor: false,
         current_clause_split_group_id: None,
         next_split_group_id: 1,
+        clause_navigation_backend_dirty: false,
     }
 }
 
@@ -353,6 +357,7 @@ fn display_preserving_bootstrap_state() -> BootstrapState {
         current_clause_has_split_left_neighbor: false,
         current_clause_split_group_id: None,
         next_split_group_id: 1,
+        clause_navigation_backend_dirty: false,
     }
 }
 
@@ -373,6 +378,7 @@ fn selected_candidate_bootstrap_state() -> BootstrapState {
         current_clause_has_split_left_neighbor: false,
         current_clause_split_group_id: None,
         next_split_group_id: 1,
+        clause_navigation_backend_dirty: false,
     }
 }
 
@@ -395,7 +401,7 @@ fn move_clause_right_bootstraps_initial_navigation_to_the_first_clause() {
     assert_eq!(state.corresponding_count, 5);
     assert_eq!(state.selection_index, 0);
     assert_eq!(state.candidates.texts, vec!["かげん"]);
-    assert_eq!(&backend.move_cursor_calls[..5], &[-1, -1, -1, -1, 0]);
+    assert!(backend.move_cursor_calls.is_empty());
     assert!(backend.shrink_text_calls.is_empty());
 }
 
@@ -422,8 +428,8 @@ fn move_clause_left_bootstraps_initial_navigation_to_the_last_clause() {
     assert_eq!(state.corresponding_count, 7);
     assert_eq!(state.selection_index, 0);
     assert_eq!(state.candidates.texts, vec!["とういつ"]);
-    assert_eq!(&backend.move_cursor_calls[..5], &[-1, -1, -1, -1, 0]);
-    assert_eq!(backend.shrink_text_calls.first(), Some(&5));
+    assert!(backend.move_cursor_calls.is_empty());
+    assert!(backend.shrink_text_calls.is_empty());
     assert_eq!(state.clause_snapshots.len(), 1);
 }
 
@@ -601,6 +607,7 @@ fn move_clause_right_rebuilds_multiple_following_clauses_without_resetting_text(
     assert!(effect.applied);
     assert_eq!(state.future_clause_snapshots.len(), 4);
     assert!(backend.shrink_text_calls.is_empty());
+    assert!(backend.move_cursor_calls.is_empty());
     assert_eq!(
         TextServiceFactory::clause_texts_for_log(
             &state.preview,
@@ -618,7 +625,8 @@ fn move_clause_right_rebuilds_multiple_following_clauses_without_resetting_text(
     };
 
     assert!(effect.applied);
-    assert_eq!(backend.shrink_text_calls, vec![3]);
+    assert!(backend.move_cursor_calls.is_empty());
+    assert!(backend.shrink_text_calls.is_empty());
     assert_eq!(
         TextServiceFactory::current_clause_preview(&state.preview, &state.fixed_prefix),
         "モード"
@@ -666,6 +674,131 @@ fn move_clause_left_bootstraps_multiple_following_clauses_without_resetting_text
     assert!(effect.applied);
     assert_eq!(state.clause_snapshots.len(), 4);
     assert!(state.future_clause_snapshots.is_empty());
+    assert!(backend.move_cursor_calls.is_empty());
+    assert!(backend.shrink_text_calls.is_empty());
+    assert!(!backend
+        .move_cursor_calls
+        .iter()
+        .any(|offset| *offset == -1 || *offset == 0));
+    assert_eq!(
+        TextServiceFactory::current_clause_preview(&state.preview, &state.fixed_prefix),
+        "初回だけ自動で設定しそのまま分節移動できるようにしました"
+    );
+    assert_eq!(
+        TextServiceFactory::clause_texts_for_log(
+            &state.preview,
+            &state.fixed_prefix,
+            &state.clause_snapshots,
+            &state.future_clause_snapshots,
+        ),
+        "文節 / モード / 見選択時の / 左右キー操作を / 初回だけ自動で設定しそのまま分節移動できるようにしました"
+    );
+}
+
+#[test]
+fn move_clause_right_after_returning_to_the_first_clause_avoids_cursor_rewalk() {
+    let mut state = multi_stage_bootstrap_state();
+    let mut backend = MultiStageBootstrapBackend::default();
+
+    {
+        let mut state_mut = state.state_mut();
+        TextServiceFactory::apply_move_clause(&mut state_mut, &mut backend, -1)
+            .expect("bootstrap to last clause");
+    }
+
+    while !state.clause_snapshots.is_empty() {
+        let mut state_mut = state.state_mut();
+        TextServiceFactory::apply_move_clause(&mut state_mut, &mut backend, -1)
+            .expect("move back toward first clause");
+    }
+
+    let effect = {
+        let mut state_mut = state.state_mut();
+        TextServiceFactory::apply_move_clause(&mut state_mut, &mut backend, 1)
+            .expect("move right from first clause")
+    };
+
+    assert!(effect.applied);
+    assert!(backend.shrink_text_calls.is_empty());
+    assert!(!backend
+        .move_cursor_calls
+        .iter()
+        .any(|offset| *offset == -1 || *offset == 0));
+    assert_eq!(
+        TextServiceFactory::current_clause_preview(&state.preview, &state.fixed_prefix),
+        "モード"
+    );
+    assert_eq!(
+        TextServiceFactory::clause_texts_for_log(
+            &state.preview,
+            &state.fixed_prefix,
+            &state.clause_snapshots,
+            &state.future_clause_snapshots,
+        ),
+        "文節 / モード / 見選択時の / 左右キー操作を / 初回だけ自動で設定しそのまま分節移動できるようにしました"
+    );
+}
+
+#[test]
+fn sync_raw_input_with_candidates_trims_stale_romaji_after_kana_backspace() {
+    let mut raw_input = "aru".to_string();
+    let candidates = with_clause_hints(
+        candidates(&["あ"], &[""], "あ", &[1]),
+        &[("あ", "あ", 1)],
+    );
+
+    TextServiceFactory::sync_raw_input_with_candidates(&mut raw_input, &candidates);
+
+    assert_eq!(raw_input, "a");
+}
+
+#[test]
+fn move_clause_right_uses_clause_hints_again_after_raw_input_resync() {
+    let mut state = multi_stage_bootstrap_state();
+    let mut backend = MultiStageBootstrapBackend::default();
+    state.raw_input.push('x');
+
+    assert!(TextServiceFactory::clause_bootstrap_hints(&state.state_mut()).is_none());
+
+    TextServiceFactory::sync_raw_input_with_candidates(&mut state.raw_input, &state.candidates);
+
+    let effect = {
+        let mut state_mut = state.state_mut();
+        TextServiceFactory::apply_move_clause(&mut state_mut, &mut backend, 1)
+            .expect("bootstrap after raw_input resync")
+    };
+
+    assert!(effect.applied);
+    assert!(backend.move_cursor_calls.is_empty());
+    assert!(backend.shrink_text_calls.is_empty());
+    assert_eq!(
+        TextServiceFactory::clause_texts_for_log(
+            &state.preview,
+            &state.fixed_prefix,
+            &state.clause_snapshots,
+            &state.future_clause_snapshots,
+        ),
+        "文節 / モード / 見選択時の / 左右キー操作を / 初回だけ自動で設定しそのまま分節移動できるようにしました"
+    );
+}
+
+#[test]
+fn move_clause_left_uses_clause_hints_again_after_raw_input_resync() {
+    let mut state = multi_stage_bootstrap_state();
+    let mut backend = MultiStageBootstrapBackend::default();
+    state.raw_input.push('x');
+
+    TextServiceFactory::sync_raw_input_with_candidates(&mut state.raw_input, &state.candidates);
+
+    let effect = {
+        let mut state_mut = state.state_mut();
+        TextServiceFactory::apply_move_clause(&mut state_mut, &mut backend, -1)
+            .expect("bootstrap left after raw_input resync")
+    };
+
+    assert!(effect.applied);
+    assert!(backend.move_cursor_calls.is_empty());
+    assert!(backend.shrink_text_calls.is_empty());
     assert_eq!(
         TextServiceFactory::current_clause_preview(&state.preview, &state.fixed_prefix),
         "初回だけ自動で設定しそのまま分節移動できるようにしました"

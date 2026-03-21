@@ -28,6 +28,72 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
     )
 }
 
+private func serverSwiftRootURL() -> URL {
+    URL(filePath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+}
+
+private struct TestClausePayload: Equatable {
+    let text: String
+    let rawHiragana: String
+    let correspondingCount: Int
+}
+
+private func makeTestConvertOptions() -> ConvertRequestOptions {
+    let root = serverSwiftRootURL()
+    let dictionaryURL = root
+        .appendingPathComponent("azooKey_dictionary_storage")
+        .appendingPathComponent("Dictionary")
+    let emojiURL = root
+        .appendingPathComponent("azooKey_emoji_dictionary_storage")
+        .appendingPathComponent("EmojiDictionary")
+        .appendingPathComponent("emoji_all_E15.1.txt")
+    let tempRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("azookey-server-tests")
+
+    return ConvertRequestOptions(
+        requireJapanesePrediction: true,
+        requireEnglishPrediction: false,
+        keyboardLanguage: .ja_JP,
+        learningType: .nothing,
+        dictionaryResourceURL: dictionaryURL,
+        memoryDirectoryURL: tempRoot,
+        sharedContainerURL: tempRoot,
+        textReplacer: .init {
+            emojiURL
+        },
+        zenzaiMode: .off,
+        preloadDictionary: true,
+        metadata: .init(versionString: "azookey-server-tests")
+    )
+}
+
+@MainActor private func debugRealClausePayloads(
+    hiragana: String
+) throws -> [TestClausePayload] {
+    var source = ComposingText()
+    source.insertAtCursorPosition(hiragana, inputStyle: .direct)
+    let preview = makeCandidatePreviewComposingText(from: source)
+    let converted = converter.requestCandidates(
+        preview.composingText,
+        options: makeTestConvertOptions()
+    )
+    let candidate = try #require(converted.mainResults.first)
+    return debugClausePayloads(
+        candidate: candidate,
+        originalComposingText: source
+    )
+    .map {
+        TestClausePayload(
+            text: $0.text,
+            rawHiragana: $0.rawHiragana,
+            correspondingCount: $0.correspondingCount
+        )
+    }
+}
+
 @Test func supportsNextInputCarryForTsuRules() async throws {
     let map = tableMap([
         row("tt", "っ", "t"),
@@ -179,6 +245,21 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
     #expect(resolved.remainingConvertTarget == "と")
 }
 
+@Test func deleteBackwardDropsWholeRomanChunkForConvertedKana() async throws {
+    let result = await MainActor.run {
+        var composingText = ComposingText()
+        composingText.insertAtCursorPosition("aru", inputStyle: .roman2kana)
+        composingText.deleteBackwardFromCursorPosition(count: 1)
+        return (
+            convertTarget: composingText.convertTarget,
+            inputCount: composingText.input.count
+        )
+    }
+
+    #expect(result.convertTarget == "あ")
+    #expect(result.inputCount == 1)
+}
+
 @Test func clausePayloadsPreserveRomanInputCountsPerClause() async throws {
     let clauses = await MainActor.run {
         var composingText = ComposingText()
@@ -205,7 +286,7 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
     #expect(clauses[0].correspondingCount == 5)
     #expect(clauses[1].text == "純一")
     #expect(clauses[1].rawHiragana == "じゅんいち")
-    #expect(clauses[1].correspondingCount == 7)
+    #expect(clauses[1].correspondingCount == 8)
 }
 
 @Test func clausePayloadsKeepMultipleBootstrapClauses() async throws {
@@ -248,6 +329,158 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
     #expect(clauses.map(\.correspondingCount) == [3, 3, 3, 3, 3])
 }
 
+@Test func clausePayloadsNormalizeUiFriendlyMultiClauses() async throws {
+    let clauses = await MainActor.run {
+        let coreCID = 561
+        let postCID = 54
+        var composingText = ComposingText()
+        composingText.insertAtCursorPosition(
+            "aabbbccdddeeffghhhijjkkllmm",
+            inputStyle: .direct
+        )
+        let candidate = Candidate(
+            text: "ある程度長い文章でも最大2文節にしか分割されない",
+            value: 0,
+            composingCount: .surfaceCount(27),
+            lastMid: 0,
+            data: [
+                DicdataElement(word: "ある", ruby: "aa", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "程度", ruby: "bbb", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "長い", ruby: "cc", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "文章", ruby: "ddd", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "でも", ruby: "ee", cid: postCID, mid: 0, value: 0),
+                DicdataElement(word: "最大", ruby: "ff", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "2", ruby: "g", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "文節", ruby: "hhh", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "に", ruby: "i", cid: postCID, mid: 0, value: 0),
+                DicdataElement(word: "しか", ruby: "jj", cid: postCID, mid: 0, value: 0),
+                DicdataElement(word: "分割", ruby: "kk", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "され", ruby: "ll", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "ない", ruby: "mm", cid: postCID, mid: 0, value: 0),
+            ]
+        )
+        return debugClausePayloads(
+            candidate: candidate,
+            originalComposingText: composingText
+        )
+    }
+
+    #expect(clauses.map(\.text) == [
+        "ある程度",
+        "長い文章でも",
+        "最大2文節にしか",
+        "分割されない",
+    ])
+    #expect(clauses.map(\.rawHiragana) == [
+        "aabbb",
+        "ccdddee",
+        "ffghhhijj",
+        "kkllmm",
+    ])
+    #expect(clauses.map(\.correspondingCount) == [5, 7, 9, 6])
+}
+
+@Test func clausePayloadNormalizationIsDeterministic() async throws {
+    let first = await MainActor.run {
+        let coreCID = 561
+        let postCID = 54
+        var composingText = ComposingText()
+        composingText.insertAtCursorPosition(
+            "aabbbccdddeeffghhhijjkkllmm",
+            inputStyle: .direct
+        )
+        let candidate = Candidate(
+            text: "ある程度長い文章でも最大2文節にしか分割されない",
+            value: 0,
+            composingCount: .surfaceCount(27),
+            lastMid: 0,
+            data: [
+                DicdataElement(word: "ある", ruby: "aa", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "程度", ruby: "bbb", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "長い", ruby: "cc", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "文章", ruby: "ddd", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "でも", ruby: "ee", cid: postCID, mid: 0, value: 0),
+                DicdataElement(word: "最大", ruby: "ff", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "2", ruby: "g", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "文節", ruby: "hhh", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "に", ruby: "i", cid: postCID, mid: 0, value: 0),
+                DicdataElement(word: "しか", ruby: "jj", cid: postCID, mid: 0, value: 0),
+                DicdataElement(word: "分割", ruby: "kk", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "され", ruby: "ll", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "ない", ruby: "mm", cid: postCID, mid: 0, value: 0),
+            ]
+        )
+        return debugClausePayloads(
+            candidate: candidate,
+            originalComposingText: composingText
+        )
+    }
+
+    let second = await MainActor.run {
+        let coreCID = 561
+        let postCID = 54
+        var composingText = ComposingText()
+        composingText.insertAtCursorPosition(
+            "aabbbccdddeeffghhhijjkkllmm",
+            inputStyle: .direct
+        )
+        let candidate = Candidate(
+            text: "ある程度長い文章でも最大2文節にしか分割されない",
+            value: 0,
+            composingCount: .surfaceCount(27),
+            lastMid: 0,
+            data: [
+                DicdataElement(word: "ある", ruby: "aa", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "程度", ruby: "bbb", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "長い", ruby: "cc", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "文章", ruby: "ddd", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "でも", ruby: "ee", cid: postCID, mid: 0, value: 0),
+                DicdataElement(word: "最大", ruby: "ff", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "2", ruby: "g", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "文節", ruby: "hhh", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "に", ruby: "i", cid: postCID, mid: 0, value: 0),
+                DicdataElement(word: "しか", ruby: "jj", cid: postCID, mid: 0, value: 0),
+                DicdataElement(word: "分割", ruby: "kk", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "され", ruby: "ll", cid: coreCID, mid: 0, value: 0),
+                DicdataElement(word: "ない", ruby: "mm", cid: postCID, mid: 0, value: 0),
+            ]
+        )
+        return debugClausePayloads(
+            candidate: candidate,
+            originalComposingText: composingText
+        )
+    }
+
+    #expect(first.map(\.text) == second.map(\.text))
+    #expect(first.map(\.rawHiragana) == second.map(\.rawHiragana))
+    #expect(first.map(\.correspondingCount) == second.map(\.correspondingCount))
+}
+
+@Test func realLongSentenceProducesMoreThanTwoClauses() async throws {
+    let reading = "あるていどながいぶんしょうでもさいだい2ぶんせつにしかぶんかつされない"
+    let clauses = try await MainActor.run {
+        try debugRealClausePayloads(hiragana: reading)
+    }
+
+    #expect(clauses.count > 2)
+    #expect(clauses.map(\.correspondingCount).reduce(0, +) == reading.count)
+    #expect(clauses.map(\.text).joined() != reading)
+}
+
+@Test func realLongSentenceClausePayloadsStayDeterministic() async throws {
+    let reading = "あるていどながいぶんしょうでもさいだい2ぶんせつにしかぶんかつされない"
+    let first = try await MainActor.run {
+        try debugRealClausePayloads(hiragana: reading)
+    }
+    let second = try await MainActor.run {
+        try debugRealClausePayloads(hiragana: reading)
+    }
+
+    #expect(first.map(\.text) == second.map(\.text))
+    #expect(first.map(\.rawHiragana) == second.map(\.rawHiragana))
+    #expect(first.map(\.correspondingCount) == second.map(\.correspondingCount))
+}
+
 @Test func trailingNPreviewFinalizesRoman2KanaOnlyInPreview() async throws {
     let result = await MainActor.run {
         var source = ComposingText()
@@ -288,6 +521,8 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
 
 @Test func trailingNPreviewSupportsCustomRomajiTable() async throws {
     let rows = [
+        row("ka", "か"),
+        row("ge", "げ"),
         row("n", "ん"),
         row("na", "な"),
         row("nn", "ん"),

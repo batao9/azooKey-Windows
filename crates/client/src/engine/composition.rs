@@ -57,6 +57,7 @@ pub struct Composition {
     pub current_clause_has_split_left_neighbor: bool,
     pub current_clause_split_group_id: Option<u64>,
     pub next_split_group_id: u64,
+    pub clause_navigation_backend_dirty: bool,
 
     pub state: CompositionState,
     pub temporary_latin: bool,
@@ -138,6 +139,7 @@ struct ClauseActionStateMut<'a> {
     current_clause_has_split_left_neighbor: &'a mut bool,
     current_clause_split_group_id: &'a mut Option<u64>,
     next_split_group_id: &'a mut u64,
+    clause_navigation_backend_dirty: &'a mut bool,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -748,6 +750,30 @@ impl TextServiceFactory {
             .chars()
             .skip(consumed_count.max(0) as usize)
             .collect()
+    }
+
+    #[inline]
+    fn sync_raw_input_with_candidates(raw_input: &mut String, candidates: &Candidates) {
+        let hinted_input_count: i32 = candidates
+            .clauses
+            .iter()
+            .map(|clause| clause.corresponding_count.max(0))
+            .sum();
+        let server_input_count = if hinted_input_count > 0 {
+            hinted_input_count
+        } else {
+            candidates
+                .corresponding_count
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(raw_input.chars().count() as i32)
+        };
+
+        *raw_input = raw_input
+            .chars()
+            .take(server_input_count.max(0) as usize)
+            .collect();
     }
 
     #[inline]
@@ -1438,6 +1464,44 @@ impl TextServiceFactory {
         }
 
         let clause_bootstrap_hints = Self::clause_bootstrap_hints(state);
+        if let Some((clause_hints, selected)) = clause_bootstrap_hints.as_ref().and_then(
+            |clause_hints| {
+                Self::select_hint_bootstrap_candidate(
+                    state.candidates,
+                    *state.corresponding_count,
+                    clause_hints,
+                )
+                .map(|selected| (clause_hints, selected))
+            },
+        )
+        {
+            *state.candidates =
+                Self::boundary_candidates_from_selection(state.candidates, &selected);
+            let Some(selected) = Self::select_candidate(state.candidates, 0) else {
+                return Ok(false);
+            };
+            let applied = Self::apply_boundary_candidate_selection(state, selected, false).applied;
+            if applied && !state.suffix.is_empty() {
+                *state.future_clause_snapshots = Self::build_future_clause_snapshots_from_hints(
+                    state.raw_input,
+                    clause_hints,
+                    *state.current_clause_split_group_id,
+                );
+                Self::sync_current_clause_and_snapshot_suffixes(state);
+                *state.clause_navigation_backend_dirty = true;
+            }
+            if applied {
+                if !Self::preserve_bootstrap_selected_display(state, &original_preview) {
+                    if let Some(set_type) = preview_set_type {
+                        Self::preserve_bootstrap_preview_conversion(state, set_type);
+                    }
+                } else if let Some(set_type) = preview_set_type {
+                    Self::preserve_bootstrap_preview_conversion(state, set_type);
+                }
+            }
+            return Ok(applied);
+        }
+
         let move_steps = if let Some(clause_hints) = clause_bootstrap_hints.as_ref() {
             let first_clause = clause_hints
                 .first()
@@ -1490,7 +1554,7 @@ impl TextServiceFactory {
 
         *state.candidates = boundary_candidates;
         if let Some(selected) = Self::select_candidate(state.candidates, 0) {
-            let applied = Self::apply_boundary_candidate_selection(state, selected).applied;
+            let applied = Self::apply_boundary_candidate_selection(state, selected, true).applied;
             if applied && !state.suffix.is_empty() {
                 if let Some(clause_hints) = clause_bootstrap_hints.as_ref().filter(|clause_hints| {
                     clause_hints.first().is_some_and(|first_clause| {
@@ -1541,6 +1605,10 @@ impl TextServiceFactory {
         }
 
         if direction > 0 {
+            if *state.clause_navigation_backend_dirty {
+                return Ok(Self::apply_move_clause_right_from_cache(state));
+            }
+
             if state.suffix.is_empty() {
                 return Ok(ClauseActionEffect::skipped());
             }
@@ -1612,6 +1680,7 @@ impl TextServiceFactory {
                 if !state.future_clause_snapshots.is_empty() {
                     state.future_clause_snapshots.clear();
                 }
+                *state.clause_navigation_backend_dirty = false;
                 *state.current_clause_is_split_derived = false;
                 *state.current_clause_is_direct_split_remainder = false;
                 *state.current_clause_has_split_left_neighbor = false;
@@ -1672,7 +1741,9 @@ impl TextServiceFactory {
                     *state.current_clause_split_group_id,
                     state.candidates,
                 );
-                let _ = backend.move_cursor(Self::MOVE_CURSOR_POP_CLAUSE_SNAPSHOT)?;
+                if !*state.clause_navigation_backend_dirty {
+                    let _ = backend.move_cursor(Self::MOVE_CURSOR_POP_CLAUSE_SNAPSHOT)?;
+                }
 
                 *state.preview = restored.preview;
                 *state.suffix = restored.suffix;
@@ -1697,6 +1768,92 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn apply_move_clause_right_from_cache(
+        state: &mut ClauseActionStateMut<'_>,
+    ) -> ClauseActionEffect {
+        if state.suffix.is_empty() || state.future_clause_snapshots.is_empty() {
+            return ClauseActionEffect::skipped();
+        }
+
+        let mut snapshot = Self::build_clause_snapshot(
+            state.preview,
+            state.suffix,
+            state.raw_input,
+            state.raw_hiragana,
+            state.fixed_prefix,
+            *state.corresponding_count,
+            *state.selection_index,
+            *state.current_clause_is_split_derived,
+            *state.current_clause_has_split_left_neighbor,
+            state.candidates,
+        );
+        snapshot.split_group_id = *state.current_clause_split_group_id;
+        snapshot.is_direct_split_remainder = *state.current_clause_is_direct_split_remainder;
+        let current_clause_preview =
+            Self::current_clause_preview(state.preview, state.fixed_prefix);
+        let current_corresponding_count = *state.corresponding_count;
+        state.clause_snapshots.push(snapshot);
+
+        *state.raw_input = state
+            .raw_input
+            .chars()
+            .skip(current_corresponding_count.max(0) as usize)
+            .collect();
+        state.fixed_prefix.push_str(&current_clause_preview);
+
+        let Some(restored_future) = state.future_clause_snapshots.pop() else {
+            return ClauseActionEffect::skipped();
+        };
+        Self::restore_future_clause_snapshot(
+            state.preview,
+            state.suffix,
+            state.raw_input,
+            state.raw_hiragana,
+            state.corresponding_count,
+            state.selection_index,
+            state.current_clause_is_split_derived,
+            state.current_clause_is_direct_split_remainder,
+            state.current_clause_has_split_left_neighbor,
+            state.current_clause_split_group_id,
+            state.candidates,
+            state.fixed_prefix,
+            &restored_future,
+        );
+        *state.suffix = Self::sync_current_clause_future_suffix(
+            state.candidates,
+            *state.selection_index,
+            *state.corresponding_count,
+            state.future_clause_snapshots,
+        );
+        ClauseActionEffect::applied(true)
+    }
+
+    fn sync_backend_clause_navigation_cache<B: ClauseActionBackend>(
+        state: &mut ClauseActionStateMut<'_>,
+        backend: &mut B,
+    ) -> Result<()> {
+        if !*state.clause_navigation_backend_dirty {
+            return Ok(());
+        }
+
+        let mut backend_candidates = backend.move_cursor(Self::MOVE_CURSOR_CLEAR_CLAUSE_SNAPSHOTS)?;
+        for snapshot in state.clause_snapshots.iter() {
+            let _ = backend.move_cursor(Self::MOVE_CURSOR_PUSH_CLAUSE_SNAPSHOT)?;
+            backend_candidates = backend.shrink_text(snapshot.corresponding_count)?;
+        }
+
+        Self::sync_backend_current_clause_to_target(
+            backend,
+            &mut backend_candidates,
+            state.raw_hiragana,
+            state.suffix,
+            *state.corresponding_count,
+        )?;
+        *state.clause_navigation_backend_dirty = false;
+        Ok(())
+    }
+
+    #[inline]
     fn apply_adjust_boundary<B: ClauseActionBackend>(
         state: &mut ClauseActionStateMut<'_>,
         backend: &mut B,
@@ -1707,6 +1864,7 @@ impl TextServiceFactory {
         }
 
         let _ = Self::bootstrap_clause_navigation(state, backend)?;
+        Self::sync_backend_clause_navigation_cache(state, backend)?;
         let fallback_candidates = state.candidates.clone();
         if !state.suffix.is_empty() || !state.future_clause_snapshots.is_empty() {
             Self::sync_backend_current_clause_to_target(
@@ -1728,7 +1886,9 @@ impl TextServiceFactory {
                     *state.corresponding_count,
                 ) {
                     *state.candidates = fallback_candidates;
-                    return Ok(Self::apply_boundary_candidate_selection(state, selected));
+                    return Ok(Self::apply_boundary_candidate_selection(
+                        state, selected, true,
+                    ));
                 }
             }
             return Ok(ClauseActionEffect::skipped());
@@ -1736,7 +1896,9 @@ impl TextServiceFactory {
 
         *state.candidates = boundary_candidates;
         if let Some(selected) = Self::select_candidate(state.candidates, 0) {
-            Ok(Self::apply_boundary_candidate_selection(state, selected))
+            Ok(Self::apply_boundary_candidate_selection(
+                state, selected, true,
+            ))
         } else {
             Ok(ClauseActionEffect::skipped())
         }
@@ -1754,9 +1916,73 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn select_hint_bootstrap_candidate(
+        candidates: &Candidates,
+        current_corresponding_count: i32,
+        clause_hints: &[ClauseHint],
+    ) -> Option<CandidateSelection> {
+        let first_clause = clause_hints.first()?;
+        (0..candidates.texts.len())
+            .filter_map(|index| Self::select_candidate(candidates, index as i32))
+            .find(|candidate| {
+                candidate.corresponding_count == first_clause.corresponding_count
+                    && candidate.text == first_clause.text
+            })
+            .or_else(|| {
+                (0..candidates.texts.len())
+                    .filter_map(|index| Self::select_candidate(candidates, index as i32))
+                    .find(|candidate| {
+                        candidate.corresponding_count == first_clause.corresponding_count
+                    })
+            })
+            .or_else(|| {
+                Self::select_split_left_candidate(candidates, current_corresponding_count).filter(
+                    |candidate| candidate.corresponding_count == first_clause.corresponding_count,
+                )
+            })
+    }
+
+    #[inline]
+    fn boundary_candidates_from_selection(
+        candidates: &Candidates,
+        selected: &CandidateSelection,
+    ) -> Candidates {
+        let mut texts = Vec::new();
+        let mut sub_texts = Vec::new();
+        let mut corresponding_count = Vec::new();
+
+        for index in 0..candidates.texts.len() {
+            let Some(candidate) = Self::select_candidate(candidates, index as i32) else {
+                continue;
+            };
+            if candidate.corresponding_count != selected.corresponding_count {
+                continue;
+            }
+            texts.push(candidate.text);
+            sub_texts.push(candidate.sub_text);
+            corresponding_count.push(candidate.corresponding_count);
+        }
+
+        if texts.is_empty() {
+            texts.push(selected.text.clone());
+            sub_texts.push(selected.sub_text.clone());
+            corresponding_count.push(selected.corresponding_count);
+        }
+
+        Candidates {
+            texts,
+            sub_texts,
+            hiragana: candidates.hiragana.clone(),
+            corresponding_count,
+            clauses: Vec::new(),
+        }
+    }
+
+    #[inline]
     fn apply_boundary_candidate_selection(
         state: &mut ClauseActionStateMut<'_>,
         selected: CandidateSelection,
+        seed_future_snapshot: bool,
     ) -> ClauseActionEffect {
         let split_group_id = (*state.current_clause_split_group_id)
             .or_else(|| {
@@ -1784,18 +2010,21 @@ impl TextServiceFactory {
         *state.raw_hiragana = selected.hiragana;
         *state.suffix = selected.sub_text.clone();
         *state.current_clause_split_group_id = Some(split_group_id);
-        let allow_bootstrap_without_existing_future = state.future_clause_snapshots.is_empty()
-            && !state.clause_snapshots.is_empty()
-            && Self::current_raw_suffix(state.raw_hiragana, *state.corresponding_count).is_empty();
-        Self::maybe_push_split_future_clause_snapshot(
-            state.future_clause_snapshots,
-            state.raw_input,
-            state.raw_hiragana,
-            *state.corresponding_count,
-            &selected.sub_text,
-            allow_bootstrap_without_existing_future,
-            Some(split_group_id),
-        );
+        if seed_future_snapshot {
+            let allow_bootstrap_without_existing_future = state.future_clause_snapshots.is_empty()
+                && !state.clause_snapshots.is_empty()
+                && Self::current_raw_suffix(state.raw_hiragana, *state.corresponding_count)
+                    .is_empty();
+            Self::maybe_push_split_future_clause_snapshot(
+                state.future_clause_snapshots,
+                state.raw_input,
+                state.raw_hiragana,
+                *state.corresponding_count,
+                &selected.sub_text,
+                allow_bootstrap_without_existing_future,
+                Some(split_group_id),
+            );
+        }
         let split_group_still_active = state
             .future_clause_snapshots
             .iter()
@@ -2299,6 +2528,7 @@ impl TextServiceFactory {
             *state.current_clause_has_split_left_neighbor;
         let mut temp_current_clause_split_group_id = *state.current_clause_split_group_id;
         let mut temp_next_split_group_id = *state.next_split_group_id;
+        let mut temp_clause_navigation_backend_dirty = *state.clause_navigation_backend_dirty;
         let mut collected = Vec::new();
         let mut result: Result<()> = Ok(());
 
@@ -2322,6 +2552,7 @@ impl TextServiceFactory {
                         &mut temp_current_clause_has_split_left_neighbor,
                     current_clause_split_group_id: &mut temp_current_clause_split_group_id,
                     next_split_group_id: &mut temp_next_split_group_id,
+                    clause_navigation_backend_dirty: &mut temp_clause_navigation_backend_dirty,
                 };
                 match Self::apply_move_clause(&mut temp_state, backend, 1) {
                     Ok(effect) => effect,
@@ -2488,7 +2719,6 @@ impl TextServiceFactory {
         )
     }
 
-    #[inline]
     fn sync_backend_current_clause_to_target<B: ClauseActionBackend>(
         backend: &mut B,
         candidates: &mut Candidates,
@@ -3270,6 +3500,7 @@ impl TextServiceFactory {
             composition.current_clause_has_split_left_neighbor;
         let mut current_clause_split_group_id = composition.current_clause_split_group_id;
         let mut next_split_group_id = composition.next_split_group_id;
+        let mut clause_navigation_backend_dirty = composition.clause_navigation_backend_dirty;
         let mut selection_index = composition.selection_index;
         let mut temporary_latin = composition.temporary_latin;
         let mut temporary_latin_shift_pending = composition.temporary_latin_shift_pending;
@@ -3306,6 +3537,7 @@ impl TextServiceFactory {
                     current_clause_has_split_left_neighbor = false;
                     current_clause_split_group_id = None;
                     next_split_group_id = 0;
+                    clause_navigation_backend_dirty = false;
                     ipc_service.hide_window()?;
                     ipc_service.set_candidates(vec![])?;
                     ipc_service.clear_text()?;
@@ -3331,6 +3563,7 @@ impl TextServiceFactory {
                     current_clause_is_direct_split_remainder = false;
                     current_clause_has_split_left_neighbor = false;
                     current_clause_split_group_id = None;
+                    clause_navigation_backend_dirty = false;
                     candidates = ipc_service.append_text_with_context(text.clone(), &candidates)?;
                     raw_input.push_str(&text);
                     if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
@@ -3355,6 +3588,7 @@ impl TextServiceFactory {
                     current_clause_is_direct_split_remainder = false;
                     current_clause_has_split_left_neighbor = false;
                     current_clause_split_group_id = None;
+                    clause_navigation_backend_dirty = false;
                     candidates = ipc_service.append_text_with_context(text.clone(), &candidates)?;
                     raw_input.push_str(text);
                     if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
@@ -3379,6 +3613,7 @@ impl TextServiceFactory {
                     current_clause_is_direct_split_remainder = false;
                     current_clause_has_split_left_neighbor = false;
                     current_clause_split_group_id = None;
+                    clause_navigation_backend_dirty = false;
                     candidates =
                         ipc_service.append_text_direct_with_context(text.clone(), &candidates)?;
                     raw_input.push_str(text);
@@ -3404,8 +3639,9 @@ impl TextServiceFactory {
                     current_clause_is_direct_split_remainder = false;
                     current_clause_has_split_left_neighbor = false;
                     current_clause_split_group_id = None;
-                    raw_input.pop();
+                    clause_navigation_backend_dirty = false;
                     candidates = ipc_service.remove_text()?;
+                    Self::sync_raw_input_with_candidates(&mut raw_input, &candidates);
                     if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
                         selection_index = selected.index;
                         corresponding_count = selected.corresponding_count;
@@ -3436,6 +3672,7 @@ impl TextServiceFactory {
                         current_clause_is_direct_split_remainder = false;
                         current_clause_has_split_left_neighbor = false;
                         current_clause_split_group_id = None;
+                        clause_navigation_backend_dirty = false;
 
                         if committed_prefix.is_empty() {
                             self.set_text("", "")?;
@@ -3500,6 +3737,7 @@ impl TextServiceFactory {
                                 &mut current_clause_has_split_left_neighbor,
                             current_clause_split_group_id: &mut current_clause_split_group_id,
                             next_split_group_id: &mut next_split_group_id,
+                            clause_navigation_backend_dirty: &mut clause_navigation_backend_dirty,
                         };
                         Self::apply_move_clause(&mut state, &mut ipc_service, *direction)?
                     };
@@ -3578,6 +3816,7 @@ impl TextServiceFactory {
                                 &mut current_clause_has_split_left_neighbor,
                             current_clause_split_group_id: &mut current_clause_split_group_id,
                             next_split_group_id: &mut next_split_group_id,
+                            clause_navigation_backend_dirty: &mut clause_navigation_backend_dirty,
                         };
                         Self::apply_adjust_boundary(&mut state, &mut ipc_service, *direction)?
                     };
@@ -3656,6 +3895,7 @@ impl TextServiceFactory {
                     current_clause_has_split_left_neighbor = false;
                     current_clause_split_group_id = None;
                     next_split_group_id = 0;
+                    clause_navigation_backend_dirty = false;
                     ipc_service.clear_text()?;
                 }
                 ClientAction::SetSelection(selection) => {
@@ -3692,6 +3932,7 @@ impl TextServiceFactory {
                                 &mut current_clause_has_split_left_neighbor,
                             current_clause_split_group_id: &mut current_clause_split_group_id,
                             next_split_group_id: &mut next_split_group_id,
+                            clause_navigation_backend_dirty: &mut clause_navigation_backend_dirty,
                         };
                         Self::apply_set_selection(&mut state, selection)
                     };
@@ -3747,6 +3988,7 @@ impl TextServiceFactory {
                     current_clause_is_direct_split_remainder = false;
                     current_clause_has_split_left_neighbor = false;
                     current_clause_split_group_id = None;
+                    clause_navigation_backend_dirty = false;
                     let shrunk_raw_input: String = raw_input
                         .chars()
                         .skip(corresponding_count.max(0) as usize)
@@ -3796,6 +4038,7 @@ impl TextServiceFactory {
                     current_clause_is_direct_split_remainder = false;
                     current_clause_has_split_left_neighbor = false;
                     current_clause_split_group_id = None;
+                    clause_navigation_backend_dirty = false;
                     let mut updated_raw_input: String = raw_input
                         .chars()
                         .skip(corresponding_count.max(0) as usize)
@@ -3835,6 +4078,7 @@ impl TextServiceFactory {
                     current_clause_is_direct_split_remainder = false;
                     current_clause_has_split_left_neighbor = false;
                     current_clause_split_group_id = None;
+                    clause_navigation_backend_dirty = false;
                     let mut updated_raw_input: String = raw_input
                         .chars()
                         .skip(corresponding_count.max(0) as usize)
@@ -3914,6 +4158,7 @@ impl TextServiceFactory {
         composition.current_clause_has_split_left_neighbor = current_clause_has_split_left_neighbor;
         composition.current_clause_split_group_id = current_clause_split_group_id;
         composition.next_split_group_id = next_split_group_id;
+        composition.clause_navigation_backend_dirty = clause_navigation_backend_dirty;
         composition.suffix = suffix.clone();
         composition.corresponding_count = corresponding_count;
         composition.temporary_latin = temporary_latin;
