@@ -1863,7 +1863,6 @@ impl TextServiceFactory {
             return Ok(ClauseActionEffect::skipped());
         }
 
-        let _ = Self::bootstrap_clause_navigation(state, backend)?;
         Self::sync_backend_clause_navigation_cache(state, backend)?;
         let fallback_candidates = state.candidates.clone();
         if !state.suffix.is_empty() || !state.future_clause_snapshots.is_empty() {

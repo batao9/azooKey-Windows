@@ -159,6 +159,53 @@ impl ClauseActionBackend for SelectedCandidateBootstrapBackend {
 }
 
 #[derive(Default)]
+struct AdjustBoundaryBackend {
+    move_cursor_calls: Vec<i32>,
+    shrink_text_calls: Vec<i32>,
+    last_direction: i32,
+}
+
+impl AdjustBoundaryBackend {
+    fn unsplit_candidates() -> Candidates {
+        with_clause_hints(
+            candidates(&["テスト文章"], &[""], "てすとぶんしょう", &[7]),
+            &[("テスト", "てすと", 3), ("文章", "ぶんしょう", 4)],
+        )
+    }
+
+    fn split_left_candidates() -> Candidates {
+        candidates(&["テスト文書"], &["う"], "てすとぶんしょう", &[6])
+    }
+
+    fn split_right_candidates() -> Candidates {
+        candidates(&["て"], &["スト文章"], "てすとぶんしょう", &[1])
+    }
+}
+
+impl ClauseActionBackend for AdjustBoundaryBackend {
+    fn move_cursor(&mut self, offset: i32) -> anyhow::Result<Candidates> {
+        self.move_cursor_calls.push(offset);
+        Ok(match offset {
+            -1 | 1 => {
+                self.last_direction = offset;
+                Self::unsplit_candidates()
+            }
+            0 => match self.last_direction {
+                -1 => Self::split_left_candidates(),
+                1 => Self::split_right_candidates(),
+                _ => Self::unsplit_candidates(),
+            },
+            _ => Self::unsplit_candidates(),
+        })
+    }
+
+    fn shrink_text(&mut self, offset: i32) -> anyhow::Result<Candidates> {
+        self.shrink_text_calls.push(offset);
+        Ok(Self::unsplit_candidates())
+    }
+}
+
+#[derive(Default)]
 struct MultiStageBootstrapBackend {
     move_cursor_calls: Vec<i32>,
     shrink_text_calls: Vec<i32>,
@@ -382,6 +429,27 @@ fn selected_candidate_bootstrap_state() -> BootstrapState {
     }
 }
 
+fn adjust_boundary_state() -> BootstrapState {
+    BootstrapState {
+        preview: "テスト文章".to_string(),
+        suffix: String::new(),
+        raw_input: "てすとぶんしょう".to_string(),
+        raw_hiragana: "てすとぶんしょう".to_string(),
+        fixed_prefix: String::new(),
+        corresponding_count: 7,
+        selection_index: 0,
+        candidates: AdjustBoundaryBackend::unsplit_candidates(),
+        clause_snapshots: Vec::new(),
+        future_clause_snapshots: Vec::new(),
+        current_clause_is_split_derived: false,
+        current_clause_is_direct_split_remainder: false,
+        current_clause_has_split_left_neighbor: false,
+        current_clause_split_group_id: None,
+        next_split_group_id: 1,
+        clause_navigation_backend_dirty: false,
+    }
+}
+
 #[test]
 fn move_clause_right_bootstraps_initial_navigation_to_the_first_clause() {
     let mut state = BootstrapState::new();
@@ -561,6 +629,52 @@ fn move_clause_right_bootstrap_keeps_selected_candidate_conversion() {
         ),
         "加藤 / 純一"
     );
+}
+
+#[test]
+fn adjust_boundary_left_from_unsplit_state_skips_auto_clause_bootstrap() {
+    let mut state = adjust_boundary_state();
+    let mut backend = AdjustBoundaryBackend::default();
+
+    let effect = {
+        let mut state_mut = state.state_mut();
+        TextServiceFactory::apply_adjust_boundary(&mut state_mut, &mut backend, -1)
+            .expect("apply_adjust_boundary")
+    };
+
+    assert!(effect.applied);
+    assert_eq!(state.preview, "テスト文書");
+    assert_eq!(state.suffix, "う");
+    assert_eq!(state.fixed_prefix, "");
+    assert_eq!(state.corresponding_count, 6);
+    assert_eq!(state.selection_index, 0);
+    assert_eq!(backend.move_cursor_calls, vec![-1, 0]);
+    assert!(backend.shrink_text_calls.is_empty());
+    assert!(state.clause_snapshots.is_empty());
+    assert!(state.future_clause_snapshots.is_empty());
+}
+
+#[test]
+fn adjust_boundary_right_from_unsplit_state_skips_auto_clause_bootstrap() {
+    let mut state = adjust_boundary_state();
+    let mut backend = AdjustBoundaryBackend::default();
+
+    let effect = {
+        let mut state_mut = state.state_mut();
+        TextServiceFactory::apply_adjust_boundary(&mut state_mut, &mut backend, 1)
+            .expect("apply_adjust_boundary")
+    };
+
+    assert!(effect.applied);
+    assert_eq!(state.preview, "て");
+    assert_eq!(state.suffix, "スト文章");
+    assert_eq!(state.fixed_prefix, "");
+    assert_eq!(state.corresponding_count, 1);
+    assert_eq!(state.selection_index, 0);
+    assert_eq!(backend.move_cursor_calls, vec![1, 0]);
+    assert!(backend.shrink_text_calls.is_empty());
+    assert!(state.clause_snapshots.is_empty());
+    assert!(state.future_clause_snapshots.is_empty());
 }
 
 #[test]
