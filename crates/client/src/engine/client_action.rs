@@ -4,6 +4,7 @@ use super::input_mode::InputMode;
 pub enum ClientAction {
     StartComposition,
     EndComposition,
+    ShowCandidateWindow,
 
     AppendText(String),
     AppendTextRaw(String),

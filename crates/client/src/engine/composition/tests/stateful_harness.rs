@@ -1466,6 +1466,7 @@ fn apply_user_action(
             ClientAction::StartComposition => {
                 harness.state = CompositionState::Composing;
             }
+            ClientAction::ShowCandidateWindow => {}
             ClientAction::EndComposition => {
                 let snapshot_count = harness.clause_snapshots.len();
                 for index in 0..snapshot_count {

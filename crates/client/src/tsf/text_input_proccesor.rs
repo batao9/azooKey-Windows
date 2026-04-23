@@ -14,7 +14,7 @@ use windows::{
         UI::TextServices::{
             CLSID_TF_CategoryMgr, ITfCategoryMgr, ITfKeyEventSink, ITfKeystrokeMgr,
             ITfLangBarItemButton, ITfLangBarItemMgr, ITfSource, ITfTextInputProcessorEx_Impl,
-            ITfTextInputProcessor_Impl, ITfThreadMgr, ITfThreadMgrEventSink,
+            ITfTextInputProcessor_Impl, ITfThreadFocusSink, ITfThreadMgr, ITfThreadMgrEventSink,
         },
     },
 };
@@ -71,11 +71,22 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
                 .insert(ITfThreadMgrEventSink::IID, cookie);
         };
 
+        tracing::debug!("AdviseThreadFocusSink");
+        unsafe {
+            let cookie = thread_mgr.cast::<ITfSource>()?.AdviseSink(
+                &ITfThreadFocusSink::IID,
+                &text_service.this::<ITfThreadFocusSink>()?,
+            )?;
+            IMEState::get()?
+                .cookies
+                .insert(ITfThreadFocusSink::IID, cookie);
+        };
+
         // initialize text layout sink
         tracing::debug!("AdviseTextLayoutSink");
-        let doc_mgr = unsafe { thread_mgr.GetFocus() };
-        if let Ok(doc_mgr) = doc_mgr {
-            text_service.advise_text_layout_sink(doc_mgr)?;
+        let doc_mgr = unsafe { thread_mgr.GetFocus().ok() };
+        if let Some(doc_mgr) = doc_mgr.as_ref() {
+            text_service.advise_text_layout_sink(doc_mgr.clone())?;
         }
 
         // initialize display attribute
@@ -99,6 +110,8 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
                 .cast::<ITfLangBarItemMgr>()?
                 .AddItem(&text_service.this::<ITfLangBarItemButton>()?)?;
         };
+        drop(text_service);
+        self.set_keyboard_disabled_for_document_mgr(doc_mgr.as_ref())?;
 
         tracing::debug!("Activate success");
 
@@ -144,6 +157,13 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         tracing::debug!("UnadviseThreadMgrEventSink");
         unsafe {
             if let Some(cookie) = IMEState::get()?.cookies.remove(&ITfThreadMgrEventSink::IID) {
+                thread_mgr.cast::<ITfSource>()?.UnadviseSink(cookie)?;
+            }
+        };
+
+        tracing::debug!("UnadviseThreadFocusSink");
+        unsafe {
+            if let Some(cookie) = IMEState::get()?.cookies.remove(&ITfThreadFocusSink::IID) {
                 thread_mgr.cast::<ITfSource>()?.UnadviseSink(cookie)?;
             }
         };

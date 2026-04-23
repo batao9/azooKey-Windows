@@ -23,7 +23,8 @@ use windows::{
             TextServices::{
                 ITfLangBarItemButton_Impl, ITfLangBarItemSink, ITfLangBarItem_Impl, ITfMenu,
                 ITfSource_Impl, TfLBIClick, GUID_LBI_INPUTMODE, TF_LANGBARITEMINFO,
-                TF_LBI_CLK_LEFT, TF_LBI_CLK_RIGHT, TF_LBI_STYLE_BTN_BUTTON, TF_LBI_STYLE_BTN_MENU,
+                TF_LBI_CLK_LEFT, TF_LBI_CLK_RIGHT, TF_LBI_STATUS_DISABLED, TF_LBI_STYLE_BTN_BUTTON,
+                TF_LBI_STYLE_BTN_MENU,
             },
             WindowsAndMessaging::{
                 AppendMenuW, CreatePopupMenu, DestroyMenu, GetAncestor, GetForegroundWindow,
@@ -108,7 +109,11 @@ impl ITfLangBarItem_Impl for TextServiceFactory_Impl {
 
     #[macros::anyhow]
     fn GetStatus(&self) -> Result<u32> {
-        Ok(0)
+        if IMEState::get()?.keyboard_disabled {
+            Ok(TF_LBI_STATUS_DISABLED)
+        } else {
+            Ok(0)
+        }
     }
 
     #[macros::anyhow]
@@ -126,6 +131,10 @@ impl ITfLangBarItem_Impl for TextServiceFactory_Impl {
 impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     fn OnClick(&self, click: TfLBIClick, pt: &POINT, _prcarea: *const RECT) -> Result<()> {
+        if IMEState::get()?.keyboard_disabled {
+            return Ok(());
+        }
+
         match click {
             TF_LBI_CLK_LEFT => self.toggle_input_mode()?,
             TF_LBI_CLK_RIGHT => self.handle_right_click(pt)?,
@@ -157,7 +166,11 @@ impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
     fn GetIcon(&self) -> Result<HICON> {
         let dll_module = DllModule::get()?;
         let state = &IMEState::get()?;
-        let input_mode = &state.input_mode;
+        let input_mode = if state.keyboard_disabled {
+            &InputMode::Latin
+        } else {
+            &state.input_mode
+        };
         let theme = get_theme()?;
 
         let icon_id = match input_mode {
