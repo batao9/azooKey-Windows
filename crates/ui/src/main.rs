@@ -30,6 +30,8 @@ pub mod ipc;
 pub mod uiaccess;
 pub mod utils;
 
+const INDICATOR_WINDOW_LEFT_OFFSET: i32 = 45;
+
 fn place_candidate_windows(
     candidate_window: &tao::window::Window,
     indicator_window: &tao::window::Window,
@@ -42,9 +44,9 @@ fn place_candidate_windows(
         rect.right,
         candidate_window,
     );
-    candidate_window.set_outer_position(PhysicalPosition::new(x as f64, y as f64));
+    candidate_window.set_outer_position(PhysicalPosition::new(x, y));
     indicator_window.set_outer_position(PhysicalPosition::new(
-        (rect.left - 45) as f64,
+        (rect.left - INDICATOR_WINDOW_LEFT_OFFSET) as f64,
         rect.bottom as f64,
     ));
 }

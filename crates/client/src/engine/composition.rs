@@ -2594,6 +2594,7 @@ impl TextServiceFactory {
         let keyboard_disabled = keyboard_disabled_from_context(context);
         self.set_keyboard_disabled_state(keyboard_disabled)?;
         if keyboard_disabled {
+            self.cancel_composition_for_disabled_context();
             return Ok(None);
         }
 
@@ -2725,6 +2726,7 @@ impl TextServiceFactory {
         let keyboard_disabled = keyboard_disabled_from_context(context);
         self.set_keyboard_disabled_state(keyboard_disabled)?;
         if keyboard_disabled {
+            self.cancel_composition_for_disabled_context();
             return Ok(None);
         }
         if !Self::is_shift_key(wparam) {
@@ -2816,6 +2818,10 @@ impl TextServiceFactory {
     }
 
     fn recover_after_key_error(&self) {
+        self.cancel_composition_for_disabled_context();
+    }
+
+    fn cancel_composition_for_disabled_context(&self) {
         let _ = self.abort_composition();
 
         if let Ok(text_service) = self.borrow() {
@@ -2824,11 +2830,16 @@ impl TextServiceFactory {
             }
         }
 
-        if let Ok(mut ime_state) = IMEState::get() {
-            if let Some(mut ipc_service) = ime_state.ipc_service.clone() {
-                let _ = ipc_service.hide_window();
-                let _ = ipc_service.set_candidates(vec![]);
-                let _ = ipc_service.clear_text();
+        let ipc_service = IMEState::get()
+            .ok()
+            .and_then(|state| state.ipc_service.clone());
+
+        if let Some(mut ipc_service) = ipc_service {
+            let _ = ipc_service.hide_window();
+            let _ = ipc_service.set_candidates(vec![]);
+            let _ = ipc_service.clear_text();
+
+            if let Ok(mut ime_state) = IMEState::get() {
                 ime_state.ipc_service = Some(ipc_service);
             }
         }

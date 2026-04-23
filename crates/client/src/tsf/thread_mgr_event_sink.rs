@@ -14,21 +14,26 @@ use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
 
 impl TextServiceFactory {
     pub fn set_keyboard_disabled_state(&self, disabled: bool) -> Result<()> {
-        let changed = {
+        let (changed, ipc_service) = {
             let mut state = IMEState::get()?;
             let changed = state.keyboard_disabled != disabled;
             state.keyboard_disabled = disabled;
+            let ipc_service = if disabled {
+                state.ipc_service.clone()
+            } else {
+                None
+            };
 
-            if disabled {
-                if let Some(mut ipc_service) = state.ipc_service.clone() {
-                    let _ = ipc_service.hide_window();
-                    let _ = ipc_service.set_candidates(vec![]);
-                    state.ipc_service = Some(ipc_service);
-                }
-            }
-
-            changed
+            (changed, ipc_service)
         };
+
+        if let Some(mut ipc_service) = ipc_service {
+            let _ = ipc_service.hide_window();
+            let _ = ipc_service.set_candidates(vec![]);
+
+            let mut state = IMEState::get()?;
+            state.ipc_service = Some(ipc_service);
+        }
 
         if changed {
             self.update_lang_bar()?;
