@@ -221,6 +221,18 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn should_shrink_before_direct_append(
+        composition: &Composition,
+        start_temporary_latin: bool,
+    ) -> bool {
+        start_temporary_latin
+            && composition.raw_input.ends_with('n')
+            && composition.raw_hiragana.ends_with('ん')
+            && Self::current_raw_suffix(&composition.raw_hiragana, composition.corresponding_count)
+                .is_empty()
+    }
+
+    #[inline]
     fn normalize_direct_symbol_char(c: char) -> char {
         let halfwidth_ascii = Self::to_halfwidth_ascii_char(c);
         if halfwidth_ascii.is_ascii_punctuation() {
@@ -2317,7 +2329,12 @@ impl TextServiceFactory {
                     if start_temporary_latin {
                         actions.push(ClientAction::SetTemporaryLatin(true));
                     }
-                    actions.push(ClientAction::AppendTextDirect(text));
+                    if Self::should_shrink_before_direct_append(composition, start_temporary_latin)
+                    {
+                        actions.push(ClientAction::ShrinkTextDirect(text));
+                    } else {
+                        actions.push(ClientAction::AppendTextDirect(text));
+                    }
                     Some((CompositionState::Composing, actions))
                 }
                 UserAction::NumpadSymbol(symbol) if *mode == InputMode::Kana => {

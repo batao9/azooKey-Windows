@@ -97,6 +97,11 @@ struct RawComposingText {
     cursor: i8,
 }
 
+struct ComposedText {
+    hiragana: Option<String>,
+    suggestions: Vec<Suggestion>,
+}
+
 #[derive(Debug, Clone)]
 #[repr(C)]
 struct FFICandidate {
@@ -360,7 +365,7 @@ fn update_active_composition_state(text: &str) {
     HAS_ACTIVE_COMPOSITION.store(!text.is_empty(), Ordering::Relaxed);
 }
 
-fn get_composed_text(use_cursor_prefix: bool) -> Result<Vec<Suggestion>, String> {
+fn get_composed_text(use_cursor_prefix: bool) -> Result<ComposedText, String> {
     unsafe {
         let mut length: c_int = 0;
         let result = if use_cursor_prefix {
@@ -385,6 +390,7 @@ fn get_composed_text(use_cursor_prefix: bool) -> Result<Vec<Suggestion>, String>
         }
 
         let mut suggestions = Vec::with_capacity(length);
+        let mut hiragana = None;
         log_event_lazy!(
             ServerLogLevel::Debug,
             "[{call_name}] candidate_count={length}"
@@ -411,6 +417,14 @@ fn get_composed_text(use_cursor_prefix: bool) -> Result<Vec<Suggestion>, String>
                 continue;
             }
 
+            if hiragana.is_none() && !candidate.hiragana.is_null() {
+                hiragana = Some(
+                    CStr::from_ptr(candidate.hiragana)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+
             let text = CStr::from_ptr(candidate.text)
                 .to_string_lossy()
                 .into_owned();
@@ -434,7 +448,10 @@ fn get_composed_text(use_cursor_prefix: bool) -> Result<Vec<Suggestion>, String>
             suggestions.push(suggestion);
         }
 
-        Ok(suggestions)
+        Ok(ComposedText {
+            hiragana,
+            suggestions,
+        })
     }
 }
 
@@ -479,7 +496,7 @@ impl AzookeyService for MyAzookeyService {
             "[append_text:{request_id}] add_text elapsed_ms={}",
             t1.saturating_sub(t0)
         );
-        let suggestions =
+        let composed_text =
             get_composed_text(false).map_err(|error| status_from_error("append_text", error))?;
         let t2 = now_timestamp_millis();
         log_event_lazy!(
@@ -494,14 +511,14 @@ impl AzookeyService for MyAzookeyService {
             "[append_text:{request_id}] success cursor={} hiragana_len={} suggestions={} total_elapsed_ms={}",
             composing_text.cursor,
             composing_text.text.chars().count(),
-            suggestions.len(),
+            composed_text.suggestions.len(),
             t2.saturating_sub(handler_start)
         );
 
         Ok(Response::new(AppendTextResponse {
             composing_text: Some(ComposingText {
-                hiragana: composing_text.text,
-                suggestions,
+                hiragana: composed_text.hiragana.unwrap_or(composing_text.text),
+                suggestions: composed_text.suggestions,
             }),
         }))
     }
@@ -523,7 +540,7 @@ impl AzookeyService for MyAzookeyService {
             "[remove_text:{request_id}] remove_text elapsed_ms={}",
             t1.saturating_sub(t0)
         );
-        let suggestions =
+        let composed_text =
             get_composed_text(false).map_err(|error| status_from_error("remove_text", error))?;
         let t2 = now_timestamp_millis();
         log_event_lazy!(
@@ -538,14 +555,14 @@ impl AzookeyService for MyAzookeyService {
             "[remove_text:{request_id}] success cursor={} hiragana_len={} suggestions={} total_elapsed_ms={}",
             composing_text.cursor,
             composing_text.text.chars().count(),
-            suggestions.len(),
+            composed_text.suggestions.len(),
             t2.saturating_sub(handler_start)
         );
 
         Ok(Response::new(RemoveTextResponse {
             composing_text: Some(ComposingText {
-                hiragana: composing_text.text,
-                suggestions,
+                hiragana: composed_text.hiragana.unwrap_or(composing_text.text),
+                suggestions: composed_text.suggestions,
             }),
         }))
     }
@@ -573,7 +590,7 @@ impl AzookeyService for MyAzookeyService {
             "[move_cursor:{request_id}] move_cursor elapsed_ms={}",
             t1.saturating_sub(t0)
         );
-        let suggestions = get_composed_text(use_cursor_prefix)
+        let composed_text = get_composed_text(use_cursor_prefix)
             .map_err(|error| status_from_error("move_cursor", error))?;
         let t2 = now_timestamp_millis();
         log_event_lazy!(
@@ -588,14 +605,14 @@ impl AzookeyService for MyAzookeyService {
             "[move_cursor:{request_id}] success cursor={} hiragana_len={} suggestions={} use_cursor_prefix={use_cursor_prefix} total_elapsed_ms={}",
             composing_text.cursor,
             composing_text.text.chars().count(),
-            suggestions.len(),
+            composed_text.suggestions.len(),
             t2.saturating_sub(handler_start)
         );
 
         Ok(Response::new(MoveCursorResponse {
             composing_text: Some(ComposingText {
-                hiragana: composing_text.text,
-                suggestions,
+                hiragana: composed_text.hiragana.unwrap_or(composing_text.text),
+                suggestions: composed_text.suggestions,
             }),
         }))
     }
@@ -642,7 +659,7 @@ impl AzookeyService for MyAzookeyService {
             "[shrink_text:{request_id}] shrink_text elapsed_ms={}",
             t1.saturating_sub(t0)
         );
-        let suggestions =
+        let composed_text =
             get_composed_text(false).map_err(|error| status_from_error("shrink_text", error))?;
         let t2 = now_timestamp_millis();
         log_event_lazy!(
@@ -656,14 +673,14 @@ impl AzookeyService for MyAzookeyService {
             ServerLogLevel::Info,
             "[shrink_text:{request_id}] success hiragana_len={} suggestions={} total_elapsed_ms={}",
             composing_text.text.chars().count(),
-            suggestions.len(),
+            composed_text.suggestions.len(),
             t2.saturating_sub(handler_start)
         );
 
         Ok(Response::new(ShrinkTextResponse {
             composing_text: Some(ComposingText {
-                hiragana: composing_text.text,
-                suggestions,
+                hiragana: composed_text.hiragana.unwrap_or(composing_text.text),
+                suggestions: composed_text.suggestions,
             }),
         }))
     }
