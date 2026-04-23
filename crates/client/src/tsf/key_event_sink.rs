@@ -61,7 +61,11 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     }
 
     #[macros::anyhow]
-    fn OnSetFocus(&self, _fforeground: BOOL) -> Result<()> {
+    fn OnSetFocus(&self, fforeground: BOOL) -> Result<()> {
+        if !fforeground.as_bool() {
+            self.set_keyboard_disabled_state(true)?;
+        }
+
         Ok(())
     }
 }

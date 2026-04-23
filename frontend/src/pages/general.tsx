@@ -21,6 +21,7 @@ type GeneralConfigState = {
     symbol_style: string;
     space_input: string;
     numpad_input: string;
+    show_candidate_window_after_space: boolean;
 };
 
 type CharacterWidthGroupsState = {
@@ -48,6 +49,7 @@ const DEFAULT_GENERAL_CONFIG: GeneralConfigState = {
     symbol_style: "corner_bracket_middle_dot",
     space_input: "always_half",
     numpad_input: "direct_input",
+    show_candidate_window_after_space: false,
 };
 
 const DEFAULT_WIDTH_GROUPS: CharacterWidthGroupsState = {
@@ -133,6 +135,10 @@ const normalizeGeneralConfig = (value?: Record<string, unknown>): GeneralConfigS
               : value?.numpad_input === "follow_input_mode"
                 ? "follow_input_mode"
                 : DEFAULT_GENERAL_CONFIG.numpad_input,
+    show_candidate_window_after_space:
+        typeof value?.show_candidate_window_after_space === "boolean"
+            ? value.show_candidate_window_after_space
+            : DEFAULT_GENERAL_CONFIG.show_candidate_window_after_space,
 });
 
 const normalizeWidthGroups = (
@@ -291,12 +297,23 @@ export const General = () => {
     };
 
     const updateGeneralConfig = async (
-        key: keyof GeneralConfigState,
+        key: keyof Omit<GeneralConfigState, "show_candidate_window_after_space">,
         nextValue: string,
     ) => {
         const data = await updateConfig((config) => {
             config.general = config.general ?? {};
             config.general[key] = nextValue;
+        });
+
+        if (data) {
+            setGeneralValue(normalizeGeneralConfig(data.general));
+        }
+    };
+
+    const updateCandidateWindowDelay = async (nextValue: boolean) => {
+        const data = await updateConfig((config) => {
+            config.general = config.general ?? {};
+            config.general.show_candidate_window_after_space = nextValue;
         });
 
         if (data) {
@@ -515,6 +532,19 @@ export const General = () => {
                                     </SelectContent>
                                 </Select>
                             </div>
+                        </div>
+
+                        <div className="flex items-center gap-4">
+                            <div className="flex-1 space-y-1">
+                                <p className="text-sm font-medium leading-none">候補ウィンドウを非表示</p>
+                                <p className="text-xs text-muted-foreground">
+                                    Space または Tab の入力まで候補を表示しません
+                                </p>
+                            </div>
+                            <Switch
+                                checked={generalValue.show_candidate_window_after_space}
+                                onCheckedChange={(value) => void updateCandidateWindowDelay(value)}
+                            />
                         </div>
                     </div>
                 </section>

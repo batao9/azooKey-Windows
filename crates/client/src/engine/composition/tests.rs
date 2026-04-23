@@ -3,7 +3,8 @@ use super::{
     CompositionState, FutureClauseSnapshot, TextServiceFactory,
 };
 use crate::engine::{
-    client_action::{ClientAction, SetTextType},
+    client_action::{ClientAction, SetSelectionType, SetTextType},
+    input_mode::InputMode,
     user_action::{Function, Navigation, UserAction},
 };
 use shared::{get_default_romaji_rows, AppConfig, RomajiRule, WidthMode};
@@ -58,3 +59,56 @@ mod integration_patterns;
 mod snapshot_restore;
 pub(super) mod stateful_harness;
 mod symbol_and_width;
+
+#[test]
+fn delayed_candidate_window_does_not_show_on_composition_start() {
+    let mut app_config = AppConfig::default();
+    app_config.general.show_candidate_window_after_space = true;
+
+    let (_, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &Composition::default(),
+        &UserAction::Input('a'),
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    )
+    .expect("input should start composition");
+
+    assert_eq!(
+        actions,
+        vec![
+            ClientAction::StartComposition,
+            ClientAction::AppendText("a".to_string())
+        ]
+    );
+}
+
+#[test]
+fn delayed_candidate_window_shows_when_space_opens_preview() {
+    let mut app_config = AppConfig::default();
+    app_config.general.show_candidate_window_after_space = true;
+    let composition = Composition {
+        state: CompositionState::Composing,
+        raw_input: "a".to_string(),
+        ..Composition::default()
+    };
+
+    let (_, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Space,
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    )
+    .expect("space should enter preview");
+
+    assert_eq!(
+        actions,
+        vec![
+            ClientAction::ShowCandidateWindow,
+            ClientAction::SetSelection(SetSelectionType::Down)
+        ]
+    );
+}

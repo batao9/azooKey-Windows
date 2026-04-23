@@ -11,7 +11,7 @@ use windows::{
         UI::TextServices::{
             ITfCompositionSink, ITfDisplayAttributeProvider, ITfKeyEventSink, ITfLangBarItem,
             ITfLangBarItemButton, ITfSource, ITfTextInputProcessor, ITfTextInputProcessorEx,
-            ITfTextLayoutSink, ITfThreadMgrEventSink,
+            ITfTextLayoutSink, ITfThreadFocusSink, ITfThreadMgrEventSink,
         },
     },
 };
@@ -29,6 +29,7 @@ use super::text_service::TextService;
     ITfTextInputProcessorEx,
     ITfKeyEventSink,
     ITfThreadMgrEventSink,
+    ITfThreadFocusSink,
     ITfTextLayoutSink,
     ITfCompositionSink,
     ITfDisplayAttributeProvider,

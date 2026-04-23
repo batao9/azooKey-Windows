@@ -10,7 +10,7 @@ use super::{
     full_width::{convert_kana_symbol, to_fullwidth, to_halfwidth},
     input_mode::InputMode,
     ipc_service::{Candidates, IPCService},
-    state::IMEState,
+    state::{keyboard_disabled_from_context, IMEState},
     text_util::{to_half_katakana, to_katakana},
     user_action::{Function, Navigation},
 };
@@ -1000,6 +1000,7 @@ impl TextServiceFactory {
         match action {
             ClientAction::StartComposition => "StartComposition",
             ClientAction::EndComposition => "EndComposition",
+            ClientAction::ShowCandidateWindow => "ShowCandidateWindow",
             ClientAction::AppendText(_) => "AppendText",
             ClientAction::AppendTextRaw(_) => "AppendTextRaw",
             ClientAction::AppendTextDirect(_) => "AppendTextDirect",
@@ -1424,6 +1425,22 @@ impl TextServiceFactory {
         ipc_service.set_selection(selection_index)?;
         if update_pos {
             self.update_pos()?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn sync_candidate_window_after_text_update(
+        &self,
+        ipc_service: &mut IPCService,
+        app_config: &AppConfig,
+        transition: &CompositionState,
+    ) -> Result<()> {
+        self.update_pos()?;
+        if !app_config.general.show_candidate_window_after_space
+            && *transition != CompositionState::None
+        {
+            ipc_service.show_window()?;
         }
         Ok(())
     }
@@ -2183,6 +2200,16 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn candidate_preview_actions(app_config: &AppConfig) -> Vec<ClientAction> {
+        let mut actions = Vec::with_capacity(2);
+        if app_config.general.show_candidate_window_after_space {
+            actions.push(ClientAction::ShowCandidateWindow);
+        }
+        actions.push(ClientAction::SetSelection(SetSelectionType::Down));
+        actions
+    }
+
+    #[inline]
     fn plan_actions_for_user_action(
         composition: &Composition,
         action: &UserAction,
@@ -2388,7 +2415,7 @@ impl TextServiceFactory {
                 )),
                 UserAction::Space | UserAction::Tab => Some((
                     CompositionState::Previewing,
-                    vec![ClientAction::SetSelection(SetSelectionType::Down)],
+                    Self::candidate_preview_actions(app_config),
                 )),
                 UserAction::Function(key) => match key {
                     Function::Six => Some((
@@ -2521,7 +2548,7 @@ impl TextServiceFactory {
                 )),
                 UserAction::Space | UserAction::Tab => Some((
                     CompositionState::Previewing,
-                    vec![ClientAction::SetSelection(SetSelectionType::Down)],
+                    Self::candidate_preview_actions(app_config),
                 )),
                 UserAction::Function(key) => match key {
                     Function::Six => Some((
@@ -2560,9 +2587,15 @@ impl TextServiceFactory {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<Option<(Vec<ClientAction>, CompositionState)>> {
-        if context.is_none() {
+        let Some(context) = context else {
+            self.set_keyboard_disabled_state(true)?;
             return Ok(None);
         };
+        let keyboard_disabled = keyboard_disabled_from_context(context);
+        self.set_keyboard_disabled_state(keyboard_disabled)?;
+        if keyboard_disabled {
+            return Ok(None);
+        }
 
         let is_ctrl_pressed = Self::is_ctrl_pressed();
         let is_shift_pressed = Self::is_shift_pressed();
@@ -2685,7 +2718,16 @@ impl TextServiceFactory {
         wparam: WPARAM,
         _lparam: LPARAM,
     ) -> Result<Option<(Vec<ClientAction>, CompositionState)>> {
-        if context.is_none() || !Self::is_shift_key(wparam) {
+        let Some(context) = context else {
+            self.set_keyboard_disabled_state(true)?;
+            return Ok(None);
+        };
+        let keyboard_disabled = keyboard_disabled_from_context(context);
+        self.set_keyboard_disabled_state(keyboard_disabled)?;
+        if keyboard_disabled {
+            return Ok(None);
+        }
+        if !Self::is_shift_key(wparam) {
             return Ok(None);
         }
 
@@ -2718,6 +2760,7 @@ impl TextServiceFactory {
             if let Some(context) = context {
                 self.borrow_mut()?.context = Some(context.clone());
             } else {
+                self.set_keyboard_disabled_state(true)?;
                 return Ok(false);
             };
 
@@ -2750,6 +2793,7 @@ impl TextServiceFactory {
             if let Some(context) = context {
                 self.borrow_mut()?.context = Some(context.clone());
             } else {
+                self.set_keyboard_disabled_state(true)?;
                 return Ok(false);
             };
 
@@ -2836,6 +2880,11 @@ impl TextServiceFactory {
             match action {
                 ClientAction::StartComposition => {
                     self.start_composition()?;
+                    if app_config.general.show_candidate_window_after_space {
+                        ipc_service.hide_window()?;
+                    }
+                }
+                ClientAction::ShowCandidateWindow => {
                     self.update_pos()?;
                     ipc_service.show_window()?;
                 }
@@ -2894,6 +2943,11 @@ impl TextServiceFactory {
                         self.set_text(&preview, &suffix)?;
                         ipc_service.set_candidates(candidates.texts.clone())?;
                         ipc_service.set_selection(selection_index)?;
+                        self.sync_candidate_window_after_text_update(
+                            &mut ipc_service,
+                            &app_config,
+                            &transition,
+                        )?;
                     }
                 }
                 ClientAction::AppendTextRaw(text) => {
@@ -2918,6 +2972,11 @@ impl TextServiceFactory {
                         self.set_text(&preview, &suffix)?;
                         ipc_service.set_candidates(candidates.texts.clone())?;
                         ipc_service.set_selection(selection_index)?;
+                        self.sync_candidate_window_after_text_update(
+                            &mut ipc_service,
+                            &app_config,
+                            &transition,
+                        )?;
                     }
                 }
                 ClientAction::AppendTextDirect(text) => {
@@ -2943,6 +3002,11 @@ impl TextServiceFactory {
                         self.set_text(&preview, &suffix)?;
                         ipc_service.set_candidates(candidates.texts.clone())?;
                         ipc_service.set_selection(selection_index)?;
+                        self.sync_candidate_window_after_text_update(
+                            &mut ipc_service,
+                            &app_config,
+                            &transition,
+                        )?;
                     }
                 }
                 ClientAction::RemoveText => {
@@ -3178,8 +3242,10 @@ impl TextServiceFactory {
                     self.update_pos()?;
                     self.end_composition()?;
 
-                    let mut ime_state = IMEState::get()?;
-                    ime_state.input_mode = mode.clone();
+                    {
+                        let mut ime_state = IMEState::get()?;
+                        ime_state.input_mode = mode.clone();
+                    }
 
                     // update the language bar
                     self.update_lang_bar()?;

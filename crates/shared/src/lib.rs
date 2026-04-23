@@ -226,6 +226,8 @@ pub struct GeneralConfig {
     pub space_input: SpaceInputMode,
     #[serde(default)]
     pub numpad_input: NumpadInputMode,
+    #[serde(default)]
+    pub show_candidate_window_after_space: bool,
 }
 
 impl Default for GeneralConfig {
@@ -235,6 +237,7 @@ impl Default for GeneralConfig {
             symbol_style: SymbolStyle::CornerBracketMiddleDot,
             space_input: SpaceInputMode::AlwaysHalf,
             numpad_input: NumpadInputMode::DirectInput,
+            show_candidate_window_after_space: false,
         }
     }
 }
@@ -303,6 +306,20 @@ pub fn zenzai_cpu_backend_supported() -> bool {
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GeneralConfig;
+
+    #[test]
+    fn candidate_window_delay_defaults_to_off() {
+        let default_config = GeneralConfig::default();
+        assert!(!default_config.show_candidate_window_after_space);
+
+        let deserialized: GeneralConfig = serde_json::from_str("{}").unwrap();
+        assert!(!deserialized.show_candidate_window_after_space);
     }
 }
 

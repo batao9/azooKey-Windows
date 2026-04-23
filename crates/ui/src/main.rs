@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
 use uiaccess::prepare_uiaccess_token;
-use utils::get_candidate_window_position;
+use utils::{get_candidate_window_position, CandidateRect};
 use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
 };
@@ -29,6 +29,25 @@ pub mod indicator;
 pub mod ipc;
 pub mod uiaccess;
 pub mod utils;
+
+fn place_candidate_windows(
+    candidate_window: &tao::window::Window,
+    indicator_window: &tao::window::Window,
+    rect: CandidateRect,
+) {
+    let (x, y) = get_candidate_window_position(
+        rect.top,
+        rect.left,
+        rect.bottom,
+        rect.right,
+        candidate_window,
+    );
+    candidate_window.set_outer_position(PhysicalPosition::new(x as f64, y as f64));
+    indicator_window.set_outer_position(PhysicalPosition::new(
+        (rect.left - 45) as f64,
+        rect.bottom as f64,
+    ));
+}
 
 #[derive(Debug)]
 pub enum UserEvent {
@@ -147,6 +166,8 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let mut last_candidate_rect: Option<CandidateRect> = None;
+
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
@@ -177,6 +198,9 @@ async fn main() -> anyhow::Result<()> {
                 UserEvent::UpdateHeight(height) => {
                     let width = candidate_window.inner_size().width as i32;
                     candidate_window.set_inner_size(LogicalSize::new(width, height));
+                    if let Some(rect) = last_candidate_rect {
+                        place_candidate_windows(&candidate_window, &indicator_window, rect);
+                    }
                 }
                 UserEvent::WindowAction(action) => {
                     match action {
@@ -222,13 +246,8 @@ async fn main() -> anyhow::Result<()> {
                             bottom,
                             right,
                         } => {
-                            let (x, y) = get_candidate_window_position(
-                                top,
-                                left,
-                                bottom,
-                                right,
-                                &candidate_window,
-                            );
+                            let rect = CandidateRect::new(top, left, bottom, right);
+                            last_candidate_rect = Some(rect);
 
                             unsafe {
                                 let _ = SetWindowPos(
@@ -251,12 +270,7 @@ async fn main() -> anyhow::Result<()> {
                                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                                 );
                             }
-                            candidate_window
-                                .set_outer_position(PhysicalPosition::new(x as f64, y as f64));
-                            indicator_window.set_outer_position(PhysicalPosition::new(
-                                (left - 45) as f64,
-                                bottom as f64,
-                            ));
+                            place_candidate_windows(&candidate_window, &indicator_window, rect);
                         }
                         WindowAction::SetCandidate { candidates } => {
                             let max_len = candidates
@@ -278,6 +292,9 @@ async fn main() -> anyhow::Result<()> {
                             event_loop_proxy
                                 .send_event(UserEvent::UpdateCandidates(candidates))
                                 .unwrap();
+                            if let Some(rect) = last_candidate_rect {
+                                place_candidate_windows(&candidate_window, &indicator_window, rect);
+                            }
                         }
                         WindowAction::SetSelection { index } => {
                             event_loop_proxy
