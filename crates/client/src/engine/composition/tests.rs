@@ -193,3 +193,33 @@ fn temporary_latin_keeps_direct_append_without_finalized_terminal_n() {
         ]
     );
 }
+
+#[test]
+fn temporary_latin_keeps_direct_append_when_raw_input_suffix_remains() {
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "かん".to_string(),
+        raw_input: "kann".to_string(),
+        raw_hiragana: "かんん".to_string(),
+        corresponding_count: 3,
+        ..Composition::default()
+    };
+
+    let (_, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input('Ａ'),
+        &InputMode::Kana,
+        true,
+        &AppConfig::default(),
+        true,
+    )
+    .expect("temporary latin should keep direct append when suffix remains");
+
+    assert_eq!(
+        actions,
+        vec![
+            ClientAction::SetTemporaryLatin(true),
+            ClientAction::AppendTextDirect("A".to_string()),
+        ]
+    );
+}

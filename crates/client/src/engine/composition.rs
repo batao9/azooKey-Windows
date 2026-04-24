@@ -228,8 +228,11 @@ impl TextServiceFactory {
         start_temporary_latin
             && composition.raw_input.ends_with('n')
             && composition.raw_hiragana.ends_with('ん')
-            && Self::current_raw_suffix(&composition.raw_hiragana, composition.corresponding_count)
-                .is_empty()
+            && Self::current_raw_input_suffix(
+                &composition.raw_input,
+                composition.corresponding_count,
+            )
+            .is_empty()
     }
 
     #[inline]
@@ -1460,6 +1463,14 @@ impl TextServiceFactory {
     #[inline]
     fn current_raw_suffix(raw_hiragana: &str, corresponding_count: i32) -> String {
         raw_hiragana
+            .chars()
+            .skip(corresponding_count.max(0) as usize)
+            .collect()
+    }
+
+    #[inline]
+    fn current_raw_input_suffix(raw_input: &str, corresponding_count: i32) -> String {
+        raw_input
             .chars()
             .skip(corresponding_count.max(0) as usize)
             .collect()
