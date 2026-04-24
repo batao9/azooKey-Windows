@@ -112,3 +112,114 @@ fn delayed_candidate_window_shows_when_space_opens_preview() {
         ]
     );
 }
+
+#[test]
+fn fkeys_use_finalized_terminal_n_hiragana() {
+    assert_eq!(
+        TextServiceFactory::converted_clause_preview_text(
+            &SetTextType::Hiragana,
+            "kagen",
+            "かげん",
+        ),
+        "かげん"
+    );
+    assert_eq!(
+        TextServiceFactory::converted_clause_preview_text(
+            &SetTextType::Katakana,
+            "kagen",
+            "かげん",
+        ),
+        "カゲン"
+    );
+}
+
+#[test]
+fn temporary_latin_after_finalized_terminal_n_starts_direct_remainder() {
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "加減".to_string(),
+        raw_input: "kagen".to_string(),
+        raw_hiragana: "かげん".to_string(),
+        corresponding_count: 5,
+        ..Composition::default()
+    };
+
+    let (transition, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input('Ａ'),
+        &InputMode::Kana,
+        true,
+        &AppConfig::default(),
+        true,
+    )
+    .expect("temporary latin should append direct text");
+
+    assert_eq!(transition, CompositionState::Composing);
+    assert_eq!(
+        actions,
+        vec![
+            ClientAction::SetTemporaryLatin(true),
+            ClientAction::ShrinkTextDirect("A".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn temporary_latin_keeps_direct_append_without_finalized_terminal_n() {
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "かげn".to_string(),
+        raw_input: "kagen".to_string(),
+        raw_hiragana: "かげn".to_string(),
+        corresponding_count: 5,
+        ..Composition::default()
+    };
+
+    let (_, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input('Ａ'),
+        &InputMode::Kana,
+        true,
+        &AppConfig::default(),
+        true,
+    )
+    .expect("temporary latin should append direct text");
+
+    assert_eq!(
+        actions,
+        vec![
+            ClientAction::SetTemporaryLatin(true),
+            ClientAction::AppendTextDirect("A".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn temporary_latin_keeps_direct_append_when_raw_input_suffix_remains() {
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "かん".to_string(),
+        raw_input: "kann".to_string(),
+        raw_hiragana: "かんん".to_string(),
+        corresponding_count: 3,
+        ..Composition::default()
+    };
+
+    let (_, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input('Ａ'),
+        &InputMode::Kana,
+        true,
+        &AppConfig::default(),
+        true,
+    )
+    .expect("temporary latin should keep direct append when suffix remains");
+
+    assert_eq!(
+        actions,
+        vec![
+            ClientAction::SetTemporaryLatin(true),
+            ClientAction::AppendTextDirect("A".to_string()),
+        ]
+    );
+}
