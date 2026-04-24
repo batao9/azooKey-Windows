@@ -6,7 +6,8 @@
 > 現在開発中であるため、安定性や機能に関しては保証できません。使用する際は自己責任でお願いします。
 
 # インストール方法
-[Release](https://github.com/fkunn1326/azooKey-Windows/releases)から`azookey-setup.exe`をダウンロードし、インストーラーを実行してください。
+[Release](https://github.com/batao9/azooKey-Windows/releases)からazookey-setup.exeをダウンロードし、インストーラーを実行してください。
+こちらは fkunn1326/azooKey-Windows の fork ですので注意してください。
 
 # 機能
 

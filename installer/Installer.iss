@@ -3,9 +3,9 @@
 #include "CodeDependencies.iss"
 
 #define MyAppName "Azookey"
-#define MyAppVersion "0.1.0-alpha.1"
-#define MyAppPublisher "fkunn1326"
-#define MyAppURL "https://github.com/fkunn1326/azooKey-Windows/"
+#define MyAppVersion "0.1.0-batao.1"
+#define MyAppPublisher "batao9"
+#define MyAppURL "https://github.com/batao9/azooKey-Windows/"
 
 [Setup]
 ; NOTE: The value of AppId uniquely identifies this application. Do not use the same AppId value in installers for other applications.
@@ -43,7 +43,7 @@ Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
 Source: "../build/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey.dll"; Flags: ignoreversion regserver 64bit
 Source: "../build/x86/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey32.dll"; Flags: ignoreversion regserver 32bit
 Source: "../build/*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "../target/release/bundle/nsis/Azookey_0.1.0_x64-setup.exe"; Flags: dontcopy noencryption
+Source: "../target/release/bundle/nsis/Azookey_0.1.0-batao.1_x64-setup.exe"; Flags: dontcopy noencryption
 Source: "./Azookey Startup.xml"; Flags: dontcopy noencryption
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
@@ -65,10 +65,10 @@ Filename: "schtasks"; \
 [Code]
 function InitializeSetup: Boolean;
 begin
-  ExtractTemporaryFile('Azookey_0.1.0_x64-setup.exe');
+  ExtractTemporaryFile('Azookey_0.1.0-batao.1_x64-setup.exe');
   Dependency_AddVC2015To2022x64;
   Dependency_AddVC2015To2022x86;
-  Dependency_Add('Azookey_0.1.0_x64-setup.exe',
+  Dependency_Add('Azookey_0.1.0-batao.1_x64-setup.exe',
     '/S',
     'Azookey',
     '', '', True, False);

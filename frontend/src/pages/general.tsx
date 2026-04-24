@@ -431,11 +431,11 @@ export const General = () => {
                     <div className="flex items-center space-x-4 rounded-md border p-4">
                         <RefreshCcw />
                         <div className="flex-1 space-y-1">
-                            <p className="text-sm font-medium leading-none">v0.1.0-alpha.1</p>
+                            <p className="text-sm font-medium leading-none">v0.1.0-batao.1</p>
                         </div>
                         <Button variant="secondary">
                             <a
-                                href="https://github.com/fkunn1326/azooKey-Windows/releases"
+                                href="https://github.com/batao9/azooKey-Windows/releases"
                                 className="flex items-center gap-x-2"
                                 target="_blank"
                                 rel="noopener noreferrer"
