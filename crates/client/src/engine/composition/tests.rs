@@ -114,7 +114,7 @@ fn delayed_candidate_window_shows_when_space_opens_preview() {
 }
 
 #[test]
-fn arrow_navigation_prepares_clause_navigation_before_move() {
+fn right_arrow_prepares_clause_navigation_without_initial_move() {
     let composition = Composition {
         state: CompositionState::Composing,
         preview: "いい加減統一しろ".to_string(),
@@ -132,15 +132,9 @@ fn arrow_navigation_prepares_clause_navigation_before_move() {
         &AppConfig::default(),
         false,
     )
-    .expect("right arrow should navigate clauses");
+    .expect("right arrow should prepare clause navigation");
 
-    assert_eq!(
-        actions,
-        vec![
-            ClientAction::EnsureClauseNavigationReady,
-            ClientAction::MoveClause(1)
-        ]
-    );
+    assert_eq!(actions, vec![ClientAction::EnsureClauseNavigationReady]);
 }
 
 #[test]
