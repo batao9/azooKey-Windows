@@ -615,6 +615,21 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn display_suffix_after_selected_clause(
+        preview: &str,
+        fixed_prefix: &str,
+        current_suffix: &str,
+        selected: &CandidateSelection,
+    ) -> String {
+        let current_preview = Self::current_clause_preview(preview, fixed_prefix);
+        current_preview
+            .strip_prefix(&selected.text)
+            .or_else(|| current_suffix.strip_prefix(&selected.text))
+            .map(str::to_string)
+            .unwrap_or_else(|| selected.sub_text.clone())
+    }
+
+    #[inline]
     fn merge_preview_with_prefix(fixed_prefix: &str, clause_preview: &str) -> String {
         if fixed_prefix.is_empty() {
             clause_preview.to_string()
@@ -1171,8 +1186,14 @@ impl TextServiceFactory {
         *state.candidates = navigation_candidates;
         *state.selection_index = selected.index;
         *state.corresponding_count = selected.corresponding_count;
+        let display_suffix = Self::display_suffix_after_selected_clause(
+            state.preview,
+            state.fixed_prefix,
+            state.suffix,
+            &selected,
+        );
         *state.preview = Self::merge_preview_with_prefix(state.fixed_prefix, &selected.text);
-        *state.suffix = selected.sub_text.clone();
+        *state.suffix = display_suffix;
         *state.raw_hiragana = selected.hiragana;
         *state.current_clause_is_split_derived = true;
         *state.current_clause_is_direct_split_remainder = false;
@@ -1301,9 +1322,15 @@ impl TextServiceFactory {
                 *state.current_clause_split_group_id = None;
                 *state.selection_index = selected.index;
                 *state.corresponding_count = selected.corresponding_count;
+                let display_suffix = Self::display_suffix_after_selected_clause(
+                    state.preview,
+                    state.fixed_prefix,
+                    state.suffix,
+                    &selected,
+                );
                 *state.preview =
                     Self::merge_preview_with_prefix(state.fixed_prefix, &selected.text);
-                *state.suffix = selected.sub_text.clone();
+                *state.suffix = display_suffix;
                 *state.raw_hiragana = selected.hiragana;
                 return Ok(ClauseActionEffect::applied(true));
             }

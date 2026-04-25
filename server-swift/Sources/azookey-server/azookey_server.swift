@@ -341,6 +341,53 @@ private func clampedCorrespondingCount(
     )
 }
 
+@MainActor func cursorPrefixCandidateResults(
+    mainResults: [Candidate],
+    firstClauseResults: [Candidate],
+    originalComposingText: ComposingText,
+    previewComposingText: ComposingText,
+    previewHiragana: String
+) -> [Candidate] {
+    guard let firstClauseCandidate = firstClauseResults.first else {
+        return mainResults
+    }
+
+    let firstClauseCorrespondingCount = resolveCandidateCompositionForDisplay(
+        originalComposingText: originalComposingText,
+        previewComposingText: previewComposingText,
+        candidateComposingCount: firstClauseCandidate.composingCount
+    ).correspondingCount
+
+    var seenTexts = Set<String>()
+    var results: [Candidate] = []
+
+    func appendIfNeeded(_ candidate: Candidate) {
+        let text = constructCandidateString(candidate: candidate, hiragana: previewHiragana)
+        guard seenTexts.insert(text).inserted else {
+            return
+        }
+        results.append(candidate)
+    }
+
+    for candidate in firstClauseResults {
+        appendIfNeeded(candidate)
+    }
+
+    for candidate in mainResults {
+        let correspondingCount = resolveCandidateCompositionForDisplay(
+            originalComposingText: originalComposingText,
+            previewComposingText: previewComposingText,
+            candidateComposingCount: candidate.composingCount
+        ).correspondingCount
+        guard correspondingCount == firstClauseCorrespondingCount else {
+            continue
+        }
+        appendIfNeeded(candidate)
+    }
+
+    return results
+}
+
 @MainActor func getOptions(context: String = "") -> ConvertRequestOptions {
     getOptions(
         context: context,
@@ -789,7 +836,13 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     let requestStart = ProcessInfo.processInfo.systemUptime
     let converted = converter.requestCandidates(previewPrefixComposingText, options: options)
     let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
-    let cursorPrefixResults = converted.firstClauseResults.isEmpty ? converted.mainResults : converted.firstClauseResults
+    let cursorPrefixResults = cursorPrefixCandidateResults(
+        mainResults: converted.mainResults,
+        firstClauseResults: converted.firstClauseResults,
+        originalComposingText: prefixComposingText,
+        previewComposingText: previewPrefixComposingText,
+        previewHiragana: previewPrefixHiragana
+    )
     serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates returned candidateCount=\(cursorPrefixResults.count) firstClauseCandidateCount=\(converted.firstClauseResults.count) mainCandidateCount=\(converted.mainResults.count) elapsed_ms=\(requestMs)")
     var result: [FFICandidate] = []
 

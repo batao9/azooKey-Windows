@@ -60,6 +60,20 @@ impl SimClause {
 
     fn candidate_texts(&self) -> Vec<String> {
         match (self.uniform_origin_id(), self.raw_hiragana().as_str()) {
+            (None, "じゅんびしてはっぴょうにのぞむ") => {
+                vec!["準備して発表に臨む".to_string()]
+            }
+            (None, "ちゅういして") => vec!["注意して".to_string()],
+            (None, "あるていどながいぶんせつでもふくすうにぶんかつされる") =>
+            {
+                vec!["ある程度長い文節でも複数に分割される".to_string()]
+            }
+            (None, "ながいぶんせつでもふくすうにぶんかつされる") => {
+                vec!["長い文節でも複数に分割される".to_string()]
+            }
+            (None, "ぶんせつでもふくすうにぶんかつされる") => {
+                vec!["文節でも複数に分割される".to_string()]
+            }
             (Some(1), "かげん") => {
                 vec!["加減".to_string(), "下限".to_string(), "かげん".to_string()]
             }
@@ -75,6 +89,25 @@ impl SimClause {
             }
             (Some(7), "ちゅうい") => vec!["注意".to_string(), "ちゅうい".to_string()],
             (Some(8), "して") => vec!["して".to_string()],
+            (Some(9), "あるていど") => vec![
+                "ある程度".to_string(),
+                "有る程度".to_string(),
+                "あるていど".to_string(),
+                "アルテイド".to_string(),
+            ],
+            (Some(10), "ながい") => {
+                vec!["長い".to_string(), "永い".to_string(), "ながい".to_string()]
+            }
+            (Some(11), "ぶんせつでも") => vec![
+                "文節でも".to_string(),
+                "分節でも".to_string(),
+                "ぶんせつでも".to_string(),
+            ],
+            (Some(12), "ふくすうにぶんかつされる") => vec![
+                "複数に分割される".to_string(),
+                "服数に分割される".to_string(),
+                "ふくすうにぶんかつされる".to_string(),
+            ],
             _ => vec![self.raw_hiragana()],
         }
     }
@@ -331,6 +364,41 @@ fn auto_clause_tyu_spec_state() -> SimSpecState {
     }
 }
 
+fn auto_clause_preserved_suffix_spec_state() -> SimSpecState {
+    SimSpecState {
+        committed_clauses: Vec::new(),
+        clauses: vec![clause(vec![
+            unit("あ", "a", "あ", 9),
+            unit("る", "ru", "る", 9),
+            unit("て", "te", "て", 9),
+            unit("い", "i", "い", 9),
+            unit("ど", "do", "ど", 9),
+            unit("な", "na", "な", 10),
+            unit("が", "ga", "が", 10),
+            unit("い", "i", "い", 10),
+            unit("ぶ", "bu", "ぶ", 11),
+            unit("ん", "n", "ん", 11),
+            unit("せ", "se", "せ", 11),
+            unit("つ", "tu", "つ", 11),
+            unit("で", "de", "で", 11),
+            unit("も", "mo", "も", 11),
+            unit("ふ", "fu", "ふ", 12),
+            unit("く", "ku", "く", 12),
+            unit("す", "su", "す", 12),
+            unit("う", "u", "う", 12),
+            unit("に", "ni", "に", 12),
+            unit("ぶ", "bu", "ぶ", 12),
+            unit("ん", "n", "ん", 12),
+            unit("か", "ka", "か", 12),
+            unit("つ", "tu", "つ", 12),
+            unit("さ", "sa", "さ", 12),
+            unit("れ", "re", "れ", 12),
+            unit("る", "ru", "る", 12),
+        ])],
+        current_index: 0,
+    }
+}
+
 fn candidates_owned(
     texts: Vec<String>,
     sub_texts: Vec<String>,
@@ -486,7 +554,15 @@ fn auto_first_clause_candidates(spec: &SimSpecState) -> Option<Candidates> {
         clauses: auto_clauses,
         current_index: 0,
     };
-    Some(candidates_for_clause(&auto_spec, 0))
+    let current = &auto_spec.clauses[0];
+    let texts = current.candidate_texts();
+    let raw_suffix = spec_join_raw_hiragana(&auto_spec.clauses[1..]);
+    Some(candidates_owned(
+        texts.clone(),
+        vec![raw_suffix; texts.len()],
+        spec_join_raw_hiragana(&auto_spec.clauses),
+        vec![current.corresponding_count(); texts.len()],
+    ))
 }
 
 fn split_units_by_offset(units: &[SimUnit], offset: i32) -> Option<(Vec<SimUnit>, Vec<SimUnit>)> {
@@ -1841,6 +1917,21 @@ pub(super) fn run_from_auto_clause_tyu(
     extra_actions: &[HarnessUserAction],
 ) -> (ClauseHarness, ScenarioBackend, Vec<HarnessUserAction>) {
     run_from_auto_clause(auto_clause_tyu_spec_state(), extra_actions)
+}
+
+pub(super) fn run_from_auto_clause_preserved_suffix(
+    extra_actions: &[HarnessUserAction],
+) -> (ClauseHarness, ScenarioBackend, Vec<HarnessUserAction>) {
+    let (mut harness, mut backend, mut history) =
+        run_to_auto_clause(auto_clause_preserved_suffix_spec_state());
+    assert_harness_matches_spec(&harness, &backend.spec, &history);
+
+    for op in extra_actions {
+        history.push(*op);
+        apply_user_action(&mut harness, &mut backend, *op, &history);
+    }
+
+    (harness, backend, history)
 }
 
 pub(super) fn fkey_cases() -> [(SetTextType, &'static str); 5] {

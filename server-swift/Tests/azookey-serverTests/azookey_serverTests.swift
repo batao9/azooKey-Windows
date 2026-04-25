@@ -28,6 +28,28 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
     )
 }
 
+private func testCandidate(
+    word: String,
+    ruby: String,
+    composingCount: ComposingCount
+) -> Candidate {
+    Candidate(
+        text: word,
+        value: -1,
+        composingCount: composingCount,
+        lastMid: MIDData.一般.mid,
+        data: [
+            DicdataElement(
+                word: word,
+                ruby: ruby,
+                cid: CIDData.一般名詞.cid,
+                mid: MIDData.一般.mid,
+                value: -1
+            )
+        ]
+    )
+}
+
 @Test func supportsNextInputCarryForTsuRules() async throws {
     let map = tableMap([
         row("tt", "っ", "t"),
@@ -306,4 +328,51 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
 
     #expect(preview.syntheticEndOfText == false)
     #expect(preview.composingText.convertTarget == "q")
+}
+
+@Test func cursorPrefixCandidatesSupplementFirstClauseWithMainResultsForSameBoundary() async throws {
+    let resultTexts = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition("aruteidonagai", inputStyle: .roman2kana)
+        let preview = makeCandidatePreviewComposingText(from: source).composingText
+        let firstClause = testCandidate(
+            word: "ある程度",
+            ruby: "あるていど",
+            composingCount: .inputCount(8)
+        )
+        let hiragana = testCandidate(
+            word: "あるていど",
+            ruby: "あるていど",
+            composingCount: .inputCount(8)
+        )
+        let katakana = testCandidate(
+            word: "アルテイド",
+            ruby: "あるていど",
+            composingCount: .inputCount(8)
+        )
+        let fullSentence = Candidate(
+            text: "ある程度長い",
+            value: -1,
+            composingCount: .inputCount(13),
+            lastMid: MIDData.一般.mid,
+            data: [
+                DicdataElement(
+                    word: "ある程度長い",
+                    ruby: "あるていどながい",
+                    cid: CIDData.一般名詞.cid,
+                    mid: MIDData.一般.mid,
+                    value: -1
+                )
+            ]
+        )
+        return cursorPrefixCandidateResults(
+            mainResults: [fullSentence, hiragana, katakana],
+            firstClauseResults: [firstClause],
+            originalComposingText: source,
+            previewComposingText: preview,
+            previewHiragana: preview.convertTarget
+        ).map { constructCandidateString(candidate: $0, hiragana: preview.convertTarget) }
+    }
+
+    #expect(resultTexts == ["ある程度", "あるていど", "アルテイド"])
 }
