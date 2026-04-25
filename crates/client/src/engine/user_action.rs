@@ -165,14 +165,14 @@ impl TryFrom<usize> for UserAction {
             0x77 => UserAction::Function(Function::Eight), // VK_F8
             0x78 => UserAction::Function(Function::Nine), // VK_F9
             0x79 => UserAction::Function(Function::Ten), // VK_F10
-            0x6A => UserAction::NumpadSymbol('*'), // VK_MULTIPLY
-            0x6B => UserAction::NumpadSymbol('+'), // VK_ADD
-            0x6C => UserAction::NumpadSymbol(','), // VK_SEPARATOR
-            0x6D => UserAction::NumpadSymbol('-'), // VK_SUBTRACT
-            0x6E => UserAction::NumpadSymbol('.'), // VK_DECIMAL
-            0x6F => UserAction::NumpadSymbol('/'), // VK_DIVIDE
-            0x16 => UserAction::InputModeOn,  // VK_IME_ON
-            0x1A => UserAction::InputModeOff, // VK_IME_OFF
+            0x6A => UserAction::NumpadSymbol('*'),       // VK_MULTIPLY
+            0x6B => UserAction::NumpadSymbol('+'),       // VK_ADD
+            0x6C => UserAction::NumpadSymbol(','),       // VK_SEPARATOR
+            0x6D => UserAction::NumpadSymbol('-'),       // VK_SUBTRACT
+            0x6E => UserAction::NumpadSymbol('.'),       // VK_DECIMAL
+            0x6F => UserAction::NumpadSymbol('/'),       // VK_DIVIDE
+            0x16 => UserAction::InputModeOn,             // VK_IME_ON
+            0x1A => UserAction::InputModeOff,            // VK_IME_OFF
 
             0xF3 | 0xF4 => UserAction::ToggleInputMode, // Zenkaku/Hankaku
 

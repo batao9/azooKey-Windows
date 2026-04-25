@@ -114,6 +114,89 @@ fn delayed_candidate_window_shows_when_space_opens_preview() {
 }
 
 #[test]
+fn arrow_navigation_prepares_clause_navigation_before_move() {
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "いい加減統一しろ".to_string(),
+        raw_input: "iikagentouitusiro".to_string(),
+        raw_hiragana: "いいかげんとういつしろ".to_string(),
+        corresponding_count: 17,
+        ..Composition::default()
+    };
+
+    let (_, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Navigation(Navigation::Right),
+        &InputMode::Kana,
+        false,
+        &AppConfig::default(),
+        false,
+    )
+    .expect("right arrow should navigate clauses");
+
+    assert_eq!(
+        actions,
+        vec![
+            ClientAction::EnsureClauseNavigationReady,
+            ClientAction::MoveClause(1)
+        ]
+    );
+}
+
+#[test]
+fn enter_commits_all_when_clause_navigation_is_active() {
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "加減".to_string(),
+        raw_input: "kagentouitu".to_string(),
+        raw_hiragana: "かげんとういつ".to_string(),
+        corresponding_count: 5,
+        future_clause_snapshots: vec![actual_future_snapshot("統一", "", "touitu", "とういつ", 6)],
+        ..Composition::default()
+    };
+
+    let (transition, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Enter,
+        &InputMode::Kana,
+        false,
+        &AppConfig::default(),
+        false,
+    )
+    .expect("enter should commit active clause navigation");
+
+    assert_eq!(transition, CompositionState::None);
+    assert_eq!(actions, vec![ClientAction::EndComposition]);
+}
+
+#[test]
+fn ctrl_down_keeps_current_clause_commit_in_clause_navigation() {
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "加減".to_string(),
+        suffix: "統一".to_string(),
+        raw_input: "kagentouitu".to_string(),
+        raw_hiragana: "かげんとういつ".to_string(),
+        corresponding_count: 5,
+        future_clause_snapshots: vec![actual_future_snapshot("統一", "", "touitu", "とういつ", 6)],
+        ..Composition::default()
+    };
+
+    let (transition, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::CommitAndNextClause,
+        &InputMode::Kana,
+        false,
+        &AppConfig::default(),
+        false,
+    )
+    .expect("ctrl+down should commit current clause");
+
+    assert_eq!(transition, CompositionState::Composing);
+    assert_eq!(actions, vec![ClientAction::ShrinkText("".to_string())]);
+}
+
+#[test]
 fn fkeys_use_finalized_terminal_n_hiragana() {
     assert_eq!(
         TextServiceFactory::converted_clause_preview_text(

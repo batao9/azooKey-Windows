@@ -288,13 +288,56 @@ fn clause_integration_fkeys_preserve_display_when_committing_current_clause() {
         );
         assert_eq!(harness_raw_clauses(&harness), "かげん / とういつ");
         assert_eq!(harness_clause_input_lengths(&harness), "5 / 6");
-        assert_eq!(harness.committed_clauses.len(), 1);
-        assert_eq!(
-            TextServiceFactory::current_clause_preview(&harness.preview, &harness.fixed_prefix),
-            "統一"
-        );
-        assert_eq!(harness.state, CompositionState::Composing);
+        assert_eq!(harness.committed_clauses.len(), 2);
+        assert!(harness.preview.is_empty());
+        assert!(harness.future_clause_snapshots.is_empty());
+        assert_eq!(harness.state, CompositionState::None);
     }
+}
+
+#[test]
+fn clause_integration_auto_clause_navigation_uses_first_clause_for_ju_sequence() {
+    let extra = vec![HarnessUserAction::Right];
+    let (harness, _, history) = run_from_auto_clause_ju(&extra);
+
+    assert_eq!(
+        harness_visible_clauses(&harness),
+        "準備して / 発表に / 臨む",
+        "history: {}\nraw clauses: {}\nclause_snapshots: {}\nfuture_clause_snapshots: {}",
+        history_string(&history),
+        harness_raw_clauses(&harness),
+        TextServiceFactory::debug_clause_snapshots(&harness.clause_snapshots),
+        TextServiceFactory::debug_future_clause_snapshots(&harness.future_clause_snapshots),
+    );
+    assert_eq!(harness_clause_input_lengths(&harness), "9 / 11 / 6");
+    assert_eq!(harness.raw_input, "haxtupyouninozomu");
+    assert_eq!(harness.raw_hiragana, "はっぴょうにのぞむ");
+    assert_eq!(
+        TextServiceFactory::current_clause_preview(&harness.preview, &harness.fixed_prefix),
+        "発表に"
+    );
+}
+
+#[test]
+fn clause_integration_auto_clause_navigation_preserves_tyu_sequence_boundary() {
+    let extra = vec![HarnessUserAction::Right];
+    let (harness, _, history) = run_from_auto_clause_tyu(&extra);
+
+    assert_eq!(
+        harness_visible_clauses(&harness),
+        "注意 / して",
+        "history: {}\nraw clauses: {}\nclause_snapshots: {}\nfuture_clause_snapshots: {}",
+        history_string(&history),
+        harness_raw_clauses(&harness),
+        TextServiceFactory::debug_clause_snapshots(&harness.clause_snapshots),
+        TextServiceFactory::debug_future_clause_snapshots(&harness.future_clause_snapshots),
+    );
+    assert_eq!(harness_raw_clauses(&harness), "ちゅうい / して");
+    assert_eq!(harness_clause_input_lengths(&harness), "5 / 4");
+    assert_eq!(
+        TextServiceFactory::current_clause_preview(&harness.preview, &harness.fixed_prefix),
+        "して"
+    );
 }
 
 #[test]

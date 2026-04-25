@@ -789,12 +789,13 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     let requestStart = ProcessInfo.processInfo.systemUptime
     let converted = converter.requestCandidates(previewPrefixComposingText, options: options)
     let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
-    serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates returned candidateCount=\(converted.mainResults.count) elapsed_ms=\(requestMs)")
+    let cursorPrefixResults = converted.firstClauseResults.isEmpty ? converted.mainResults : converted.firstClauseResults
+    serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates returned candidateCount=\(cursorPrefixResults.count) firstClauseCandidateCount=\(converted.firstClauseResults.count) mainCandidateCount=\(converted.mainResults.count) elapsed_ms=\(requestMs)")
     var result: [FFICandidate] = []
 
-    for i in 0..<converted.mainResults.count {
-        let candidate = converted.mainResults[i]
-        serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)/\(converted.mainResults.count)] start")
+    for i in 0..<cursorPrefixResults.count {
+        let candidate = cursorPrefixResults[i]
+        serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)/\(cursorPrefixResults.count)] start")
 
         let text = strdup(constructCandidateString(candidate: candidate, hiragana: previewPrefixHiragana))
         serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)] textReady")
@@ -808,7 +809,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         debugLogResolvedCorrespondingCount(
             scope: "GetComposedTextForCursorPrefix",
             candidateIndex: i,
-            candidateTotal: converted.mainResults.count,
+            candidateTotal: cursorPrefixResults.count,
             candidateComposingCount: candidate.composingCount,
             resolvedCorrespondingCount: correspondingCount,
             inputCount: prefixComposingText.input.count,
