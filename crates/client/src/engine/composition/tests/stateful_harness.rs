@@ -998,6 +998,27 @@ fn harness_as_composition(harness: &ClauseHarness) -> Composition {
     }
 }
 
+pub(super) fn assert_adjust_boundary_is_blocked(harness: &ClauseHarness, direction: i32) {
+    let composition = harness_as_composition(harness);
+    let app_config = AppConfig::default();
+    let Some((transition, actions)) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::AdjustClauseBoundary(direction),
+        &crate::engine::input_mode::InputMode::Kana,
+        true,
+        &app_config,
+        false,
+    ) else {
+        panic!("adjust boundary was not consumed for direction {direction}");
+    };
+
+    assert_eq!(transition, composition.state);
+    assert!(
+        actions.is_empty(),
+        "adjust boundary should be blocked without client actions: direction={direction}, actions={actions:?}"
+    );
+}
+
 fn committed_clause_from_snapshot(
     snapshot: &ClauseSnapshot,
     next_raw_hiragana: Option<&str>,
@@ -1178,6 +1199,15 @@ impl ScenarioBackend {
     fn move_spec_left(&mut self) {
         if self.spec.current_index > 0 {
             self.spec.current_index -= 1;
+        }
+    }
+
+    fn move_spec_to_last(&mut self) {
+        if !self.spec.clauses.is_empty() {
+            self.spec.current_index = self.spec.clauses.len() - 1;
+            if let Some(current) = self.spec.clauses.get_mut(self.spec.current_index) {
+                current.pending_remainder = false;
+            }
         }
     }
 
@@ -1479,6 +1509,11 @@ fn apply_user_action(
         )
     });
 
+    if actions.is_empty() {
+        harness.state = transition;
+        return;
+    }
+
     for action in actions {
         match action {
             ClientAction::EnsureClauseNavigationReady => {
@@ -1550,6 +1585,13 @@ fn apply_user_action(
                     harness.corresponding_count,
                     harness.selection_index,
                 );
+                if direction == TextServiceFactory::MOVE_CLAUSE_TO_LAST {
+                    backend.move_spec_to_last();
+                } else if direction > 0 {
+                    backend.move_spec_right();
+                } else if direction < 0 {
+                    backend.move_spec_left();
+                }
             }
             ClientAction::AdjustBoundary(direction) => {
                 let effect = {
@@ -1814,7 +1856,9 @@ fn apply_user_action(
         }
     }
 
-    backend.apply_expected_user_action(op);
+    if !matches!(op, HarnessUserAction::Left | HarnessUserAction::Right) {
+        backend.apply_expected_user_action(op);
+    }
     harness.state = transition;
 }
 
