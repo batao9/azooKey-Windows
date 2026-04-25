@@ -376,3 +376,118 @@ private func testCandidate(
 
     #expect(resultTexts == ["ある程度", "あるていど", "アルテイド"])
 }
+
+@Test func cursorPrefixCandidatesSupplementWithExactClauseResultsWhenMainResultsLackSameBoundary() async throws {
+    let resultTexts = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition("aruteidonagaibunsetsudemo", inputStyle: .roman2kana)
+        let preview = makeCandidatePreviewComposingText(from: source).composingText
+        let firstClause = testCandidate(
+            word: "ある程度",
+            ruby: "あるていど",
+            composingCount: .inputCount(8)
+        )
+        let fullSentence = Candidate(
+            text: "ある程度長い文節でも",
+            value: -1,
+            composingCount: .inputCount(25),
+            lastMid: MIDData.一般.mid,
+            data: [
+                DicdataElement(
+                    word: "ある程度長い文節でも",
+                    ruby: "あるていどながいぶんせつでも",
+                    cid: CIDData.一般名詞.cid,
+                    mid: MIDData.一般.mid,
+                    value: -1
+                )
+            ]
+        )
+        let hiragana = testCandidate(
+            word: "あるていど",
+            ruby: "あるていど",
+            composingCount: .inputCount(8)
+        )
+        let katakana = testCandidate(
+            word: "アルテイド",
+            ruby: "あるていど",
+            composingCount: .inputCount(8)
+        )
+        return cursorPrefixCandidateResults(
+            mainResults: [fullSentence],
+            firstClauseResults: [firstClause],
+            exactClauseResults: [hiragana, katakana],
+            originalComposingText: source,
+            previewComposingText: preview,
+            previewHiragana: preview.convertTarget
+        ).map { constructCandidateString(candidate: $0, hiragana: preview.convertTarget) }
+    }
+
+    #expect(resultTexts == ["ある程度", "あるていど", "アルテイド"])
+}
+
+@Test func cursorPrefixCandidatesSupplementParticleClauseWithExactClauseResults() async throws {
+    let resultTexts = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition("bunsetsudemofukusuunibunkatsusareru", inputStyle: .roman2kana)
+        let preview = makeCandidatePreviewComposingText(from: source).composingText
+        let firstClause = testCandidate(
+            word: "文節でも",
+            ruby: "ぶんせつでも",
+            composingCount: .inputCount(12)
+        )
+        let alternative = testCandidate(
+            word: "分節でも",
+            ruby: "ぶんせつでも",
+            composingCount: .inputCount(12)
+        )
+        let hiragana = testCandidate(
+            word: "ぶんせつでも",
+            ruby: "ぶんせつでも",
+            composingCount: .inputCount(12)
+        )
+        let katakana = testCandidate(
+            word: "ブンセツデモ",
+            ruby: "ぶんせつでも",
+            composingCount: .inputCount(12)
+        )
+        let fullSentence = Candidate(
+            text: "文節でも複数に分割される",
+            value: -1,
+            composingCount: .inputCount(35),
+            lastMid: MIDData.一般.mid,
+            data: [
+                DicdataElement(
+                    word: "文節でも複数に分割される",
+                    ruby: "ぶんせつでもふくすうにぶんかつされる",
+                    cid: CIDData.一般名詞.cid,
+                    mid: MIDData.一般.mid,
+                    value: -1
+                )
+            ]
+        )
+        return cursorPrefixCandidateResults(
+            mainResults: [fullSentence],
+            firstClauseResults: [firstClause, alternative],
+            exactClauseResults: [firstClause, alternative, hiragana, katakana],
+            originalComposingText: source,
+            previewComposingText: preview,
+            previewHiragana: preview.convertTarget
+        ).map { constructCandidateString(candidate: $0, hiragana: preview.convertTarget) }
+    }
+
+    #expect(resultTexts == ["文節でも", "分節でも", "ぶんせつでも", "ブンセツデモ"])
+}
+
+@Test func cursorPrefixExactClauseComposingTextPreservesSelectedClauseInput() async throws {
+    let clause = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition("aruteidonagaibunsetsudemo", inputStyle: .roman2kana)
+        return makeCursorPrefixExactClauseComposingText(
+            prefixComposingText: source,
+            correspondingCount: 8
+        )
+    }
+
+    #expect(clause.convertTarget == "あるていど")
+    #expect(clause.input.count == 8)
+}
