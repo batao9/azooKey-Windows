@@ -368,29 +368,31 @@ private func clampedCorrespondingCount(
         results.append(candidate)
     }
 
-    for candidate in firstClauseResults {
-        appendIfNeeded(candidate)
-    }
-
-    for candidate in mainResults {
+    func matchesFirstClauseBoundary(_ candidate: Candidate) -> Bool {
         let correspondingCount = resolveCandidateCompositionForDisplay(
             originalComposingText: originalComposingText,
             previewComposingText: previewComposingText,
             candidateComposingCount: candidate.composingCount
         ).correspondingCount
-        guard correspondingCount == firstClauseCorrespondingCount else {
+        return correspondingCount == firstClauseCorrespondingCount
+    }
+
+    for candidate in firstClauseResults {
+        guard matchesFirstClauseBoundary(candidate) else {
+            continue
+        }
+        appendIfNeeded(candidate)
+    }
+
+    for candidate in mainResults {
+        guard matchesFirstClauseBoundary(candidate) else {
             continue
         }
         appendIfNeeded(candidate)
     }
 
     for candidate in exactClauseResults {
-        let correspondingCount = resolveCandidateCompositionForDisplay(
-            originalComposingText: originalComposingText,
-            previewComposingText: previewComposingText,
-            candidateComposingCount: candidate.composingCount
-        ).correspondingCount
-        guard correspondingCount == firstClauseCorrespondingCount else {
+        guard matchesFirstClauseBoundary(candidate) else {
             continue
         }
         appendIfNeeded(candidate)
