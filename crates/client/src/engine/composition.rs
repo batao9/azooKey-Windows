@@ -162,6 +162,44 @@ impl ClauseActionEffect {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MoveClauseProgressMarker {
+    preview: String,
+    suffix: String,
+    raw_input: String,
+    raw_hiragana: String,
+    fixed_prefix: String,
+    corresponding_count: i32,
+    selection_index: i32,
+    clause_snapshot_count: usize,
+    future_clause_snapshot_count: usize,
+    current_clause_is_split_derived: bool,
+    current_clause_is_direct_split_remainder: bool,
+    current_clause_has_split_left_neighbor: bool,
+    current_clause_split_group_id: Option<u64>,
+}
+
+impl MoveClauseProgressMarker {
+    fn from_state(state: &ClauseActionStateMut<'_>) -> Self {
+        Self {
+            preview: state.preview.clone(),
+            suffix: state.suffix.clone(),
+            raw_input: state.raw_input.clone(),
+            raw_hiragana: state.raw_hiragana.clone(),
+            fixed_prefix: state.fixed_prefix.clone(),
+            corresponding_count: *state.corresponding_count,
+            selection_index: *state.selection_index,
+            clause_snapshot_count: state.clause_snapshots.len(),
+            future_clause_snapshot_count: state.future_clause_snapshots.len(),
+            current_clause_is_split_derived: *state.current_clause_is_split_derived,
+            current_clause_is_direct_split_remainder: *state
+                .current_clause_is_direct_split_remainder,
+            current_clause_has_split_left_neighbor: *state.current_clause_has_split_left_neighbor,
+            current_clause_split_group_id: *state.current_clause_split_group_id,
+        }
+    }
+}
+
 impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     fn OnCompositionTerminated(
@@ -1249,8 +1287,13 @@ impl TextServiceFactory {
         if direction == Self::MOVE_CLAUSE_TO_LAST {
             let mut applied_any = false;
             loop {
+                let before = MoveClauseProgressMarker::from_state(state);
                 let effect = Self::apply_move_clause(state, backend, 1)?;
                 if !effect.applied {
+                    break;
+                }
+                let after = MoveClauseProgressMarker::from_state(state);
+                if before == after {
                     break;
                 }
                 applied_any = true;
