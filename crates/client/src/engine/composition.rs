@@ -2116,7 +2116,7 @@ impl TextServiceFactory {
         let mut collected = Vec::new();
 
         loop {
-            let effect = {
+            let (effect, made_progress) = {
                 let mut temp_state = ClauseActionStateMut {
                     preview: &mut temp_preview,
                     suffix: &mut temp_suffix,
@@ -2136,9 +2136,12 @@ impl TextServiceFactory {
                     current_clause_split_group_id: &mut temp_current_clause_split_group_id,
                     next_split_group_id: &mut temp_next_split_group_id,
                 };
-                Self::apply_move_clause(&mut temp_state, backend, 1)?
+                let before = MoveClauseProgressMarker::from_state(&temp_state);
+                let effect = Self::apply_move_clause(&mut temp_state, backend, 1)?;
+                let after = MoveClauseProgressMarker::from_state(&temp_state);
+                (effect, before != after)
             };
-            if !effect.applied {
+            if !effect.applied || !made_progress {
                 break;
             }
 

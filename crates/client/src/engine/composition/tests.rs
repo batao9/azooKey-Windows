@@ -257,6 +257,85 @@ fn move_clause_to_last_stops_when_right_move_makes_no_progress() {
     assert_eq!(backend.shrink_calls, 1);
 }
 
+struct NonProgressEnsureBackend {
+    move_cursor_zero_calls: usize,
+    shrink_calls: usize,
+}
+
+impl ClauseActionBackend for NonProgressEnsureBackend {
+    fn move_cursor(&mut self, offset: i32) -> anyhow::Result<Candidates> {
+        if offset == 0 {
+            self.move_cursor_zero_calls += 1;
+            if self.move_cursor_zero_calls == 1 {
+                return Ok(candidates(
+                    &["いい加減"],
+                    &["統一"],
+                    "いいかげんとういつ",
+                    &[7],
+                ));
+            }
+        }
+        Ok(Candidates::default())
+    }
+
+    fn shrink_text(&mut self, _offset: i32) -> anyhow::Result<Candidates> {
+        self.shrink_calls += 1;
+        assert!(
+            self.shrink_calls <= 1,
+            "future snapshot rebuild retried a non-progressing right move"
+        );
+        Ok(Candidates::default())
+    }
+}
+
+#[test]
+fn ensure_clause_navigation_stops_rebuilding_future_on_non_progress_move() {
+    let mut preview = "いい加減統一".to_string();
+    let mut suffix = String::new();
+    let mut raw_input = "iikagentouitu".to_string();
+    let mut raw_hiragana = "いいかげんとういつ".to_string();
+    let mut fixed_prefix = String::new();
+    let mut corresponding_count = 13;
+    let mut selection_index = 0;
+    let mut candidates = candidates(&["いい加減統一"], &[""], "いいかげんとういつ", &[13]);
+    let mut clause_snapshots = Vec::new();
+    let mut future_clause_snapshots = Vec::new();
+    let mut current_clause_is_split_derived = false;
+    let mut current_clause_is_direct_split_remainder = false;
+    let mut current_clause_has_split_left_neighbor = false;
+    let mut current_clause_split_group_id = None;
+    let mut next_split_group_id = 1;
+    let mut backend = NonProgressEnsureBackend {
+        move_cursor_zero_calls: 0,
+        shrink_calls: 0,
+    };
+
+    let mut state = ClauseActionStateMut {
+        preview: &mut preview,
+        suffix: &mut suffix,
+        raw_input: &mut raw_input,
+        raw_hiragana: &mut raw_hiragana,
+        fixed_prefix: &mut fixed_prefix,
+        corresponding_count: &mut corresponding_count,
+        selection_index: &mut selection_index,
+        candidates: &mut candidates,
+        clause_snapshots: &mut clause_snapshots,
+        future_clause_snapshots: &mut future_clause_snapshots,
+        current_clause_is_split_derived: &mut current_clause_is_split_derived,
+        current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+        current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+        current_clause_split_group_id: &mut current_clause_split_group_id,
+        next_split_group_id: &mut next_split_group_id,
+    };
+
+    let effect = TextServiceFactory::ensure_clause_navigation_ready(&mut state, &mut backend)
+        .expect("ensure clause navigation should return");
+
+    assert!(effect.applied);
+    assert_eq!(backend.shrink_calls, 1);
+    assert!(future_clause_snapshots.is_empty());
+}
+
 #[test]
 fn fkeys_use_finalized_terminal_n_hiragana() {
     assert_eq!(
