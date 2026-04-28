@@ -409,6 +409,38 @@ private func testCandidate(
     #expect(resultTexts == ["いい加減", "いいかげん"])
 }
 
+@Test func cursorPrefixCandidatesUseLongestFirstClauseBoundaryWhenShorterCandidateRanksFirst() async throws {
+    let resultTexts = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition("iikagentouitusiro", inputStyle: .roman2kana)
+        let preview = makeCandidatePreviewComposingText(from: source).composingText
+        let tooShort = testCandidate(
+            word: "いい",
+            ruby: "いい",
+            composingCount: .inputCount(2)
+        )
+        let firstClause = testCandidate(
+            word: "いい加減",
+            ruby: "いいかげん",
+            composingCount: .inputCount(7)
+        )
+        let hiragana = testCandidate(
+            word: "いいかげん",
+            ruby: "いいかげん",
+            composingCount: .inputCount(7)
+        )
+        return cursorPrefixCandidateResults(
+            mainResults: [],
+            firstClauseResults: [tooShort, firstClause, hiragana],
+            originalComposingText: source,
+            previewComposingText: preview,
+            previewHiragana: preview.convertTarget
+        ).map { constructCandidateString(candidate: $0, hiragana: preview.convertTarget) }
+    }
+
+    #expect(resultTexts == ["いい加減", "いいかげん"])
+}
+
 @Test func cursorPrefixCandidatesSupplementWithExactClauseResultsWhenMainResultsLackSameBoundary() async throws {
     let resultTexts = await MainActor.run {
         var source = ComposingText()

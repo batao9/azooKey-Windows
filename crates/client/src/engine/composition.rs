@@ -1243,7 +1243,8 @@ impl TextServiceFactory {
         }
 
         let navigation_candidates = backend.move_cursor(0)?;
-        let Some(selected) = Self::select_candidate(&navigation_candidates, 0) else {
+        let Some(selected) = Self::select_candidate(&navigation_candidates, *state.selection_index)
+        else {
             return Ok(ClauseActionEffect::skipped());
         };
 

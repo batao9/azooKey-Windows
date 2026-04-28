@@ -406,15 +406,15 @@ private func clampedCorrespondingCount(
     originalComposingText: ComposingText,
     previewComposingText: ComposingText
 ) -> Int? {
-    guard let firstClauseCandidate = firstClauseResults.first else {
-        return nil
-    }
-
-    return resolveCandidateCompositionForDisplay(
-        originalComposingText: originalComposingText,
-        previewComposingText: previewComposingText,
-        candidateComposingCount: firstClauseCandidate.composingCount
-    ).correspondingCount
+    firstClauseResults
+        .map {
+            resolveCandidateCompositionForDisplay(
+                originalComposingText: originalComposingText,
+                previewComposingText: previewComposingText,
+                candidateComposingCount: $0.composingCount
+            ).correspondingCount
+        }
+        .max()
 }
 
 @MainActor func makeCursorPrefixExactClauseComposingText(
