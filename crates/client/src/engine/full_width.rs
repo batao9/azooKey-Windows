@@ -108,22 +108,23 @@ static HALF_FULL_AZOOKEY: LazyLock<HashMap<&'static str, &'static str>> = LazyLo
     ])
 });
 
-static HALF_FULL_CONFIGURABLE: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
-    let mut map = HALF_FULL_AZOOKEY.clone();
-    map.extend([
-        ("0", "０"),
-        ("1", "１"),
-        ("2", "２"),
-        ("3", "３"),
-        ("4", "４"),
-        ("5", "５"),
-        ("6", "６"),
-        ("7", "７"),
-        ("8", "８"),
-        ("9", "９"),
-    ]);
-    map
-});
+static HALF_FULL_CONFIGURABLE: LazyLock<HashMap<&'static str, &'static str>> =
+    LazyLock::new(|| {
+        let mut map = HALF_FULL_AZOOKEY.clone();
+        map.extend([
+            ("0", "０"),
+            ("1", "１"),
+            ("2", "２"),
+            ("3", "３"),
+            ("4", "４"),
+            ("5", "５"),
+            ("6", "６"),
+            ("7", "７"),
+            ("8", "８"),
+            ("9", "９"),
+        ]);
+        map
+    });
 
 static SYMBOL_FULLWIDTH_DEFAULTS: LazyLock<HashMap<&'static str, bool>> =
     LazyLock::new(|| HashMap::from(CHARACTER_WIDTH_SYMBOL_DEFAULTS));
@@ -237,7 +238,9 @@ pub fn convert_kana_symbol(
 
             let base = apply_basic_setting(&key, general)
                 .map(str::to_string)
-                .unwrap_or_else(|| legacy_fullwidth_or_half(&key, &character_width.symbol_fullwidth));
+                .unwrap_or_else(|| {
+                    legacy_fullwidth_or_half(&key, &character_width.symbol_fullwidth)
+                });
 
             apply_width_groups_with_source_key(&base, &key, groups)
         })
@@ -302,7 +305,9 @@ fn legacy_fullwidth_or_half(key: &str, symbol_fullwidth: &HashMap<String, bool>)
 }
 
 fn apply_width_groups(text: &str, groups: &CharacterWidthGroups) -> String {
-    text.chars().map(|c| apply_width_group_char(c, groups)).collect()
+    text.chars()
+        .map(|c| apply_width_group_char(c, groups))
+        .collect()
 }
 
 fn apply_width_groups_with_source_key(
@@ -565,6 +570,9 @@ mod tests {
         let mut config = default_character_width();
         config.groups.hash_group = WidthMode::Full;
 
-        assert_eq!(convert_kana_symbol("ˆ", &GeneralConfig::default(), &config, &[]), "＾");
+        assert_eq!(
+            convert_kana_symbol("ˆ", &GeneralConfig::default(), &config, &[]),
+            "＾"
+        );
     }
 }

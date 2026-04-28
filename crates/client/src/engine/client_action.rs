@@ -17,6 +17,7 @@ pub enum ClientAction {
     SetTextWithType(SetTextType),
 
     MoveCursor(i32),
+    EnsureClauseNavigationReady,
     MoveClause(i32),
     AdjustBoundary(i32),
     SetSelection(SetSelectionType),

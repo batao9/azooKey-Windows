@@ -288,13 +288,160 @@ fn clause_integration_fkeys_preserve_display_when_committing_current_clause() {
         );
         assert_eq!(harness_raw_clauses(&harness), "かげん / とういつ");
         assert_eq!(harness_clause_input_lengths(&harness), "5 / 6");
-        assert_eq!(harness.committed_clauses.len(), 1);
-        assert_eq!(
-            TextServiceFactory::current_clause_preview(&harness.preview, &harness.fixed_prefix),
-            "統一"
-        );
-        assert_eq!(harness.state, CompositionState::Composing);
+        assert_eq!(harness.committed_clauses.len(), 2);
+        assert!(harness.preview.is_empty());
+        assert!(harness.future_clause_snapshots.is_empty());
+        assert_eq!(harness.state, CompositionState::None);
     }
+}
+
+#[test]
+fn clause_integration_auto_clause_navigation_uses_first_clause_for_ju_sequence() {
+    let extra = vec![HarnessUserAction::Right];
+    let (harness, _, history) = run_from_auto_clause_ju(&extra);
+
+    assert_eq!(
+        harness_visible_clauses(&harness),
+        "準備して / 発表に / 臨む",
+        "history: {}\nraw clauses: {}\nclause_snapshots: {}\nfuture_clause_snapshots: {}",
+        history_string(&history),
+        harness_raw_clauses(&harness),
+        TextServiceFactory::debug_clause_snapshots(&harness.clause_snapshots),
+        TextServiceFactory::debug_future_clause_snapshots(&harness.future_clause_snapshots),
+    );
+    assert_eq!(harness_clause_input_lengths(&harness), "9 / 11 / 6");
+    assert_eq!(
+        TextServiceFactory::current_clause_preview(&harness.preview, &harness.fixed_prefix),
+        "準備して"
+    );
+}
+
+#[test]
+fn clause_integration_auto_clause_navigation_moves_to_second_clause_on_next_right() {
+    let extra = vec![HarnessUserAction::Right, HarnessUserAction::Right];
+    let (harness, _, history) = run_from_auto_clause_ju(&extra);
+
+    assert_eq!(
+        harness_visible_clauses(&harness),
+        "準備して / 発表に / 臨む",
+        "history: {}\nraw clauses: {}\nclause_snapshots: {}\nfuture_clause_snapshots: {}",
+        history_string(&history),
+        harness_raw_clauses(&harness),
+        TextServiceFactory::debug_clause_snapshots(&harness.clause_snapshots),
+        TextServiceFactory::debug_future_clause_snapshots(&harness.future_clause_snapshots),
+    );
+    assert_eq!(harness_clause_input_lengths(&harness), "9 / 11 / 6");
+    assert_eq!(harness.raw_input, "haxtupyouninozomu");
+    assert_eq!(harness.raw_hiragana, "はっぴょうにのぞむ");
+    assert_eq!(
+        TextServiceFactory::current_clause_preview(&harness.preview, &harness.fixed_prefix),
+        "発表に"
+    );
+}
+
+#[test]
+fn clause_integration_auto_clause_navigation_preserves_tyu_sequence_boundary() {
+    let extra = vec![HarnessUserAction::Right];
+    let (harness, _, history) = run_from_auto_clause_tyu(&extra);
+
+    assert_eq!(
+        harness_visible_clauses(&harness),
+        "注意 / して",
+        "history: {}\nraw clauses: {}\nclause_snapshots: {}\nfuture_clause_snapshots: {}",
+        history_string(&history),
+        harness_raw_clauses(&harness),
+        TextServiceFactory::debug_clause_snapshots(&harness.clause_snapshots),
+        TextServiceFactory::debug_future_clause_snapshots(&harness.future_clause_snapshots),
+    );
+    assert_eq!(harness_raw_clauses(&harness), "ちゅうい / して");
+    assert_eq!(harness_clause_input_lengths(&harness), "5 / 4");
+    assert_eq!(
+        TextServiceFactory::current_clause_preview(&harness.preview, &harness.fixed_prefix),
+        "注意"
+    );
+}
+
+#[test]
+fn clause_integration_auto_clause_navigation_moves_tyu_to_second_clause_on_next_right() {
+    let extra = vec![HarnessUserAction::Right, HarnessUserAction::Right];
+    let (harness, _, history) = run_from_auto_clause_tyu(&extra);
+
+    assert_eq!(
+        harness_visible_clauses(&harness),
+        "注意 / して",
+        "history: {}\nraw clauses: {}\nclause_snapshots: {}\nfuture_clause_snapshots: {}",
+        history_string(&history),
+        harness_raw_clauses(&harness),
+        TextServiceFactory::debug_clause_snapshots(&harness.clause_snapshots),
+        TextServiceFactory::debug_future_clause_snapshots(&harness.future_clause_snapshots),
+    );
+    assert_eq!(harness_raw_clauses(&harness), "ちゅうい / して");
+    assert_eq!(harness_clause_input_lengths(&harness), "5 / 4");
+    assert_eq!(
+        TextServiceFactory::current_clause_preview(&harness.preview, &harness.fixed_prefix),
+        "して"
+    );
+}
+
+#[test]
+fn clause_integration_auto_clause_navigation_preserves_realtime_suffix_display() {
+    let extra = vec![HarnessUserAction::Right];
+    let (harness, _, history) = run_from_auto_clause_preserved_suffix(&extra);
+
+    assert_eq!(
+        harness_visible_clauses(&harness),
+        "ある程度 / 長い / 文節でも / 複数に分割される",
+        "history: {}\nraw clauses: {}\nclause_snapshots: {}\nfuture_clause_snapshots: {}\npreview={} fixed_prefix={} suffix={}",
+        history_string(&history),
+        harness_raw_clauses(&harness),
+        TextServiceFactory::debug_clause_snapshots(&harness.clause_snapshots),
+        TextServiceFactory::debug_future_clause_snapshots(&harness.future_clause_snapshots),
+        harness.preview,
+        harness.fixed_prefix,
+        harness.suffix,
+    );
+    assert_eq!(harness.suffix, "長い文節でも複数に分割される");
+    assert_eq!(
+        TextServiceFactory::current_clause_preview(&harness.preview, &harness.fixed_prefix),
+        "ある程度"
+    );
+}
+
+#[test]
+fn clause_integration_auto_clause_navigation_left_starts_at_last_clause() {
+    let extra = vec![HarnessUserAction::Left];
+    let (harness, _, history) = run_from_auto_clause_preserved_suffix(&extra);
+
+    assert_eq!(
+        harness_visible_clauses(&harness),
+        "ある程度 / 長い / 文節でも / 複数に分割される",
+        "history: {}\nraw clauses: {}\nclause_snapshots: {}\nfuture_clause_snapshots: {}\npreview={} fixed_prefix={} suffix={}",
+        history_string(&history),
+        harness_raw_clauses(&harness),
+        TextServiceFactory::debug_clause_snapshots(&harness.clause_snapshots),
+        TextServiceFactory::debug_future_clause_snapshots(&harness.future_clause_snapshots),
+        harness.preview,
+        harness.fixed_prefix,
+        harness.suffix,
+    );
+    assert!(harness.suffix.is_empty());
+    assert_eq!(
+        TextServiceFactory::current_clause_preview(&harness.preview, &harness.fixed_prefix),
+        "複数に分割される"
+    );
+}
+
+#[test]
+fn clause_integration_auto_clause_navigation_blocks_shift_arrows_after_auto_split() {
+    let right_extra = vec![HarnessUserAction::Right];
+    let (right_harness, _, _) = run_from_auto_clause_preserved_suffix(&right_extra);
+    assert_adjust_boundary_is_blocked(&right_harness, -1);
+    assert_adjust_boundary_is_blocked(&right_harness, 1);
+
+    let left_extra = vec![HarnessUserAction::Left];
+    let (left_harness, _, _) = run_from_auto_clause_preserved_suffix(&left_extra);
+    assert_adjust_boundary_is_blocked(&left_harness, -1);
+    assert_adjust_boundary_is_blocked(&left_harness, 1);
 }
 
 #[test]

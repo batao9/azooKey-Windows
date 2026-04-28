@@ -28,6 +28,28 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
     )
 }
 
+private func testCandidate(
+    word: String,
+    ruby: String,
+    composingCount: ComposingCount
+) -> Candidate {
+    Candidate(
+        text: word,
+        value: -1,
+        composingCount: composingCount,
+        lastMid: MIDData.一般.mid,
+        data: [
+            DicdataElement(
+                word: word,
+                ruby: ruby,
+                cid: CIDData.一般名詞.cid,
+                mid: MIDData.一般.mid,
+                value: -1
+            )
+        ]
+    )
+}
+
 @Test func supportsNextInputCarryForTsuRules() async throws {
     let map = tableMap([
         row("tt", "っ", "t"),
@@ -306,4 +328,230 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
 
     #expect(preview.syntheticEndOfText == false)
     #expect(preview.composingText.convertTarget == "q")
+}
+
+@Test func cursorPrefixCandidatesSupplementFirstClauseWithMainResultsForSameBoundary() async throws {
+    let resultTexts = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition("aruteidonagai", inputStyle: .roman2kana)
+        let preview = makeCandidatePreviewComposingText(from: source).composingText
+        let firstClause = testCandidate(
+            word: "ある程度",
+            ruby: "あるていど",
+            composingCount: .inputCount(8)
+        )
+        let hiragana = testCandidate(
+            word: "あるていど",
+            ruby: "あるていど",
+            composingCount: .inputCount(8)
+        )
+        let katakana = testCandidate(
+            word: "アルテイド",
+            ruby: "あるていど",
+            composingCount: .inputCount(8)
+        )
+        let fullSentence = Candidate(
+            text: "ある程度長い",
+            value: -1,
+            composingCount: .inputCount(13),
+            lastMid: MIDData.一般.mid,
+            data: [
+                DicdataElement(
+                    word: "ある程度長い",
+                    ruby: "あるていどながい",
+                    cid: CIDData.一般名詞.cid,
+                    mid: MIDData.一般.mid,
+                    value: -1
+                )
+            ]
+        )
+        return cursorPrefixCandidateResults(
+            mainResults: [fullSentence, hiragana, katakana],
+            firstClauseResults: [firstClause],
+            originalComposingText: source,
+            previewComposingText: preview,
+            previewHiragana: preview.convertTarget
+        ).map { constructCandidateString(candidate: $0, hiragana: preview.convertTarget) }
+    }
+
+    #expect(resultTexts == ["ある程度", "あるていど", "アルテイド"])
+}
+
+@Test func cursorPrefixCandidatesDropFirstClauseResultsForDifferentBoundary() async throws {
+    let resultTexts = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition("iikagentouitusiro", inputStyle: .roman2kana)
+        let preview = makeCandidatePreviewComposingText(from: source).composingText
+        let firstClause = testCandidate(
+            word: "いい加減",
+            ruby: "いいかげん",
+            composingCount: .inputCount(7)
+        )
+        let tooShort = testCandidate(
+            word: "いい",
+            ruby: "いい",
+            composingCount: .inputCount(2)
+        )
+        let hiragana = testCandidate(
+            word: "いいかげん",
+            ruby: "いいかげん",
+            composingCount: .inputCount(7)
+        )
+        return cursorPrefixCandidateResults(
+            mainResults: [],
+            firstClauseResults: [firstClause, tooShort, hiragana],
+            originalComposingText: source,
+            previewComposingText: preview,
+            previewHiragana: preview.convertTarget
+        ).map { constructCandidateString(candidate: $0, hiragana: preview.convertTarget) }
+    }
+
+    #expect(resultTexts == ["いい加減", "いいかげん"])
+}
+
+@Test func cursorPrefixCandidatesUseLongestFirstClauseBoundaryWhenShorterCandidateRanksFirst() async throws {
+    let resultTexts = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition("iikagentouitusiro", inputStyle: .roman2kana)
+        let preview = makeCandidatePreviewComposingText(from: source).composingText
+        let tooShort = testCandidate(
+            word: "いい",
+            ruby: "いい",
+            composingCount: .inputCount(2)
+        )
+        let firstClause = testCandidate(
+            word: "いい加減",
+            ruby: "いいかげん",
+            composingCount: .inputCount(7)
+        )
+        let hiragana = testCandidate(
+            word: "いいかげん",
+            ruby: "いいかげん",
+            composingCount: .inputCount(7)
+        )
+        return cursorPrefixCandidateResults(
+            mainResults: [],
+            firstClauseResults: [tooShort, firstClause, hiragana],
+            originalComposingText: source,
+            previewComposingText: preview,
+            previewHiragana: preview.convertTarget
+        ).map { constructCandidateString(candidate: $0, hiragana: preview.convertTarget) }
+    }
+
+    #expect(resultTexts == ["いい加減", "いいかげん"])
+}
+
+@Test func cursorPrefixCandidatesSupplementWithExactClauseResultsWhenMainResultsLackSameBoundary() async throws {
+    let resultTexts = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition("aruteidonagaibunsetsudemo", inputStyle: .roman2kana)
+        let preview = makeCandidatePreviewComposingText(from: source).composingText
+        let firstClause = testCandidate(
+            word: "ある程度",
+            ruby: "あるていど",
+            composingCount: .inputCount(8)
+        )
+        let fullSentence = Candidate(
+            text: "ある程度長い文節でも",
+            value: -1,
+            composingCount: .inputCount(25),
+            lastMid: MIDData.一般.mid,
+            data: [
+                DicdataElement(
+                    word: "ある程度長い文節でも",
+                    ruby: "あるていどながいぶんせつでも",
+                    cid: CIDData.一般名詞.cid,
+                    mid: MIDData.一般.mid,
+                    value: -1
+                )
+            ]
+        )
+        let hiragana = testCandidate(
+            word: "あるていど",
+            ruby: "あるていど",
+            composingCount: .inputCount(8)
+        )
+        let katakana = testCandidate(
+            word: "アルテイド",
+            ruby: "あるていど",
+            composingCount: .inputCount(8)
+        )
+        return cursorPrefixCandidateResults(
+            mainResults: [fullSentence],
+            firstClauseResults: [firstClause],
+            exactClauseResults: [hiragana, katakana],
+            originalComposingText: source,
+            previewComposingText: preview,
+            previewHiragana: preview.convertTarget
+        ).map { constructCandidateString(candidate: $0, hiragana: preview.convertTarget) }
+    }
+
+    #expect(resultTexts == ["ある程度", "あるていど", "アルテイド"])
+}
+
+@Test func cursorPrefixCandidatesSupplementParticleClauseWithExactClauseResults() async throws {
+    let resultTexts = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition("bunsetsudemofukusuunibunkatsusareru", inputStyle: .roman2kana)
+        let preview = makeCandidatePreviewComposingText(from: source).composingText
+        let firstClause = testCandidate(
+            word: "文節でも",
+            ruby: "ぶんせつでも",
+            composingCount: .inputCount(12)
+        )
+        let alternative = testCandidate(
+            word: "分節でも",
+            ruby: "ぶんせつでも",
+            composingCount: .inputCount(12)
+        )
+        let hiragana = testCandidate(
+            word: "ぶんせつでも",
+            ruby: "ぶんせつでも",
+            composingCount: .inputCount(12)
+        )
+        let katakana = testCandidate(
+            word: "ブンセツデモ",
+            ruby: "ぶんせつでも",
+            composingCount: .inputCount(12)
+        )
+        let fullSentence = Candidate(
+            text: "文節でも複数に分割される",
+            value: -1,
+            composingCount: .inputCount(35),
+            lastMid: MIDData.一般.mid,
+            data: [
+                DicdataElement(
+                    word: "文節でも複数に分割される",
+                    ruby: "ぶんせつでもふくすうにぶんかつされる",
+                    cid: CIDData.一般名詞.cid,
+                    mid: MIDData.一般.mid,
+                    value: -1
+                )
+            ]
+        )
+        return cursorPrefixCandidateResults(
+            mainResults: [fullSentence],
+            firstClauseResults: [firstClause, alternative],
+            exactClauseResults: [firstClause, alternative, hiragana, katakana],
+            originalComposingText: source,
+            previewComposingText: preview,
+            previewHiragana: preview.convertTarget
+        ).map { constructCandidateString(candidate: $0, hiragana: preview.convertTarget) }
+    }
+
+    #expect(resultTexts == ["文節でも", "分節でも", "ぶんせつでも", "ブンセツデモ"])
+}
+
+@Test func cursorPrefixExactClauseComposingTextPreservesSelectedClauseInput() async throws {
+    let clause = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition("aruteidonagaibunsetsudemo", inputStyle: .roman2kana)
+        return makeCursorPrefixExactClauseComposingText(
+            prefixComposingText: source,
+            correspondingCount: 8
+        )
+    }
+
+    #expect(clause.convertTarget == "あるていど")
+    #expect(clause.input.count == 8)
 }

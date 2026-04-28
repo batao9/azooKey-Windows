@@ -60,10 +60,54 @@ impl SimClause {
 
     fn candidate_texts(&self) -> Vec<String> {
         match (self.uniform_origin_id(), self.raw_hiragana().as_str()) {
+            (None, "じゅんびしてはっぴょうにのぞむ") => {
+                vec!["準備して発表に臨む".to_string()]
+            }
+            (None, "ちゅういして") => vec!["注意して".to_string()],
+            (None, "あるていどながいぶんせつでもふくすうにぶんかつされる") =>
+            {
+                vec!["ある程度長い文節でも複数に分割される".to_string()]
+            }
+            (None, "ながいぶんせつでもふくすうにぶんかつされる") => {
+                vec!["長い文節でも複数に分割される".to_string()]
+            }
+            (None, "ぶんせつでもふくすうにぶんかつされる") => {
+                vec!["文節でも複数に分割される".to_string()]
+            }
             (Some(1), "かげん") => {
                 vec!["加減".to_string(), "下限".to_string(), "かげん".to_string()]
             }
             (Some(2), "とういつ") => vec!["統一".to_string(), "とういつ".to_string()],
+            (Some(4), "じゅんびして") => {
+                vec!["準備して".to_string(), "じゅんびして".to_string()]
+            }
+            (Some(5), "はっぴょうに") => {
+                vec!["発表に".to_string(), "はっぴょうに".to_string()]
+            }
+            (Some(6), "のぞむ") => {
+                vec!["臨む".to_string(), "望む".to_string(), "のぞむ".to_string()]
+            }
+            (Some(7), "ちゅうい") => vec!["注意".to_string(), "ちゅうい".to_string()],
+            (Some(8), "して") => vec!["して".to_string()],
+            (Some(9), "あるていど") => vec![
+                "ある程度".to_string(),
+                "有る程度".to_string(),
+                "あるていど".to_string(),
+                "アルテイド".to_string(),
+            ],
+            (Some(10), "ながい") => {
+                vec!["長い".to_string(), "永い".to_string(), "ながい".to_string()]
+            }
+            (Some(11), "ぶんせつでも") => vec![
+                "文節でも".to_string(),
+                "分節でも".to_string(),
+                "ぶんせつでも".to_string(),
+            ],
+            (Some(12), "ふくすうにぶんかつされる") => vec![
+                "複数に分割される".to_string(),
+                "服数に分割される".to_string(),
+                "ふくすうにぶんかつされる".to_string(),
+            ],
             _ => vec![self.raw_hiragana()],
         }
     }
@@ -284,6 +328,77 @@ fn fkey_two_clause_spec_state() -> SimSpecState {
     }
 }
 
+fn auto_clause_ju_spec_state() -> SimSpecState {
+    SimSpecState {
+        committed_clauses: Vec::new(),
+        clauses: vec![clause(vec![
+            unit("じゅ", "ju", "じゅ", 4),
+            unit("ん", "n", "ん", 4),
+            unit("び", "bi", "び", 4),
+            unit("し", "si", "し", 4),
+            unit("て", "te", "て", 4),
+            unit("は", "ha", "は", 5),
+            unit("っ", "xtu", "っ", 5),
+            unit("ぴょ", "pyo", "ぴょ", 5),
+            unit("う", "u", "う", 5),
+            unit("に", "ni", "に", 5),
+            unit("の", "no", "の", 6),
+            unit("ぞ", "zo", "ぞ", 6),
+            unit("む", "mu", "む", 6),
+        ])],
+        current_index: 0,
+    }
+}
+
+fn auto_clause_tyu_spec_state() -> SimSpecState {
+    SimSpecState {
+        committed_clauses: Vec::new(),
+        clauses: vec![clause(vec![
+            unit("ちゅ", "tyu", "ちゅ", 7),
+            unit("う", "u", "う", 7),
+            unit("い", "i", "い", 7),
+            unit("し", "si", "し", 8),
+            unit("て", "te", "て", 8),
+        ])],
+        current_index: 0,
+    }
+}
+
+fn auto_clause_preserved_suffix_spec_state() -> SimSpecState {
+    SimSpecState {
+        committed_clauses: Vec::new(),
+        clauses: vec![clause(vec![
+            unit("あ", "a", "あ", 9),
+            unit("る", "ru", "る", 9),
+            unit("て", "te", "て", 9),
+            unit("い", "i", "い", 9),
+            unit("ど", "do", "ど", 9),
+            unit("な", "na", "な", 10),
+            unit("が", "ga", "が", 10),
+            unit("い", "i", "い", 10),
+            unit("ぶ", "bu", "ぶ", 11),
+            unit("ん", "n", "ん", 11),
+            unit("せ", "se", "せ", 11),
+            unit("つ", "tu", "つ", 11),
+            unit("で", "de", "で", 11),
+            unit("も", "mo", "も", 11),
+            unit("ふ", "fu", "ふ", 12),
+            unit("く", "ku", "く", 12),
+            unit("す", "su", "す", 12),
+            unit("う", "u", "う", 12),
+            unit("に", "ni", "に", 12),
+            unit("ぶ", "bu", "ぶ", 12),
+            unit("ん", "n", "ん", 12),
+            unit("か", "ka", "か", 12),
+            unit("つ", "tu", "つ", 12),
+            unit("さ", "sa", "さ", 12),
+            unit("れ", "re", "れ", 12),
+            unit("る", "ru", "る", 12),
+        ])],
+        current_index: 0,
+    }
+}
+
 fn candidates_owned(
     texts: Vec<String>,
     sub_texts: Vec<String>,
@@ -408,6 +523,46 @@ fn candidates_for_clause(spec: &SimSpecState, clause_index: usize) -> Candidates
         spec_join_raw_hiragana(&spec.clauses[clause_index..]),
         vec![current.corresponding_count(); texts.len()],
     )
+}
+
+fn auto_split_clauses_by_origin(units: &[SimUnit]) -> Vec<SimClause> {
+    let mut clauses: Vec<SimClause> = Vec::new();
+
+    for unit in units.iter().cloned() {
+        if let Some(last) = clauses.last_mut() {
+            if last.uniform_origin_id() == Some(unit.origin_id) {
+                last.units.push(unit);
+                continue;
+            }
+        }
+
+        clauses.push(clause(vec![unit]));
+    }
+
+    clauses
+}
+
+fn auto_first_clause_candidates(spec: &SimSpecState) -> Option<Candidates> {
+    let only_clause = spec.clauses.first()?;
+    let auto_clauses = auto_split_clauses_by_origin(&only_clause.units);
+    if auto_clauses.len() <= 1 {
+        return None;
+    }
+
+    let auto_spec = SimSpecState {
+        committed_clauses: Vec::new(),
+        clauses: auto_clauses,
+        current_index: 0,
+    };
+    let current = &auto_spec.clauses[0];
+    let texts = current.candidate_texts();
+    let raw_suffix = spec_join_raw_hiragana(&auto_spec.clauses[1..]);
+    Some(candidates_owned(
+        texts.clone(),
+        vec![raw_suffix; texts.len()],
+        spec_join_raw_hiragana(&auto_spec.clauses),
+        vec![current.corresponding_count(); texts.len()],
+    ))
 }
 
 fn split_units_by_offset(units: &[SimUnit], offset: i32) -> Option<(Vec<SimUnit>, Vec<SimUnit>)> {
@@ -739,7 +894,8 @@ pub(super) fn harness_raw_clauses(harness: &ClauseHarness) -> String {
         return clauses.join(" / ");
     }
 
-    let trailing = harness.suffix.clone();
+    let trailing =
+        TextServiceFactory::current_raw_suffix(&harness.raw_hiragana, harness.corresponding_count);
     let current_raw = harness
         .raw_hiragana
         .strip_suffix(&trailing)
@@ -842,6 +998,27 @@ fn harness_as_composition(harness: &ClauseHarness) -> Composition {
     }
 }
 
+pub(super) fn assert_adjust_boundary_is_blocked(harness: &ClauseHarness, direction: i32) {
+    let composition = harness_as_composition(harness);
+    let app_config = AppConfig::default();
+    let Some((transition, actions)) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::AdjustClauseBoundary(direction),
+        &crate::engine::input_mode::InputMode::Kana,
+        true,
+        &app_config,
+        false,
+    ) else {
+        panic!("adjust boundary was not consumed for direction {direction}");
+    };
+
+    assert_eq!(transition, composition.state);
+    assert!(
+        actions.is_empty(),
+        "adjust boundary should be blocked without client actions: direction={direction}, actions={actions:?}"
+    );
+}
+
 fn committed_clause_from_snapshot(
     snapshot: &ClauseSnapshot,
     next_raw_hiragana: Option<&str>,
@@ -872,6 +1049,21 @@ fn committed_current_clause_from_harness(harness: &ClauseHarness) -> SimCommitte
             &harness.future_clause_snapshots,
         ),
         corresponding_count: harness.corresponding_count,
+    }
+}
+
+fn committed_clause_from_future_snapshot(
+    snapshot: &FutureClauseSnapshot,
+    next_raw_hiragana: Option<&str>,
+) -> SimCommittedClause {
+    SimCommittedClause {
+        display: snapshot.selected_text.clone(),
+        raw_hiragana: TextServiceFactory::clause_raw_preview(
+            &snapshot.raw_hiragana,
+            next_raw_hiragana,
+            snapshot.corresponding_count,
+        ),
+        corresponding_count: snapshot.corresponding_count,
     }
 }
 
@@ -1010,6 +1202,30 @@ impl ScenarioBackend {
         }
     }
 
+    fn move_spec_to_last(&mut self) {
+        if !self.spec.clauses.is_empty() {
+            self.spec.current_index = self.spec.clauses.len() - 1;
+            if let Some(current) = self.spec.clauses.get_mut(self.spec.current_index) {
+                current.pending_remainder = false;
+            }
+        }
+    }
+
+    fn ensure_spec_clause_navigation_ready(&mut self) {
+        if self.spec.clauses.len() != 1 || self.spec.current_index != 0 {
+            return;
+        }
+
+        let units = self.spec.clauses[0].units.clone();
+        let auto_clauses = auto_split_clauses_by_origin(&units);
+        if auto_clauses.len() <= 1 {
+            return;
+        }
+
+        self.spec.clauses = auto_clauses;
+        self.spec.current_index = 0;
+    }
+
     fn step_spec_selection(&mut self, delta: i32) {
         let Some(current) = self.spec.clauses.get_mut(self.spec.current_index) else {
             return;
@@ -1021,16 +1237,8 @@ impl ScenarioBackend {
         current.clamp_selection();
     }
 
-    fn commit_spec_current_clause(&mut self) {
-        if self.spec.clauses.is_empty() || self.spec.current_index >= self.spec.clauses.len() {
-            return;
-        }
-
-        let committed = self
-            .spec
-            .clauses
-            .drain(..=self.spec.current_index)
-            .collect::<Vec<_>>();
+    fn commit_spec_all_clauses(&mut self) {
+        let committed = self.spec.clauses.drain(..).collect::<Vec<_>>();
         self.spec
             .committed_clauses
             .extend(committed.into_iter().map(|clause| SimCommittedClause {
@@ -1038,15 +1246,7 @@ impl ScenarioBackend {
                 raw_hiragana: clause.raw_hiragana(),
                 corresponding_count: clause.corresponding_count(),
             }));
-
-        if self.spec.clauses.is_empty() {
-            self.spec.current_index = 0;
-        } else {
-            self.spec.current_index = 0;
-            if let Some(current) = self.spec.clauses.get_mut(0) {
-                current.pending_remainder = false;
-            }
-        }
+        self.spec.current_index = 0;
     }
 
     fn apply_expected_user_action(&mut self, op: HarnessUserAction) {
@@ -1055,7 +1255,7 @@ impl ScenarioBackend {
             HarnessUserAction::Right => self.move_spec_right(),
             HarnessUserAction::ShiftLeft => self.split_spec_left(),
             HarnessUserAction::Space => {}
-            HarnessUserAction::Enter => self.commit_spec_current_clause(),
+            HarnessUserAction::Enter => self.commit_spec_all_clauses(),
             HarnessUserAction::SetTextType(set_type) => {
                 if let Some(current) = self.spec.clauses.get_mut(self.spec.current_index) {
                     current.display_override = Some(set_type);
@@ -1087,6 +1287,8 @@ impl ClauseActionBackend for ScenarioBackend {
             0 => {
                 if self.blocked_boundary {
                     Ok(Candidates::default())
+                } else if let Some(candidates) = auto_first_clause_candidates(&self.server) {
+                    Ok(candidates)
                 } else {
                     Ok(self.current_candidates())
                 }
@@ -1307,8 +1509,37 @@ fn apply_user_action(
         )
     });
 
+    if actions.is_empty() {
+        harness.state = transition;
+        return;
+    }
+
     for action in actions {
         match action {
+            ClientAction::EnsureClauseNavigationReady => {
+                let mut state = ClauseActionStateMut {
+                    preview: &mut harness.preview,
+                    suffix: &mut harness.suffix,
+                    raw_input: &mut harness.raw_input,
+                    raw_hiragana: &mut harness.raw_hiragana,
+                    fixed_prefix: &mut harness.fixed_prefix,
+                    corresponding_count: &mut harness.corresponding_count,
+                    selection_index: &mut harness.selection_index,
+                    candidates: &mut harness.candidates,
+                    clause_snapshots: &mut harness.clause_snapshots,
+                    future_clause_snapshots: &mut harness.future_clause_snapshots,
+                    current_clause_is_split_derived: &mut harness.current_clause_is_split_derived,
+                    current_clause_is_direct_split_remainder: &mut harness
+                        .current_clause_is_direct_split_remainder,
+                    current_clause_has_split_left_neighbor: &mut harness
+                        .current_clause_has_split_left_neighbor,
+                    current_clause_split_group_id: &mut harness.current_clause_split_group_id,
+                    next_split_group_id: &mut harness.next_split_group_id,
+                };
+                TextServiceFactory::ensure_clause_navigation_ready(&mut state, backend)
+                    .expect("ensure_clause_navigation_ready");
+                backend.ensure_spec_clause_navigation_ready();
+            }
             ClientAction::MoveClause(direction) => {
                 backend.sync_current_selection(harness.selection_index);
                 let effect = {
@@ -1354,6 +1585,13 @@ fn apply_user_action(
                     harness.corresponding_count,
                     harness.selection_index,
                 );
+                if direction == TextServiceFactory::MOVE_CLAUSE_TO_LAST {
+                    backend.move_spec_to_last();
+                } else if direction > 0 {
+                    backend.move_spec_right();
+                } else if direction < 0 {
+                    backend.move_spec_left();
+                }
             }
             ClientAction::AdjustBoundary(direction) => {
                 let effect = {
@@ -1490,6 +1728,22 @@ fn apply_user_action(
                         .committed_clauses
                         .push(committed_current_clause_from_harness(harness));
                 }
+                let ordered_future = harness
+                    .future_clause_snapshots
+                    .iter()
+                    .rev()
+                    .collect::<Vec<_>>();
+                for (index, snapshot) in ordered_future.iter().enumerate() {
+                    let next_raw_hiragana = ordered_future
+                        .get(index + 1)
+                        .map(|next| next.raw_hiragana.as_str());
+                    harness
+                        .committed_clauses
+                        .push(committed_clause_from_future_snapshot(
+                            snapshot,
+                            next_raw_hiragana,
+                        ));
+                }
                 harness.preview.clear();
                 harness.suffix.clear();
                 harness.raw_input.clear();
@@ -1602,7 +1856,9 @@ fn apply_user_action(
         }
     }
 
-    backend.apply_expected_user_action(op);
+    if !matches!(op, HarnessUserAction::Left | HarnessUserAction::Right) {
+        backend.apply_expected_user_action(op);
+    }
     harness.state = transition;
 }
 
@@ -1624,6 +1880,15 @@ fn run_to_logged_baseline() -> (ClauseHarness, ScenarioBackend, Vec<HarnessUserA
 
 fn run_to_fkey_baseline() -> (ClauseHarness, ScenarioBackend, Vec<HarnessUserAction>) {
     let spec = fkey_two_clause_spec_state();
+    let harness = build_harness_from_spec(&spec, CompositionState::Composing);
+    let backend = ScenarioBackend::new(spec);
+    let history = Vec::new();
+    (harness, backend, history)
+}
+
+fn run_to_auto_clause(
+    spec: SimSpecState,
+) -> (ClauseHarness, ScenarioBackend, Vec<HarnessUserAction>) {
     let harness = build_harness_from_spec(&spec, CompositionState::Composing);
     let backend = ScenarioBackend::new(spec);
     let history = Vec::new();
@@ -1665,6 +1930,49 @@ pub(super) fn run_from_fkey_baseline(
         history.push(*op);
         apply_user_action(&mut harness, &mut backend, *op, &history);
         assert_harness_matches_spec(&harness, &backend.spec, &history);
+    }
+
+    (harness, backend, history)
+}
+
+fn run_from_auto_clause(
+    spec: SimSpecState,
+    extra_actions: &[HarnessUserAction],
+) -> (ClauseHarness, ScenarioBackend, Vec<HarnessUserAction>) {
+    let (mut harness, mut backend, mut history) = run_to_auto_clause(spec);
+    assert_harness_matches_spec(&harness, &backend.spec, &history);
+
+    for op in extra_actions {
+        history.push(*op);
+        apply_user_action(&mut harness, &mut backend, *op, &history);
+        assert_harness_matches_spec(&harness, &backend.spec, &history);
+    }
+
+    (harness, backend, history)
+}
+
+pub(super) fn run_from_auto_clause_ju(
+    extra_actions: &[HarnessUserAction],
+) -> (ClauseHarness, ScenarioBackend, Vec<HarnessUserAction>) {
+    run_from_auto_clause(auto_clause_ju_spec_state(), extra_actions)
+}
+
+pub(super) fn run_from_auto_clause_tyu(
+    extra_actions: &[HarnessUserAction],
+) -> (ClauseHarness, ScenarioBackend, Vec<HarnessUserAction>) {
+    run_from_auto_clause(auto_clause_tyu_spec_state(), extra_actions)
+}
+
+pub(super) fn run_from_auto_clause_preserved_suffix(
+    extra_actions: &[HarnessUserAction],
+) -> (ClauseHarness, ScenarioBackend, Vec<HarnessUserAction>) {
+    let (mut harness, mut backend, mut history) =
+        run_to_auto_clause(auto_clause_preserved_suffix_spec_state());
+    assert_harness_matches_spec(&harness, &backend.spec, &history);
+
+    for op in extra_actions {
+        history.push(*op);
+        apply_user_action(&mut harness, &mut backend, *op, &history);
     }
 
     (harness, backend, history)
