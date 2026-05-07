@@ -2265,12 +2265,7 @@ impl TextServiceFactory {
         match action {
             UserAction::Input(ch) => {
                 let input = ch.to_string();
-                Some(convert_kana_symbol(
-                    &input,
-                    &app_config.general,
-                    &app_config.character_width,
-                    &app_config.romaji_table.rows,
-                ))
+                Some(Self::punctuation_commit_text_for_input(&input, app_config))
             }
             UserAction::NumpadSymbol(symbol) => Some(
                 Self::numpad_text_for_mode(*symbol, app_config.general.numpad_input, false)
@@ -2278,6 +2273,24 @@ impl TextServiceFactory {
             ),
             _ => None,
         }
+    }
+
+    #[inline]
+    fn punctuation_commit_text_for_input(input: &str, app_config: &AppConfig) -> String {
+        if Self::effective_zenzai_runtime_enabled(app_config) {
+            if let Some(mapped) =
+                Self::single_symbol_romaji_output(input, &app_config.romaji_table.rows)
+            {
+                return mapped;
+            }
+        }
+
+        convert_kana_symbol(
+            input,
+            &app_config.general,
+            &app_config.character_width,
+            &app_config.romaji_table.rows,
+        )
     }
 
     #[inline]
@@ -2302,6 +2315,11 @@ impl TextServiceFactory {
             }
             UserAction::NumpadSymbol(symbol) => {
                 Self::punctuation_commit_target_enabled(*symbol, app_config)
+                    && !Self::has_multi_character_romaji_context(
+                        raw_input_before,
+                        *symbol,
+                        &app_config.romaji_table.rows,
+                    )
             }
             _ => false,
         }

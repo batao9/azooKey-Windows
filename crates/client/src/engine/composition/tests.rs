@@ -267,6 +267,87 @@ fn punctuation_commit_preserves_multi_character_romaji_punctuation_sequences() {
 }
 
 #[test]
+fn punctuation_commit_preserves_numpad_multi_character_romaji_punctuation_sequences() {
+    let mut app_config = AppConfig::default();
+    app_config.general.punctuation_commit = true;
+    app_config.romaji_table.rows = get_default_romaji_rows();
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "z".to_string(),
+        raw_input: "z".to_string(),
+        raw_hiragana: "z".to_string(),
+        corresponding_count: 1,
+        ..Composition::default()
+    };
+
+    let (period_transition, period_actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::NumpadSymbol('.'),
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    )
+    .expect("numpad z. should stay on the romaji input path");
+    let (comma_transition, comma_actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::NumpadSymbol(','),
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    )
+    .expect("numpad z, should stay on the romaji input path");
+
+    assert_eq!(period_transition, CompositionState::Composing);
+    assert_eq!(
+        period_actions,
+        vec![ClientAction::AppendTextRaw(".".to_string())]
+    );
+    assert_eq!(comma_transition, CompositionState::Composing);
+    assert_eq!(
+        comma_actions,
+        vec![ClientAction::AppendTextRaw(",".to_string())]
+    );
+}
+
+#[test]
+fn punctuation_commit_preserves_zenzai_single_symbol_romaji_mapping() {
+    let mut app_config = AppConfig::default();
+    app_config.general.punctuation_commit = true;
+    app_config.zenzai.enable = true;
+    app_config.zenzai.backend = "vulkan".to_string();
+    app_config.romaji_table.rows = vec![row("?", "QUESTION", "")];
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "今日は".to_string(),
+        raw_input: "kyouha".to_string(),
+        raw_hiragana: "きょうは".to_string(),
+        corresponding_count: 6,
+        ..Composition::default()
+    };
+
+    let (transition, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input('?'),
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    )
+    .expect("single-symbol romaji mapping should commit mapped punctuation");
+
+    assert_eq!(transition, CompositionState::None);
+    assert_eq!(
+        actions,
+        vec![
+            ClientAction::EndComposition,
+            ClientAction::CommitTextDirect("QUESTION".to_string())
+        ]
+    );
+}
+
+#[test]
 fn punctuation_commit_also_applies_while_previewing() {
     let mut app_config = AppConfig::default();
     app_config.general.punctuation_commit = true;
