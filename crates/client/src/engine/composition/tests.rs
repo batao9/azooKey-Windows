@@ -7,7 +7,7 @@ use crate::engine::{
     input_mode::InputMode,
     user_action::{Function, Navigation, UserAction},
 };
-use shared::{get_default_romaji_rows, AppConfig, RomajiRule, WidthMode};
+use shared::{get_default_romaji_rows, AppConfig, PunctuationStyle, RomajiRule, WidthMode};
 
 pub(super) fn row(input: &str, output: &str, next_input: &str) -> RomajiRule {
     RomajiRule {
@@ -110,6 +110,362 @@ fn delayed_candidate_window_shows_when_space_opens_preview() {
             ClientAction::ShowCandidateWindow,
             ClientAction::SetSelection(SetSelectionType::Down)
         ]
+    );
+}
+
+#[test]
+fn punctuation_commit_defaults_off_and_keeps_existing_append_path() {
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "今日は".to_string(),
+        raw_input: "kyouha".to_string(),
+        raw_hiragana: "きょうは".to_string(),
+        corresponding_count: 6,
+        ..Composition::default()
+    };
+
+    let (transition, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input(','),
+        &InputMode::Kana,
+        false,
+        &AppConfig::default(),
+        false,
+    )
+    .expect("comma should keep composing by default");
+
+    assert_eq!(transition, CompositionState::Composing);
+    assert_eq!(actions, vec![ClientAction::AppendText(",".to_string())]);
+}
+
+#[test]
+fn punctuation_commit_commits_current_composition_then_punctuation() {
+    let mut app_config = AppConfig::default();
+    app_config.general.punctuation_commit = true;
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "今日は".to_string(),
+        raw_input: "kyouha".to_string(),
+        raw_hiragana: "きょうは".to_string(),
+        corresponding_count: 6,
+        ..Composition::default()
+    };
+
+    let (transition, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input(','),
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    )
+    .expect("comma should commit punctuation");
+
+    assert_eq!(transition, CompositionState::None);
+    assert_eq!(
+        actions,
+        vec![
+            ClientAction::EndComposition,
+            ClientAction::CommitTextDirect("、".to_string())
+        ]
+    );
+}
+
+#[test]
+fn punctuation_commit_respects_punctuation_style_and_width_for_output() {
+    let mut app_config = AppConfig::default();
+    app_config.general.punctuation_commit = true;
+    app_config.general.punctuation_style = PunctuationStyle::FullwidthCommaFullwidthPeriod;
+    app_config.character_width.groups.comma_period = WidthMode::Half;
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "今日は".to_string(),
+        raw_input: "kyouha".to_string(),
+        raw_hiragana: "きょうは".to_string(),
+        corresponding_count: 6,
+        ..Composition::default()
+    };
+
+    let (_, comma_actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input(','),
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    )
+    .expect("comma should commit punctuation");
+    let (_, period_actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input('.'),
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    )
+    .expect("period should commit punctuation");
+
+    assert_eq!(
+        comma_actions,
+        vec![
+            ClientAction::EndComposition,
+            ClientAction::CommitTextDirect(",".to_string())
+        ]
+    );
+    assert_eq!(
+        period_actions,
+        vec![
+            ClientAction::EndComposition,
+            ClientAction::CommitTextDirect(".".to_string())
+        ]
+    );
+}
+
+#[test]
+fn punctuation_commit_preserves_multi_character_romaji_punctuation_sequences() {
+    let mut app_config = AppConfig::default();
+    app_config.general.punctuation_commit = true;
+    app_config.romaji_table.rows = get_default_romaji_rows();
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "z".to_string(),
+        raw_input: "z".to_string(),
+        raw_hiragana: "z".to_string(),
+        corresponding_count: 1,
+        ..Composition::default()
+    };
+
+    let (period_transition, period_actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input('.'),
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    )
+    .expect("z. should stay on the romaji input path");
+    let (comma_transition, comma_actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input(','),
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    )
+    .expect("z, should stay on the romaji input path");
+
+    assert_eq!(period_transition, CompositionState::Composing);
+    assert_eq!(
+        period_actions,
+        vec![ClientAction::AppendText(".".to_string())]
+    );
+    assert_eq!(comma_transition, CompositionState::Composing);
+    assert_eq!(
+        comma_actions,
+        vec![ClientAction::AppendText(",".to_string())]
+    );
+}
+
+#[test]
+fn punctuation_commit_also_applies_while_previewing() {
+    let mut app_config = AppConfig::default();
+    app_config.general.punctuation_commit = true;
+    let composition = Composition {
+        state: CompositionState::Previewing,
+        preview: "今日は".to_string(),
+        raw_input: "kyouha".to_string(),
+        raw_hiragana: "きょうは".to_string(),
+        corresponding_count: 6,
+        ..Composition::default()
+    };
+
+    let (transition, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input('。'),
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    )
+    .expect("kuten should commit punctuation while previewing");
+
+    assert_eq!(transition, CompositionState::None);
+    assert_eq!(
+        actions,
+        vec![
+            ClientAction::EndComposition,
+            ClientAction::CommitTextDirect("。".to_string())
+        ]
+    );
+}
+
+#[test]
+fn punctuation_commit_can_disable_punctuation_target_only() {
+    let mut app_config = AppConfig::default();
+    app_config.general.punctuation_commit = true;
+    app_config.general.punctuation_commit_punctuation = false;
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "今日は".to_string(),
+        raw_input: "kyouha".to_string(),
+        raw_hiragana: "きょうは".to_string(),
+        corresponding_count: 6,
+        ..Composition::default()
+    };
+
+    let (transition, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input(','),
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    )
+    .expect("comma should keep composing when punctuation target is disabled");
+
+    assert_eq!(transition, CompositionState::Composing);
+    assert_eq!(actions, vec![ClientAction::AppendText(",".to_string())]);
+}
+
+#[test]
+fn punctuation_commit_supports_exclamation_and_question_with_fullwidth_setting() {
+    let mut app_config = AppConfig::default();
+    app_config.general.punctuation_commit = true;
+    app_config.character_width.groups.question_exclamation = WidthMode::Full;
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "今日は".to_string(),
+        raw_input: "kyouha".to_string(),
+        raw_hiragana: "きょうは".to_string(),
+        corresponding_count: 6,
+        ..Composition::default()
+    };
+
+    let (_, exclamation_actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input('!'),
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    )
+    .expect("exclamation should commit");
+    let (_, question_actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input('?'),
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    )
+    .expect("question should commit");
+
+    assert_eq!(
+        exclamation_actions,
+        vec![
+            ClientAction::EndComposition,
+            ClientAction::CommitTextDirect("！".to_string())
+        ]
+    );
+    assert_eq!(
+        question_actions,
+        vec![
+            ClientAction::EndComposition,
+            ClientAction::CommitTextDirect("？".to_string())
+        ]
+    );
+}
+
+#[test]
+fn punctuation_commit_supports_fullwidth_exclamation_and_question_with_halfwidth_setting() {
+    let mut app_config = AppConfig::default();
+    app_config.general.punctuation_commit = true;
+    app_config.character_width.groups.question_exclamation = WidthMode::Half;
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "今日は".to_string(),
+        raw_input: "kyouha".to_string(),
+        raw_hiragana: "きょうは".to_string(),
+        corresponding_count: 6,
+        ..Composition::default()
+    };
+
+    let (_, exclamation_actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input('！'),
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    )
+    .expect("fullwidth exclamation should commit");
+    let (_, question_actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input('？'),
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    )
+    .expect("fullwidth question should commit");
+
+    assert_eq!(
+        exclamation_actions,
+        vec![
+            ClientAction::EndComposition,
+            ClientAction::CommitTextDirect("!".to_string())
+        ]
+    );
+    assert_eq!(
+        question_actions,
+        vec![
+            ClientAction::EndComposition,
+            ClientAction::CommitTextDirect("?".to_string())
+        ]
+    );
+}
+
+#[test]
+fn punctuation_commit_can_disable_exclamation_and_question_individually() {
+    let mut app_config = AppConfig::default();
+    app_config.general.punctuation_commit = true;
+    app_config.general.punctuation_commit_exclamation = false;
+    app_config.general.punctuation_commit_question = false;
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "今日は".to_string(),
+        raw_input: "kyouha".to_string(),
+        raw_hiragana: "きょうは".to_string(),
+        corresponding_count: 6,
+        ..Composition::default()
+    };
+
+    let (_, exclamation_actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input('!'),
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    )
+    .expect("disabled exclamation should keep composing");
+    let (_, question_actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input('?'),
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    )
+    .expect("disabled question should keep composing");
+
+    assert_eq!(
+        exclamation_actions,
+        vec![ClientAction::AppendText("!".to_string())]
+    );
+    assert_eq!(
+        question_actions,
+        vec![ClientAction::AppendText("?".to_string())]
     );
 }
 

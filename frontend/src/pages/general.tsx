@@ -21,6 +21,10 @@ type GeneralConfigState = {
     symbol_style: string;
     space_input: string;
     numpad_input: string;
+    punctuation_commit: boolean;
+    punctuation_commit_punctuation: boolean;
+    punctuation_commit_exclamation: boolean;
+    punctuation_commit_question: boolean;
     show_candidate_window_after_space: boolean;
 };
 
@@ -49,6 +53,10 @@ const DEFAULT_GENERAL_CONFIG: GeneralConfigState = {
     symbol_style: "corner_bracket_middle_dot",
     space_input: "always_half",
     numpad_input: "direct_input",
+    punctuation_commit: false,
+    punctuation_commit_punctuation: true,
+    punctuation_commit_exclamation: true,
+    punctuation_commit_question: true,
     show_candidate_window_after_space: false,
 };
 
@@ -135,6 +143,22 @@ const normalizeGeneralConfig = (value?: Record<string, unknown>): GeneralConfigS
               : value?.numpad_input === "follow_input_mode"
                 ? "follow_input_mode"
                 : DEFAULT_GENERAL_CONFIG.numpad_input,
+    punctuation_commit:
+        typeof value?.punctuation_commit === "boolean"
+            ? value.punctuation_commit
+            : DEFAULT_GENERAL_CONFIG.punctuation_commit,
+    punctuation_commit_punctuation:
+        typeof value?.punctuation_commit_punctuation === "boolean"
+            ? value.punctuation_commit_punctuation
+            : DEFAULT_GENERAL_CONFIG.punctuation_commit_punctuation,
+    punctuation_commit_exclamation:
+        typeof value?.punctuation_commit_exclamation === "boolean"
+            ? value.punctuation_commit_exclamation
+            : DEFAULT_GENERAL_CONFIG.punctuation_commit_exclamation,
+    punctuation_commit_question:
+        typeof value?.punctuation_commit_question === "boolean"
+            ? value.punctuation_commit_question
+            : DEFAULT_GENERAL_CONFIG.punctuation_commit_question,
     show_candidate_window_after_space:
         typeof value?.show_candidate_window_after_space === "boolean"
             ? value.show_candidate_window_after_space
@@ -297,7 +321,14 @@ export const General = () => {
     };
 
     const updateGeneralConfig = async (
-        key: keyof Omit<GeneralConfigState, "show_candidate_window_after_space">,
+        key: keyof Omit<
+            GeneralConfigState,
+            | "punctuation_commit"
+            | "punctuation_commit_punctuation"
+            | "punctuation_commit_exclamation"
+            | "punctuation_commit_question"
+            | "show_candidate_window_after_space"
+        >,
         nextValue: string,
     ) => {
         const data = await updateConfig((config) => {
@@ -310,15 +341,27 @@ export const General = () => {
         }
     };
 
-    const updateCandidateWindowDelay = async (nextValue: boolean) => {
+    const updateGeneralBooleanConfig = async (
+        key:
+            | "punctuation_commit"
+            | "punctuation_commit_punctuation"
+            | "punctuation_commit_exclamation"
+            | "punctuation_commit_question"
+            | "show_candidate_window_after_space",
+        nextValue: boolean,
+    ) => {
         const data = await updateConfig((config) => {
             config.general = config.general ?? {};
-            config.general.show_candidate_window_after_space = nextValue;
+            config.general[key] = nextValue;
         });
 
         if (data) {
             setGeneralValue(normalizeGeneralConfig(data.general));
         }
+    };
+
+    const updateCandidateWindowDelay = async (nextValue: boolean) => {
+        await updateGeneralBooleanConfig("show_candidate_window_after_space", nextValue);
     };
 
     const updateWidthGroup = async (
@@ -546,6 +589,67 @@ export const General = () => {
                                 onCheckedChange={(value) => void updateCandidateWindowDelay(value)}
                             />
                         </div>
+                    </div>
+                </section>
+
+                <section className="space-y-3">
+                    <h1 className="text-sm font-bold text-foreground">句読点確定</h1>
+                    <div className="space-y-3 rounded-md border p-4">
+                        <div className="flex items-center gap-4">
+                            <div className="flex-1 space-y-1">
+                                <p className="text-sm font-medium leading-none">句読点確定</p>
+                                <p className="text-xs text-muted-foreground">
+                                    対象記号の入力時に現在の変換を確定します
+                                </p>
+                            </div>
+                            <Switch
+                                checked={generalValue.punctuation_commit}
+                                onCheckedChange={(value) =>
+                                    void updateGeneralBooleanConfig("punctuation_commit", value)
+                                }
+                            />
+                        </div>
+
+                        {generalValue.punctuation_commit ? (
+                            <div className="space-y-3 border-t pt-3">
+                                <div className="flex items-center gap-4">
+                                    <p className="flex-1 text-sm font-medium">句読点</p>
+                                    <Switch
+                                        checked={generalValue.punctuation_commit_punctuation}
+                                        onCheckedChange={(value) =>
+                                            void updateGeneralBooleanConfig(
+                                                "punctuation_commit_punctuation",
+                                                value,
+                                            )
+                                        }
+                                    />
+                                </div>
+                                <div className="flex items-center gap-4">
+                                    <p className="flex-1 text-sm font-medium">！</p>
+                                    <Switch
+                                        checked={generalValue.punctuation_commit_exclamation}
+                                        onCheckedChange={(value) =>
+                                            void updateGeneralBooleanConfig(
+                                                "punctuation_commit_exclamation",
+                                                value,
+                                            )
+                                        }
+                                    />
+                                </div>
+                                <div className="flex items-center gap-4">
+                                    <p className="flex-1 text-sm font-medium">？</p>
+                                    <Switch
+                                        checked={generalValue.punctuation_commit_question}
+                                        onCheckedChange={(value) =>
+                                            void updateGeneralBooleanConfig(
+                                                "punctuation_commit_question",
+                                                value,
+                                            )
+                                        }
+                                    />
+                                </div>
+                            </div>
+                        ) : null}
                     </div>
                 </section>
 

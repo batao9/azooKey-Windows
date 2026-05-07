@@ -9,6 +9,7 @@ pub enum ClientAction {
     AppendText(String),
     AppendTextRaw(String),
     AppendTextDirect(String),
+    CommitTextDirect(String),
     RemoveText,
     ShrinkText(String),
     ShrinkTextRaw(String),

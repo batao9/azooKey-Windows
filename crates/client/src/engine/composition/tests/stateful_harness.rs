@@ -1467,6 +1467,13 @@ fn apply_user_action(
                 harness.state = CompositionState::Composing;
             }
             ClientAction::ShowCandidateWindow => {}
+            ClientAction::CommitTextDirect(text) => {
+                harness.committed_clauses.push(SimCommittedClause {
+                    display: text.clone(),
+                    raw_hiragana: text,
+                    corresponding_count: 1,
+                });
+            }
             ClientAction::EndComposition => {
                 let snapshot_count = harness.clause_snapshots.len();
                 for index in 0..snapshot_count {
