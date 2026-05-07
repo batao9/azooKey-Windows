@@ -227,6 +227,14 @@ pub struct GeneralConfig {
     #[serde(default)]
     pub numpad_input: NumpadInputMode,
     #[serde(default)]
+    pub punctuation_commit: bool,
+    #[serde(default = "default_punctuation_commit_target_enabled")]
+    pub punctuation_commit_punctuation: bool,
+    #[serde(default = "default_punctuation_commit_target_enabled")]
+    pub punctuation_commit_exclamation: bool,
+    #[serde(default = "default_punctuation_commit_target_enabled")]
+    pub punctuation_commit_question: bool,
+    #[serde(default)]
     pub show_candidate_window_after_space: bool,
 }
 
@@ -237,6 +245,10 @@ impl Default for GeneralConfig {
             symbol_style: SymbolStyle::CornerBracketMiddleDot,
             space_input: SpaceInputMode::AlwaysHalf,
             numpad_input: NumpadInputMode::DirectInput,
+            punctuation_commit: false,
+            punctuation_commit_punctuation: true,
+            punctuation_commit_exclamation: true,
+            punctuation_commit_question: true,
             show_candidate_window_after_space: false,
         }
     }
@@ -320,6 +332,21 @@ mod tests {
 
         let deserialized: GeneralConfig = serde_json::from_str("{}").unwrap();
         assert!(!deserialized.show_candidate_window_after_space);
+    }
+
+    #[test]
+    fn punctuation_commit_defaults_to_off() {
+        let default_config = GeneralConfig::default();
+        assert!(!default_config.punctuation_commit);
+        assert!(default_config.punctuation_commit_punctuation);
+        assert!(default_config.punctuation_commit_exclamation);
+        assert!(default_config.punctuation_commit_question);
+
+        let deserialized: GeneralConfig = serde_json::from_str("{}").unwrap();
+        assert!(!deserialized.punctuation_commit);
+        assert!(deserialized.punctuation_commit_punctuation);
+        assert!(deserialized.punctuation_commit_exclamation);
+        assert!(deserialized.punctuation_commit_question);
     }
 }
 
@@ -406,6 +433,10 @@ impl Default for NumpadInputMode {
 }
 
 fn default_shortcut_enabled() -> bool {
+    true
+}
+
+fn default_punctuation_commit_target_enabled() -> bool {
     true
 }
 

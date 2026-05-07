@@ -1019,6 +1019,7 @@ impl TextServiceFactory {
             ClientAction::AppendText(_) => "AppendText",
             ClientAction::AppendTextRaw(_) => "AppendTextRaw",
             ClientAction::AppendTextDirect(_) => "AppendTextDirect",
+            ClientAction::CommitTextDirect(_) => "CommitTextDirect",
             ClientAction::RemoveText => "RemoveText",
             ClientAction::MoveCursor(_) => "MoveCursor",
             ClientAction::MoveClause(_) => "MoveClause",
@@ -2223,6 +2224,119 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn is_punctuation_commit_char(c: char) -> bool {
+        matches!(c, ',' | '.' | '、' | '。' | '，' | '．')
+    }
+
+    #[inline]
+    fn is_exclamation_commit_char(c: char) -> bool {
+        matches!(c, '!' | '！')
+    }
+
+    #[inline]
+    fn is_question_commit_char(c: char) -> bool {
+        matches!(c, '?' | '？')
+    }
+
+    #[inline]
+    fn punctuation_commit_target_enabled(c: char, app_config: &AppConfig) -> bool {
+        (Self::is_punctuation_commit_char(c) && app_config.general.punctuation_commit_punctuation)
+            || (Self::is_exclamation_commit_char(c)
+                && app_config.general.punctuation_commit_exclamation)
+            || (Self::is_question_commit_char(c) && app_config.general.punctuation_commit_question)
+    }
+
+    #[inline]
+    fn punctuation_commit_text_for_action(
+        action: &UserAction,
+        mode: &InputMode,
+        raw_input_before: &str,
+        app_config: &AppConfig,
+    ) -> Option<String> {
+        if !Self::punctuation_commit_action_target_enabled(
+            action,
+            mode,
+            raw_input_before,
+            app_config,
+        ) {
+            return None;
+        }
+
+        match action {
+            UserAction::Input(ch) => {
+                let input = ch.to_string();
+                Some(Self::punctuation_commit_text_for_input(&input, app_config))
+            }
+            UserAction::NumpadSymbol(symbol) => Some(
+                Self::numpad_text_for_mode(*symbol, app_config.general.numpad_input, false)
+                    .unwrap_or_else(|| symbol.to_string()),
+            ),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn punctuation_commit_text_for_input(input: &str, app_config: &AppConfig) -> String {
+        if Self::effective_zenzai_runtime_enabled(app_config) {
+            if let Some(mapped) =
+                Self::single_symbol_romaji_output(input, &app_config.romaji_table.rows)
+            {
+                return mapped;
+            }
+        }
+
+        convert_kana_symbol(
+            input,
+            &app_config.general,
+            &app_config.character_width,
+            &app_config.romaji_table.rows,
+        )
+    }
+
+    #[inline]
+    fn punctuation_commit_action_target_enabled(
+        action: &UserAction,
+        mode: &InputMode,
+        raw_input_before: &str,
+        app_config: &AppConfig,
+    ) -> bool {
+        if !app_config.general.punctuation_commit || *mode != InputMode::Kana {
+            return false;
+        }
+
+        match action {
+            UserAction::Input(ch) => {
+                Self::punctuation_commit_target_enabled(*ch, app_config)
+                    && !Self::has_multi_character_romaji_context(
+                        raw_input_before,
+                        *ch,
+                        &app_config.romaji_table.rows,
+                    )
+            }
+            UserAction::NumpadSymbol(symbol) => {
+                Self::punctuation_commit_target_enabled(*symbol, app_config)
+                    && !Self::has_multi_character_romaji_context(
+                        raw_input_before,
+                        *symbol,
+                        &app_config.romaji_table.rows,
+                    )
+            }
+            _ => false,
+        }
+    }
+
+    #[inline]
+    fn punctuation_commit_actions(text: String) -> (CompositionState, Vec<ClientAction>) {
+        (
+            CompositionState::None,
+            vec![
+                ClientAction::EndComposition,
+                ClientAction::CommitTextDirect(text),
+            ],
+        )
+    }
+
+    #[inline]
     fn candidate_preview_actions(app_config: &AppConfig) -> Vec<ClientAction> {
         let mut actions = Vec::with_capacity(2);
         if app_config.general.show_candidate_window_after_space {
@@ -2332,6 +2446,23 @@ impl TextServiceFactory {
                 _ => None,
             },
             CompositionState::Composing => match action {
+                _ if !composition.temporary_latin
+                    && !start_temporary_latin
+                    && Self::punctuation_commit_action_target_enabled(
+                        action,
+                        mode,
+                        &composition.raw_input,
+                        app_config,
+                    ) =>
+                {
+                    let text = Self::punctuation_commit_text_for_action(
+                        action,
+                        mode,
+                        &composition.raw_input,
+                        app_config,
+                    )?;
+                    Some(Self::punctuation_commit_actions(text))
+                }
                 _ if (composition.temporary_latin || start_temporary_latin)
                     && Self::direct_text_for_action(action).is_some() =>
                 {
@@ -2470,6 +2601,23 @@ impl TextServiceFactory {
                 _ => None,
             },
             CompositionState::Previewing => match action {
+                _ if !composition.temporary_latin
+                    && !start_temporary_latin
+                    && Self::punctuation_commit_action_target_enabled(
+                        action,
+                        mode,
+                        &composition.raw_input,
+                        app_config,
+                    ) =>
+                {
+                    let text = Self::punctuation_commit_text_for_action(
+                        action,
+                        mode,
+                        &composition.raw_input,
+                        app_config,
+                    )?;
+                    Some(Self::punctuation_commit_actions(text))
+                }
                 _ if (composition.temporary_latin || start_temporary_latin)
                     && Self::direct_text_for_action(action).is_some() =>
                 {
@@ -3047,6 +3195,11 @@ impl TextServiceFactory {
                             &transition,
                         )?;
                     }
+                }
+                ClientAction::CommitTextDirect(text) => {
+                    self.start_composition()?;
+                    self.set_text(text, "")?;
+                    self.end_composition()?;
                 }
                 ClientAction::RemoveText => {
                     Self::clear_clause_caches(
