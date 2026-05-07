@@ -474,7 +474,7 @@ export const General = () => {
                     <div className="flex items-center space-x-4 rounded-md border p-4">
                         <RefreshCcw />
                         <div className="flex-1 space-y-1">
-                            <p className="text-sm font-medium leading-none">v0.1.0-batao.1</p>
+                            <p className="text-sm font-medium leading-none">v0.1.0-batao.2</p>
                         </div>
                         <Button variant="secondary">
                             <a
