@@ -11,6 +11,7 @@ import { Appearance } from "@/pages/appearance"
 import { Zenzai } from "@/pages/zenzai"
 import { About } from "@/pages/about"
 import { Dictionary } from "@/pages/dictionary"
+import { DeveloperOptions } from "@/pages/developer-options"
 import { Toaster } from "@/components/ui/sonner"
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
@@ -25,6 +26,7 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
               <Route path="/appearance" element={<Appearance />} />
               <Route path="/zenzai" element={<Zenzai />} />
               <Route path="/dictionary" element={<Dictionary />} />
+              <Route path="/developer-options" element={<DeveloperOptions />} />
               <Route path="/about" element={<About />} />
             </Routes>
             <Toaster />

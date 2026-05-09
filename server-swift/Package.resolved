@@ -4,9 +4,10 @@
     {
       "identity" : "azookeykanakanjiconverter",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/azookey/AzooKeyKanaKanjiConverter",
+      "location" : "https://github.com/batao9/AzooKeyKanaKanjiConverter",
       "state" : {
-        "revision" : "884456d9d077f9e2136d273e0bfbd39b05374f7f"
+        "branch" : "main",
+        "revision" : "e4c5bdabe739c83b9b90ed8f58a2ea82f1f39052"
       }
     },
     {

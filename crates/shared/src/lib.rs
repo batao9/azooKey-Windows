@@ -399,6 +399,14 @@ pub struct UserDictionaryConfig {
     pub entries: Vec<UserDictionaryEntry>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DeveloperOptionsConfig {
+    #[serde(default)]
+    pub enable: bool,
+    #[serde(default)]
+    pub logging: bool,
+}
+
 impl Default for CharacterWidthConfig {
     fn default() -> Self {
         Self {
@@ -463,6 +471,8 @@ pub struct AppConfig {
     pub character_width: CharacterWidthConfig,
     #[serde(default)]
     pub user_dictionary: UserDictionaryConfig,
+    #[serde(default)]
+    pub developer_options: DeveloperOptionsConfig,
 }
 
 impl Default for AppConfig {
@@ -479,6 +489,7 @@ impl Default for AppConfig {
             romaji_table: RomajiTableConfig::default(),
             character_width: CharacterWidthConfig::default(),
             user_dictionary: UserDictionaryConfig::default(),
+            developer_options: DeveloperOptionsConfig::default(),
         }
     }
 }

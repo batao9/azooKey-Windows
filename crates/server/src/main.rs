@@ -17,10 +17,10 @@ use std::{
     io::Write,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex, OnceLock,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 const USE_ZENZAI: bool = true;
@@ -30,9 +30,9 @@ const WARMUP_INTERVAL_SECS: u64 = 30;
 
 static SERVER_LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 static SERVER_LOG_LEVEL: OnceLock<ServerLogLevel> = OnceLock::new();
+static SERVER_PERF_LOG_ENABLED: AtomicBool = AtomicBool::new(false);
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-static HAS_ACTIVE_COMPOSITION: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static HAS_ACTIVE_COMPOSITION: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum ServerLogLevel {
@@ -83,11 +83,43 @@ fn should_log(level: ServerLogLevel) -> bool {
     level <= current_server_log_level()
 }
 
+fn perf_log_enabled() -> bool {
+    SERVER_PERF_LOG_ENABLED.load(Ordering::Relaxed)
+}
+
+fn refresh_perf_log_enabled_from_config() {
+    let config = shared::AppConfig::read();
+    SERVER_PERF_LOG_ENABLED.store(
+        config.developer_options.enable && config.developer_options.logging,
+        Ordering::Relaxed,
+    );
+}
+
+fn should_collect_timing(level: ServerLogLevel) -> bool {
+    should_log(level) || perf_log_enabled()
+}
+
+fn timing_start(enabled: bool) -> Option<Instant> {
+    enabled.then(Instant::now)
+}
+
+fn elapsed_millis(start: Option<Instant>) -> u128 {
+    start.map_or(0, |start| start.elapsed().as_millis())
+}
+
 macro_rules! log_event_lazy {
     ($level:expr, $($arg:tt)*) => {{
         let level = $level;
         if should_log(level) {
             log_event(level, &format!($($arg)*));
+        }
+    }};
+}
+
+macro_rules! perf_log_lazy {
+    ($($arg:tt)*) => {{
+        if perf_log_enabled() {
+            log_event_unfiltered("PERF", &format!($($arg)*));
         }
     }};
 }
@@ -180,12 +212,11 @@ fn log_event(level: ServerLogLevel, message: &str) {
         return;
     }
 
-    let line = format!(
-        "[{}] [{}] {}",
-        now_timestamp_millis(),
-        level.as_str(),
-        message
-    );
+    log_event_unfiltered(level.as_str(), message);
+}
+
+fn log_event_unfiltered(level: &str, message: &str) {
+    let line = format!("[{}] [{}] {}", now_timestamp_millis(), level, message);
     eprintln!("{line}");
 
     if let Some(slot) = SERVER_LOG_FILE.get() {
@@ -367,12 +398,16 @@ fn update_active_composition_state(text: &str) {
 
 fn get_composed_text(use_cursor_prefix: bool) -> Result<ComposedText, String> {
     unsafe {
+        let collect_timing = perf_log_enabled();
+        let total_start = timing_start(collect_timing);
         let mut length: c_int = 0;
+        let ffi_start = timing_start(collect_timing);
         let result = if use_cursor_prefix {
             GetComposedTextForCursorPrefix(&mut length)
         } else {
             GetComposedText(&mut length)
         };
+        let ffi_elapsed_ms = elapsed_millis(ffi_start);
         let call_name = if use_cursor_prefix {
             "GetComposedTextForCursorPrefix"
         } else {
@@ -391,6 +426,7 @@ fn get_composed_text(use_cursor_prefix: bool) -> Result<ComposedText, String> {
 
         let mut suggestions = Vec::with_capacity(length);
         let mut hiragana = None;
+        let parse_start = timing_start(collect_timing);
         log_event_lazy!(
             ServerLogLevel::Debug,
             "[{call_name}] candidate_count={length}"
@@ -447,6 +483,13 @@ fn get_composed_text(use_cursor_prefix: bool) -> Result<ComposedText, String> {
             }
             suggestions.push(suggestion);
         }
+        let parse_elapsed_ms = elapsed_millis(parse_start);
+
+        perf_log_lazy!(
+            "kind=perf\tcomponent=rust-server\toperation={call_name}\tuse_cursor_prefix={use_cursor_prefix}\tcandidate_count={length}\tunique_suggestions={}\tffi_elapsed_ms={ffi_elapsed_ms}\tparse_elapsed_ms={parse_elapsed_ms}\ttotal_elapsed_ms={}",
+            suggestions.len(),
+            elapsed_millis(total_start)
+        );
 
         Ok(ComposedText {
             hiragana,
@@ -475,44 +518,52 @@ impl AzookeyService for MyAzookeyService {
         request: Request<AppendTextRequest>,
     ) -> Result<Response<AppendTextResponse>, Status> {
         let request_id = next_request_id();
-        let handler_start = now_timestamp_millis();
+        let collect_timing = should_collect_timing(ServerLogLevel::Info);
+        let perf_start = timing_start(collect_timing);
         let request = request.into_inner();
         let input = request.text_to_append;
+        let input_len = input.chars().count();
         log_event_lazy!(
             ServerLogLevel::Info,
             "[append_text:{request_id}] start input_len={} input_style={}",
-            input.chars().count(),
+            input_len,
             request.input_style
         );
-        let t0 = now_timestamp_millis();
+        let add_start = timing_start(collect_timing);
         let composing_text = if request.input_style == INPUT_STYLE_DIRECT {
             add_text_direct(&input).map_err(|error| status_from_error("append_text", error))?
         } else {
             add_text(&input).map_err(|error| status_from_error("append_text", error))?
         };
-        let t1 = now_timestamp_millis();
+        let add_elapsed_ms = elapsed_millis(add_start);
         log_event_lazy!(
             ServerLogLevel::Info,
-            "[append_text:{request_id}] add_text elapsed_ms={}",
-            t1.saturating_sub(t0)
+            "[append_text:{request_id}] add_text elapsed_ms={add_elapsed_ms}",
         );
+        let get_composed_start = timing_start(collect_timing);
         let composed_text =
             get_composed_text(false).map_err(|error| status_from_error("append_text", error))?;
-        let t2 = now_timestamp_millis();
+        let get_composed_elapsed_ms = elapsed_millis(get_composed_start);
         log_event_lazy!(
             ServerLogLevel::Info,
-            "[append_text:{request_id}] get_composed_text elapsed_ms={}",
-            t2.saturating_sub(t1)
+            "[append_text:{request_id}] get_composed_text elapsed_ms={get_composed_elapsed_ms}",
         );
         update_active_composition_state(&composing_text.text);
+        let hiragana_len = composing_text.text.chars().count();
+        let suggestion_count = composed_text.suggestions.len();
+        let total_elapsed_ms = elapsed_millis(perf_start);
 
         log_event_lazy!(
             ServerLogLevel::Info,
             "[append_text:{request_id}] success cursor={} hiragana_len={} suggestions={} total_elapsed_ms={}",
             composing_text.cursor,
-            composing_text.text.chars().count(),
-            composed_text.suggestions.len(),
-            t2.saturating_sub(handler_start)
+            hiragana_len,
+            suggestion_count,
+            total_elapsed_ms
+        );
+        perf_log_lazy!(
+            "kind=perf\tcomponent=rust-server\toperation=append_text\trequest_id={request_id}\tinput_len={input_len}\tinput_style={}\thiragana_len={hiragana_len}\tsuggestions={suggestion_count}\tadd_text_elapsed_ms={add_elapsed_ms}\tget_composed_text_elapsed_ms={get_composed_elapsed_ms}\ttotal_elapsed_ms={total_elapsed_ms}",
+            request.input_style
         );
 
         Ok(Response::new(AppendTextResponse {
@@ -528,35 +579,41 @@ impl AzookeyService for MyAzookeyService {
         _: Request<RemoveTextRequest>,
     ) -> Result<Response<RemoveTextResponse>, Status> {
         let request_id = next_request_id();
-        let handler_start = now_timestamp_millis();
+        let collect_timing = should_collect_timing(ServerLogLevel::Info);
+        let perf_start = timing_start(collect_timing);
         log_event_lazy!(ServerLogLevel::Info, "[remove_text:{request_id}] start");
 
-        let t0 = now_timestamp_millis();
+        let remove_start = timing_start(collect_timing);
         let composing_text =
             remove_text().map_err(|error| status_from_error("remove_text", error))?;
-        let t1 = now_timestamp_millis();
+        let remove_elapsed_ms = elapsed_millis(remove_start);
         log_event_lazy!(
             ServerLogLevel::Info,
-            "[remove_text:{request_id}] remove_text elapsed_ms={}",
-            t1.saturating_sub(t0)
+            "[remove_text:{request_id}] remove_text elapsed_ms={remove_elapsed_ms}",
         );
+        let get_composed_start = timing_start(collect_timing);
         let composed_text =
             get_composed_text(false).map_err(|error| status_from_error("remove_text", error))?;
-        let t2 = now_timestamp_millis();
+        let get_composed_elapsed_ms = elapsed_millis(get_composed_start);
         log_event_lazy!(
             ServerLogLevel::Info,
-            "[remove_text:{request_id}] get_composed_text elapsed_ms={}",
-            t2.saturating_sub(t1)
+            "[remove_text:{request_id}] get_composed_text elapsed_ms={get_composed_elapsed_ms}",
         );
         update_active_composition_state(&composing_text.text);
+        let hiragana_len = composing_text.text.chars().count();
+        let suggestion_count = composed_text.suggestions.len();
+        let total_elapsed_ms = elapsed_millis(perf_start);
 
         log_event_lazy!(
             ServerLogLevel::Info,
             "[remove_text:{request_id}] success cursor={} hiragana_len={} suggestions={} total_elapsed_ms={}",
             composing_text.cursor,
-            composing_text.text.chars().count(),
-            composed_text.suggestions.len(),
-            t2.saturating_sub(handler_start)
+            hiragana_len,
+            suggestion_count,
+            total_elapsed_ms
+        );
+        perf_log_lazy!(
+            "kind=perf\tcomponent=rust-server\toperation=remove_text\trequest_id={request_id}\thiragana_len={hiragana_len}\tsuggestions={suggestion_count}\tremove_text_elapsed_ms={remove_elapsed_ms}\tget_composed_text_elapsed_ms={get_composed_elapsed_ms}\ttotal_elapsed_ms={total_elapsed_ms}"
         );
 
         Ok(Response::new(RemoveTextResponse {
@@ -572,7 +629,8 @@ impl AzookeyService for MyAzookeyService {
         request: Request<MoveCursorRequest>,
     ) -> Result<Response<MoveCursorResponse>, Status> {
         let request_id = next_request_id();
-        let handler_start = now_timestamp_millis();
+        let collect_timing = should_collect_timing(ServerLogLevel::Info);
+        let perf_start = timing_start(collect_timing);
         let raw_offset = request.into_inner().offset;
         log_event_lazy!(
             ServerLogLevel::Info,
@@ -581,32 +639,37 @@ impl AzookeyService for MyAzookeyService {
 
         let offset = i8_offset_from_i32("move_cursor", raw_offset)?;
         let use_cursor_prefix = offset == 0;
-        let t0 = now_timestamp_millis();
+        let move_start = timing_start(collect_timing);
         let composing_text =
             move_cursor(offset).map_err(|error| status_from_error("move_cursor", error))?;
-        let t1 = now_timestamp_millis();
+        let move_elapsed_ms = elapsed_millis(move_start);
         log_event_lazy!(
             ServerLogLevel::Info,
-            "[move_cursor:{request_id}] move_cursor elapsed_ms={}",
-            t1.saturating_sub(t0)
+            "[move_cursor:{request_id}] move_cursor elapsed_ms={move_elapsed_ms}",
         );
+        let get_composed_start = timing_start(collect_timing);
         let composed_text = get_composed_text(use_cursor_prefix)
             .map_err(|error| status_from_error("move_cursor", error))?;
-        let t2 = now_timestamp_millis();
+        let get_composed_elapsed_ms = elapsed_millis(get_composed_start);
         log_event_lazy!(
             ServerLogLevel::Info,
-            "[move_cursor:{request_id}] get_composed_text elapsed_ms={}",
-            t2.saturating_sub(t1)
+            "[move_cursor:{request_id}] get_composed_text elapsed_ms={get_composed_elapsed_ms}",
         );
         update_active_composition_state(&composing_text.text);
+        let hiragana_len = composing_text.text.chars().count();
+        let suggestion_count = composed_text.suggestions.len();
+        let total_elapsed_ms = elapsed_millis(perf_start);
 
         log_event_lazy!(
             ServerLogLevel::Info,
             "[move_cursor:{request_id}] success cursor={} hiragana_len={} suggestions={} use_cursor_prefix={use_cursor_prefix} total_elapsed_ms={}",
             composing_text.cursor,
-            composing_text.text.chars().count(),
-            composed_text.suggestions.len(),
-            t2.saturating_sub(handler_start)
+            hiragana_len,
+            suggestion_count,
+            total_elapsed_ms
+        );
+        perf_log_lazy!(
+            "kind=perf\tcomponent=rust-server\toperation=move_cursor\trequest_id={request_id}\toffset={raw_offset}\tuse_cursor_prefix={use_cursor_prefix}\thiragana_len={hiragana_len}\tsuggestions={suggestion_count}\tmove_cursor_elapsed_ms={move_elapsed_ms}\tget_composed_text_elapsed_ms={get_composed_elapsed_ms}\ttotal_elapsed_ms={total_elapsed_ms}"
         );
 
         Ok(Response::new(MoveCursorResponse {
@@ -642,7 +705,8 @@ impl AzookeyService for MyAzookeyService {
         request: Request<ShrinkTextRequest>,
     ) -> Result<Response<ShrinkTextResponse>, Status> {
         let request_id = next_request_id();
-        let handler_start = now_timestamp_millis();
+        let collect_timing = should_collect_timing(ServerLogLevel::Info);
+        let perf_start = timing_start(collect_timing);
         let raw_offset = request.into_inner().offset;
         log_event_lazy!(
             ServerLogLevel::Info,
@@ -650,31 +714,36 @@ impl AzookeyService for MyAzookeyService {
         );
 
         let offset = i8_offset_from_i32("shrink_text", raw_offset)?;
-        let t0 = now_timestamp_millis();
+        let shrink_start = timing_start(collect_timing);
         let composing_text =
             shrink_text(offset).map_err(|error| status_from_error("shrink_text", error))?;
-        let t1 = now_timestamp_millis();
+        let shrink_elapsed_ms = elapsed_millis(shrink_start);
         log_event_lazy!(
             ServerLogLevel::Info,
-            "[shrink_text:{request_id}] shrink_text elapsed_ms={}",
-            t1.saturating_sub(t0)
+            "[shrink_text:{request_id}] shrink_text elapsed_ms={shrink_elapsed_ms}",
         );
+        let get_composed_start = timing_start(collect_timing);
         let composed_text =
             get_composed_text(false).map_err(|error| status_from_error("shrink_text", error))?;
-        let t2 = now_timestamp_millis();
+        let get_composed_elapsed_ms = elapsed_millis(get_composed_start);
         log_event_lazy!(
             ServerLogLevel::Info,
-            "[shrink_text:{request_id}] get_composed_text elapsed_ms={}",
-            t2.saturating_sub(t1)
+            "[shrink_text:{request_id}] get_composed_text elapsed_ms={get_composed_elapsed_ms}",
         );
         update_active_composition_state(&composing_text.text);
+        let hiragana_len = composing_text.text.chars().count();
+        let suggestion_count = composed_text.suggestions.len();
+        let total_elapsed_ms = elapsed_millis(perf_start);
 
         log_event_lazy!(
             ServerLogLevel::Info,
             "[shrink_text:{request_id}] success hiragana_len={} suggestions={} total_elapsed_ms={}",
-            composing_text.text.chars().count(),
-            composed_text.suggestions.len(),
-            t2.saturating_sub(handler_start)
+            hiragana_len,
+            suggestion_count,
+            total_elapsed_ms
+        );
+        perf_log_lazy!(
+            "kind=perf\tcomponent=rust-server\toperation=shrink_text\trequest_id={request_id}\toffset={raw_offset}\thiragana_len={hiragana_len}\tsuggestions={suggestion_count}\tshrink_text_elapsed_ms={shrink_elapsed_ms}\tget_composed_text_elapsed_ms={get_composed_elapsed_ms}\ttotal_elapsed_ms={total_elapsed_ms}"
         );
 
         Ok(Response::new(ShrinkTextResponse {
@@ -728,6 +797,7 @@ impl AzookeyService for MyAzookeyService {
         log_event_lazy!(ServerLogLevel::Info, "[update_config:{request_id}] start");
         let t0 = now_timestamp_millis();
         unsafe { LoadConfig() };
+        refresh_perf_log_enabled_from_config();
         let t1 = now_timestamp_millis();
         let has_active_composition = query_active_composition_state();
         log_event_lazy!(
@@ -748,6 +818,7 @@ impl AzookeyService for MyAzookeyService {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    refresh_perf_log_enabled_from_config();
     let log_path = init_server_log_file();
     install_panic_hook();
     log_event_lazy!(

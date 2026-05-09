@@ -2,7 +2,7 @@ import KanaKanjiConverterModule
 import Foundation
 import ffi
 
-@MainActor let converter = KanaKanjiConverter()
+@MainActor var converter: KanaKanjiConverter!
 @MainActor var composingText = ComposingText()
 @MainActor var composingTextSnapshots: [ComposingText] = []
 @MainActor var currentInputStyle: InputStyle = .roman2kana
@@ -50,6 +50,11 @@ private enum ServerLogLevel: Int {
 }
 
 private let serverLogThreshold = ServerLogLevel.fromEnvironment()
+nonisolated(unsafe) private var serverPerfLogEnabled = false
+
+private func shouldCollectTiming(for level: ServerLogLevel) -> Bool {
+    level.rawValue <= serverLogThreshold.rawValue || serverPerfLogEnabled
+}
 
 private func serverLogPath() -> URL {
     if let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] {
@@ -69,14 +74,7 @@ private func serverLogTimestampMillis() -> UInt64 {
     UInt64(Date().timeIntervalSince1970 * 1000)
 }
 
-private func serverLog(_ level: String = "INFO", _ message: @autoclosure () -> String) {
-    let resolvedLevel = ServerLogLevel(label: level)
-    guard resolvedLevel.rawValue <= serverLogThreshold.rawValue else {
-        return
-    }
-
-    let resolvedMessage = message()
-    let line = "[\(serverLogTimestampMillis())] [SWIFT/\(level)] \(resolvedMessage)"
+private func writeServerLogLine(_ line: String) {
     fputs("\(line)\n", stderr)
 
     let logPath = serverLogPath()
@@ -113,10 +111,59 @@ private func serverLog(_ level: String = "INFO", _ message: @autoclosure () -> S
     handle.write(data)
 }
 
+private func serverLog(_ level: String = "INFO", _ message: @autoclosure () -> String) {
+    let resolvedLevel = ServerLogLevel(label: level)
+    guard resolvedLevel.rawValue <= serverLogThreshold.rawValue else {
+        return
+    }
+
+    let resolvedMessage = message()
+    let line = "[\(serverLogTimestampMillis())] [SWIFT/\(level)] \(resolvedMessage)"
+    writeServerLogLine(line)
+}
+
+private func serverPerfLog(_ message: @autoclosure () -> String) {
+    guard serverPerfLogEnabled else {
+        return
+    }
+
+    let line = "[\(serverLogTimestampMillis())] [SWIFT/PERF] \(message())"
+    writeServerLogLine(line)
+}
+
+private func timingStart(enabled: Bool) -> TimeInterval? {
+    enabled ? ProcessInfo.processInfo.systemUptime : nil
+}
+
+private func elapsedMillis(since start: TimeInterval?) -> Int {
+    guard let start else {
+        return 0
+    }
+
+    return Int((ProcessInfo.processInfo.systemUptime - start) * 1000)
+}
+
+@MainActor private func configureEnginePerfLogging() {
+    KanaKanjiConverterEnginePerfLog.configure(enabled: serverPerfLogEnabled) { message in
+        serverPerfLog("ENGINE \(message)")
+    }
+}
+
+@MainActor private func configureEngineRuntime(zenzaiEnabled: Bool) {
+    let normalizedBackend = ((config["backend"] as? String) ?? "cpu")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    let shouldOffloadToGpu = zenzaiEnabled && !normalizedBackend.isEmpty && normalizedBackend != "cpu"
+    KanaKanjiConverterEngineRuntime.configure(
+        gpuLayerCount: shouldOffloadToGpu ? Int32.max : 0
+    )
+}
+
 private struct AppSettings: Decodable {
     let zenzai: ZenzaiSettings?
     let user_dictionary: UserDictionarySettings?
     let romaji_table: RomajiTableSettings?
+    let developer_options: DeveloperOptionsSettings?
 }
 
 private struct ZenzaiSettings: Decodable {
@@ -136,6 +183,11 @@ private struct UserDictionaryEntry: Decodable {
 
 private struct RomajiTableSettings: Decodable {
     let rows: [RomajiTableRow]?
+}
+
+private struct DeveloperOptionsSettings: Decodable {
+    let enable: Bool?
+    let logging: Bool?
 }
 
 enum RomajiInputStyleSelection: Equatable {
@@ -213,7 +265,10 @@ private func cpuZenzaiBackendSupportedFromEnvironment() -> Bool {
     do {
         try content.write(to: fileURL, atomically: true, encoding: .utf8)
         let previousURL = customRomajiTableURL
-        currentInputStyle = .mapped(id: .custom(fileURL))
+        let tableName = "azookey-windows-custom-romaji"
+        let table = try InputStyleManager.loadTable(from: fileURL)
+        InputStyleManager.registerInputStyle(table: table, for: tableName)
+        currentInputStyle = .mapped(id: .tableName(tableName))
         customRomajiTableURL = fileURL
 
         if let previousURL, previousURL != fileURL {
@@ -272,26 +327,11 @@ private func clampedCorrespondingCount(
         return (composingText: composingText, syntheticEndOfText: false)
     }
 
-    switch trailingElement.piece {
-    case .character:
-        guard trailingElement.inputStyle != .direct else {
-            return (composingText: composingText, syntheticEndOfText: false)
-        }
-    case .endOfText:
+    if trailingElement.inputStyle == .direct {
         return (composingText: composingText, syntheticEndOfText: false)
     }
 
-    var previewComposingText = composingText
-    let originalConvertTarget = previewComposingText.convertTarget
-    previewComposingText.insertAtCursorPosition([
-        .init(piece: .endOfText, inputStyle: trailingElement.inputStyle)
-    ])
-
-    guard previewComposingText.convertTarget != originalConvertTarget else {
-        return (composingText: composingText, syntheticEndOfText: false)
-    }
-
-    return (composingText: previewComposingText, syntheticEndOfText: true)
+    return (composingText: composingText, syntheticEndOfText: false)
 }
 
 @MainActor func makeCandidatePreviewComposingTextForCursorPrefix(
@@ -356,18 +396,20 @@ private func clampedCorrespondingCount(
     context: String = "",
     zenzaiEnabled: Bool
 ) -> ConvertRequestOptions {
+    configureEnginePerfLogging()
+    configureEngineRuntime(zenzaiEnabled: zenzaiEnabled)
     let profile = (config["profile"] as? String) ?? ""
     return ConvertRequestOptions(
-        requireJapanesePrediction: true,
-        requireEnglishPrediction: false,
+        requireJapanesePrediction: .autoMix,
+        requireEnglishPrediction: .disabled,
         keyboardLanguage: .ja_JP,
         learningType: .nothing,
-        dictionaryResourceURL: execURL.appendingPathComponent("Dictionary"),
         memoryDirectoryURL: URL(filePath: "./test"),
         sharedContainerURL: URL(filePath: "./test"),
         textReplacer: .init {
             return execURL.appendingPathComponent("EmojiDictionary").appendingPathComponent("emoji_all_E15.1.txt")
         },
+        specialCandidateProviders: nil,
         // zenzai
         zenzaiMode: zenzaiEnabled ? .on(
             weight: execURL.appendingPathComponent("zenz.gguf"),
@@ -381,7 +423,6 @@ private func clampedCorrespondingCount(
                 )
             )
         ) : .off,
-        preloadDictionary: true,
         metadata: .init(versionString: "Azookey for Windows")
     )
 }
@@ -445,12 +486,15 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     let previousUsedCustomRomajiTable = customRomajiTableURL != nil
     var dynamicUserDictionary: [DicdataElement] = []
     defer {
-        converter.sendToDicdataStore(.importDynamicUserDict(dynamicUserDictionary))
+        converter.importDynamicUserDictionary(dynamicUserDictionary)
     }
 
     config["enable"] = false
     config["profile"] = ""
     config["backend"] = "cpu"
+    config["developerOptionsEnable"] = false
+    config["developerOptionsLogging"] = false
+    serverPerfLogEnabled = false
     setRoman2KanaInputStyle()
 
     if let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] {
@@ -476,6 +520,12 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
             }
 
             applyRomajiInputStyle(rows: settings.romaji_table?.rows)
+            let developerOptionsEnable = settings.developer_options?.enable ?? false
+            let developerOptionsLogging = developerOptionsEnable && (settings.developer_options?.logging ?? false)
+            config["developerOptionsEnable"] = developerOptionsEnable
+            config["developerOptionsLogging"] = developerOptionsLogging
+            serverPerfLogEnabled = developerOptionsLogging
+            configureEnginePerfLogging()
 
             let sourceEntries = settings.user_dictionary?.entries ?? []
             var seen: Set<String> = []
@@ -520,6 +570,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     } else {
         serverLog("WARN", "LoadConfig: APPDATA is not set. Using defaults.")
     }
+    configureEnginePerfLogging()
 
     let currentZenzaiEnabled = (config["enable"] as? Bool) ?? false
     let currentProfile = (config["profile"] as? String) ?? ""
@@ -553,6 +604,10 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     let path = String(cString: path)
     serverLog("INFO", "Initialize: start path=\(path) use_zenzai=\(use_zenzai)")
     execURL = URL(filePath: path)
+    converter = KanaKanjiConverter(
+        dictionaryURL: execURL.appendingPathComponent("Dictionary"),
+        preloadDictionary: true
+    )
 
     load_config()
 
@@ -704,6 +759,9 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 
 @_silgen_name("GetComposedText")
 @MainActor public func get_composed_text(lengthPtr: UnsafeMutablePointer<Int>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
+    let collectTiming = shouldCollectTiming(for: .info)
+    let totalStart = timingStart(enabled: serverPerfLogEnabled)
+    let prepareStart = timingStart(enabled: serverPerfLogEnabled)
     let originalHiragana = composingText.convertTarget
     let contextString = (config["context"] as? String) ?? ""
     let runtimeZenzaiEnabled = currentRuntimeZenzaiEnabled()
@@ -719,26 +777,42 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         inputCount: composingText.input.count,
         hiraganaCount: originalHiragana.count
     )
+    let prepareMs = elapsedMillis(since: prepareStart)
+    let optionsStart = timingStart(enabled: serverPerfLogEnabled)
     let options = getOptions(context: contextString, zenzaiEnabled: useZenzai)
+    let optionsMs = elapsedMillis(since: optionsStart)
     serverLog("INFO", "GetComposedText: requestCandidates begin useZenzai=\(useZenzai) syntheticEndOfText=\(previewState.syntheticEndOfText)")
-    let requestStart = ProcessInfo.processInfo.systemUptime
+    let requestStart = timingStart(enabled: collectTiming)
     let converted = converter.requestCandidates(previewComposingText, options: options)
-    let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
+    let requestMs = elapsedMillis(since: requestStart)
     serverLog("INFO", "GetComposedText: requestCandidates returned candidateCount=\(converted.mainResults.count) elapsed_ms=\(requestMs)")
     var result: [FFICandidate] = []
+    let formatStart = timingStart(enabled: serverPerfLogEnabled)
+    var constructCandidateMs = 0
+    var resolveCandidateMs = 0
+    var duplicateStringMs = 0
 
     for i in 0..<converted.mainResults.count {
         let candidate = converted.mainResults[i]
         serverLog("DEBUG", "GetComposedText: candidate[\(i + 1)/\(converted.mainResults.count)] start")
 
-        let text = strdup(constructCandidateString(candidate: candidate, hiragana: previewHiragana))
+        let constructStart = timingStart(enabled: serverPerfLogEnabled)
+        let candidateText = constructCandidateString(candidate: candidate, hiragana: previewHiragana)
+        constructCandidateMs += elapsedMillis(since: constructStart)
+        let duplicateTextStart = timingStart(enabled: serverPerfLogEnabled)
+        let text = strdup(candidateText)
+        duplicateStringMs += elapsedMillis(since: duplicateTextStart)
         serverLog("DEBUG", "GetComposedText: candidate[\(i + 1)] textReady")
+        let duplicateHiraganaStart = timingStart(enabled: serverPerfLogEnabled)
         let hiragana = strdup(previewHiragana)
+        duplicateStringMs += elapsedMillis(since: duplicateHiraganaStart)
+        let resolveStart = timingStart(enabled: serverPerfLogEnabled)
         let resolvedCandidate = resolveCandidateCompositionForDisplay(
             originalComposingText: composingText,
             previewComposingText: previewComposingText,
             candidateComposingCount: candidate.composingCount
         )
+        resolveCandidateMs += elapsedMillis(since: resolveStart)
         let correspondingCount = resolvedCandidate.correspondingCount
         debugLogResolvedCorrespondingCount(
             scope: "GetComposedText",
@@ -749,20 +823,32 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
             inputCount: composingText.input.count,
             isZenzaiEnabled: useZenzai
         )
+        let duplicateSubtextStart = timingStart(enabled: serverPerfLogEnabled)
         let subtext = strdup(resolvedCandidate.remainingConvertTarget)
+        duplicateStringMs += elapsedMillis(since: duplicateSubtextStart)
         serverLog("DEBUG", "GetComposedText: candidate[\(i + 1)] subtextReady")
 
         result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))
     }
+    let formatMs = elapsedMillis(since: formatStart)
 
     lengthPtr.pointee = result.count
     serverLog("INFO", "GetComposedText: completed candidateCount=\(result.count) useZenzai=\(useZenzai)")
+    let marshalStart = timingStart(enabled: serverPerfLogEnabled)
+    let pointer = to_list_pointer(result)
+    let marshalMs = elapsedMillis(since: marshalStart)
+    serverPerfLog(
+        "kind=perf\tcomponent=swift-server\toperation=GetComposedText\tinput_count=\(composingText.input.count)\thiragana_len=\(originalHiragana.count)\tpreview_hiragana_len=\(previewHiragana.count)\tcontext_len=\(contextString.count)\truntime_zenzai_enabled=\(runtimeZenzaiEnabled)\tuse_zenzai=\(useZenzai)\tsynthetic_end_of_text=\(previewState.syntheticEndOfText)\tcandidate_count=\(converted.mainResults.count)\tprepare_ms=\(prepareMs)\toptions_ms=\(optionsMs)\trequest_candidates_ms=\(requestMs)\tformat_candidates_ms=\(formatMs)\tconstruct_candidate_ms=\(constructCandidateMs)\tresolve_candidate_ms=\(resolveCandidateMs)\tduplicate_string_ms=\(duplicateStringMs)\tffi_marshal_ms=\(marshalMs)\ttotal_ms=\(elapsedMillis(since: totalStart))"
+    )
 
-    return to_list_pointer(result)
+    return pointer
 }
 
 @_silgen_name("GetComposedTextForCursorPrefix")
 @MainActor public func get_composed_text_for_cursor_prefix(lengthPtr: UnsafeMutablePointer<Int>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
+    let collectTiming = shouldCollectTiming(for: .info)
+    let totalStart = timingStart(enabled: serverPerfLogEnabled)
+    let prepareStart = timingStart(enabled: serverPerfLogEnabled)
     let hiragana = composingText.convertTarget
     let suffixAfterCursor = String(hiragana.dropFirst(composingText.convertTargetCursorPosition))
     let prefixComposingText = composingText.prefixToCursorPosition()
@@ -784,26 +870,42 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         inputCount: prefixComposingText.input.count,
         hiraganaCount: prefixHiragana.count
     )
+    let prepareMs = elapsedMillis(since: prepareStart)
+    let optionsStart = timingStart(enabled: serverPerfLogEnabled)
     let options = getOptions(context: contextString, zenzaiEnabled: useZenzai)
+    let optionsMs = elapsedMillis(since: optionsStart)
     serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates begin useZenzai=\(useZenzai) syntheticEndOfText=\(previewState.syntheticEndOfText)")
-    let requestStart = ProcessInfo.processInfo.systemUptime
+    let requestStart = timingStart(enabled: collectTiming)
     let converted = converter.requestCandidates(previewPrefixComposingText, options: options)
-    let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
+    let requestMs = elapsedMillis(since: requestStart)
     serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates returned candidateCount=\(converted.mainResults.count) elapsed_ms=\(requestMs)")
     var result: [FFICandidate] = []
+    let formatStart = timingStart(enabled: serverPerfLogEnabled)
+    var constructCandidateMs = 0
+    var resolveCandidateMs = 0
+    var duplicateStringMs = 0
 
     for i in 0..<converted.mainResults.count {
         let candidate = converted.mainResults[i]
         serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)/\(converted.mainResults.count)] start")
 
-        let text = strdup(constructCandidateString(candidate: candidate, hiragana: previewPrefixHiragana))
+        let constructStart = timingStart(enabled: serverPerfLogEnabled)
+        let candidateText = constructCandidateString(candidate: candidate, hiragana: previewPrefixHiragana)
+        constructCandidateMs += elapsedMillis(since: constructStart)
+        let duplicateTextStart = timingStart(enabled: serverPerfLogEnabled)
+        let text = strdup(candidateText)
+        duplicateStringMs += elapsedMillis(since: duplicateTextStart)
         serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)] textReady")
+        let duplicateHiraganaStart = timingStart(enabled: serverPerfLogEnabled)
         let hiragana = strdup(previewPrefixHiragana + suffixAfterCursor)
+        duplicateStringMs += elapsedMillis(since: duplicateHiraganaStart)
+        let resolveStart = timingStart(enabled: serverPerfLogEnabled)
         let resolvedCandidate = resolveCandidateCompositionForDisplay(
             originalComposingText: prefixComposingText,
             previewComposingText: previewPrefixComposingText,
             candidateComposingCount: candidate.composingCount
         )
+        resolveCandidateMs += elapsedMillis(since: resolveStart)
         let correspondingCount = resolvedCandidate.correspondingCount
         debugLogResolvedCorrespondingCount(
             scope: "GetComposedTextForCursorPrefix",
@@ -814,16 +916,25 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
             inputCount: prefixComposingText.input.count,
             isZenzaiEnabled: useZenzai
         )
+        let duplicateSubtextStart = timingStart(enabled: serverPerfLogEnabled)
         let subtext = strdup(resolvedCandidate.remainingConvertTarget + suffixAfterCursor)
+        duplicateStringMs += elapsedMillis(since: duplicateSubtextStart)
         serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)] subtextReady")
 
         result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))
     }
+    let formatMs = elapsedMillis(since: formatStart)
 
     lengthPtr.pointee = result.count
     serverLog("INFO", "GetComposedTextForCursorPrefix: completed candidateCount=\(result.count) useZenzai=\(useZenzai)")
+    let marshalStart = timingStart(enabled: serverPerfLogEnabled)
+    let pointer = to_list_pointer(result)
+    let marshalMs = elapsedMillis(since: marshalStart)
+    serverPerfLog(
+        "kind=perf\tcomponent=swift-server\toperation=GetComposedTextForCursorPrefix\tinput_count=\(prefixComposingText.input.count)\tprefix_len=\(prefixHiragana.count)\tpreview_prefix_len=\(previewPrefixHiragana.count)\tsuffix_len=\(suffixAfterCursor.count)\tcontext_len=\(contextString.count)\truntime_zenzai_enabled=\(runtimeZenzaiEnabled)\tuse_zenzai=\(useZenzai)\tsynthetic_end_of_text=\(previewState.syntheticEndOfText)\tcandidate_count=\(converted.mainResults.count)\tprepare_ms=\(prepareMs)\toptions_ms=\(optionsMs)\trequest_candidates_ms=\(requestMs)\tformat_candidates_ms=\(formatMs)\tconstruct_candidate_ms=\(constructCandidateMs)\tresolve_candidate_ms=\(resolveCandidateMs)\tduplicate_string_ms=\(duplicateStringMs)\tffi_marshal_ms=\(marshalMs)\ttotal_ms=\(elapsedMillis(since: totalStart))"
+    )
 
-    return to_list_pointer(result)
+    return pointer
 }
 
 @_silgen_name("ShrinkText")
