@@ -238,7 +238,7 @@ impl TextServiceFactory {
     #[inline]
     fn normalize_direct_symbol_char(c: char) -> char {
         let halfwidth_ascii = Self::to_halfwidth_ascii_char(c);
-        if halfwidth_ascii.is_ascii_punctuation() {
+        if halfwidth_ascii.is_ascii_alphanumeric() || halfwidth_ascii.is_ascii_punctuation() {
             return halfwidth_ascii;
         }
 

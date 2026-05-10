@@ -49,11 +49,30 @@ private enum ServerLogLevel: Int {
     }
 }
 
+private final class ServerPerfLogState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var enabled = false
+
+    func isEnabled() -> Bool {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        return enabled
+    }
+
+    func setEnabled(_ value: Bool) {
+        lock.lock()
+        enabled = value
+        lock.unlock()
+    }
+}
+
 private let serverLogThreshold = ServerLogLevel.fromEnvironment()
-nonisolated(unsafe) private var serverPerfLogEnabled = false
+private let serverPerfLogState = ServerPerfLogState()
 
 private func shouldCollectTiming(for level: ServerLogLevel) -> Bool {
-    level.rawValue <= serverLogThreshold.rawValue || serverPerfLogEnabled
+    level.rawValue <= serverLogThreshold.rawValue || serverPerfLogState.isEnabled()
 }
 
 private func serverLogPath() -> URL {
@@ -123,7 +142,7 @@ private func serverLog(_ level: String = "INFO", _ message: @autoclosure () -> S
 }
 
 private func serverPerfLog(_ message: @autoclosure () -> String) {
-    guard serverPerfLogEnabled else {
+    guard serverPerfLogState.isEnabled() else {
         return
     }
 
@@ -144,7 +163,7 @@ private func elapsedMillis(since start: TimeInterval?) -> Int {
 }
 
 @MainActor private func configureEnginePerfLogging() {
-    KanaKanjiConverterEnginePerfLog.configure(enabled: serverPerfLogEnabled) { message in
+    KanaKanjiConverterEnginePerfLog.configure(enabled: serverPerfLogState.isEnabled()) { message in
         serverPerfLog("ENGINE \(message)")
     }
 }
@@ -327,11 +346,26 @@ private func clampedCorrespondingCount(
         return (composingText: composingText, syntheticEndOfText: false)
     }
 
-    if trailingElement.inputStyle == .direct {
+    switch trailingElement.piece {
+    case .character, .key:
+        guard trailingElement.inputStyle != .direct else {
+            return (composingText: composingText, syntheticEndOfText: false)
+        }
+    case .compositionSeparator:
         return (composingText: composingText, syntheticEndOfText: false)
     }
 
-    return (composingText: composingText, syntheticEndOfText: false)
+    var previewComposingText = composingText
+    let originalConvertTarget = previewComposingText.convertTarget
+    previewComposingText.insertAtCursorPosition([
+        .init(piece: .compositionSeparator, inputStyle: trailingElement.inputStyle)
+    ])
+
+    guard previewComposingText.convertTarget != originalConvertTarget else {
+        return (composingText: composingText, syntheticEndOfText: false)
+    }
+
+    return (composingText: previewComposingText, syntheticEndOfText: true)
 }
 
 @MainActor func makeCandidatePreviewComposingTextForCursorPrefix(
@@ -494,7 +528,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     config["backend"] = "cpu"
     config["developerOptionsEnable"] = false
     config["developerOptionsLogging"] = false
-    serverPerfLogEnabled = false
+    serverPerfLogState.setEnabled(false)
     setRoman2KanaInputStyle()
 
     if let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] {
@@ -524,7 +558,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
             let developerOptionsLogging = developerOptionsEnable && (settings.developer_options?.logging ?? false)
             config["developerOptionsEnable"] = developerOptionsEnable
             config["developerOptionsLogging"] = developerOptionsLogging
-            serverPerfLogEnabled = developerOptionsLogging
+            serverPerfLogState.setEnabled(developerOptionsLogging)
             configureEnginePerfLogging()
 
             let sourceEntries = settings.user_dictionary?.entries ?? []
@@ -760,8 +794,9 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 @_silgen_name("GetComposedText")
 @MainActor public func get_composed_text(lengthPtr: UnsafeMutablePointer<Int>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
     let collectTiming = shouldCollectTiming(for: .info)
-    let totalStart = timingStart(enabled: serverPerfLogEnabled)
-    let prepareStart = timingStart(enabled: serverPerfLogEnabled)
+    let perfTiming = serverPerfLogState.isEnabled()
+    let totalStart = timingStart(enabled: perfTiming)
+    let prepareStart = timingStart(enabled: perfTiming)
     let originalHiragana = composingText.convertTarget
     let contextString = (config["context"] as? String) ?? ""
     let runtimeZenzaiEnabled = currentRuntimeZenzaiEnabled()
@@ -778,7 +813,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         hiraganaCount: originalHiragana.count
     )
     let prepareMs = elapsedMillis(since: prepareStart)
-    let optionsStart = timingStart(enabled: serverPerfLogEnabled)
+    let optionsStart = timingStart(enabled: perfTiming)
     let options = getOptions(context: contextString, zenzaiEnabled: useZenzai)
     let optionsMs = elapsedMillis(since: optionsStart)
     serverLog("INFO", "GetComposedText: requestCandidates begin useZenzai=\(useZenzai) syntheticEndOfText=\(previewState.syntheticEndOfText)")
@@ -787,7 +822,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     let requestMs = elapsedMillis(since: requestStart)
     serverLog("INFO", "GetComposedText: requestCandidates returned candidateCount=\(converted.mainResults.count) elapsed_ms=\(requestMs)")
     var result: [FFICandidate] = []
-    let formatStart = timingStart(enabled: serverPerfLogEnabled)
+    let formatStart = timingStart(enabled: perfTiming)
     var constructCandidateMs = 0
     var resolveCandidateMs = 0
     var duplicateStringMs = 0
@@ -796,17 +831,17 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         let candidate = converted.mainResults[i]
         serverLog("DEBUG", "GetComposedText: candidate[\(i + 1)/\(converted.mainResults.count)] start")
 
-        let constructStart = timingStart(enabled: serverPerfLogEnabled)
+        let constructStart = timingStart(enabled: perfTiming)
         let candidateText = constructCandidateString(candidate: candidate, hiragana: previewHiragana)
         constructCandidateMs += elapsedMillis(since: constructStart)
-        let duplicateTextStart = timingStart(enabled: serverPerfLogEnabled)
+        let duplicateTextStart = timingStart(enabled: perfTiming)
         let text = strdup(candidateText)
         duplicateStringMs += elapsedMillis(since: duplicateTextStart)
         serverLog("DEBUG", "GetComposedText: candidate[\(i + 1)] textReady")
-        let duplicateHiraganaStart = timingStart(enabled: serverPerfLogEnabled)
+        let duplicateHiraganaStart = timingStart(enabled: perfTiming)
         let hiragana = strdup(previewHiragana)
         duplicateStringMs += elapsedMillis(since: duplicateHiraganaStart)
-        let resolveStart = timingStart(enabled: serverPerfLogEnabled)
+        let resolveStart = timingStart(enabled: perfTiming)
         let resolvedCandidate = resolveCandidateCompositionForDisplay(
             originalComposingText: composingText,
             previewComposingText: previewComposingText,
@@ -823,7 +858,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
             inputCount: composingText.input.count,
             isZenzaiEnabled: useZenzai
         )
-        let duplicateSubtextStart = timingStart(enabled: serverPerfLogEnabled)
+        let duplicateSubtextStart = timingStart(enabled: perfTiming)
         let subtext = strdup(resolvedCandidate.remainingConvertTarget)
         duplicateStringMs += elapsedMillis(since: duplicateSubtextStart)
         serverLog("DEBUG", "GetComposedText: candidate[\(i + 1)] subtextReady")
@@ -834,7 +869,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 
     lengthPtr.pointee = result.count
     serverLog("INFO", "GetComposedText: completed candidateCount=\(result.count) useZenzai=\(useZenzai)")
-    let marshalStart = timingStart(enabled: serverPerfLogEnabled)
+    let marshalStart = timingStart(enabled: perfTiming)
     let pointer = to_list_pointer(result)
     let marshalMs = elapsedMillis(since: marshalStart)
     serverPerfLog(
@@ -847,8 +882,9 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 @_silgen_name("GetComposedTextForCursorPrefix")
 @MainActor public func get_composed_text_for_cursor_prefix(lengthPtr: UnsafeMutablePointer<Int>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
     let collectTiming = shouldCollectTiming(for: .info)
-    let totalStart = timingStart(enabled: serverPerfLogEnabled)
-    let prepareStart = timingStart(enabled: serverPerfLogEnabled)
+    let perfTiming = serverPerfLogState.isEnabled()
+    let totalStart = timingStart(enabled: perfTiming)
+    let prepareStart = timingStart(enabled: perfTiming)
     let hiragana = composingText.convertTarget
     let suffixAfterCursor = String(hiragana.dropFirst(composingText.convertTargetCursorPosition))
     let prefixComposingText = composingText.prefixToCursorPosition()
@@ -871,7 +907,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         hiraganaCount: prefixHiragana.count
     )
     let prepareMs = elapsedMillis(since: prepareStart)
-    let optionsStart = timingStart(enabled: serverPerfLogEnabled)
+    let optionsStart = timingStart(enabled: perfTiming)
     let options = getOptions(context: contextString, zenzaiEnabled: useZenzai)
     let optionsMs = elapsedMillis(since: optionsStart)
     serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates begin useZenzai=\(useZenzai) syntheticEndOfText=\(previewState.syntheticEndOfText)")
@@ -880,7 +916,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     let requestMs = elapsedMillis(since: requestStart)
     serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates returned candidateCount=\(converted.mainResults.count) elapsed_ms=\(requestMs)")
     var result: [FFICandidate] = []
-    let formatStart = timingStart(enabled: serverPerfLogEnabled)
+    let formatStart = timingStart(enabled: perfTiming)
     var constructCandidateMs = 0
     var resolveCandidateMs = 0
     var duplicateStringMs = 0
@@ -889,17 +925,17 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         let candidate = converted.mainResults[i]
         serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)/\(converted.mainResults.count)] start")
 
-        let constructStart = timingStart(enabled: serverPerfLogEnabled)
+        let constructStart = timingStart(enabled: perfTiming)
         let candidateText = constructCandidateString(candidate: candidate, hiragana: previewPrefixHiragana)
         constructCandidateMs += elapsedMillis(since: constructStart)
-        let duplicateTextStart = timingStart(enabled: serverPerfLogEnabled)
+        let duplicateTextStart = timingStart(enabled: perfTiming)
         let text = strdup(candidateText)
         duplicateStringMs += elapsedMillis(since: duplicateTextStart)
         serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)] textReady")
-        let duplicateHiraganaStart = timingStart(enabled: serverPerfLogEnabled)
+        let duplicateHiraganaStart = timingStart(enabled: perfTiming)
         let hiragana = strdup(previewPrefixHiragana + suffixAfterCursor)
         duplicateStringMs += elapsedMillis(since: duplicateHiraganaStart)
-        let resolveStart = timingStart(enabled: serverPerfLogEnabled)
+        let resolveStart = timingStart(enabled: perfTiming)
         let resolvedCandidate = resolveCandidateCompositionForDisplay(
             originalComposingText: prefixComposingText,
             previewComposingText: previewPrefixComposingText,
@@ -916,7 +952,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
             inputCount: prefixComposingText.input.count,
             isZenzaiEnabled: useZenzai
         )
-        let duplicateSubtextStart = timingStart(enabled: serverPerfLogEnabled)
+        let duplicateSubtextStart = timingStart(enabled: perfTiming)
         let subtext = strdup(resolvedCandidate.remainingConvertTarget + suffixAfterCursor)
         duplicateStringMs += elapsedMillis(since: duplicateSubtextStart)
         serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)] subtextReady")
@@ -927,7 +963,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
 
     lengthPtr.pointee = result.count
     serverLog("INFO", "GetComposedTextForCursorPrefix: completed candidateCount=\(result.count) useZenzai=\(useZenzai)")
-    let marshalStart = timingStart(enabled: serverPerfLogEnabled)
+    let marshalStart = timingStart(enabled: perfTiming)
     let pointer = to_list_pointer(result)
     let marshalMs = elapsedMillis(since: marshalStart)
     serverPerfLog(

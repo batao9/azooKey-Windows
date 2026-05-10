@@ -7,19 +7,15 @@ private func row(_ input: String, _ output: String, _ next: String = "") -> Roma
     RomajiTableRow(input: input, output: output, next_input: next)
 }
 
-private func makeTemporaryCustomInputStyle(_ rows: [RomajiTableRow]) throws -> InputStyle {
+private func makeTemporaryCustomInputStyle(_ rows: [RomajiTableRow]) throws -> (inputStyle: InputStyle, fileURL: URL) {
     let fileURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("azookey-romaji-test-\(UUID().uuidString).tsv")
     let content = try #require(buildCustomRomajiTableContent(rows: rows))
     try content.write(to: fileURL, atomically: true, encoding: .utf8)
-    return .mapped(id: .custom(fileURL))
-}
-
-private func customInputStyleURL(_ inputStyle: InputStyle) -> URL? {
-    guard case .mapped(id: .custom(let url)) = inputStyle else {
-        return nil
-    }
-    return url
+    let tableName = "azookey-romaji-test-\(UUID().uuidString)"
+    let table = try InputStyleManager.loadTable(from: fileURL)
+    InputStyleManager.registerInputStyle(table: table, for: tableName)
+    return (.mapped(id: .tableName(tableName)), fileURL)
 }
 
 private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
@@ -63,7 +59,7 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
 
     #expect(map["n"] == nil)
     #expect(map["n{composition-separator}"] == "ん")
-    #expect(map["n{any-0x00}"] == "ん{any-0x00}")
+    #expect(map["n{any character}"] == "ん{any character}")
     #expect(map["ny"] == "ny")
     #expect(map["na"] == "な")
     #expect(map["nn"] == "ん")
@@ -219,6 +215,8 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
 
 @Test func trailingNPreviewSupportsCustomRomajiTable() async throws {
     let rows = [
+        row("ka", "か"),
+        row("ge", "げ"),
         row("n", "ん"),
         row("na", "な"),
         row("nn", "ん"),
@@ -226,8 +224,7 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
         row("nya", "にゃ"),
         row("-", "ー"),
     ]
-    let inputStyle = try makeTemporaryCustomInputStyle(rows)
-    let fileURL = try #require(customInputStyleURL(inputStyle))
+    let (inputStyle, fileURL) = try makeTemporaryCustomInputStyle(rows)
     defer {
         try? FileManager.default.removeItem(at: fileURL)
     }
@@ -292,8 +289,7 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
         row("q", "く"),
         row("qa", "くぁ"),
     ]
-    let inputStyle = try makeTemporaryCustomInputStyle(rows)
-    let fileURL = try #require(customInputStyleURL(inputStyle))
+    let (inputStyle, fileURL) = try makeTemporaryCustomInputStyle(rows)
     defer {
         try? FileManager.default.removeItem(at: fileURL)
     }

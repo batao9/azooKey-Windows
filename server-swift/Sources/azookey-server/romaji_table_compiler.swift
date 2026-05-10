@@ -26,9 +26,16 @@ func normalizeRomajiCell(_ value: String) -> String {
 }
 
 private func escapeInputTableToken(_ value: String) -> String {
-    value
-        .replacingOccurrences(of: "{", with: "{lbracket}")
-        .replacingOccurrences(of: "}", with: "{rbracket}")
+    value.map { character in
+        switch character {
+        case "{":
+            "{lbracket}"
+        case "}":
+            "{rbracket}"
+        default:
+            String(character)
+        }
+    }.joined()
 }
 
 func buildCustomRomajiTableEntries(rows: [RomajiTableRow]) -> [(key: String, value: String)] {
@@ -131,8 +138,8 @@ func buildCustomRomajiTableEntries(rows: [RomajiTableRow]) -> [(key: String, val
             literalEscaping: false
         )
         upsertEntry(
-            rawKey: "\(escapedInput){any-0x00}",
-            rawValue: "\(escapedOutput){any-0x00}",
+            rawKey: "\(escapedInput){any character}",
+            rawValue: "\(escapedOutput){any character}",
             source: .generated,
             literalEscaping: false
         )
