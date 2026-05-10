@@ -27,6 +27,34 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
     )
 }
 
+private func packageRootURL() -> URL {
+    URL(filePath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+}
+
+private func testConvertRequestOptions(memoryURL: URL) -> ConvertRequestOptions {
+    let packageRoot = packageRootURL()
+    return ConvertRequestOptions(
+        requireJapanesePrediction: .autoMix,
+        requireEnglishPrediction: .disabled,
+        keyboardLanguage: .ja_JP,
+        learningType: .nothing,
+        memoryDirectoryURL: memoryURL,
+        sharedContainerURL: memoryURL,
+        textReplacer: .init {
+            packageRoot
+                .appending(path: "azooKey_emoji_dictionary_storage")
+                .appending(path: "EmojiDictionary")
+                .appending(path: "emoji_all_E15.1.txt")
+        },
+        specialCandidateProviders: nil,
+        zenzaiMode: .off,
+        metadata: .init(versionString: "Azookey for Windows test")
+    )
+}
+
 @Test func supportsNextInputCarryForTsuRules() async throws {
     let map = tableMap([
         row("tt", "っ", "t"),
@@ -257,6 +285,34 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
     }
 
     #expect(convertTarget == "んた")
+}
+
+@Test func dictionaryCandidatesIncludeKanjiAfterRomanTrailingNPreview() async throws {
+    let packageRoot = packageRootURL()
+    let dictionaryURL = packageRoot
+        .appending(path: "azooKey_dictionary_storage")
+        .appending(path: "Dictionary")
+    let memoryURL = FileManager.default.temporaryDirectory
+        .appending(path: "azookey-server-test-\(UUID().uuidString)")
+    defer {
+        try? FileManager.default.removeItem(at: memoryURL)
+    }
+
+    let candidates = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition("iikagenn", inputStyle: .roman2kana)
+        let preview = makeCandidatePreviewComposingText(from: source)
+        let previewHiragana = preview.composingText.convertTarget
+        let testConverter = KanaKanjiConverter(dictionaryURL: dictionaryURL, preloadDictionary: true)
+        return testConverter.requestCandidates(
+            preview.composingText,
+            options: testConvertRequestOptions(memoryURL: memoryURL)
+        )
+        .mainResults
+        .map { constructCandidateString(candidate: $0, hiragana: previewHiragana) }
+    }
+
+    #expect(candidates.contains { $0.contains("加減") }, "candidates: \(candidates)")
 }
 
 @Test func trailingNPreviewUsesPreviewSuffixForDisplaySubtext() async throws {
