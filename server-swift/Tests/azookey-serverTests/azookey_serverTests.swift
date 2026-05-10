@@ -24,6 +24,15 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
     )
 }
 
+private func testDictionaryURL() -> URL {
+    URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("azooKey_dictionary_storage")
+        .appendingPathComponent("Dictionary")
+}
+
 @Test func supportsNextInputCarryForTsuRules() async throws {
     let map = tableMap([
         row("tt", "っ", "t"),
@@ -125,6 +134,28 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
     )
 
     #expect(useZenzai)
+}
+
+@Test func dictionaryCandidatesIncludeKanjiForKagen() async throws {
+    let dictionaryURL = testDictionaryURL()
+    let loudsURL = dictionaryURL
+        .appendingPathComponent("louds")
+        .appendingPathComponent("カ.louds")
+    #expect(FileManager.default.fileExists(atPath: loudsURL.path))
+
+    let candidates = await MainActor.run {
+        let converter = KanaKanjiConverter(dictionaryURL: dictionaryURL, preloadDictionary: true)
+        var composingText = ComposingText()
+        composingText.insertAtCursorPosition("kagen", inputStyle: .roman2kana)
+        let preview = makeCandidatePreviewComposingText(from: composingText)
+        let result = converter.requestCandidates(
+            preview.composingText,
+            options: getOptions(zenzaiEnabled: false)
+        )
+        return result.mainResults.map { constructCandidateString(candidate: $0, hiragana: "かげん") }
+    }
+
+    #expect(candidates.contains("加減"))
 }
 
 @Test func cpuBackendIsDisabledWhenAvxIsUnavailable() async throws {
