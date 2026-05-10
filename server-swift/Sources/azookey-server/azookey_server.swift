@@ -375,7 +375,7 @@ private func clampedCorrespondingCount(
     configureEngineRuntime(zenzaiEnabled: zenzaiEnabled)
     let profile = (config["profile"] as? String) ?? ""
     return ConvertRequestOptions(
-        requireJapanesePrediction: .autoMix,
+        requireJapanesePrediction: .manualMix,
         requireEnglishPrediction: .disabled,
         keyboardLanguage: .ja_JP,
         learningType: .nothing,

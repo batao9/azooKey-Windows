@@ -37,7 +37,7 @@ private func packageRootURL() -> URL {
 private func testConvertRequestOptions(memoryURL: URL) -> ConvertRequestOptions {
     let packageRoot = packageRootURL()
     return ConvertRequestOptions(
-        requireJapanesePrediction: .autoMix,
+        requireJapanesePrediction: .manualMix,
         requireEnglishPrediction: .disabled,
         keyboardLanguage: .ja_JP,
         learningType: .nothing,
@@ -313,6 +313,37 @@ private func testConvertRequestOptions(memoryURL: URL) -> ConvertRequestOptions 
     }
 
     #expect(candidates.contains { $0.contains("加減") }, "candidates: \(candidates)")
+}
+
+@Test func singleWordKanjiCandidateBeatsHiraganaPrediction() async throws {
+    let packageRoot = packageRootURL()
+    let dictionaryURL = packageRoot
+        .appending(path: "azooKey_dictionary_storage")
+        .appending(path: "Dictionary")
+    let memoryURL = FileManager.default.temporaryDirectory
+        .appending(path: "azookey-server-test-\(UUID().uuidString)")
+    defer {
+        try? FileManager.default.removeItem(at: memoryURL)
+    }
+
+    let candidates = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition("kannji", inputStyle: .roman2kana)
+        let preview = makeCandidatePreviewComposingText(from: source)
+        let previewHiragana = preview.composingText.convertTarget
+        let testConverter = KanaKanjiConverter(dictionaryURL: dictionaryURL, preloadDictionary: true)
+        return testConverter.requestCandidates(
+            preview.composingText,
+            options: testConvertRequestOptions(memoryURL: memoryURL)
+        )
+        .mainResults
+        .prefix(5)
+        .map { candidate in
+            constructCandidateString(candidate: candidate, hiragana: previewHiragana)
+        }
+    }
+
+    #expect(candidates.first == "感じ", "candidates: \(candidates)")
 }
 
 @Test func trailingNPreviewUsesPreviewSuffixForDisplaySubtext() async throws {
