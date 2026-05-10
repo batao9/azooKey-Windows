@@ -12,14 +12,13 @@ private func makeTemporaryCustomInputStyle(_ rows: [RomajiTableRow]) throws -> I
         .appendingPathComponent("azookey-romaji-test-\(UUID().uuidString).tsv")
     let content = try #require(buildCustomRomajiTableContent(rows: rows))
     try content.write(to: fileURL, atomically: true, encoding: .utf8)
-    return .mapped(id: .custom(fileURL))
-}
-
-private func customInputStyleURL(_ inputStyle: InputStyle) -> URL? {
-    guard case .mapped(id: .custom(let url)) = inputStyle else {
-        return nil
+    defer {
+        try? FileManager.default.removeItem(at: fileURL)
     }
-    return url
+    let tableName = "azookey-windows-test-romaji-\(UUID().uuidString)"
+    let table = try InputStyleManager.loadTable(from: fileURL)
+    InputStyleManager.registerInputStyle(table: table, for: tableName)
+    return .mapped(id: .tableName(tableName))
 }
 
 private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
@@ -63,7 +62,7 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
 
     #expect(map["n"] == nil)
     #expect(map["n{composition-separator}"] == "ん")
-    #expect(map["n{any-0x00}"] == "ん{any-0x00}")
+    #expect(map["n{any character}"] == "ん{any character}")
     #expect(map["ny"] == "ny")
     #expect(map["na"] == "な")
     #expect(map["nn"] == "ん")
@@ -227,10 +226,6 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
         row("-", "ー"),
     ]
     let inputStyle = try makeTemporaryCustomInputStyle(rows)
-    let fileURL = try #require(customInputStyleURL(inputStyle))
-    defer {
-        try? FileManager.default.removeItem(at: fileURL)
-    }
 
     let result = await MainActor.run {
         var source = ComposingText()
@@ -242,6 +237,26 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
     #expect(result.source.convertTarget == "かげn")
     #expect(result.preview.syntheticEndOfText)
     #expect(result.preview.composingText.convertTarget == "かげん")
+}
+
+@Test func customRomajiTableCommitsNBeforeConsonant() async throws {
+    let rows = [
+        row("n", "ん"),
+        row("na", "な"),
+        row("nn", "ん"),
+        row("n'", "ん"),
+        row("nya", "にゃ"),
+        row("ta", "た"),
+    ]
+    let inputStyle = try makeTemporaryCustomInputStyle(rows)
+
+    let convertTarget = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition("nta", inputStyle: inputStyle)
+        return source.convertTarget
+    }
+
+    #expect(convertTarget == "んた")
 }
 
 @Test func trailingNPreviewUsesPreviewSuffixForDisplaySubtext() async throws {
@@ -293,10 +308,6 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
         row("qa", "くぁ"),
     ]
     let inputStyle = try makeTemporaryCustomInputStyle(rows)
-    let fileURL = try #require(customInputStyleURL(inputStyle))
-    defer {
-        try? FileManager.default.removeItem(at: fileURL)
-    }
 
     let preview = await MainActor.run {
         var source = ComposingText()

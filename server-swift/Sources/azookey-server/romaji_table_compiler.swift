@@ -131,8 +131,8 @@ func buildCustomRomajiTableEntries(rows: [RomajiTableRow]) -> [(key: String, val
             literalEscaping: false
         )
         upsertEntry(
-            rawKey: "\(escapedInput){any-0x00}",
-            rawValue: "\(escapedOutput){any-0x00}",
+            rawKey: "\(escapedInput){any character}",
+            rawValue: "\(escapedOutput){any character}",
             source: .generated,
             literalEscaping: false
         )
