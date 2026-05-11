@@ -37,7 +37,7 @@ private func packageRootURL() -> URL {
 private func testConvertRequestOptions(memoryURL: URL) -> ConvertRequestOptions {
     let packageRoot = packageRootURL()
     return ConvertRequestOptions(
-        requireJapanesePrediction: .manualMix,
+        requireJapanesePrediction: .disabled,
         requireEnglishPrediction: .disabled,
         keyboardLanguage: .ja_JP,
         learningType: .nothing,
@@ -176,6 +176,19 @@ private func testConvertRequestOptions(memoryURL: URL) -> ConvertRequestOptions 
     )
 
     #expect(enabled)
+}
+
+@Test func zenzaiBackendNormalizationIgnoresCaseAndWhitespace() async throws {
+    #expect(normalizedZenzaiBackend(" Vulkan ") == "vulkan")
+    #expect(normalizedZenzaiBackend(nil) == "cpu")
+}
+
+@Test func serverOptionsDisableJapanesePrediction() async throws {
+    let predictionMode = await MainActor.run {
+        getOptions(zenzaiEnabled: false).requireJapanesePrediction
+    }
+
+    #expect(predictionMode == .disabled)
 }
 
 @Test func surfaceCountTracksUnderlyingRomanInputLength() async throws {

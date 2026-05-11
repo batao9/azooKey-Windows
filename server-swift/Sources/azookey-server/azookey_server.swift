@@ -2,8 +2,12 @@ import KanaKanjiConverterModule
 import Foundation
 import ffi
 
+private let fallbackDictionaryURL = URL(fileURLWithPath: "/dev/null")
+
+@MainActor var converterDictionaryURL = fallbackDictionaryURL
+@MainActor var converterPreloadDictionary = false
 @MainActor var converter = KanaKanjiConverter(
-    dictionaryURL: URL(fileURLWithPath: "/dev/null"),
+    dictionaryURL: fallbackDictionaryURL,
     preloadDictionary: false
 )
 @MainActor var composingText = ComposingText()
@@ -116,10 +120,21 @@ private func serverLog(_ level: String = "INFO", _ message: @autoclosure () -> S
     handle.write(data)
 }
 
-@MainActor private func configureEngineRuntime(zenzaiEnabled: Bool) {
-    let normalizedBackend = ((config["backend"] as? String) ?? "cpu")
+@MainActor private func rebuildConverter() {
+    converter = KanaKanjiConverter(
+        dictionaryURL: converterDictionaryURL,
+        preloadDictionary: converterPreloadDictionary
+    )
+}
+
+func normalizedZenzaiBackend(_ backend: String?) -> String {
+    (backend ?? "cpu")
         .trimmingCharacters(in: .whitespacesAndNewlines)
         .lowercased()
+}
+
+@MainActor private func configureEngineRuntime(zenzaiEnabled: Bool) {
+    let normalizedBackend = normalizedZenzaiBackend(config["backend"] as? String)
     let shouldOffloadToGpu = zenzaiEnabled && !normalizedBackend.isEmpty && normalizedBackend != "cpu"
     KanaKanjiConverterEngineRuntime.configure(
         gpuLayerCount: shouldOffloadToGpu ? Int32.max : 0
@@ -189,9 +204,7 @@ func effectiveZenzaiRuntimeEnabled(
         return false
     }
 
-    let normalizedBackend = (backend ?? "cpu")
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-        .lowercased()
+    let normalizedBackend = normalizedZenzaiBackend(backend)
 
     if normalizedBackend.isEmpty || normalizedBackend == "cpu" {
         return cpuBackendSupported
@@ -375,7 +388,7 @@ private func clampedCorrespondingCount(
     configureEngineRuntime(zenzaiEnabled: zenzaiEnabled)
     let profile = (config["profile"] as? String) ?? ""
     return ConvertRequestOptions(
-        requireJapanesePrediction: .manualMix,
+        requireJapanesePrediction: .disabled,
         requireEnglishPrediction: .disabled,
         keyboardLanguage: .ja_JP,
         learningType: .nothing,
@@ -546,11 +559,17 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
         cpuBackendSupported: cpuZenzaiBackendSupportedFromEnvironment()
     )
     let currentUsedCustomRomajiTable = customRomajiTableURL != nil
+    let backendChanged = normalizedZenzaiBackend(previousBackend) != normalizedZenzaiBackend(currentBackend)
     if previousEffectiveZenzaiEnabled != currentEffectiveZenzaiEnabled
         || previousProfile != currentProfile
+        || backendChanged
         || previousUsedCustomRomajiTable != currentUsedCustomRomajiTable
     {
-        converter.stopComposition()
+        if backendChanged {
+            rebuildConverter()
+        } else {
+            converter.stopComposition()
+        }
         composingText = ComposingText()
         composingTextSnapshots.removeAll()
     }
@@ -569,10 +588,9 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     let path = String(cString: path)
     serverLog("INFO", "Initialize: start path=\(path) use_zenzai=\(use_zenzai)")
     execURL = URL(filePath: path)
-    converter = KanaKanjiConverter(
-        dictionaryURL: execURL.appendingPathComponent("Dictionary"),
-        preloadDictionary: true
-    )
+    converterDictionaryURL = execURL.appendingPathComponent("Dictionary")
+    converterPreloadDictionary = true
+    rebuildConverter()
 
     load_config()
 
