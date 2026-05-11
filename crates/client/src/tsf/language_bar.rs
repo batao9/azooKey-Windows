@@ -1,5 +1,6 @@
 use std::{
     env,
+    os::windows::ffi::OsStrExt as _,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU32, Ordering},
 };
@@ -368,10 +369,8 @@ fn launch_settings_app() -> Result<()> {
 }
 
 fn shell_execute_open(settings_path: &Path, install_dir: &Path) -> Result<()> {
-    let settings_path = settings_path.to_string_lossy();
-    let settings_path = settings_path.as_ref().to_wide_16();
-    let install_dir = install_dir.to_string_lossy();
-    let install_dir = install_dir.as_ref().to_wide_16();
+    let settings_path = path_to_wide(settings_path);
+    let install_dir = path_to_wide(install_dir);
 
     let result = unsafe {
         ShellExecuteW(
@@ -391,6 +390,13 @@ fn shell_execute_open(settings_path: &Path, install_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn path_to_wide(path: &Path) -> Vec<u16> {
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SettingsAppPath {
     path: PathBuf,
@@ -401,13 +407,10 @@ fn resolve_settings_app_path() -> Result<SettingsAppPath> {
     let mut candidates = resolve_settings_app_path_candidates()?;
 
     if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
-        let fallback_install_location = Path::new(&local_app_data).join(SETTINGS_APP_DIRNAME);
-        let fallback_install_location = fallback_install_location.to_string_lossy();
         candidates.push(SettingsAppPath {
-            path: resolve_settings_app_path_from_install_location(
-                fallback_install_location.as_ref(),
-                SETTINGS_APP_FILENAME,
-            )?,
+            path: Path::new(&local_app_data)
+                .join(SETTINGS_APP_DIRNAME)
+                .join(SETTINGS_APP_FILENAME),
             source: "LOCALAPPDATA fallback",
         });
     } else {
@@ -500,17 +503,16 @@ fn select_existing_settings_app_path(
     candidates: Vec<SettingsAppPath>,
     exists: impl Fn(&Path) -> bool,
 ) -> Result<SettingsAppPath> {
-    if let Some(index) = candidates
-        .iter()
-        .position(|candidate| exists(&candidate.path))
-    {
-        return Ok(candidates
-            .into_iter()
-            .nth(index)
-            .expect("selected candidate index should exist"));
+    let mut missing_candidates = Vec::new();
+    for candidate in candidates {
+        if exists(&candidate.path) {
+            return Ok(candidate);
+        }
+
+        missing_candidates.push(candidate);
     }
 
-    let candidate_list = candidates
+    let candidate_list = missing_candidates
         .iter()
         .map(|candidate| format!("{}={}", candidate.source, candidate.path.display()))
         .collect::<Vec<_>>()
