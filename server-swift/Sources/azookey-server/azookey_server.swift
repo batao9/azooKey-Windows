@@ -2,7 +2,18 @@ import KanaKanjiConverterModule
 import Foundation
 import ffi
 
-private let fallbackDictionaryURL = URL(fileURLWithPath: "/dev/null")
+private let fallbackDictionaryURL: URL = {
+    let temporaryDirectory = FileManager.default.temporaryDirectory
+    let url = temporaryDirectory
+        .appendingPathComponent("Azookey")
+        .appendingPathComponent("FallbackDictionary", isDirectory: true)
+    do {
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    } catch {
+        return temporaryDirectory
+    }
+}()
 
 @MainActor var converterDictionaryURL = fallbackDictionaryURL
 @MainActor var converterPreloadDictionary = false
@@ -13,7 +24,7 @@ private let fallbackDictionaryURL = URL(fileURLWithPath: "/dev/null")
 @MainActor var composingText = ComposingText()
 @MainActor var composingTextSnapshots: [ComposingText] = []
 @MainActor var currentInputStyle: InputStyle = .roman2kana
-@MainActor var customRomajiTableURL: URL?
+@MainActor var customRomajiTableEnabled = false
 
 @MainActor var execURL = URL(filePath: "")
 @MainActor var config: [String : Any] = [
@@ -219,12 +230,7 @@ private func cpuZenzaiBackendSupportedFromEnvironment() -> Bool {
 
 @MainActor private func setRoman2KanaInputStyle() {
     currentInputStyle = .roman2kana
-
-    if let existing = customRomajiTableURL {
-        try? FileManager.default.removeItem(at: existing)
-    }
-
-    customRomajiTableURL = nil
+    customRomajiTableEnabled = false
 }
 
 @MainActor private func setCustomRomajiInputStyle(rows: [RomajiTableRow]?) {
@@ -238,16 +244,14 @@ private func cpuZenzaiBackendSupportedFromEnvironment() -> Bool {
 
     do {
         try content.write(to: fileURL, atomically: true, encoding: .utf8)
-        let previousURL = customRomajiTableURL
+        defer {
+            try? FileManager.default.removeItem(at: fileURL)
+        }
         let tableName = "azookey-windows-custom-romaji"
         let table = try InputStyleManager.loadTable(from: fileURL)
         InputStyleManager.registerInputStyle(table: table, for: tableName)
         currentInputStyle = .mapped(id: .tableName(tableName))
-        customRomajiTableURL = fileURL
-
-        if let previousURL, previousURL != fileURL {
-            try? FileManager.default.removeItem(at: previousURL)
-        }
+        customRomajiTableEnabled = true
     } catch {
         serverLog("ERROR", "Failed to apply custom romaji table: \(error)")
         setRoman2KanaInputStyle()
@@ -471,7 +475,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
         backend: previousBackend,
         cpuBackendSupported: cpuZenzaiBackendSupportedFromEnvironment()
     )
-    let previousUsedCustomRomajiTable = customRomajiTableURL != nil
+    let previousUsedCustomRomajiTable = customRomajiTableEnabled
     var dynamicUserDictionary: [DicdataElement] = []
     defer {
         converter.importDynamicUserDictionary(dynamicUserDictionary)
@@ -558,7 +562,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
         backend: currentBackend,
         cpuBackendSupported: cpuZenzaiBackendSupportedFromEnvironment()
     )
-    let currentUsedCustomRomajiTable = customRomajiTableURL != nil
+    let currentUsedCustomRomajiTable = customRomajiTableEnabled
     let backendChanged = normalizedZenzaiBackend(previousBackend) != normalizedZenzaiBackend(currentBackend)
     if previousEffectiveZenzaiEnabled != currentEffectiveZenzaiEnabled
         || previousProfile != currentProfile
