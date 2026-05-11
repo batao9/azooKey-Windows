@@ -2,6 +2,7 @@ use std::{
     cell::RefCell,
     env,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use windows::{
@@ -29,9 +30,9 @@ use windows::{
             WindowsAndMessaging::{
                 AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
                 DestroyWindow, IsWindow, LoadImageW, PostMessageW, RegisterClassW,
-                SetForegroundWindow, TrackPopupMenu, HICON, HMENU, IMAGE_ICON, LR_DEFAULTCOLOR,
-                MF_STRING, SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
-                WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
+                SetForegroundWindow, TrackPopupMenu, UnregisterClassW, HICON, HMENU, IMAGE_ICON,
+                LR_DEFAULTCOLOR, MF_STRING, SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD,
+                TPM_RIGHTBUTTON, WM_NULL, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
             },
         },
     },
@@ -42,6 +43,7 @@ use crate::{
         client_action::ClientAction, composition::CompositionState, input_mode::InputMode,
         state::IMEState, theme::get_theme,
     },
+    extension::StringExt as _,
     globals::{DllModule, GUID_TEXT_SERVICE, TEXTSERVICE_LANGBARITEMSINK_COOKIE},
 };
 
@@ -60,11 +62,12 @@ const INFO: TF_LANGBARITEMINFO = TF_LANGBARITEMINFO {
 const SETTINGS_MENU_ID: usize = 1;
 const SETTINGS_APP_DIRNAME: &str = "Azookey";
 const SETTINGS_APP_FILENAME: &str = "frontend.exe";
-const MENU_OWNER_WINDOW_CLASS_NAME: PCWSTR = w!("AzookeyLangBarMenuOwner");
 const SETTINGS_APP_UNINSTALL_SUBKEY: PCWSTR =
     w!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Azookey");
 const SETTINGS_APP_INSTALL_LOCATION_VALUE: PCWSTR = w!("InstallLocation");
 const SETTINGS_APP_MAIN_BINARY_NAME_VALUE: PCWSTR = w!("MainBinaryName");
+
+static MENU_OWNER_WINDOW_CLASS_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
 thread_local! {
     static MENU_OWNER_WINDOW: RefCell<Option<MenuOwnerWindow>> = RefCell::new(None);
@@ -208,18 +211,29 @@ impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
     }
 }
 
+pub(crate) fn cleanup_menu_owner_window() {
+    MENU_OWNER_WINDOW.with(|owner| {
+        owner.borrow_mut().take();
+    });
+}
+
 fn launch_settings_app_with_logging() {
     if let Err(error) = launch_settings_app() {
         tracing::warn!(?error, "Failed to launch settings app");
     }
 }
 
-struct MenuOwnerWindow(HWND);
+struct MenuOwnerWindow {
+    hwnd: HWND,
+    class_name: Vec<u16>,
+    hinstance: HINSTANCE,
+}
 
 impl Drop for MenuOwnerWindow {
     fn drop(&mut self) {
         unsafe {
-            let _ = DestroyWindow(self.0);
+            let _ = DestroyWindow(self.hwnd);
+            let _ = UnregisterClassW(PCWSTR(self.class_name.as_ptr()), self.hinstance);
         }
     }
 }
@@ -279,7 +293,7 @@ fn menu_owner_window() -> Result<HWND> {
             let owner = owner.borrow();
             owner
                 .as_ref()
-                .map(|window| unsafe { !IsWindow(window.0).as_bool() })
+                .map(|window| unsafe { !IsWindow(window.hwnd).as_bool() })
                 .unwrap_or(true)
         };
 
@@ -290,7 +304,7 @@ fn menu_owner_window() -> Result<HWND> {
         owner
             .borrow()
             .as_ref()
-            .map(|window| window.0)
+            .map(|window| window.hwnd)
             .context("Menu owner window is not available")
     })
 }
@@ -301,39 +315,62 @@ fn create_menu_owner_window() -> Result<MenuOwnerWindow> {
     let hinstance = HINSTANCE(hmodule.0);
 
     unsafe {
-        let window_class = WNDCLASSW {
-            lpfnWndProc: Some(menu_owner_window_proc),
-            hInstance: hinstance,
-            lpszClassName: MENU_OWNER_WINDOW_CLASS_NAME,
-            ..Default::default()
-        };
+        for _ in 0..32 {
+            let class_name = menu_owner_window_class_name(hmodule);
+            let window_class = WNDCLASSW {
+                lpfnWndProc: Some(menu_owner_window_proc),
+                hInstance: hinstance,
+                lpszClassName: PCWSTR(class_name.as_ptr()),
+                ..Default::default()
+            };
 
-        let atom = RegisterClassW(&window_class);
-        if atom == 0 {
-            let error = GetLastError();
-            if error != ERROR_CLASS_ALREADY_EXISTS {
+            let atom = RegisterClassW(&window_class);
+            if atom == 0 {
+                let error = GetLastError();
+                if error == ERROR_CLASS_ALREADY_EXISTS {
+                    continue;
+                }
+
                 anyhow::bail!("Failed to register menu owner window class: {:?}", error);
             }
+
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                PCWSTR(class_name.as_ptr()),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                HWND::default(),
+                HMENU::default(),
+                hinstance,
+                None,
+            )
+            .context("Failed to create menu owner window")?;
+
+            return Ok(MenuOwnerWindow {
+                hwnd,
+                class_name,
+                hinstance,
+            });
         }
 
-        let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW,
-            MENU_OWNER_WINDOW_CLASS_NAME,
-            w!(""),
-            WS_POPUP,
-            0,
-            0,
-            0,
-            0,
-            HWND::default(),
-            HMENU::default(),
-            hinstance,
-            None,
-        )
-        .context("Failed to create menu owner window")?;
-
-        Ok(MenuOwnerWindow(hwnd))
+        anyhow::bail!("Failed to register unique menu owner window class")
     }
+}
+
+fn menu_owner_window_class_name(hmodule: windows::Win32::Foundation::HMODULE) -> Vec<u16> {
+    let sequence = MENU_OWNER_WINDOW_CLASS_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "AzookeyLangBarMenuOwner-{}-{:p}-{}",
+        std::process::id(),
+        hmodule.0,
+        sequence
+    )
+    .as_str()
+    .to_wide_16()
 }
 
 fn launch_settings_app() -> Result<()> {
@@ -360,8 +397,10 @@ fn launch_settings_app() -> Result<()> {
 }
 
 fn shell_execute_open(settings_path: &Path, install_dir: &Path) -> Result<()> {
-    let settings_path = wide_null(&settings_path.to_string_lossy());
-    let install_dir = wide_null(&install_dir.to_string_lossy());
+    let settings_path = settings_path.to_string_lossy();
+    let settings_path = settings_path.as_ref().to_wide_16();
+    let install_dir = install_dir.to_string_lossy();
+    let install_dir = install_dir.as_ref().to_wide_16();
 
     let result = unsafe {
         ShellExecuteW(
@@ -379,10 +418,6 @@ fn shell_execute_open(settings_path: &Path, install_dir: &Path) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn wide_null(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -484,16 +519,23 @@ fn select_existing_settings_app_path(
     candidates: Vec<SettingsAppPath>,
     exists: impl Fn(&Path) -> bool,
 ) -> Result<SettingsAppPath> {
+    if let Some(index) = candidates
+        .iter()
+        .position(|candidate| exists(&candidate.path))
+    {
+        return Ok(candidates
+            .into_iter()
+            .nth(index)
+            .expect("selected candidate index should exist"));
+    }
+
     let candidate_list = candidates
         .iter()
         .map(|candidate| format!("{}={}", candidate.source, candidate.path.display()))
         .collect::<Vec<_>>()
         .join(", ");
 
-    candidates
-        .into_iter()
-        .find(|candidate| exists(&candidate.path))
-        .with_context(|| format!("Settings app not found in candidates: {candidate_list}"))
+    anyhow::bail!("Settings app not found in candidates: {candidate_list}")
 }
 
 fn resolve_settings_app_path_from_install_location(
