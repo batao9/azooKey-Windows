@@ -2,11 +2,29 @@ import KanaKanjiConverterModule
 import Foundation
 import ffi
 
-@MainActor let converter = KanaKanjiConverter()
+private let fallbackDictionaryURL: URL = {
+    let temporaryDirectory = FileManager.default.temporaryDirectory
+    let url = temporaryDirectory
+        .appendingPathComponent("Azookey")
+        .appendingPathComponent("FallbackDictionary", isDirectory: true)
+    do {
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    } catch {
+        return temporaryDirectory
+    }
+}()
+
+@MainActor var converterDictionaryURL = fallbackDictionaryURL
+@MainActor var converterPreloadDictionary = false
+@MainActor var converter = KanaKanjiConverter(
+    dictionaryURL: fallbackDictionaryURL,
+    preloadDictionary: false
+)
 @MainActor var composingText = ComposingText()
 @MainActor var composingTextSnapshots: [ComposingText] = []
 @MainActor var currentInputStyle: InputStyle = .roman2kana
-@MainActor var customRomajiTableURL: URL?
+@MainActor var customRomajiTableEnabled = false
 
 @MainActor var execURL = URL(filePath: "")
 @MainActor var config: [String : Any] = [
@@ -113,6 +131,27 @@ private func serverLog(_ level: String = "INFO", _ message: @autoclosure () -> S
     handle.write(data)
 }
 
+@MainActor private func rebuildConverter() {
+    converter = KanaKanjiConverter(
+        dictionaryURL: converterDictionaryURL,
+        preloadDictionary: converterPreloadDictionary
+    )
+}
+
+func normalizedZenzaiBackend(_ backend: String?) -> String {
+    (backend ?? "cpu")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+}
+
+@MainActor private func configureEngineRuntime(zenzaiEnabled: Bool) {
+    let normalizedBackend = normalizedZenzaiBackend(config["backend"] as? String)
+    let shouldOffloadToGpu = zenzaiEnabled && !normalizedBackend.isEmpty && normalizedBackend != "cpu"
+    KanaKanjiConverterEngineRuntime.configure(
+        gpuLayerCount: shouldOffloadToGpu ? Int32.max : 0
+    )
+}
+
 private struct AppSettings: Decodable {
     let zenzai: ZenzaiSettings?
     let user_dictionary: UserDictionarySettings?
@@ -176,9 +215,7 @@ func effectiveZenzaiRuntimeEnabled(
         return false
     }
 
-    let normalizedBackend = (backend ?? "cpu")
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-        .lowercased()
+    let normalizedBackend = normalizedZenzaiBackend(backend)
 
     if normalizedBackend.isEmpty || normalizedBackend == "cpu" {
         return cpuBackendSupported
@@ -193,12 +230,7 @@ private func cpuZenzaiBackendSupportedFromEnvironment() -> Bool {
 
 @MainActor private func setRoman2KanaInputStyle() {
     currentInputStyle = .roman2kana
-
-    if let existing = customRomajiTableURL {
-        try? FileManager.default.removeItem(at: existing)
-    }
-
-    customRomajiTableURL = nil
+    customRomajiTableEnabled = false
 }
 
 @MainActor private func setCustomRomajiInputStyle(rows: [RomajiTableRow]?) {
@@ -212,13 +244,14 @@ private func cpuZenzaiBackendSupportedFromEnvironment() -> Bool {
 
     do {
         try content.write(to: fileURL, atomically: true, encoding: .utf8)
-        let previousURL = customRomajiTableURL
-        currentInputStyle = .mapped(id: .custom(fileURL))
-        customRomajiTableURL = fileURL
-
-        if let previousURL, previousURL != fileURL {
-            try? FileManager.default.removeItem(at: previousURL)
+        defer {
+            try? FileManager.default.removeItem(at: fileURL)
         }
+        let tableName = "azookey-windows-custom-romaji"
+        let table = try InputStyleManager.loadTable(from: fileURL)
+        InputStyleManager.registerInputStyle(table: table, for: tableName)
+        currentInputStyle = .mapped(id: .tableName(tableName))
+        customRomajiTableEnabled = true
     } catch {
         serverLog("ERROR", "Failed to apply custom romaji table: \(error)")
         setRoman2KanaInputStyle()
@@ -273,18 +306,18 @@ private func clampedCorrespondingCount(
     }
 
     switch trailingElement.piece {
-    case .character:
+    case .character, .key:
         guard trailingElement.inputStyle != .direct else {
             return (composingText: composingText, syntheticEndOfText: false)
         }
-    case .endOfText:
+    case .compositionSeparator:
         return (composingText: composingText, syntheticEndOfText: false)
     }
 
     var previewComposingText = composingText
     let originalConvertTarget = previewComposingText.convertTarget
     previewComposingText.insertAtCursorPosition([
-        .init(piece: .endOfText, inputStyle: trailingElement.inputStyle)
+        .init(piece: .compositionSeparator, inputStyle: trailingElement.inputStyle)
     ])
 
     guard previewComposingText.convertTarget != originalConvertTarget else {
@@ -356,18 +389,19 @@ private func clampedCorrespondingCount(
     context: String = "",
     zenzaiEnabled: Bool
 ) -> ConvertRequestOptions {
+    configureEngineRuntime(zenzaiEnabled: zenzaiEnabled)
     let profile = (config["profile"] as? String) ?? ""
     return ConvertRequestOptions(
-        requireJapanesePrediction: true,
-        requireEnglishPrediction: false,
+        requireJapanesePrediction: .disabled,
+        requireEnglishPrediction: .disabled,
         keyboardLanguage: .ja_JP,
         learningType: .nothing,
-        dictionaryResourceURL: execURL.appendingPathComponent("Dictionary"),
         memoryDirectoryURL: URL(filePath: "./test"),
         sharedContainerURL: URL(filePath: "./test"),
         textReplacer: .init {
             return execURL.appendingPathComponent("EmojiDictionary").appendingPathComponent("emoji_all_E15.1.txt")
         },
+        specialCandidateProviders: nil,
         // zenzai
         zenzaiMode: zenzaiEnabled ? .on(
             weight: execURL.appendingPathComponent("zenz.gguf"),
@@ -381,7 +415,6 @@ private func clampedCorrespondingCount(
                 )
             )
         ) : .off,
-        preloadDictionary: true,
         metadata: .init(versionString: "Azookey for Windows")
     )
 }
@@ -442,10 +475,10 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
         backend: previousBackend,
         cpuBackendSupported: cpuZenzaiBackendSupportedFromEnvironment()
     )
-    let previousUsedCustomRomajiTable = customRomajiTableURL != nil
+    let previousUsedCustomRomajiTable = customRomajiTableEnabled
     var dynamicUserDictionary: [DicdataElement] = []
     defer {
-        converter.sendToDicdataStore(.importDynamicUserDict(dynamicUserDictionary))
+        converter.importDynamicUserDictionary(dynamicUserDictionary)
     }
 
     config["enable"] = false
@@ -529,12 +562,18 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
         backend: currentBackend,
         cpuBackendSupported: cpuZenzaiBackendSupportedFromEnvironment()
     )
-    let currentUsedCustomRomajiTable = customRomajiTableURL != nil
+    let currentUsedCustomRomajiTable = customRomajiTableEnabled
+    let backendChanged = normalizedZenzaiBackend(previousBackend) != normalizedZenzaiBackend(currentBackend)
     if previousEffectiveZenzaiEnabled != currentEffectiveZenzaiEnabled
         || previousProfile != currentProfile
+        || backendChanged
         || previousUsedCustomRomajiTable != currentUsedCustomRomajiTable
     {
-        converter.stopComposition()
+        if backendChanged {
+            rebuildConverter()
+        } else {
+            converter.stopComposition()
+        }
         composingText = ComposingText()
         composingTextSnapshots.removeAll()
     }
@@ -553,6 +592,9 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     let path = String(cString: path)
     serverLog("INFO", "Initialize: start path=\(path) use_zenzai=\(use_zenzai)")
     execURL = URL(filePath: path)
+    converterDictionaryURL = execURL.appendingPathComponent("Dictionary")
+    converterPreloadDictionary = true
+    rebuildConverter()
 
     load_config()
 

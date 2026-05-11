@@ -12,19 +12,46 @@ private func makeTemporaryCustomInputStyle(_ rows: [RomajiTableRow]) throws -> I
         .appendingPathComponent("azookey-romaji-test-\(UUID().uuidString).tsv")
     let content = try #require(buildCustomRomajiTableContent(rows: rows))
     try content.write(to: fileURL, atomically: true, encoding: .utf8)
-    return .mapped(id: .custom(fileURL))
-}
-
-private func customInputStyleURL(_ inputStyle: InputStyle) -> URL? {
-    guard case .mapped(id: .custom(let url)) = inputStyle else {
-        return nil
+    defer {
+        try? FileManager.default.removeItem(at: fileURL)
     }
-    return url
+    let tableName = "azookey-windows-test-romaji-\(UUID().uuidString)"
+    let table = try InputStyleManager.loadTable(from: fileURL)
+    InputStyleManager.registerInputStyle(table: table, for: tableName)
+    return .mapped(id: .tableName(tableName))
 }
 
 private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
     Dictionary(
         uniqueKeysWithValues: buildCustomRomajiTableEntries(rows: rows).map { ($0.key, $0.value) }
+    )
+}
+
+private func packageRootURL() -> URL {
+    URL(filePath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+}
+
+private func testConvertRequestOptions(memoryURL: URL) -> ConvertRequestOptions {
+    let packageRoot = packageRootURL()
+    return ConvertRequestOptions(
+        requireJapanesePrediction: .disabled,
+        requireEnglishPrediction: .disabled,
+        keyboardLanguage: .ja_JP,
+        learningType: .nothing,
+        memoryDirectoryURL: memoryURL,
+        sharedContainerURL: memoryURL,
+        textReplacer: .init {
+            packageRoot
+                .appending(path: "azooKey_emoji_dictionary_storage")
+                .appending(path: "EmojiDictionary")
+                .appending(path: "emoji_all_E15.1.txt")
+        },
+        specialCandidateProviders: nil,
+        zenzaiMode: .off,
+        metadata: .init(versionString: "Azookey for Windows test")
     )
 }
 
@@ -63,7 +90,7 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
 
     #expect(map["n"] == nil)
     #expect(map["n{composition-separator}"] == "ん")
-    #expect(map["n{any-0x00}"] == "ん{any-0x00}")
+    #expect(map["n{any character}"] == "ん{any character}")
     #expect(map["ny"] == "ny")
     #expect(map["na"] == "な")
     #expect(map["nn"] == "ん")
@@ -151,6 +178,19 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
     #expect(enabled)
 }
 
+@Test func zenzaiBackendNormalizationIgnoresCaseAndWhitespace() async throws {
+    #expect(normalizedZenzaiBackend(" Vulkan ") == "vulkan")
+    #expect(normalizedZenzaiBackend(nil) == "cpu")
+}
+
+@Test func serverOptionsDisableJapanesePrediction() async throws {
+    let predictionMode = await MainActor.run {
+        getOptions(zenzaiEnabled: false).requireJapanesePrediction
+    }
+
+    #expect(predictionMode == .disabled)
+}
+
 @Test func surfaceCountTracksUnderlyingRomanInputLength() async throws {
     let resolved = await MainActor.run {
         var composingText = ComposingText()
@@ -227,10 +267,6 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
         row("-", "ー"),
     ]
     let inputStyle = try makeTemporaryCustomInputStyle(rows)
-    let fileURL = try #require(customInputStyleURL(inputStyle))
-    defer {
-        try? FileManager.default.removeItem(at: fileURL)
-    }
 
     let result = await MainActor.run {
         var source = ComposingText()
@@ -242,6 +278,85 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
     #expect(result.source.convertTarget == "かげn")
     #expect(result.preview.syntheticEndOfText)
     #expect(result.preview.composingText.convertTarget == "かげん")
+}
+
+@Test func customRomajiTableCommitsNBeforeConsonant() async throws {
+    let rows = [
+        row("n", "ん"),
+        row("na", "な"),
+        row("nn", "ん"),
+        row("n'", "ん"),
+        row("nya", "にゃ"),
+        row("ta", "た"),
+    ]
+    let inputStyle = try makeTemporaryCustomInputStyle(rows)
+
+    let convertTarget = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition("nta", inputStyle: inputStyle)
+        return source.convertTarget
+    }
+
+    #expect(convertTarget == "んた")
+}
+
+@Test func dictionaryCandidatesIncludeKanjiAfterRomanTrailingNPreview() async throws {
+    let packageRoot = packageRootURL()
+    let dictionaryURL = packageRoot
+        .appending(path: "azooKey_dictionary_storage")
+        .appending(path: "Dictionary")
+    let memoryURL = FileManager.default.temporaryDirectory
+        .appending(path: "azookey-server-test-\(UUID().uuidString)")
+    defer {
+        try? FileManager.default.removeItem(at: memoryURL)
+    }
+
+    let candidates = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition("iikagenn", inputStyle: .roman2kana)
+        let preview = makeCandidatePreviewComposingText(from: source)
+        let previewHiragana = preview.composingText.convertTarget
+        let testConverter = KanaKanjiConverter(dictionaryURL: dictionaryURL, preloadDictionary: true)
+        return testConverter.requestCandidates(
+            preview.composingText,
+            options: testConvertRequestOptions(memoryURL: memoryURL)
+        )
+        .mainResults
+        .map { constructCandidateString(candidate: $0, hiragana: previewHiragana) }
+    }
+
+    #expect(candidates.contains { $0.contains("加減") }, "candidates: \(candidates)")
+}
+
+@Test func singleWordKanjiCandidateBeatsHiraganaPrediction() async throws {
+    let packageRoot = packageRootURL()
+    let dictionaryURL = packageRoot
+        .appending(path: "azooKey_dictionary_storage")
+        .appending(path: "Dictionary")
+    let memoryURL = FileManager.default.temporaryDirectory
+        .appending(path: "azookey-server-test-\(UUID().uuidString)")
+    defer {
+        try? FileManager.default.removeItem(at: memoryURL)
+    }
+
+    let candidates = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition("kannji", inputStyle: .roman2kana)
+        let preview = makeCandidatePreviewComposingText(from: source)
+        let previewHiragana = preview.composingText.convertTarget
+        let testConverter = KanaKanjiConverter(dictionaryURL: dictionaryURL, preloadDictionary: true)
+        return testConverter.requestCandidates(
+            preview.composingText,
+            options: testConvertRequestOptions(memoryURL: memoryURL)
+        )
+        .mainResults
+        .prefix(5)
+        .map { candidate in
+            constructCandidateString(candidate: candidate, hiragana: previewHiragana)
+        }
+    }
+
+    #expect(candidates.first == "感じ", "candidates: \(candidates)")
 }
 
 @Test func trailingNPreviewUsesPreviewSuffixForDisplaySubtext() async throws {
@@ -293,10 +408,6 @@ private func tableMap(_ rows: [RomajiTableRow]) -> [String: String] {
         row("qa", "くぁ"),
     ]
     let inputStyle = try makeTemporaryCustomInputStyle(rows)
-    let fileURL = try #require(customInputStyleURL(inputStyle))
-    defer {
-        try? FileManager.default.removeItem(at: fileURL)
-    }
 
     let preview = await MainActor.run {
         var source = ComposingText()
