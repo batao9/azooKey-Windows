@@ -1,17 +1,17 @@
 use std::{
+    cell::RefCell,
     env,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use windows::{
     core::{w, IUnknown, Interface as _, BSTR, GUID, PCWSTR},
     Win32::{
         Foundation::{
-            BOOL, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, E_INVALIDARG, HWND,
-            LPARAM, POINT, RECT, WPARAM,
+            GetLastError, BOOL, ERROR_CLASS_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
+            ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, E_INVALIDARG, HINSTANCE, HWND, LPARAM, LRESULT,
+            POINT, RECT, WPARAM,
         },
-        Graphics::Gdi::HBITMAP,
         System::{
             Ole::CONNECT_E_CANNOTCONNECT,
             Registry::{
@@ -20,17 +20,18 @@ use windows::{
             },
         },
         UI::{
+            Shell::ShellExecuteW,
             TextServices::{
                 ITfLangBarItemButton_Impl, ITfLangBarItemSink, ITfLangBarItem_Impl, ITfMenu,
                 ITfSource_Impl, TfLBIClick, GUID_LBI_INPUTMODE, TF_LANGBARITEMINFO,
                 TF_LBI_CLK_LEFT, TF_LBI_CLK_RIGHT, TF_LBI_STATUS_DISABLED, TF_LBI_STYLE_BTN_BUTTON,
-                TF_LBI_STYLE_BTN_MENU,
             },
             WindowsAndMessaging::{
-                AppendMenuW, CreatePopupMenu, DestroyMenu, GetAncestor, GetForegroundWindow,
-                LoadImageW, PostMessageW, SetForegroundWindow, TrackPopupMenu, WindowFromPoint,
-                GA_ROOT, HICON, HMENU, IMAGE_ICON, LR_DEFAULTCOLOR, MF_STRING, TPM_NONOTIFY,
-                TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
+                AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+                DestroyWindow, IsWindow, LoadImageW, PostMessageW, RegisterClassW,
+                SetForegroundWindow, TrackPopupMenu, HICON, HMENU, IMAGE_ICON, LR_DEFAULTCOLOR,
+                MF_STRING, SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
+                WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
             },
         },
     },
@@ -51,7 +52,7 @@ use super::factory::TextServiceFactory_Impl;
 const INFO: TF_LANGBARITEMINFO = TF_LANGBARITEMINFO {
     clsidService: GUID_TEXT_SERVICE,
     guidItem: GUID_LBI_INPUTMODE,
-    dwStyle: TF_LBI_STYLE_BTN_BUTTON | TF_LBI_STYLE_BTN_MENU,
+    dwStyle: TF_LBI_STYLE_BTN_BUTTON,
     ulSort: 0,
     szDescription: [0; 32],
 };
@@ -59,10 +60,15 @@ const INFO: TF_LANGBARITEMINFO = TF_LANGBARITEMINFO {
 const SETTINGS_MENU_ID: usize = 1;
 const SETTINGS_APP_DIRNAME: &str = "Azookey";
 const SETTINGS_APP_FILENAME: &str = "frontend.exe";
+const MENU_OWNER_WINDOW_CLASS_NAME: PCWSTR = w!("AzookeyLangBarMenuOwner");
 const SETTINGS_APP_UNINSTALL_SUBKEY: PCWSTR =
     w!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Azookey");
 const SETTINGS_APP_INSTALL_LOCATION_VALUE: PCWSTR = w!("InstallLocation");
 const SETTINGS_APP_MAIN_BINARY_NAME_VALUE: PCWSTR = w!("MainBinaryName");
+
+thread_local! {
+    static MENU_OWNER_WINDOW: RefCell<Option<MenuOwnerWindow>> = RefCell::new(None);
+}
 
 // you need to implement these three interfaces to create a language bar item
 // if not, you will get E_FAIL error in ITfLangBarItemMgr::AddItem
@@ -145,20 +151,12 @@ impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
     }
 
     #[macros::anyhow]
-    fn InitMenu(&self, pmenu: Option<&ITfMenu>) -> Result<()> {
-        if let Some(menu) = pmenu {
-            add_settings_menu_item(menu)?;
-        }
-
+    fn InitMenu(&self, _pmenu: Option<&ITfMenu>) -> Result<()> {
         Ok(())
     }
 
     #[macros::anyhow]
-    fn OnMenuSelect(&self, w_id: u32) -> Result<()> {
-        if w_id == SETTINGS_MENU_ID as u32 {
-            launch_settings_app_with_logging();
-        }
-
+    fn OnMenuSelect(&self, _w_id: u32) -> Result<()> {
         Ok(())
     }
 
@@ -216,21 +214,14 @@ fn launch_settings_app_with_logging() {
     }
 }
 
-fn add_settings_menu_item(menu: &ITfMenu) -> Result<()> {
-    let text: Vec<u16> = "設定".encode_utf16().collect();
+struct MenuOwnerWindow(HWND);
 
-    unsafe {
-        menu.AddMenuItem(
-            SETTINGS_MENU_ID as u32,
-            0,
-            HBITMAP::default(),
-            HBITMAP::default(),
-            &text,
-            std::ptr::null_mut(),
-        )?;
+impl Drop for MenuOwnerWindow {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyWindow(self.0);
+        }
     }
-
-    Ok(())
 }
 
 fn show_settings_menu(pt: &POINT) -> Result<Option<u32>> {
@@ -248,10 +239,7 @@ fn show_settings_menu(pt: &POINT) -> Result<Option<u32>> {
         let menu = PopupMenu(CreatePopupMenu()?);
         AppendMenuW(menu.0, MF_STRING, SETTINGS_MENU_ID, w!("設定"))?;
 
-        let hwnd = resolve_menu_owner_window(*pt);
-        if hwnd.0.is_null() {
-            return Ok(None);
-        }
+        let hwnd = menu_owner_window()?;
 
         let _ = SetForegroundWindow(hwnd);
 
@@ -276,24 +264,81 @@ fn show_settings_menu(pt: &POINT) -> Result<Option<u32>> {
     }
 }
 
-fn resolve_menu_owner_window(pt: POINT) -> HWND {
-    unsafe {
-        let hwnd = WindowFromPoint(pt);
-        if !hwnd.0.is_null() {
-            let root = GetAncestor(hwnd, GA_ROOT);
-            if !root.0.is_null() {
-                return root;
-            }
+unsafe extern "system" fn menu_owner_window_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
 
-            return hwnd;
+fn menu_owner_window() -> Result<HWND> {
+    MENU_OWNER_WINDOW.with(|owner| {
+        let recreate = {
+            let owner = owner.borrow();
+            owner
+                .as_ref()
+                .map(|window| unsafe { !IsWindow(window.0).as_bool() })
+                .unwrap_or(true)
+        };
+
+        if recreate {
+            owner.borrow_mut().replace(create_menu_owner_window()?);
         }
 
-        GetForegroundWindow()
+        owner
+            .borrow()
+            .as_ref()
+            .map(|window| window.0)
+            .context("Menu owner window is not available")
+    })
+}
+
+fn create_menu_owner_window() -> Result<MenuOwnerWindow> {
+    let dll_module = DllModule::get()?;
+    let hmodule = dll_module.hinst.context("Dll instance not found")?;
+    let hinstance = HINSTANCE(hmodule.0);
+
+    unsafe {
+        let window_class = WNDCLASSW {
+            lpfnWndProc: Some(menu_owner_window_proc),
+            hInstance: hinstance,
+            lpszClassName: MENU_OWNER_WINDOW_CLASS_NAME,
+            ..Default::default()
+        };
+
+        let atom = RegisterClassW(&window_class);
+        if atom == 0 {
+            let error = GetLastError();
+            if error != ERROR_CLASS_ALREADY_EXISTS {
+                anyhow::bail!("Failed to register menu owner window class: {:?}", error);
+            }
+        }
+
+        let hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            MENU_OWNER_WINDOW_CLASS_NAME,
+            w!(""),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            HWND::default(),
+            HMENU::default(),
+            hinstance,
+            None,
+        )
+        .context("Failed to create menu owner window")?;
+
+        Ok(MenuOwnerWindow(hwnd))
     }
 }
 
 fn launch_settings_app() -> Result<()> {
-    let settings_path = resolve_settings_app_path()?;
+    let settings_app = resolve_settings_app_path()?;
+    let settings_path = settings_app.path;
     let install_dir = settings_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -303,51 +348,111 @@ fn launch_settings_app() -> Result<()> {
         anyhow::bail!("Settings app not found: {}", settings_path.display());
     }
 
-    Command::new(&settings_path)
-        .current_dir(install_dir)
-        .spawn()
-        .with_context(|| format!("Failed to spawn {}", settings_path.display()))?;
+    shell_execute_open(&settings_path, install_dir).with_context(|| {
+        format!(
+            "Failed to launch settings app from {}: {}",
+            settings_app.source,
+            settings_path.display()
+        )
+    })?;
 
     Ok(())
 }
 
-fn resolve_settings_app_path() -> Result<PathBuf> {
-    if let Some(settings_path) = resolve_settings_app_path_from_registry()? {
-        return Ok(settings_path);
+fn shell_execute_open(settings_path: &Path, install_dir: &Path) -> Result<()> {
+    let settings_path = wide_null(&settings_path.to_string_lossy());
+    let install_dir = wide_null(&install_dir.to_string_lossy());
+
+    let result = unsafe {
+        ShellExecuteW(
+            HWND::default(),
+            w!("open"),
+            PCWSTR(settings_path.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR(install_dir.as_ptr()),
+            SW_SHOWNORMAL,
+        )
+    };
+
+    if result.0 as isize <= 32 {
+        anyhow::bail!("ShellExecuteW failed: code={}", result.0 as isize);
     }
 
-    let local_app_data = env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?;
-    let fallback_install_location = Path::new(&local_app_data).join(SETTINGS_APP_DIRNAME);
-    let fallback_install_location = fallback_install_location.to_string_lossy();
-
-    resolve_settings_app_path_from_install_location(
-        fallback_install_location.as_ref(),
-        SETTINGS_APP_FILENAME,
-    )
+    Ok(())
 }
 
-fn resolve_settings_app_path_from_registry() -> Result<Option<PathBuf>> {
-    for (hkey, flags) in [
-        (HKEY_CURRENT_USER, REG_ROUTINE_FLAGS(0)),
-        (HKEY_LOCAL_MACHINE, REG_ROUTINE_FLAGS(0)),
-        (HKEY_LOCAL_MACHINE, RRF_SUBKEY_WOW6464KEY),
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SettingsAppPath {
+    path: PathBuf,
+    source: &'static str,
+}
+
+fn resolve_settings_app_path() -> Result<SettingsAppPath> {
+    let mut candidates = resolve_settings_app_path_candidates()?;
+
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+        let fallback_install_location = Path::new(&local_app_data).join(SETTINGS_APP_DIRNAME);
+        let fallback_install_location = fallback_install_location.to_string_lossy();
+        candidates.push(SettingsAppPath {
+            path: resolve_settings_app_path_from_install_location(
+                fallback_install_location.as_ref(),
+                SETTINGS_APP_FILENAME,
+            )?,
+            source: "LOCALAPPDATA fallback",
+        });
+    } else {
+        tracing::debug!("LOCALAPPDATA is not set; skip settings app fallback path");
+    }
+
+    select_existing_settings_app_path(candidates, Path::is_file)
+}
+
+fn resolve_settings_app_path_candidates() -> Result<Vec<SettingsAppPath>> {
+    let mut candidates = Vec::new();
+
+    for (hkey, flags, source) in [
+        (
+            HKEY_CURRENT_USER,
+            REG_ROUTINE_FLAGS(0),
+            "HKCU uninstall key",
+        ),
+        (
+            HKEY_CURRENT_USER,
+            RRF_SUBKEY_WOW6464KEY,
+            "HKCU WOW64 uninstall key",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            REG_ROUTINE_FLAGS(0),
+            "HKLM uninstall key",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            RRF_SUBKEY_WOW6464KEY,
+            "HKLM WOW64 uninstall key",
+        ),
     ] {
-        match resolve_settings_app_path_from_uninstall_key(hkey, flags) {
-            Ok(Some(settings_path)) => return Ok(Some(settings_path)),
+        match resolve_settings_app_path_from_uninstall_key(hkey, flags, source) {
+            Ok(Some(settings_path)) => candidates.push(settings_path),
             Ok(None) => {}
             Err(error) => {
-                tracing::debug!(?error, "Skip invalid settings app install metadata");
+                tracing::debug!(?error, source, "Skip invalid settings app install metadata");
             }
         }
     }
 
-    Ok(None)
+    Ok(candidates)
 }
 
 fn resolve_settings_app_path_from_uninstall_key(
     hkey: HKEY,
     flags: REG_ROUTINE_FLAGS,
-) -> Result<Option<PathBuf>> {
+    source: &'static str,
+) -> Result<Option<SettingsAppPath>> {
     let install_location = match read_registry_string(
         hkey,
         SETTINGS_APP_UNINSTALL_SUBKEY,
@@ -369,7 +474,26 @@ fn resolve_settings_app_path_from_uninstall_key(
     let settings_path =
         resolve_settings_app_path_from_install_location(&install_location, &main_binary_name)?;
 
-    Ok(Some(settings_path))
+    Ok(Some(SettingsAppPath {
+        path: settings_path,
+        source,
+    }))
+}
+
+fn select_existing_settings_app_path(
+    candidates: Vec<SettingsAppPath>,
+    exists: impl Fn(&Path) -> bool,
+) -> Result<SettingsAppPath> {
+    let candidate_list = candidates
+        .iter()
+        .map(|candidate| format!("{}={}", candidate.source, candidate.path.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    candidates
+        .into_iter()
+        .find(|candidate| exists(&candidate.path))
+        .with_context(|| format!("Settings app not found in candidates: {candidate_list}"))
 }
 
 fn resolve_settings_app_path_from_install_location(
@@ -489,7 +613,10 @@ impl ITfSource_Impl for TextServiceFactory_Impl {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_settings_app_path_from_install_location, trim_registry_string};
+    use super::{
+        resolve_settings_app_path_from_install_location, select_existing_settings_app_path,
+        trim_registry_string, SettingsAppPath,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -525,5 +652,45 @@ mod tests {
     #[test]
     fn trim_registry_string_removes_wrapping_quotes_only() {
         assert_eq!(trim_registry_string("  \"Azookey\"  "), "Azookey");
+    }
+
+    #[test]
+    fn select_existing_settings_app_path_skips_missing_registry_candidate() {
+        let candidates = vec![
+            SettingsAppPath {
+                path: PathBuf::from("C:/Old/Azookey/frontend.exe"),
+                source: "HKCU uninstall key",
+            },
+            SettingsAppPath {
+                path: PathBuf::from("C:/Users/test/AppData/Local/Azookey/frontend.exe"),
+                source: "LOCALAPPDATA fallback",
+            },
+        ];
+
+        let selected = select_existing_settings_app_path(candidates, |path| {
+            path == PathBuf::from("C:/Users/test/AppData/Local/Azookey/frontend.exe")
+        })
+        .expect("existing fallback should be selected");
+
+        assert_eq!(selected.source, "LOCALAPPDATA fallback");
+        assert_eq!(
+            selected.path,
+            PathBuf::from("C:/Users/test/AppData/Local/Azookey/frontend.exe")
+        );
+    }
+
+    #[test]
+    fn select_existing_settings_app_path_reports_all_missing_candidates() {
+        let candidates = vec![SettingsAppPath {
+            path: PathBuf::from("C:/Old/Azookey/frontend.exe"),
+            source: "HKCU uninstall key",
+        }];
+
+        let error = select_existing_settings_app_path(candidates, |_| false)
+            .expect_err("missing candidates should fail");
+
+        assert!(error
+            .to_string()
+            .contains("HKCU uninstall key=C:/Old/Azookey/frontend.exe"));
     }
 }
