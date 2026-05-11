@@ -54,8 +54,6 @@ pub extern "system" fn DllMain(
         tracing::debug!("DLL_PROCESS_DETACH");
 
         let result: anyhow::Result<()> = (|| {
-            tsf::language_bar::cleanup_menu_owner_window();
-
             let mut dll_instance = DllModule::get()?;
             dll_instance.hinst = None;
             // send a signal to the tracing writer thread to exit

@@ -1,5 +1,4 @@
 use std::{
-    cell::RefCell,
     env,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU32, Ordering},
@@ -17,7 +16,7 @@ use windows::{
             Ole::CONNECT_E_CANNOTCONNECT,
             Registry::{
                 RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_ROUTINE_FLAGS,
-                REG_VALUE_TYPE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY,
+                REG_VALUE_TYPE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6432KEY, RRF_SUBKEY_WOW6464KEY,
             },
         },
         UI::{
@@ -29,10 +28,10 @@ use windows::{
             },
             WindowsAndMessaging::{
                 AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-                DestroyWindow, IsWindow, LoadImageW, PostMessageW, RegisterClassW,
-                SetForegroundWindow, TrackPopupMenu, UnregisterClassW, HICON, HMENU, IMAGE_ICON,
-                LR_DEFAULTCOLOR, MF_STRING, SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD,
-                TPM_RIGHTBUTTON, WM_NULL, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
+                DestroyWindow, LoadImageW, PostMessageW, RegisterClassW, SetForegroundWindow,
+                TrackPopupMenu, UnregisterClassW, HICON, HMENU, IMAGE_ICON, LR_DEFAULTCOLOR,
+                MF_STRING, SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
+                WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
             },
         },
     },
@@ -68,10 +67,6 @@ const SETTINGS_APP_INSTALL_LOCATION_VALUE: PCWSTR = w!("InstallLocation");
 const SETTINGS_APP_MAIN_BINARY_NAME_VALUE: PCWSTR = w!("MainBinaryName");
 
 static MENU_OWNER_WINDOW_CLASS_SEQUENCE: AtomicU32 = AtomicU32::new(0);
-
-thread_local! {
-    static MENU_OWNER_WINDOW: RefCell<Option<MenuOwnerWindow>> = RefCell::new(None);
-}
 
 // you need to implement these three interfaces to create a language bar item
 // if not, you will get E_FAIL error in ITfLangBarItemMgr::AddItem
@@ -211,12 +206,6 @@ impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
     }
 }
 
-pub(crate) fn cleanup_menu_owner_window() {
-    MENU_OWNER_WINDOW.with(|owner| {
-        owner.borrow_mut().take();
-    });
-}
-
 fn launch_settings_app_with_logging() {
     if let Err(error) = launch_settings_app() {
         tracing::warn!(?error, "Failed to launch settings app");
@@ -250,12 +239,11 @@ fn show_settings_menu(pt: &POINT) -> Result<Option<u32>> {
     }
 
     unsafe {
+        let owner = create_menu_owner_window()?;
         let menu = PopupMenu(CreatePopupMenu()?);
         AppendMenuW(menu.0, MF_STRING, SETTINGS_MENU_ID, w!("設定"))?;
 
-        let hwnd = menu_owner_window()?;
-
-        let _ = SetForegroundWindow(hwnd);
+        let _ = SetForegroundWindow(owner.hwnd);
 
         let selected = TrackPopupMenu(
             menu.0,
@@ -263,12 +251,12 @@ fn show_settings_menu(pt: &POINT) -> Result<Option<u32>> {
             pt.x,
             pt.y,
             0,
-            hwnd,
+            owner.hwnd,
             None,
         )
         .0 as u32;
 
-        let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = PostMessageW(owner.hwnd, WM_NULL, WPARAM(0), LPARAM(0));
 
         if selected == 0 {
             Ok(None)
@@ -285,28 +273,6 @@ unsafe extern "system" fn menu_owner_window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-}
-
-fn menu_owner_window() -> Result<HWND> {
-    MENU_OWNER_WINDOW.with(|owner| {
-        let recreate = {
-            let owner = owner.borrow();
-            owner
-                .as_ref()
-                .map(|window| unsafe { !IsWindow(window.hwnd).as_bool() })
-                .unwrap_or(true)
-        };
-
-        if recreate {
-            owner.borrow_mut().replace(create_menu_owner_window()?);
-        }
-
-        owner
-            .borrow()
-            .as_ref()
-            .map(|window| window.hwnd)
-            .context("Menu owner window is not available")
-    })
 }
 
 fn create_menu_owner_window() -> Result<MenuOwnerWindow> {
@@ -334,7 +300,7 @@ fn create_menu_owner_window() -> Result<MenuOwnerWindow> {
                 anyhow::bail!("Failed to register menu owner window class: {:?}", error);
             }
 
-            let hwnd = CreateWindowExW(
+            let hwnd = match CreateWindowExW(
                 WS_EX_TOOLWINDOW,
                 PCWSTR(class_name.as_ptr()),
                 w!(""),
@@ -347,8 +313,13 @@ fn create_menu_owner_window() -> Result<MenuOwnerWindow> {
                 HMENU::default(),
                 hinstance,
                 None,
-            )
-            .context("Failed to create menu owner window")?;
+            ) {
+                Ok(hwnd) => hwnd,
+                Err(error) => {
+                    let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), hinstance);
+                    return Err(error).context("Failed to create menu owner window");
+                }
+            };
 
             return Ok(MenuOwnerWindow {
                 hwnd,
@@ -458,7 +429,12 @@ fn resolve_settings_app_path_candidates() -> Result<Vec<SettingsAppPath>> {
         (
             HKEY_CURRENT_USER,
             RRF_SUBKEY_WOW6464KEY,
-            "HKCU WOW64 uninstall key",
+            "HKCU 64-bit uninstall key",
+        ),
+        (
+            HKEY_CURRENT_USER,
+            RRF_SUBKEY_WOW6432KEY,
+            "HKCU 32-bit uninstall key",
         ),
         (
             HKEY_LOCAL_MACHINE,
@@ -468,7 +444,12 @@ fn resolve_settings_app_path_candidates() -> Result<Vec<SettingsAppPath>> {
         (
             HKEY_LOCAL_MACHINE,
             RRF_SUBKEY_WOW6464KEY,
-            "HKLM WOW64 uninstall key",
+            "HKLM 64-bit uninstall key",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            RRF_SUBKEY_WOW6432KEY,
+            "HKLM 32-bit uninstall key",
         ),
     ] {
         match resolve_settings_app_path_from_uninstall_key(hkey, flags, source) {
