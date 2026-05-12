@@ -341,6 +341,30 @@ fn clause_integration_auto_clause_navigation_preserves_tyu_sequence_boundary() {
 }
 
 #[test]
+fn clause_integration_auto_clause_navigation_preserves_realtime_suffix_display() {
+    let extra = vec![HarnessUserAction::Right];
+    let (harness, _, history) = run_from_auto_clause_preserved_suffix(&extra);
+
+    assert_eq!(
+        harness_visible_clauses(&harness),
+        "ある程度 / 長い / 文節でも複数に分割される",
+        "history: {}\nraw clauses: {}\nclause_snapshots: {}\nfuture_clause_snapshots: {}\npreview={} fixed_prefix={} suffix={}",
+        history_string(&history),
+        harness_raw_clauses(&harness),
+        TextServiceFactory::debug_clause_snapshots(&harness.clause_snapshots),
+        TextServiceFactory::debug_future_clause_snapshots(&harness.future_clause_snapshots),
+        harness.preview,
+        harness.fixed_prefix,
+        harness.suffix,
+    );
+    assert_eq!(harness.suffix, "文節でも複数に分割される");
+    assert_eq!(
+        TextServiceFactory::current_clause_preview(&harness.preview, &harness.fixed_prefix),
+        "長い"
+    );
+}
+
+#[test]
 fn clause_integration_logged_baseline_f7_keeps_future_display_when_moving_left() {
     let extra = vec![
         HarnessUserAction::Left,
