@@ -1,11 +1,14 @@
 {
   "name": "frontend",
   "private": true,
-  "version": "0.1.0-batao.2",
+  "version": "0.1.0-batao.3",
   "type": "module",
   "scripts": {
+    "sync-version": "node ../scripts/sync-version.mjs",
+    "prebuild": "npm run sync-version",
     "dev": "vite",
     "build": "tsc && vite build",
+    "pretauri": "npm run sync-version",
     "preview": "vite preview",
     "tauri": "tauri"
   },

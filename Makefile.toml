@@ -24,12 +24,17 @@ command = "cargo"
 args = ["build", "-p", "azookey-windows", "--target=i686-pc-windows-msvc", "${@}"]
 
 [tasks.build_tauri]
-description = "Build the swift code"
+description = "Build the Tauri frontend"
 script_runner = "@shell"
 script = """
 cd frontend
 npm run tauri build
 """
+
+[tasks.sync_version]
+description = "Sync app version into generated metadata"
+command = "node"
+args = ["scripts/sync-version.mjs"]
 
 [tasks.build_installer]
 command = "iscc"
@@ -81,6 +86,7 @@ clear = true
 description = "Run the flow"
 dependencies = [
     "format",
+    "sync_version",
     "build_swift",
     "build_x64",
     "build_x86",
