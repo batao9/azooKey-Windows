@@ -377,19 +377,18 @@ private func clampedCorrespondingCount(
 @MainActor func cursorPrefixCandidateResults(
     mainResults: [Candidate],
     firstClauseResults: [Candidate],
+    exactClauseResults: [Candidate] = [],
     originalComposingText: ComposingText,
     previewComposingText: ComposingText,
     previewHiragana: String
 ) -> [Candidate] {
-    guard let firstClauseCandidate = firstClauseResults.first else {
+    guard let firstClauseCorrespondingCount = cursorPrefixFirstClauseCorrespondingCount(
+        firstClauseResults: firstClauseResults,
+        originalComposingText: originalComposingText,
+        previewComposingText: previewComposingText
+    ) else {
         return mainResults
     }
-
-    let firstClauseCorrespondingCount = resolveCandidateCompositionForDisplay(
-        originalComposingText: originalComposingText,
-        previewComposingText: previewComposingText,
-        candidateComposingCount: firstClauseCandidate.composingCount
-    ).correspondingCount
 
     var seenTexts = Set<String>()
     var results: [Candidate] = []
@@ -402,23 +401,68 @@ private func clampedCorrespondingCount(
         results.append(candidate)
     }
 
-    for candidate in firstClauseResults {
-        appendIfNeeded(candidate)
-    }
-
-    for candidate in mainResults {
+    func matchesFirstClauseBoundary(_ candidate: Candidate) -> Bool {
         let correspondingCount = resolveCandidateCompositionForDisplay(
             originalComposingText: originalComposingText,
             previewComposingText: previewComposingText,
             candidateComposingCount: candidate.composingCount
         ).correspondingCount
-        guard correspondingCount == firstClauseCorrespondingCount else {
+        return correspondingCount == firstClauseCorrespondingCount
+    }
+
+    for candidate in firstClauseResults {
+        guard matchesFirstClauseBoundary(candidate) else {
+            continue
+        }
+        appendIfNeeded(candidate)
+    }
+
+    for candidate in mainResults {
+        guard matchesFirstClauseBoundary(candidate) else {
+            continue
+        }
+        appendIfNeeded(candidate)
+    }
+
+    for candidate in exactClauseResults {
+        guard matchesFirstClauseBoundary(candidate) else {
             continue
         }
         appendIfNeeded(candidate)
     }
 
     return results
+}
+
+@MainActor func cursorPrefixFirstClauseCorrespondingCount(
+    firstClauseResults: [Candidate],
+    originalComposingText: ComposingText,
+    previewComposingText: ComposingText
+) -> Int? {
+    firstClauseResults
+        .map {
+            resolveCandidateCompositionForDisplay(
+                originalComposingText: originalComposingText,
+                previewComposingText: previewComposingText,
+                candidateComposingCount: $0.composingCount
+            ).correspondingCount
+        }
+        .max()
+}
+
+@MainActor func makeCursorPrefixExactClauseComposingText(
+    prefixComposingText: ComposingText,
+    correspondingCount: Int
+) -> ComposingText {
+    var clauseComposingText = ComposingText()
+    let count = clampedCorrespondingCount(
+        composingText: prefixComposingText,
+        rawCount: correspondingCount
+    )
+    clauseComposingText.insertAtCursorPosition(
+        Array(prefixComposingText.input.prefix(count))
+    )
+    return clauseComposingText
 }
 
 @MainActor func getOptions(context: String = "") -> ConvertRequestOptions {
@@ -878,14 +922,44 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     let requestStart = ProcessInfo.processInfo.systemUptime
     let converted = converter.requestCandidates(previewPrefixComposingText, options: options)
     let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
-    let cursorPrefixResults = cursorPrefixCandidateResults(
+    let firstClauseCorrespondingCount = cursorPrefixFirstClauseCorrespondingCount(
+        firstClauseResults: converted.firstClauseResults,
+        originalComposingText: prefixComposingText,
+        previewComposingText: previewPrefixComposingText
+    )
+    let preliminaryCursorPrefixResults = cursorPrefixCandidateResults(
         mainResults: converted.mainResults,
         firstClauseResults: converted.firstClauseResults,
         originalComposingText: prefixComposingText,
         previewComposingText: previewPrefixComposingText,
         previewHiragana: previewPrefixHiragana
     )
-    serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates returned candidateCount=\(cursorPrefixResults.count) firstClauseCandidateCount=\(converted.firstClauseResults.count) mainCandidateCount=\(converted.mainResults.count) elapsed_ms=\(requestMs)")
+    let shouldRequestExactClauseResults = preliminaryCursorPrefixResults.count < 5
+    var exactClauseResults: [Candidate] = []
+    if let firstClauseCorrespondingCount, shouldRequestExactClauseResults {
+        let exactClauseComposingText = makeCursorPrefixExactClauseComposingText(
+            prefixComposingText: prefixComposingText,
+            correspondingCount: firstClauseCorrespondingCount
+        )
+        let exactClausePreviewState = makeCandidatePreviewComposingText(
+            from: exactClauseComposingText
+        )
+        exactClauseResults = converter.requestCandidates(
+            exactClausePreviewState.composingText,
+            options: options
+        ).mainResults
+    }
+    let cursorPrefixResults = exactClauseResults.isEmpty
+        ? preliminaryCursorPrefixResults
+        : cursorPrefixCandidateResults(
+            mainResults: converted.mainResults,
+            firstClauseResults: converted.firstClauseResults,
+            exactClauseResults: exactClauseResults,
+            originalComposingText: prefixComposingText,
+            previewComposingText: previewPrefixComposingText,
+            previewHiragana: previewPrefixHiragana
+        )
+    serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates returned candidateCount=\(cursorPrefixResults.count) firstClauseCandidateCount=\(converted.firstClauseResults.count) mainCandidateCount=\(converted.mainResults.count) exactClauseCandidateCount=\(exactClauseResults.count) elapsed_ms=\(requestMs)")
     var result: [FFICandidate] = []
 
     for i in 0..<cursorPrefixResults.count {
