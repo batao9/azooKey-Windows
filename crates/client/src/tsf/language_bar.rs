@@ -336,9 +336,9 @@ fn create_menu_owner_window() -> Result<MenuOwnerWindow> {
 fn menu_owner_window_class_name(hmodule: windows::Win32::Foundation::HMODULE) -> Vec<u16> {
     let sequence = MENU_OWNER_WINDOW_CLASS_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!(
-        "AzookeyLangBarMenuOwner-{}-{:p}-{}",
+        "AzookeyLangBarMenuOwner-{}-{:#x}-{}",
         std::process::id(),
-        hmodule.0,
+        hmodule.0 as usize,
         sequence
     )
     .as_str()
@@ -510,6 +510,12 @@ fn select_existing_settings_app_path(
         }
 
         missing_candidates.push(candidate);
+    }
+
+    if missing_candidates.is_empty() {
+        anyhow::bail!(
+            "Settings app not found because no install metadata or LOCALAPPDATA fallback candidate is available"
+        );
     }
 
     let candidate_list = missing_candidates
@@ -717,5 +723,15 @@ mod tests {
         assert!(error
             .to_string()
             .contains("HKCU uninstall key=C:/Old/Azookey/frontend.exe"));
+    }
+
+    #[test]
+    fn select_existing_settings_app_path_reports_empty_candidates() {
+        let error = select_existing_settings_app_path(Vec::new(), |_| false)
+            .expect_err("empty candidates should fail");
+
+        assert!(error
+            .to_string()
+            .contains("no install metadata or LOCALAPPDATA fallback candidate is available"));
     }
 }
