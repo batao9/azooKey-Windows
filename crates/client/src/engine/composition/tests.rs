@@ -365,7 +365,7 @@ fn ensure_clause_navigation_preserves_current_candidate_selection() {
     let mut fixed_prefix = String::new();
     let mut corresponding_count = 13;
     let mut selection_index = 1;
-    let mut candidates = candidates(
+    let mut current_candidates = candidates(
         &["いい加減統一", "良い加減統一"],
         &["", ""],
         "いいかげんとういつ",
@@ -388,7 +388,7 @@ fn ensure_clause_navigation_preserves_current_candidate_selection() {
         fixed_prefix: &mut fixed_prefix,
         corresponding_count: &mut corresponding_count,
         selection_index: &mut selection_index,
-        candidates: &mut candidates,
+        candidates: &mut current_candidates,
         clause_snapshots: &mut clause_snapshots,
         future_clause_snapshots: &mut future_clause_snapshots,
         current_clause_is_split_derived: &mut current_clause_is_split_derived,
@@ -406,6 +406,124 @@ fn ensure_clause_navigation_preserves_current_candidate_selection() {
     assert_eq!(selection_index, 1);
     assert_eq!(corresponding_count, 7);
     assert_eq!(suffix, "統一");
+}
+
+struct MoveRightCollapsedRemainderBackend {
+    moved_left: bool,
+}
+
+impl ClauseActionBackend for MoveRightCollapsedRemainderBackend {
+    fn move_cursor(&mut self, offset: i32) -> anyhow::Result<Candidates> {
+        if offset < 0 {
+            self.moved_left = true;
+        }
+
+        if self.moved_left {
+            return Ok(candidates(
+                &["長い", "永い", "ながい"],
+                &["文節でも複数に分割される"; 3],
+                "ながいぶんせつでもふくすうにぶんかつされる",
+                &[5, 5, 5],
+            ));
+        }
+
+        Ok(Candidates::default())
+    }
+
+    fn shrink_text(&mut self, _offset: i32) -> anyhow::Result<Candidates> {
+        Ok(candidates(
+            &["長い文節でも複数に分割される"],
+            &[""],
+            "ながいぶんせつでもふくすうにぶんかつされる",
+            &[26],
+        ))
+    }
+}
+
+#[test]
+fn move_clause_right_preserves_future_clause_when_server_returns_collapsed_remainder() {
+    let mut preview = "ある程度".to_string();
+    let mut suffix = "長い文節でも複数に分割される".to_string();
+    let mut raw_input = "aruteidonagaibunsetudemohukusuunibunkatusareru".to_string();
+    let mut raw_hiragana = "あるていどながいぶんせつでもふくすうにぶんかつされる".to_string();
+    let mut fixed_prefix = String::new();
+    let mut corresponding_count = 9;
+    let mut selection_index = 0;
+    let mut current_candidates = candidates(
+        &["ある程度"],
+        &["長い文節でも複数に分割される"],
+        "あるていどながいぶんせつでもふくすうにぶんかつされる",
+        &[9],
+    );
+    let mut clause_snapshots = Vec::new();
+    let mut future_clause_snapshots = vec![
+        actual_future_snapshot(
+            "文節でも",
+            "複数に分割される",
+            "bunsetudemohukusuunibunkatusareru",
+            "ぶんせつでもふくすうにぶんかつされる",
+            11,
+        ),
+        TextServiceFactory::build_future_clause_snapshot(
+            "長い",
+            "文節でも複数に分割される",
+            "nagaibunsetudemohukusuunibunkatusareru",
+            "ながいぶんせつでもふくすうにぶんかつされる",
+            "",
+            5,
+            0,
+            &candidates(
+                &["長い", "永い", "ながい"],
+                &["文節でも複数に分割される"; 3],
+                "ながいぶんせつでもふくすうにぶんかつされる",
+                &[5, 5, 5],
+            ),
+        ),
+    ];
+    let mut current_clause_is_split_derived = false;
+    let mut current_clause_is_direct_split_remainder = false;
+    let mut current_clause_has_split_left_neighbor = false;
+    let mut current_clause_split_group_id = None;
+    let mut next_split_group_id = 1;
+    let mut backend = MoveRightCollapsedRemainderBackend { moved_left: false };
+
+    let mut state = ClauseActionStateMut {
+        preview: &mut preview,
+        suffix: &mut suffix,
+        raw_input: &mut raw_input,
+        raw_hiragana: &mut raw_hiragana,
+        fixed_prefix: &mut fixed_prefix,
+        corresponding_count: &mut corresponding_count,
+        selection_index: &mut selection_index,
+        candidates: &mut current_candidates,
+        clause_snapshots: &mut clause_snapshots,
+        future_clause_snapshots: &mut future_clause_snapshots,
+        current_clause_is_split_derived: &mut current_clause_is_split_derived,
+        current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+        current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+        current_clause_split_group_id: &mut current_clause_split_group_id,
+        next_split_group_id: &mut next_split_group_id,
+    };
+
+    let effect = TextServiceFactory::apply_move_clause(&mut state, &mut backend, 1)
+        .expect("right move should return");
+
+    assert!(effect.applied);
+    assert!(backend.moved_left);
+    assert_eq!(
+        TextServiceFactory::current_clause_preview(&preview, &fixed_prefix),
+        "長い"
+    );
+    assert_eq!(suffix, "文節でも複数に分割される");
+    assert_eq!(
+        TextServiceFactory::clause_texts_for_log(
+            &preview,
+            &fixed_prefix,
+            &[],
+            &future_clause_snapshots
+        ),
+        "長い / 文節でも"
+    );
 }
 
 #[test]

@@ -2274,6 +2274,9 @@ impl TextServiceFactory {
             .last()
             .map(|snapshot| {
                 server_candidates.hiragana == snapshot.raw_hiragana
+                    || server_candidates
+                        .hiragana
+                        .starts_with(&snapshot.raw_hiragana)
                     || server_candidates.hiragana.ends_with(&snapshot.raw_hiragana)
                     || snapshot.raw_hiragana.ends_with(&server_candidates.hiragana)
             })
