@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { ExternalLink, Keyboard, RefreshCcw, Table2, Trash2 } from "lucide-react";
@@ -232,6 +233,7 @@ export const General = () => {
     const [isRomajiEditorOpen, setIsRomajiEditorOpen] = useState(false);
     const [romajiDraftRows, setRomajiDraftRows] = useState<RomajiRow[]>([]);
     const [defaultRomajiRows, setDefaultRomajiRows] = useState<RomajiRow[]>([]);
+    const [appVersion, setAppVersion] = useState<string | null>(null);
     const [pendingFocusNewRow, setPendingFocusNewRow] = useState(false);
     const romajiEditorScrollRef = useRef<HTMLDivElement | null>(null);
     const romajiInputRefs = useRef<Array<HTMLInputElement | null>>([]);
@@ -259,6 +261,12 @@ export const General = () => {
             })
             .catch(() => {
                 // Keep empty defaults if fetch fails
+            });
+
+        getVersion()
+            .then(setAppVersion)
+            .catch(() => {
+                setAppVersion(null);
             });
     }, []);
 
@@ -474,7 +482,9 @@ export const General = () => {
                     <div className="flex items-center space-x-4 rounded-md border p-4">
                         <RefreshCcw />
                         <div className="flex-1 space-y-1">
-                            <p className="text-sm font-medium leading-none">v0.1.0-batao.2</p>
+                            <p className="text-sm font-medium leading-none">
+                                {appVersion ? `v${appVersion}` : "v-"}
+                            </p>
                         </div>
                         <Button variant="secondary">
                             <a
