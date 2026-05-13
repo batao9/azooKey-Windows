@@ -269,7 +269,7 @@ fn clause_integration_fkeys_preserve_display_when_moving_right() {
 }
 
 #[test]
-fn clause_integration_fkeys_preserve_display_when_committing_current_clause() {
+fn clause_integration_fkeys_commit_all_clauses_when_clause_navigation_is_active() {
     for (set_type, converted_clause) in fkey_cases() {
         let extra = vec![
             HarnessUserAction::SetTextType(set_type),

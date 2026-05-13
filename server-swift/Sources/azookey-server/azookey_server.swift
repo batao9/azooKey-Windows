@@ -35,6 +35,8 @@ private let fallbackDictionaryURL: URL = {
 let maxUserDictionaryEntryCount = 50
 let minInputCountForZenzaiCandidates = 4
 let minHiraganaCountForZenzaiCandidates = 2
+// Request exact-clause supplements only when boundary-matched candidates are sparse.
+let cursorPrefixExactClauseSupplementCandidateThreshold = 5
 let serverLogFileName = "server.log"
 
 private enum ServerLogLevel: Int {
@@ -358,6 +360,28 @@ private func clampedCorrespondingCount(
     )
 }
 
+typealias CandidateDisplayResolution = (correspondingCount: Int, remainingConvertTarget: String)
+
+@MainActor func resolveCandidateCompositionForDisplay(
+    originalComposingText: ComposingText,
+    previewComposingText: ComposingText,
+    candidateComposingCount: ComposingCount,
+    resolutionCache: inout [String: CandidateDisplayResolution]
+) -> CandidateDisplayResolution {
+    let cacheKey = String(describing: candidateComposingCount)
+    if let cached = resolutionCache[cacheKey] {
+        return cached
+    }
+
+    let resolved = resolveCandidateCompositionForDisplay(
+        originalComposingText: originalComposingText,
+        previewComposingText: previewComposingText,
+        candidateComposingCount: candidateComposingCount
+    )
+    resolutionCache[cacheKey] = resolved
+    return resolved
+}
+
 @MainActor private func debugLogResolvedCorrespondingCount(
     scope: String,
     candidateIndex: Int,
@@ -382,11 +406,36 @@ private func clampedCorrespondingCount(
     previewComposingText: ComposingText,
     previewHiragana: String
 ) -> [Candidate] {
-    guard let firstClauseCorrespondingCount = cursorPrefixFirstClauseCorrespondingCount(
+    var resolutionCache: [String: CandidateDisplayResolution] = [:]
+    let firstClauseCorrespondingCount = cursorPrefixFirstClauseCorrespondingCount(
         firstClauseResults: firstClauseResults,
         originalComposingText: originalComposingText,
-        previewComposingText: previewComposingText
-    ) else {
+        previewComposingText: previewComposingText,
+        resolutionCache: &resolutionCache
+    )
+    return cursorPrefixCandidateResults(
+        mainResults: mainResults,
+        firstClauseResults: firstClauseResults,
+        exactClauseResults: exactClauseResults,
+        firstClauseCorrespondingCount: firstClauseCorrespondingCount,
+        originalComposingText: originalComposingText,
+        previewComposingText: previewComposingText,
+        previewHiragana: previewHiragana,
+        resolutionCache: &resolutionCache
+    )
+}
+
+@MainActor func cursorPrefixCandidateResults(
+    mainResults: [Candidate],
+    firstClauseResults: [Candidate],
+    exactClauseResults: [Candidate] = [],
+    firstClauseCorrespondingCount: Int?,
+    originalComposingText: ComposingText,
+    previewComposingText: ComposingText,
+    previewHiragana: String,
+    resolutionCache: inout [String: CandidateDisplayResolution]
+) -> [Candidate] {
+    guard let firstClauseCorrespondingCount else {
         return mainResults
     }
 
@@ -405,7 +454,8 @@ private func clampedCorrespondingCount(
         let correspondingCount = resolveCandidateCompositionForDisplay(
             originalComposingText: originalComposingText,
             previewComposingText: previewComposingText,
-            candidateComposingCount: candidate.composingCount
+            candidateComposingCount: candidate.composingCount,
+            resolutionCache: &resolutionCache
         ).correspondingCount
         return correspondingCount == firstClauseCorrespondingCount
     }
@@ -439,12 +489,28 @@ private func clampedCorrespondingCount(
     originalComposingText: ComposingText,
     previewComposingText: ComposingText
 ) -> Int? {
+    var resolutionCache: [String: CandidateDisplayResolution] = [:]
+    return cursorPrefixFirstClauseCorrespondingCount(
+        firstClauseResults: firstClauseResults,
+        originalComposingText: originalComposingText,
+        previewComposingText: previewComposingText,
+        resolutionCache: &resolutionCache
+    )
+}
+
+@MainActor func cursorPrefixFirstClauseCorrespondingCount(
+    firstClauseResults: [Candidate],
+    originalComposingText: ComposingText,
+    previewComposingText: ComposingText,
+    resolutionCache: inout [String: CandidateDisplayResolution]
+) -> Int? {
     firstClauseResults
         .map {
             resolveCandidateCompositionForDisplay(
                 originalComposingText: originalComposingText,
                 previewComposingText: previewComposingText,
-                candidateComposingCount: $0.composingCount
+                candidateComposingCount: $0.composingCount,
+                resolutionCache: &resolutionCache
             ).correspondingCount
         }
         .max()
@@ -922,19 +988,23 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     let requestStart = ProcessInfo.processInfo.systemUptime
     let converted = converter.requestCandidates(previewPrefixComposingText, options: options)
     let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
+    var cursorPrefixResolutionCache: [String: CandidateDisplayResolution] = [:]
     let firstClauseCorrespondingCount = cursorPrefixFirstClauseCorrespondingCount(
         firstClauseResults: converted.firstClauseResults,
         originalComposingText: prefixComposingText,
-        previewComposingText: previewPrefixComposingText
+        previewComposingText: previewPrefixComposingText,
+        resolutionCache: &cursorPrefixResolutionCache
     )
     let preliminaryCursorPrefixResults = cursorPrefixCandidateResults(
         mainResults: converted.mainResults,
         firstClauseResults: converted.firstClauseResults,
+        firstClauseCorrespondingCount: firstClauseCorrespondingCount,
         originalComposingText: prefixComposingText,
         previewComposingText: previewPrefixComposingText,
-        previewHiragana: previewPrefixHiragana
+        previewHiragana: previewPrefixHiragana,
+        resolutionCache: &cursorPrefixResolutionCache
     )
-    let shouldRequestExactClauseResults = preliminaryCursorPrefixResults.count < 5
+    let shouldRequestExactClauseResults = preliminaryCursorPrefixResults.count < cursorPrefixExactClauseSupplementCandidateThreshold
     var exactClauseResults: [Candidate] = []
     if let firstClauseCorrespondingCount, shouldRequestExactClauseResults {
         let exactClauseComposingText = makeCursorPrefixExactClauseComposingText(
@@ -955,9 +1025,11 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
             mainResults: converted.mainResults,
             firstClauseResults: converted.firstClauseResults,
             exactClauseResults: exactClauseResults,
+            firstClauseCorrespondingCount: firstClauseCorrespondingCount,
             originalComposingText: prefixComposingText,
             previewComposingText: previewPrefixComposingText,
-            previewHiragana: previewPrefixHiragana
+            previewHiragana: previewPrefixHiragana,
+            resolutionCache: &cursorPrefixResolutionCache
         )
     serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates returned candidateCount=\(cursorPrefixResults.count) firstClauseCandidateCount=\(converted.firstClauseResults.count) mainCandidateCount=\(converted.mainResults.count) exactClauseCandidateCount=\(exactClauseResults.count) elapsed_ms=\(requestMs)")
     var result: [FFICandidate] = []
