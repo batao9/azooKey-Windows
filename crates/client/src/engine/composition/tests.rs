@@ -138,6 +138,17 @@ fn right_arrow_prepares_clause_navigation_without_initial_move() {
 }
 
 #[test]
+fn initial_left_arrow_defers_clause_navigation_ready_ui_sync_until_last_clause() {
+    let actions = vec![
+        ClientAction::EnsureClauseNavigationReady,
+        ClientAction::MoveClause(TextServiceFactory::MOVE_CLAUSE_TO_LAST),
+    ];
+
+    assert!(TextServiceFactory::should_defer_clause_navigation_ready_sync(&actions, 0));
+    assert!(!TextServiceFactory::should_defer_clause_navigation_ready_sync(&actions, 1));
+}
+
+#[test]
 fn enter_commits_all_when_clause_navigation_is_active() {
     let composition = Composition {
         state: CompositionState::Composing,

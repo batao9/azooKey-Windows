@@ -2592,6 +2592,17 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn should_defer_clause_navigation_ready_sync(actions: &[ClientAction], index: usize) -> bool {
+        matches!(
+            (actions.get(index), actions.get(index + 1)),
+            (
+                Some(ClientAction::EnsureClauseNavigationReady),
+                Some(ClientAction::MoveClause(direction)),
+            ) if *direction == Self::MOVE_CLAUSE_TO_LAST
+        )
+    }
+
+    #[inline]
     fn plan_actions_for_user_action(
         composition: &Composition,
         action: &UserAction,
@@ -3322,7 +3333,7 @@ impl TextServiceFactory {
 
         self.update_context(&preview)?;
 
-        for action in actions {
+        for (action_index, action) in actions.iter().enumerate() {
             match action {
                 ClientAction::StartComposition => {
                     self.start_composition()?;
@@ -3571,6 +3582,26 @@ impl TextServiceFactory {
                     };
 
                     if effect.applied {
+                        let defer_ui_sync =
+                            Self::should_defer_clause_navigation_ready_sync(actions, action_index);
+                        if defer_ui_sync {
+                            Self::log_clause_action_state(
+                                "defer",
+                                action,
+                                &preview,
+                                &suffix,
+                                &raw_input,
+                                &raw_hiragana,
+                                &fixed_prefix,
+                                corresponding_count,
+                                selection_index,
+                                &candidates,
+                                &clause_snapshots,
+                                &future_clause_snapshots,
+                            );
+                            continue;
+                        }
+
                         self.sync_clause_action_ui(
                             &preview,
                             &suffix,
