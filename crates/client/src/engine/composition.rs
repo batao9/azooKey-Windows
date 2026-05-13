@@ -1244,6 +1244,7 @@ impl TextServiceFactory {
         }
 
         let navigation_candidates = backend.move_cursor(0)?;
+        // The full-conversion selection index may be outside this shorter clause list.
         let Some(selected) = Self::select_candidate(&navigation_candidates, *state.selection_index)
         else {
             return Ok(ClauseActionEffect::skipped());

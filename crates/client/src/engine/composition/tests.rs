@@ -437,6 +437,63 @@ fn ensure_clause_navigation_preserves_current_candidate_selection() {
     assert_eq!(suffix, "統一");
 }
 
+#[test]
+fn ensure_clause_navigation_clamps_out_of_range_selection_index() {
+    let mut preview = "程良い加減統一".to_string();
+    let mut suffix = String::new();
+    let mut raw_input = "iikagentouitu".to_string();
+    let mut raw_hiragana = "いいかげんとういつ".to_string();
+    let mut fixed_prefix = String::new();
+    let mut corresponding_count = 13;
+    let mut selection_index = 3;
+    let mut current_candidates = candidates(
+        &[
+            "いい加減統一",
+            "良い加減統一",
+            "好い加減統一",
+            "程良い加減統一",
+        ],
+        &["", "", "", ""],
+        "いいかげんとういつ",
+        &[13, 13, 13, 13],
+    );
+    let mut clause_snapshots = Vec::new();
+    let mut future_clause_snapshots = Vec::new();
+    let mut current_clause_is_split_derived = false;
+    let mut current_clause_is_direct_split_remainder = false;
+    let mut current_clause_has_split_left_neighbor = false;
+    let mut current_clause_split_group_id = None;
+    let mut next_split_group_id = 1;
+    let mut backend = PreserveSelectionEnsureBackend;
+
+    let mut state = ClauseActionStateMut {
+        preview: &mut preview,
+        suffix: &mut suffix,
+        raw_input: &mut raw_input,
+        raw_hiragana: &mut raw_hiragana,
+        fixed_prefix: &mut fixed_prefix,
+        corresponding_count: &mut corresponding_count,
+        selection_index: &mut selection_index,
+        candidates: &mut current_candidates,
+        clause_snapshots: &mut clause_snapshots,
+        future_clause_snapshots: &mut future_clause_snapshots,
+        current_clause_is_split_derived: &mut current_clause_is_split_derived,
+        current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+        current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+        current_clause_split_group_id: &mut current_clause_split_group_id,
+        next_split_group_id: &mut next_split_group_id,
+    };
+
+    let effect = TextServiceFactory::ensure_clause_navigation_ready(&mut state, &mut backend)
+        .expect("ensure clause navigation should return");
+
+    assert!(effect.applied);
+    assert_eq!(preview, "良い加減");
+    assert_eq!(selection_index, 1);
+    assert_eq!(corresponding_count, 7);
+    assert_eq!(suffix, "統一");
+}
+
 struct MoveRightCollapsedRemainderBackend {
     moved_left: bool,
 }
