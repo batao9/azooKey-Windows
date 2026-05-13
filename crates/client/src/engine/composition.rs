@@ -2603,6 +2603,18 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn deferred_clause_navigation_ready_sync_update_pos(
+        deferred_update_pos: Option<bool>,
+        move_effect: ClauseActionEffect,
+    ) -> Option<bool> {
+        if move_effect.applied {
+            None
+        } else {
+            deferred_update_pos
+        }
+    }
+
+    #[inline]
     fn plan_actions_for_user_action(
         composition: &Composition,
         action: &UserAction,
@@ -3330,6 +3342,7 @@ impl TextServiceFactory {
             .clone()
             .context("ipc_service is None")?;
         let mut transition = transition;
+        let mut deferred_clause_navigation_ready_sync_update_pos = None;
 
         self.update_context(&preview)?;
 
@@ -3585,6 +3598,8 @@ impl TextServiceFactory {
                         let defer_ui_sync =
                             Self::should_defer_clause_navigation_ready_sync(actions, action_index);
                         if defer_ui_sync {
+                            deferred_clause_navigation_ready_sync_update_pos =
+                                Some(effect.update_pos);
                             Self::log_clause_action_state(
                                 "defer",
                                 action,
@@ -3679,6 +3694,11 @@ impl TextServiceFactory {
                         Self::apply_move_clause(&mut state, &mut ipc_service, *direction)?
                     };
 
+                    let deferred_sync_update_pos =
+                        Self::deferred_clause_navigation_ready_sync_update_pos(
+                            deferred_clause_navigation_ready_sync_update_pos.take(),
+                            effect,
+                        );
                     if effect.applied {
                         self.sync_clause_action_ui(
                             &preview,
@@ -3690,6 +3710,29 @@ impl TextServiceFactory {
                         )?;
                         Self::log_clause_action_state(
                             "after",
+                            action,
+                            &preview,
+                            &suffix,
+                            &raw_input,
+                            &raw_hiragana,
+                            &fixed_prefix,
+                            corresponding_count,
+                            selection_index,
+                            &candidates,
+                            &clause_snapshots,
+                            &future_clause_snapshots,
+                        );
+                    } else if let Some(update_pos) = deferred_sync_update_pos {
+                        self.sync_clause_action_ui(
+                            &preview,
+                            &suffix,
+                            &candidates,
+                            selection_index,
+                            &mut ipc_service,
+                            update_pos,
+                        )?;
+                        Self::log_clause_action_state(
+                            "after-deferred",
                             action,
                             &preview,
                             &suffix,

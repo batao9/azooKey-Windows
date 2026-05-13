@@ -1,6 +1,6 @@
 use super::{
-    Candidates, ClauseActionBackend, ClauseActionStateMut, ClauseSnapshot, Composition,
-    CompositionState, FutureClauseSnapshot, TextServiceFactory,
+    Candidates, ClauseActionBackend, ClauseActionEffect, ClauseActionStateMut, ClauseSnapshot,
+    Composition, CompositionState, FutureClauseSnapshot, TextServiceFactory,
 };
 use crate::engine::{
     client_action::{ClientAction, SetSelectionType, SetTextType},
@@ -146,6 +146,24 @@ fn initial_left_arrow_defers_clause_navigation_ready_ui_sync_until_last_clause()
 
     assert!(TextServiceFactory::should_defer_clause_navigation_ready_sync(&actions, 0));
     assert!(!TextServiceFactory::should_defer_clause_navigation_ready_sync(&actions, 1));
+}
+
+#[test]
+fn skipped_move_to_last_flushes_deferred_clause_navigation_ready_ui_sync() {
+    assert_eq!(
+        TextServiceFactory::deferred_clause_navigation_ready_sync_update_pos(
+            Some(true),
+            ClauseActionEffect::skipped()
+        ),
+        Some(true)
+    );
+    assert_eq!(
+        TextServiceFactory::deferred_clause_navigation_ready_sync_update_pos(
+            Some(true),
+            ClauseActionEffect::applied(true)
+        ),
+        None
+    );
 }
 
 #[test]
