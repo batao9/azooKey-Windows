@@ -660,6 +660,64 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn select_navigation_candidate_for_current_preview(
+        navigation_candidates: &Candidates,
+        current_preview: &str,
+        fixed_prefix: &str,
+        current_candidates: &Candidates,
+        selection_index: i32,
+    ) -> Option<CandidateSelection> {
+        let current_selected = Self::select_candidate(current_candidates, selection_index);
+        let target_preview = current_selected
+            .as_ref()
+            .map(|selected| selected.text.as_str())
+            .filter(|text| !text.is_empty())
+            .unwrap_or(current_preview);
+        let target_clause_preview = target_preview
+            .strip_prefix(fixed_prefix)
+            .unwrap_or(target_preview);
+
+        if let Some(index) = (0..navigation_candidates.texts.len()).find(|index| {
+            let text = navigation_candidates
+                .texts
+                .get(*index)
+                .map(String::as_str)
+                .unwrap_or_default();
+            let sub_text = navigation_candidates
+                .sub_texts
+                .get(*index)
+                .map(String::as_str)
+                .unwrap_or_default();
+
+            target_clause_preview.strip_prefix(text) == Some(sub_text)
+        }) {
+            return Self::select_candidate(navigation_candidates, index as i32);
+        }
+
+        if let Some(index) = navigation_candidates
+            .texts
+            .iter()
+            .enumerate()
+            .filter(|(_, text)| !text.is_empty() && target_clause_preview.starts_with(*text))
+            .max_by_key(|(index, text)| {
+                (
+                    navigation_candidates
+                        .corresponding_count
+                        .get(*index)
+                        .copied()
+                        .unwrap_or(0),
+                    text.len(),
+                )
+            })
+            .map(|(index, _)| index)
+        {
+            return Self::select_candidate(navigation_candidates, index as i32);
+        }
+
+        Self::select_candidate(navigation_candidates, selection_index)
+    }
+
+    #[inline]
     fn candidate_splits_raw_input(selected: &CandidateSelection, raw_input: &str) -> bool {
         selected.corresponding_count > 0
             && selected.corresponding_count < raw_input.chars().count() as i32
@@ -1257,9 +1315,13 @@ impl TextServiceFactory {
         }
 
         let navigation_candidates = backend.move_cursor(0)?;
-        // The full-conversion selection index may be outside this shorter clause list.
-        let Some(selected) = Self::select_candidate(&navigation_candidates, *state.selection_index)
-        else {
+        let Some(selected) = Self::select_navigation_candidate_for_current_preview(
+            &navigation_candidates,
+            state.preview,
+            state.fixed_prefix,
+            state.candidates,
+            *state.selection_index,
+        ) else {
             return Ok(ClauseActionEffect::skipped());
         };
 
