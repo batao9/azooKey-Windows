@@ -28,6 +28,10 @@ use windows::Win32::{
 };
 
 use anyhow::{Context, Result};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash as _, Hasher as _},
+};
 
 #[derive(Default, Clone, PartialEq, Debug)]
 pub enum CompositionState {
@@ -162,13 +166,14 @@ impl ClauseActionEffect {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct MoveClauseProgressMarker {
-    preview: String,
-    suffix: String,
-    raw_input: String,
-    raw_hiragana: String,
-    fixed_prefix: String,
+    preview_len: usize,
+    suffix_len: usize,
+    raw_input_len: usize,
+    raw_hiragana_len: usize,
+    fixed_prefix_len: usize,
+    text_hash: u64,
     corresponding_count: i32,
     selection_index: i32,
     clause_snapshot_count: usize,
@@ -181,12 +186,20 @@ struct MoveClauseProgressMarker {
 
 impl MoveClauseProgressMarker {
     fn from_state(state: &ClauseActionStateMut<'_>) -> Self {
+        let mut hasher = DefaultHasher::new();
+        state.preview.hash(&mut hasher);
+        state.suffix.hash(&mut hasher);
+        state.raw_input.hash(&mut hasher);
+        state.raw_hiragana.hash(&mut hasher);
+        state.fixed_prefix.hash(&mut hasher);
+
         Self {
-            preview: state.preview.clone(),
-            suffix: state.suffix.clone(),
-            raw_input: state.raw_input.clone(),
-            raw_hiragana: state.raw_hiragana.clone(),
-            fixed_prefix: state.fixed_prefix.clone(),
+            preview_len: state.preview.len(),
+            suffix_len: state.suffix.len(),
+            raw_input_len: state.raw_input.len(),
+            raw_hiragana_len: state.raw_hiragana.len(),
+            fixed_prefix_len: state.fixed_prefix.len(),
+            text_hash: hasher.finish(),
             corresponding_count: *state.corresponding_count,
             selection_index: *state.selection_index,
             clause_snapshot_count: state.clause_snapshots.len(),

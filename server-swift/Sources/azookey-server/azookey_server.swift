@@ -1044,7 +1044,8 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         let resolvedCandidate = resolveCandidateCompositionForDisplay(
             originalComposingText: prefixComposingText,
             previewComposingText: previewPrefixComposingText,
-            candidateComposingCount: candidate.composingCount
+            candidateComposingCount: candidate.composingCount,
+            resolutionCache: &cursorPrefixResolutionCache
         )
         let correspondingCount = resolvedCandidate.correspondingCount
         debugLogResolvedCorrespondingCount(
