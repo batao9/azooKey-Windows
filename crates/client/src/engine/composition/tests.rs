@@ -405,6 +405,29 @@ impl ClauseActionBackend for ReorderedNavigationEnsureBackend {
     }
 }
 
+struct FKeyDisplayEnsureBackend {
+    shrunk: bool,
+}
+
+impl ClauseActionBackend for FKeyDisplayEnsureBackend {
+    fn move_cursor(&mut self, offset: i32) -> anyhow::Result<Candidates> {
+        if offset == 0 && !self.shrunk {
+            return Ok(candidates(
+                &["加減", "下限", "かげん"],
+                &["統一", "統一", "統一"],
+                "かげんとういつ",
+                &[5, 5, 5],
+            ));
+        }
+        Ok(Candidates::default())
+    }
+
+    fn shrink_text(&mut self, _offset: i32) -> anyhow::Result<Candidates> {
+        self.shrunk = true;
+        Ok(candidates(&["統一"], &[""], "とういつ", &[6]))
+    }
+}
+
 #[test]
 fn ensure_clause_navigation_preserves_current_candidate_selection() {
     let mut preview = "良い加減統一".to_string();
@@ -507,6 +530,60 @@ fn ensure_clause_navigation_matches_current_preview_before_reusing_index() {
     assert_eq!(selection_index, 2);
     assert_eq!(corresponding_count, 7);
     assert_eq!(suffix, "統一");
+}
+
+#[test]
+fn ensure_clause_navigation_preserves_fkey_display_preview() {
+    let mut preview = "カゲントウイツ".to_string();
+    let mut suffix = String::new();
+    let mut raw_input = "kagentouitu".to_string();
+    let mut raw_hiragana = "かげんとういつ".to_string();
+    let mut fixed_prefix = String::new();
+    let mut corresponding_count = 11;
+    let mut selection_index = 0;
+    let mut current_candidates = candidates(
+        &["加減統一", "下限統一", "かげん統一"],
+        &["", "", ""],
+        "かげんとういつ",
+        &[11, 11, 11],
+    );
+    let mut clause_snapshots = Vec::new();
+    let mut future_clause_snapshots = Vec::new();
+    let mut current_clause_is_split_derived = false;
+    let mut current_clause_is_direct_split_remainder = false;
+    let mut current_clause_has_split_left_neighbor = false;
+    let mut current_clause_split_group_id = None;
+    let mut next_split_group_id = 1;
+    let mut backend = FKeyDisplayEnsureBackend { shrunk: false };
+
+    let mut state = ClauseActionStateMut {
+        preview: &mut preview,
+        suffix: &mut suffix,
+        raw_input: &mut raw_input,
+        raw_hiragana: &mut raw_hiragana,
+        fixed_prefix: &mut fixed_prefix,
+        corresponding_count: &mut corresponding_count,
+        selection_index: &mut selection_index,
+        candidates: &mut current_candidates,
+        clause_snapshots: &mut clause_snapshots,
+        future_clause_snapshots: &mut future_clause_snapshots,
+        current_clause_is_split_derived: &mut current_clause_is_split_derived,
+        current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+        current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+        current_clause_split_group_id: &mut current_clause_split_group_id,
+        next_split_group_id: &mut next_split_group_id,
+    };
+
+    let effect = TextServiceFactory::ensure_clause_navigation_ready(&mut state, &mut backend)
+        .expect("ensure clause navigation should return");
+
+    assert!(effect.applied);
+    assert_eq!(preview, "カゲン");
+    assert_eq!(suffix, "トウイツ");
+    assert_eq!(selection_index, 0);
+    assert_eq!(corresponding_count, 5);
+    assert_eq!(current_candidates.texts[0], "カゲン");
+    assert_eq!(current_candidates.sub_texts[0], "トウイツ");
 }
 
 #[test]

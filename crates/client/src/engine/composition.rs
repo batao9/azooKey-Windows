@@ -664,18 +664,11 @@ impl TextServiceFactory {
         navigation_candidates: &Candidates,
         current_preview: &str,
         fixed_prefix: &str,
-        current_candidates: &Candidates,
         selection_index: i32,
     ) -> Option<CandidateSelection> {
-        let current_selected = Self::select_candidate(current_candidates, selection_index);
-        let target_preview = current_selected
-            .as_ref()
-            .map(|selected| selected.text.as_str())
-            .filter(|text| !text.is_empty())
-            .unwrap_or(current_preview);
-        let target_clause_preview = target_preview
+        let target_clause_preview = current_preview
             .strip_prefix(fixed_prefix)
-            .unwrap_or(target_preview);
+            .unwrap_or(current_preview);
 
         if let Some(index) = (0..navigation_candidates.texts.len()).find(|index| {
             let text = navigation_candidates
@@ -715,6 +708,88 @@ impl TextServiceFactory {
         }
 
         Self::select_candidate(navigation_candidates, selection_index)
+    }
+
+    #[inline]
+    fn split_at_char_count(value: &str, char_count: i32) -> (String, String) {
+        let split_at = char_count.max(0) as usize;
+        let mut prefix = String::new();
+        let mut suffix = String::new();
+
+        for (index, ch) in value.chars().enumerate() {
+            if index < split_at {
+                prefix.push(ch);
+            } else {
+                suffix.push(ch);
+            }
+        }
+
+        (prefix, suffix)
+    }
+
+    #[inline]
+    fn display_override_set_type(
+        current_preview: &str,
+        fixed_prefix: &str,
+        raw_input: &str,
+        raw_hiragana: &str,
+    ) -> Option<SetTextType> {
+        let target_clause_preview = current_preview
+            .strip_prefix(fixed_prefix)
+            .unwrap_or(current_preview);
+        let set_types = [
+            SetTextType::Hiragana,
+            SetTextType::Katakana,
+            SetTextType::HalfKatakana,
+            SetTextType::FullLatin,
+            SetTextType::HalfLatin,
+        ];
+
+        for set_type in set_types {
+            if Self::converted_clause_preview_text(&set_type, raw_input, raw_hiragana)
+                != target_clause_preview
+            {
+                continue;
+            }
+
+            return Some(set_type);
+        }
+
+        None
+    }
+
+    #[inline]
+    fn display_override_split_for_selected_candidate(
+        set_type: &SetTextType,
+        raw_input: &str,
+        raw_hiragana: &str,
+        selected: &CandidateSelection,
+        suffix_raw_input: Option<&str>,
+        suffix_raw_hiragana: Option<&str>,
+    ) -> (String, String) {
+        let (clause_raw_input, suffix_raw_input) = suffix_raw_input
+            .and_then(|suffix| {
+                raw_input
+                    .strip_suffix(suffix)
+                    .map(|prefix| (prefix, suffix))
+            })
+            .map(|(prefix, suffix)| (prefix.to_string(), suffix.to_string()))
+            .unwrap_or_else(|| Self::split_at_char_count(raw_input, selected.corresponding_count));
+        let (clause_raw_hiragana, suffix_raw_hiragana) = suffix_raw_hiragana
+            .and_then(|suffix| {
+                raw_hiragana
+                    .strip_suffix(suffix)
+                    .map(|prefix| (prefix, suffix))
+            })
+            .map(|(prefix, suffix)| (prefix.to_string(), suffix.to_string()))
+            .unwrap_or_else(|| {
+                Self::split_at_char_count(raw_hiragana, selected.corresponding_count)
+            });
+
+        (
+            Self::converted_clause_preview_text(set_type, &clause_raw_input, &clause_raw_hiragana),
+            Self::converted_clause_preview_text(set_type, &suffix_raw_input, &suffix_raw_hiragana),
+        )
     }
 
     #[inline]
@@ -1315,11 +1390,10 @@ impl TextServiceFactory {
         }
 
         let navigation_candidates = backend.move_cursor(0)?;
-        let Some(selected) = Self::select_navigation_candidate_for_current_preview(
+        let Some(mut selected) = Self::select_navigation_candidate_for_current_preview(
             &navigation_candidates,
             state.preview,
             state.fixed_prefix,
-            state.candidates,
             *state.selection_index,
         ) else {
             return Ok(ClauseActionEffect::skipped());
@@ -1328,6 +1402,13 @@ impl TextServiceFactory {
         if !Self::candidate_splits_raw_input(&selected, state.raw_input) {
             return Ok(ClauseActionEffect::skipped());
         }
+
+        let display_override_set_type = Self::display_override_set_type(
+            state.preview,
+            state.fixed_prefix,
+            state.raw_input,
+            state.raw_hiragana,
+        );
 
         *state.candidates = navigation_candidates;
         *state.selection_index = selected.index;
@@ -1340,12 +1421,41 @@ impl TextServiceFactory {
         );
         *state.preview = Self::merge_preview_with_prefix(state.fixed_prefix, &selected.text);
         *state.suffix = display_suffix;
-        *state.raw_hiragana = selected.hiragana;
+        *state.raw_hiragana = selected.hiragana.clone();
         *state.current_clause_is_split_derived = true;
         *state.current_clause_is_direct_split_remainder = false;
         *state.current_clause_has_split_left_neighbor = false;
         *state.current_clause_split_group_id = None;
         Self::rebuild_future_clause_snapshots_from_backend(state, backend)?;
+        if let Some(set_type) = display_override_set_type {
+            let suffix_raw_input = state
+                .future_clause_snapshots
+                .last()
+                .map(|snapshot| snapshot.raw_input.as_str());
+            let suffix_raw_hiragana = state
+                .future_clause_snapshots
+                .last()
+                .map(|snapshot| snapshot.raw_hiragana.as_str());
+            let (converted_text, converted_sub_text) =
+                Self::display_override_split_for_selected_candidate(
+                    &set_type,
+                    state.raw_input,
+                    state.raw_hiragana,
+                    &selected,
+                    suffix_raw_input,
+                    suffix_raw_hiragana,
+                );
+            selected.text = converted_text;
+            selected.sub_text = converted_sub_text;
+            let selected_index = selected.index.max(0) as usize;
+            if let Some(text) = state.candidates.texts.get_mut(selected_index) {
+                *text = selected.text.clone();
+            }
+            if let Some(sub_text) = state.candidates.sub_texts.get_mut(selected_index) {
+                *sub_text = selected.sub_text.clone();
+            }
+            *state.preview = Self::merge_preview_with_prefix(state.fixed_prefix, &selected.text);
+        }
         *state.suffix = Self::sync_current_clause_future_suffix(
             state.candidates,
             *state.selection_index,
