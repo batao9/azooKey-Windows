@@ -761,6 +761,161 @@ fn move_clause_right_preserves_future_clause_when_server_returns_collapsed_remai
     );
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SingleNBoundaryServerState {
+    Full,
+    BadSuffix,
+}
+
+struct InitialSplitSingleNBoundaryBackend {
+    server: SingleNBoundaryServerState,
+    snapshots: Vec<SingleNBoundaryServerState>,
+}
+
+impl InitialSplitSingleNBoundaryBackend {
+    fn current_candidates(&self) -> Candidates {
+        match self.server {
+            SingleNBoundaryServerState::Full => {
+                candidates(&["いい加減"], &["横溢しろ"], "いいかげんとういつしろ", &[7])
+            }
+            SingleNBoundaryServerState::BadSuffix => {
+                candidates(&["横溢しろ"], &[""], "おういつしろ", &[9])
+            }
+        }
+    }
+}
+
+impl ClauseActionBackend for InitialSplitSingleNBoundaryBackend {
+    fn move_cursor(&mut self, offset: i32) -> anyhow::Result<Candidates> {
+        match offset {
+            value if value == TextServiceFactory::MOVE_CURSOR_PUSH_CLAUSE_SNAPSHOT => {
+                self.snapshots.push(self.server);
+            }
+            value if value == TextServiceFactory::MOVE_CURSOR_POP_CLAUSE_SNAPSHOT => {
+                if let Some(restored) = self.snapshots.pop() {
+                    self.server = restored;
+                }
+            }
+            _ => {}
+        }
+        Ok(self.current_candidates())
+    }
+
+    fn shrink_text(&mut self, offset: i32) -> anyhow::Result<Candidates> {
+        assert_eq!(offset, 7);
+        self.server = SingleNBoundaryServerState::BadSuffix;
+        Ok(self.current_candidates())
+    }
+}
+
+#[test]
+fn initial_auto_split_recovers_single_n_suffix_without_reinput() {
+    let mut preview = "いい加減統一しろ".to_string();
+    let mut suffix = String::new();
+    let mut raw_input = "iikagentouitusiro".to_string();
+    let mut raw_hiragana = "いいかげんとういつしろ".to_string();
+    let mut fixed_prefix = String::new();
+    let mut corresponding_count = 17;
+    let mut selection_index = 0;
+    let mut current_candidates = candidates(
+        &["いい加減統一しろ"],
+        &[""],
+        "いいかげんとういつしろ",
+        &[17],
+    );
+    let mut clause_snapshots = Vec::new();
+    let mut future_clause_snapshots = Vec::new();
+    let mut current_clause_is_split_derived = false;
+    let mut current_clause_is_direct_split_remainder = false;
+    let mut current_clause_has_split_left_neighbor = false;
+    let mut current_clause_split_group_id = None;
+    let mut next_split_group_id = 1;
+    let mut backend = InitialSplitSingleNBoundaryBackend {
+        server: SingleNBoundaryServerState::Full,
+        snapshots: Vec::new(),
+    };
+
+    {
+        let mut state = ClauseActionStateMut {
+            preview: &mut preview,
+            suffix: &mut suffix,
+            raw_input: &mut raw_input,
+            raw_hiragana: &mut raw_hiragana,
+            fixed_prefix: &mut fixed_prefix,
+            corresponding_count: &mut corresponding_count,
+            selection_index: &mut selection_index,
+            candidates: &mut current_candidates,
+            clause_snapshots: &mut clause_snapshots,
+            future_clause_snapshots: &mut future_clause_snapshots,
+            current_clause_is_split_derived: &mut current_clause_is_split_derived,
+            current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+            current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+            current_clause_split_group_id: &mut current_clause_split_group_id,
+            next_split_group_id: &mut next_split_group_id,
+        };
+        let effect = TextServiceFactory::ensure_clause_navigation_ready(&mut state, &mut backend)
+            .expect("clause navigation should prepare");
+        assert!(effect.applied);
+    }
+
+    assert_eq!(backend.server, SingleNBoundaryServerState::Full);
+    assert_eq!(backend.snapshots.len(), 0);
+    assert_eq!(suffix, "統一しろ");
+    assert_eq!(
+        future_clause_snapshots
+            .last()
+            .map(|snapshot| snapshot.selected_text.as_str()),
+        Some("統一しろ")
+    );
+    assert_eq!(
+        future_clause_snapshots
+            .last()
+            .map(|snapshot| snapshot.raw_input.as_str()),
+        Some("touitusiro")
+    );
+    assert_eq!(
+        future_clause_snapshots
+            .last()
+            .map(|snapshot| snapshot.raw_hiragana.as_str()),
+        Some("とういつしろ")
+    );
+
+    {
+        let mut state = ClauseActionStateMut {
+            preview: &mut preview,
+            suffix: &mut suffix,
+            raw_input: &mut raw_input,
+            raw_hiragana: &mut raw_hiragana,
+            fixed_prefix: &mut fixed_prefix,
+            corresponding_count: &mut corresponding_count,
+            selection_index: &mut selection_index,
+            candidates: &mut current_candidates,
+            clause_snapshots: &mut clause_snapshots,
+            future_clause_snapshots: &mut future_clause_snapshots,
+            current_clause_is_split_derived: &mut current_clause_is_split_derived,
+            current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+            current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+            current_clause_split_group_id: &mut current_clause_split_group_id,
+            next_split_group_id: &mut next_split_group_id,
+        };
+        let effect = TextServiceFactory::apply_move_clause(&mut state, &mut backend, 1)
+            .expect("right move should restore the cached suffix");
+        assert!(effect.applied);
+    }
+
+    assert_eq!(suffix, "");
+    assert_eq!(raw_input, "touitusiro");
+    assert_eq!(raw_hiragana, "とういつしろ");
+    assert_eq!(
+        TextServiceFactory::current_clause_preview(&preview, &fixed_prefix),
+        "統一しろ"
+    );
+    assert_eq!(
+        current_candidates.texts.first().map(String::as_str),
+        Some("統一しろ")
+    );
+}
+
 #[test]
 fn punctuation_commit_defaults_off_and_keeps_existing_append_path() {
     let composition = Composition {

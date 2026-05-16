@@ -216,6 +216,67 @@ fn adjust_boundary_without_existing_future_cache_does_not_capture_initial_split_
 }
 
 #[test]
+fn auto_split_bootstrap_uses_raw_suffix_hint_when_input_count_is_not_kana_count() {
+    let mut future = Vec::new();
+
+    TextServiceFactory::maybe_push_split_future_clause_snapshot(
+        &mut future,
+        "iikagentouitusiro",
+        "いいかげんとういつしろ",
+        7,
+        "とういつしろ",
+        true,
+        Some(1),
+    );
+
+    let snapshot = future
+        .last()
+        .expect("auto split should cache the remaining clause");
+    assert_eq!(snapshot.raw_input, "touitusiro");
+    assert_eq!(snapshot.raw_hiragana, "とういつしろ");
+    assert_eq!(snapshot.clause_preview, "とういつしろ");
+}
+
+#[test]
+fn auto_split_bootstrap_keeps_double_n_suffix_boundary() {
+    let mut future = Vec::new();
+
+    TextServiceFactory::maybe_push_split_future_clause_snapshot(
+        &mut future,
+        "iikagenntouitusiro",
+        "いいかげんとういつしろ",
+        8,
+        "とういつしろ",
+        true,
+        Some(1),
+    );
+
+    let snapshot = future
+        .last()
+        .expect("double-n auto split should cache the same remaining clause");
+    assert_eq!(snapshot.raw_input, "touitusiro");
+    assert_eq!(snapshot.raw_hiragana, "とういつしろ");
+    assert_eq!(snapshot.clause_preview, "とういつしろ");
+}
+
+#[test]
+fn auto_split_bootstrap_does_not_cache_untrusted_display_suffix() {
+    let mut future = Vec::new();
+
+    TextServiceFactory::maybe_push_split_future_clause_snapshot(
+        &mut future,
+        "iikagentouitusiro",
+        "いいかげんとういつしろ",
+        7,
+        "横溢しろ",
+        true,
+        Some(1),
+    );
+
+    assert!(future.is_empty());
+}
+
+#[test]
 fn adjust_boundary_bootstraps_last_clause_split_without_existing_future_cache() {
     let mut future = Vec::new();
 

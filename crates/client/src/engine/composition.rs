@@ -1419,6 +1419,14 @@ impl TextServiceFactory {
             state.suffix,
             &selected,
         );
+        selected.sub_text = display_suffix.clone();
+        if let Some(sub_text) = state
+            .candidates
+            .sub_texts
+            .get_mut(selected.index.max(0) as usize)
+        {
+            *sub_text = display_suffix.clone();
+        }
         *state.preview = Self::merge_preview_with_prefix(state.fixed_prefix, &selected.text);
         *state.suffix = display_suffix;
         *state.raw_hiragana = selected.hiragana.clone();
@@ -2001,6 +2009,65 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn trusted_raw_hiragana_suffix(raw_hiragana: &str, raw_suffix_hint: &str) -> Option<String> {
+        (!raw_suffix_hint.is_empty() && raw_hiragana.ends_with(raw_suffix_hint))
+            .then(|| raw_suffix_hint.to_string())
+    }
+
+    #[inline]
+    fn common_suffix_char_count(left: &str, right: &str) -> usize {
+        left.chars()
+            .rev()
+            .zip(right.chars().rev())
+            .take_while(|(left, right)| left == right)
+            .count()
+    }
+
+    #[inline]
+    fn recover_single_n_raw_hiragana_suffix(
+        full_raw_hiragana: &str,
+        server_raw_hiragana: &str,
+    ) -> Option<String> {
+        if server_raw_hiragana.is_empty() {
+            return None;
+        }
+
+        if full_raw_hiragana.ends_with(server_raw_hiragana) {
+            return Some(server_raw_hiragana.to_string());
+        }
+
+        let common_suffix_len =
+            Self::common_suffix_char_count(full_raw_hiragana, server_raw_hiragana);
+        let server_len = server_raw_hiragana.chars().count();
+        if common_suffix_len == 0 || common_suffix_len + 1 != server_len {
+            return None;
+        }
+
+        let full_len = full_raw_hiragana.chars().count();
+        if full_len <= common_suffix_len {
+            return None;
+        }
+
+        Some(
+            full_raw_hiragana
+                .chars()
+                .skip(full_len - common_suffix_len - 1)
+                .collect(),
+        )
+    }
+
+    #[inline]
+    fn has_recoverable_single_n_raw_hiragana_suffix(
+        server_raw_hiragana: &str,
+        snapshot_raw_hiragana: &str,
+    ) -> bool {
+        !server_raw_hiragana.is_empty()
+            && server_raw_hiragana.chars().count() == snapshot_raw_hiragana.chars().count()
+            && Self::common_suffix_char_count(server_raw_hiragana, snapshot_raw_hiragana) + 1
+                == snapshot_raw_hiragana.chars().count()
+    }
+
+    #[inline]
     fn maybe_push_split_future_clause_snapshot(
         future_clause_snapshots: &mut Vec<FutureClauseSnapshot>,
         raw_input: &str,
@@ -2018,29 +2085,25 @@ impl TextServiceFactory {
             .last()
             .and_then(|snapshot| Self::restore_raw_suffix_from_sub_text(raw_suffix_hint, snapshot))
             .unwrap_or_else(|| raw_suffix_hint.to_string());
-        let has_matching_future_hint = !normalized_raw_suffix_hint.is_empty()
-            && future_clause_snapshots.last().is_some_and(|snapshot| {
-                Self::future_snapshot_matches_raw_suffix(snapshot, &normalized_raw_suffix_hint)
-            });
-        let mut raw_suffix =
-            if has_matching_future_hint {
-                normalized_raw_suffix_hint
-            } else if let Some(snapshot) = future_clause_snapshots.iter().rev().find(|snapshot| {
-                !raw_input_suffix.is_empty() && raw_input_suffix == snapshot.raw_input
-            }) {
-                snapshot.raw_hiragana.clone()
-            } else {
-                let raw_suffix = Self::current_raw_suffix(raw_hiragana, corresponding_count);
-                if raw_suffix.is_empty()
-                    && future_clause_snapshots.is_empty()
-                    && allow_bootstrap_without_existing_future
-                    && !normalized_raw_suffix_hint.is_empty()
-                {
-                    normalized_raw_suffix_hint
-                } else {
-                    raw_suffix
-                }
-            };
+        let mut raw_suffix = if let Some(snapshot) = future_clause_snapshots
+            .iter()
+            .rev()
+            .find(|snapshot| !raw_input_suffix.is_empty() && raw_input_suffix == snapshot.raw_input)
+        {
+            snapshot.raw_hiragana.clone()
+        } else if let Some(raw_suffix) =
+            Self::trusted_raw_hiragana_suffix(raw_hiragana, &normalized_raw_suffix_hint)
+        {
+            raw_suffix
+        } else if let Some(snapshot) = future_clause_snapshots.last().filter(|snapshot| {
+            Self::future_snapshot_matches_raw_suffix(snapshot, &normalized_raw_suffix_hint)
+        }) {
+            snapshot.raw_hiragana.clone()
+        } else if !future_clause_snapshots.is_empty() && !allow_bootstrap_without_existing_future {
+            Self::current_raw_suffix(raw_hiragana, corresponding_count)
+        } else {
+            String::new()
+        };
         if raw_suffix.is_empty() {
             return;
         }
@@ -2301,6 +2364,10 @@ impl TextServiceFactory {
             *state.current_clause_has_split_left_neighbor;
         let mut temp_current_clause_split_group_id = *state.current_clause_split_group_id;
         let mut temp_next_split_group_id = *state.next_split_group_id;
+        let initial_suffix = state.suffix.clone();
+        let initial_raw_input_suffix =
+            Self::current_raw_input_suffix(state.raw_input, *state.corresponding_count);
+        let initial_raw_hiragana = state.raw_hiragana.clone();
         let mut collected = Vec::new();
 
         loop {
@@ -2348,6 +2415,29 @@ impl TextServiceFactory {
                 snapshot.is_direct_split_remainder = true;
                 snapshot.has_split_left_neighbor = true;
                 snapshot.split_group_id = *state.current_clause_split_group_id;
+                if temp_suffix.is_empty()
+                    && !initial_suffix.is_empty()
+                    && !initial_raw_input_suffix.is_empty()
+                    && temp_raw_input == initial_raw_input_suffix
+                {
+                    if let Some(raw_hiragana_suffix) = Self::recover_single_n_raw_hiragana_suffix(
+                        &initial_raw_hiragana,
+                        &snapshot.raw_hiragana,
+                    ) {
+                        let mut repaired_snapshot = Self::build_conservative_future_clause_snapshot(
+                            &initial_suffix,
+                            "",
+                            &initial_raw_input_suffix,
+                            &raw_hiragana_suffix,
+                            initial_raw_input_suffix.chars().count() as i32,
+                        );
+                        repaired_snapshot.is_split_derived = true;
+                        repaired_snapshot.is_direct_split_remainder = true;
+                        repaired_snapshot.has_split_left_neighbor = true;
+                        repaired_snapshot.split_group_id = *state.current_clause_split_group_id;
+                        snapshot = repaired_snapshot;
+                    }
+                }
             } else {
                 snapshot.is_split_derived = temp_current_clause_is_split_derived;
                 snapshot.is_direct_split_remainder = temp_current_clause_is_direct_split_remainder;
@@ -2465,6 +2555,10 @@ impl TextServiceFactory {
                         .starts_with(&snapshot.raw_hiragana)
                     || server_candidates.hiragana.ends_with(&snapshot.raw_hiragana)
                     || snapshot.raw_hiragana.ends_with(&server_candidates.hiragana)
+                    || Self::has_recoverable_single_n_raw_hiragana_suffix(
+                        &server_candidates.hiragana,
+                        &snapshot.raw_hiragana,
+                    )
             })
             .unwrap_or(false)
     }
