@@ -362,6 +362,11 @@ private func clampedCorrespondingCount(
 
 typealias CandidateDisplayResolution = (correspondingCount: Int, remainingConvertTarget: String)
 
+struct CursorPrefixCandidateResult {
+    let candidate: Candidate
+    let displayText: String
+}
+
 @MainActor func resolveCandidateCompositionForDisplay(
     originalComposingText: ComposingText,
     previewComposingText: ComposingText,
@@ -406,6 +411,24 @@ typealias CandidateDisplayResolution = (correspondingCount: Int, remainingConver
     previewComposingText: ComposingText,
     previewHiragana: String
 ) -> [Candidate] {
+    cursorPrefixCandidateDisplayResults(
+        mainResults: mainResults,
+        firstClauseResults: firstClauseResults,
+        exactClauseResults: exactClauseResults,
+        originalComposingText: originalComposingText,
+        previewComposingText: previewComposingText,
+        previewHiragana: previewHiragana
+    ).map(\.candidate)
+}
+
+@MainActor func cursorPrefixCandidateDisplayResults(
+    mainResults: [Candidate],
+    firstClauseResults: [Candidate],
+    exactClauseResults: [Candidate] = [],
+    originalComposingText: ComposingText,
+    previewComposingText: ComposingText,
+    previewHiragana: String
+) -> [CursorPrefixCandidateResult] {
     var resolutionCache: [String: CandidateDisplayResolution] = [:]
     let firstClauseCorrespondingCount = cursorPrefixFirstClauseCorrespondingCount(
         firstClauseResults: firstClauseResults,
@@ -413,7 +436,7 @@ typealias CandidateDisplayResolution = (correspondingCount: Int, remainingConver
         previewComposingText: previewComposingText,
         resolutionCache: &resolutionCache
     )
-    return cursorPrefixCandidateResults(
+    return cursorPrefixCandidateDisplayResults(
         mainResults: mainResults,
         firstClauseResults: firstClauseResults,
         exactClauseResults: exactClauseResults,
@@ -425,7 +448,7 @@ typealias CandidateDisplayResolution = (correspondingCount: Int, remainingConver
     )
 }
 
-@MainActor func cursorPrefixCandidateResults(
+@MainActor func cursorPrefixCandidateDisplayResults(
     mainResults: [Candidate],
     firstClauseResults: [Candidate],
     exactClauseResults: [Candidate] = [],
@@ -434,20 +457,25 @@ typealias CandidateDisplayResolution = (correspondingCount: Int, remainingConver
     previewComposingText: ComposingText,
     previewHiragana: String,
     resolutionCache: inout [String: CandidateDisplayResolution]
-) -> [Candidate] {
+) -> [CursorPrefixCandidateResult] {
     guard let firstClauseCorrespondingCount else {
-        return mainResults
+        return mainResults.map {
+            CursorPrefixCandidateResult(
+                candidate: $0,
+                displayText: constructCandidateString(candidate: $0, hiragana: previewHiragana)
+            )
+        }
     }
 
     var seenTexts = Set<String>()
-    var results: [Candidate] = []
+    var results: [CursorPrefixCandidateResult] = []
 
     func appendIfNeeded(_ candidate: Candidate) {
         let text = constructCandidateString(candidate: candidate, hiragana: previewHiragana)
         guard seenTexts.insert(text).inserted else {
             return
         }
-        results.append(candidate)
+        results.append(CursorPrefixCandidateResult(candidate: candidate, displayText: text))
     }
 
     func matchesFirstClauseBoundary(_ candidate: Candidate) -> Bool {
@@ -987,7 +1015,6 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates begin useZenzai=\(useZenzai) syntheticEndOfText=\(previewState.syntheticEndOfText)")
     let requestStart = ProcessInfo.processInfo.systemUptime
     let converted = converter.requestCandidates(previewPrefixComposingText, options: options)
-    let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
     var cursorPrefixResolutionCache: [String: CandidateDisplayResolution] = [:]
     let firstClauseCorrespondingCount = cursorPrefixFirstClauseCorrespondingCount(
         firstClauseResults: converted.firstClauseResults,
@@ -995,7 +1022,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
         previewComposingText: previewPrefixComposingText,
         resolutionCache: &cursorPrefixResolutionCache
     )
-    let preliminaryCursorPrefixResults = cursorPrefixCandidateResults(
+    let preliminaryCursorPrefixResults = cursorPrefixCandidateDisplayResults(
         mainResults: converted.mainResults,
         firstClauseResults: converted.firstClauseResults,
         firstClauseCorrespondingCount: firstClauseCorrespondingCount,
@@ -1021,7 +1048,7 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     }
     let cursorPrefixResults = exactClauseResults.isEmpty
         ? preliminaryCursorPrefixResults
-        : cursorPrefixCandidateResults(
+        : cursorPrefixCandidateDisplayResults(
             mainResults: converted.mainResults,
             firstClauseResults: converted.firstClauseResults,
             exactClauseResults: exactClauseResults,
@@ -1031,14 +1058,16 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
             previewHiragana: previewPrefixHiragana,
             resolutionCache: &cursorPrefixResolutionCache
         )
+    let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
     serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates returned candidateCount=\(cursorPrefixResults.count) firstClauseCandidateCount=\(converted.firstClauseResults.count) mainCandidateCount=\(converted.mainResults.count) exactClauseCandidateCount=\(exactClauseResults.count) elapsed_ms=\(requestMs)")
     var result: [FFICandidate] = []
 
     for i in 0..<cursorPrefixResults.count {
-        let candidate = cursorPrefixResults[i]
+        let cursorPrefixResult = cursorPrefixResults[i]
+        let candidate = cursorPrefixResult.candidate
         serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)/\(cursorPrefixResults.count)] start")
 
-        let text = strdup(constructCandidateString(candidate: candidate, hiragana: previewPrefixHiragana))
+        let text = strdup(cursorPrefixResult.displayText)
         serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)] textReady")
         let hiragana = strdup(previewPrefixHiragana + suffixAfterCursor)
         let resolvedCandidate = resolveCandidateCompositionForDisplay(
