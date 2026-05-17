@@ -35,6 +35,8 @@ private let fallbackDictionaryURL: URL = {
 let maxUserDictionaryEntryCount = 50
 let minInputCountForZenzaiCandidates = 4
 let minHiraganaCountForZenzaiCandidates = 2
+// Request exact-clause supplements only when boundary-matched candidates are sparse.
+let cursorPrefixExactClauseSupplementCandidateThreshold = 5
 let serverLogFileName = "server.log"
 
 private enum ServerLogLevel: Int {
@@ -278,6 +280,80 @@ private func clampedCorrespondingCount(
     min(composingText.input.count, max(0, rawCount))
 }
 
+private func inputCharacter(_ element: ComposingText.InputElement) -> Character? {
+    switch element.piece {
+    case .character(let character):
+        character
+    case .key(_, let input, _):
+        input
+    case .compositionSeparator:
+        nil
+    }
+}
+
+private func asciiLowercase(_ character: Character) -> Character? {
+    let scalars = String(character).unicodeScalars
+    guard scalars.count == 1, let scalar = scalars.first else {
+        return nil
+    }
+
+    let value = scalar.value
+    if (65...90).contains(value), let lowered = UnicodeScalar(value + 32) {
+        return Character(lowered)
+    }
+    if (97...122).contains(value) {
+        return character
+    }
+    return nil
+}
+
+private func isAsciiRomajiVowel(_ character: Character) -> Bool {
+    guard let lowered = asciiLowercase(character) else {
+        return false
+    }
+    switch lowered {
+    case "a", "i", "u", "e", "o":
+        return true
+    default:
+        return false
+    }
+}
+
+private func isAsciiRomajiConsonantExceptN(_ character: Character) -> Bool {
+    guard let lowered = asciiLowercase(character) else {
+        return false
+    }
+    return lowered != "n" && !isAsciiRomajiVowel(lowered)
+}
+
+private func adjustedCorrespondingCountForDelayedSingleN(
+    composingText: ComposingText,
+    rawCount: Int
+) -> Int {
+    let splitAt = clampedCorrespondingCount(composingText: composingText, rawCount: rawCount)
+    guard splitAt >= 2, splitAt < composingText.input.count else {
+        return splitAt
+    }
+
+    let previousElement = composingText.input[splitAt - 2]
+    let consumedElement = composingText.input[splitAt - 1]
+    let nextElement = composingText.input[splitAt]
+    guard previousElement.inputStyle != .direct,
+          consumedElement.inputStyle != .direct,
+          nextElement.inputStyle != .direct,
+          let previous = inputCharacter(previousElement),
+          asciiLowercase(previous) == "n",
+          let consumed = inputCharacter(consumedElement),
+          isAsciiRomajiConsonantExceptN(consumed),
+          let next = inputCharacter(nextElement),
+          isAsciiRomajiVowel(next)
+    else {
+        return splitAt
+    }
+
+    return splitAt - 1
+}
+
 @MainActor func resolveCandidateComposition(
     composingText: ComposingText,
     candidateComposingCount: ComposingCount
@@ -285,11 +361,24 @@ private func clampedCorrespondingCount(
     var remainingComposingText = composingText
     remainingComposingText.prefixComplete(composingCount: candidateComposingCount)
 
+    let rawCount = composingText.input.count - remainingComposingText.input.count
+    let correspondingCount = adjustedCorrespondingCountForDelayedSingleN(
+        composingText: composingText,
+        rawCount: rawCount
+    )
+    if correspondingCount != rawCount {
+        var adjustedRemainingComposingText = composingText
+        adjustedRemainingComposingText.prefixComplete(
+            composingCount: .inputCount(correspondingCount)
+        )
+        return (
+            correspondingCount: correspondingCount,
+            remainingConvertTarget: adjustedRemainingComposingText.convertTarget
+        )
+    }
+
     return (
-        correspondingCount: clampedCorrespondingCount(
-            composingText: composingText,
-            rawCount: composingText.input.count - remainingComposingText.input.count
-        ),
+        correspondingCount: correspondingCount,
         remainingConvertTarget: remainingComposingText.convertTarget
     )
 }
@@ -358,6 +447,116 @@ private func clampedCorrespondingCount(
     )
 }
 
+typealias CandidateDisplayResolution = (correspondingCount: Int, remainingConvertTarget: String)
+
+struct CursorPrefixCandidateResult {
+    let candidate: Candidate
+    let displayText: String
+}
+
+private struct CursorPrefixBoundaryCandidate {
+    let index: Int
+    let correspondingCount: Int
+    let score: Int
+}
+
+private let cursorPrefixClauseTerminalSuffixes = [
+    "ではない",
+    "じゃない",
+    "である",
+    "でした",
+    "だった",
+    "ました",
+    "ません",
+    "です",
+    "ます",
+    "ない",
+]
+
+private func candidateRubyBoundarySet(_ candidate: Candidate) -> Set<Int> {
+    var boundaries = Set<Int>()
+    var cursor = 0
+    for element in candidate.data {
+        cursor += element.ruby.count
+        boundaries.insert(cursor)
+    }
+    return boundaries
+}
+
+private func cursorPrefixTerminalPhraseBonus(prefixHiragana: String) -> Int {
+    cursorPrefixClauseTerminalSuffixes.contains { prefixHiragana.hasSuffix($0) } ? 120 : 0
+}
+
+private func cursorPrefixTokenBoundaryPenalty(
+    candidate: Candidate,
+    prefixSurfaceCount: Int
+) -> Int {
+    guard prefixSurfaceCount > 0,
+          prefixSurfaceCount < candidate.rubyCount
+    else {
+        return 0
+    }
+
+    return candidateRubyBoundarySet(candidate).contains(prefixSurfaceCount) ? 0 : 160
+}
+
+private func cursorPrefixBoundaryScore(
+    candidate: Candidate,
+    candidateIndex: Int,
+    resolution: CandidateDisplayResolution,
+    previewHiragana: String
+) -> Int {
+    let remainingCount = resolution.remainingConvertTarget.count
+    let prefixSurfaceCount = max(0, previewHiragana.count - remainingCount)
+    let prefixHiragana = String(previewHiragana.prefix(prefixSurfaceCount))
+    let terminalBonus = cursorPrefixTerminalPhraseBonus(prefixHiragana: prefixHiragana)
+    let tokenBoundaryPenalty = cursorPrefixTokenBoundaryPenalty(
+        candidate: candidate,
+        prefixSurfaceCount: prefixSurfaceCount
+    )
+
+    return resolution.correspondingCount * 4
+        + terminalBonus
+        - tokenBoundaryPenalty
+        - candidateIndex
+}
+
+private func preferCursorPrefixBoundary(
+    _ candidate: CursorPrefixBoundaryCandidate,
+    over current: CursorPrefixBoundaryCandidate?
+) -> Bool {
+    guard let current else {
+        return true
+    }
+    if candidate.score != current.score {
+        return candidate.score > current.score
+    }
+    if candidate.correspondingCount != current.correspondingCount {
+        return candidate.correspondingCount > current.correspondingCount
+    }
+    return candidate.index < current.index
+}
+
+@MainActor func resolveCandidateCompositionForDisplay(
+    originalComposingText: ComposingText,
+    previewComposingText: ComposingText,
+    candidateComposingCount: ComposingCount,
+    resolutionCache: inout [String: CandidateDisplayResolution]
+) -> CandidateDisplayResolution {
+    let cacheKey = String(describing: candidateComposingCount)
+    if let cached = resolutionCache[cacheKey] {
+        return cached
+    }
+
+    let resolved = resolveCandidateCompositionForDisplay(
+        originalComposingText: originalComposingText,
+        previewComposingText: previewComposingText,
+        candidateComposingCount: candidateComposingCount
+    )
+    resolutionCache[cacheKey] = resolved
+    return resolved
+}
+
 @MainActor private func debugLogResolvedCorrespondingCount(
     scope: String,
     candidateIndex: Int,
@@ -372,6 +571,189 @@ private func clampedCorrespondingCount(
         "DEBUG",
         "[\(scope)] mode=\(mode) candidate[\(candidateIndex + 1)/\(candidateTotal)] composingCount=\(candidateComposingCount) resolvedCorrespondingCount=\(resolvedCorrespondingCount) inputCount=\(inputCount)"
     )
+}
+
+@MainActor func cursorPrefixCandidateResults(
+    mainResults: [Candidate],
+    firstClauseResults: [Candidate],
+    exactClauseResults: [Candidate] = [],
+    originalComposingText: ComposingText,
+    previewComposingText: ComposingText,
+    previewHiragana: String
+) -> [Candidate] {
+    cursorPrefixCandidateDisplayResults(
+        mainResults: mainResults,
+        firstClauseResults: firstClauseResults,
+        exactClauseResults: exactClauseResults,
+        originalComposingText: originalComposingText,
+        previewComposingText: previewComposingText,
+        previewHiragana: previewHiragana
+    ).map(\.candidate)
+}
+
+@MainActor func cursorPrefixCandidateDisplayResults(
+    mainResults: [Candidate],
+    firstClauseResults: [Candidate],
+    exactClauseResults: [Candidate] = [],
+    originalComposingText: ComposingText,
+    previewComposingText: ComposingText,
+    previewHiragana: String
+) -> [CursorPrefixCandidateResult] {
+    var resolutionCache: [String: CandidateDisplayResolution] = [:]
+    let firstClauseCorrespondingCount = cursorPrefixFirstClauseCorrespondingCount(
+        firstClauseResults: firstClauseResults,
+        originalComposingText: originalComposingText,
+        previewComposingText: previewComposingText,
+        resolutionCache: &resolutionCache
+    )
+    return cursorPrefixCandidateDisplayResults(
+        mainResults: mainResults,
+        firstClauseResults: firstClauseResults,
+        exactClauseResults: exactClauseResults,
+        firstClauseCorrespondingCount: firstClauseCorrespondingCount,
+        originalComposingText: originalComposingText,
+        previewComposingText: previewComposingText,
+        previewHiragana: previewHiragana,
+        resolutionCache: &resolutionCache
+    )
+}
+
+@MainActor func cursorPrefixCandidateDisplayResults(
+    mainResults: [Candidate],
+    firstClauseResults: [Candidate],
+    exactClauseResults: [Candidate] = [],
+    firstClauseCorrespondingCount: Int?,
+    originalComposingText: ComposingText,
+    previewComposingText: ComposingText,
+    previewHiragana: String,
+    resolutionCache: inout [String: CandidateDisplayResolution]
+) -> [CursorPrefixCandidateResult] {
+    guard let firstClauseCorrespondingCount else {
+        return mainResults.map {
+            CursorPrefixCandidateResult(
+                candidate: $0,
+                displayText: constructCandidateString(candidate: $0, hiragana: previewHiragana)
+            )
+        }
+    }
+
+    var seenTexts = Set<String>()
+    var results: [CursorPrefixCandidateResult] = []
+
+    func appendIfNeeded(_ candidate: Candidate) {
+        let text = constructCandidateString(candidate: candidate, hiragana: previewHiragana)
+        guard seenTexts.insert(text).inserted else {
+            return
+        }
+        results.append(CursorPrefixCandidateResult(candidate: candidate, displayText: text))
+    }
+
+    func matchesFirstClauseBoundary(_ candidate: Candidate) -> Bool {
+        let correspondingCount = resolveCandidateCompositionForDisplay(
+            originalComposingText: originalComposingText,
+            previewComposingText: previewComposingText,
+            candidateComposingCount: candidate.composingCount,
+            resolutionCache: &resolutionCache
+        ).correspondingCount
+        return correspondingCount == firstClauseCorrespondingCount
+    }
+
+    for candidate in firstClauseResults {
+        guard matchesFirstClauseBoundary(candidate) else {
+            continue
+        }
+        appendIfNeeded(candidate)
+    }
+
+    for candidate in mainResults {
+        guard matchesFirstClauseBoundary(candidate) else {
+            continue
+        }
+        appendIfNeeded(candidate)
+    }
+
+    for candidate in exactClauseResults {
+        guard matchesFirstClauseBoundary(candidate) else {
+            continue
+        }
+        appendIfNeeded(candidate)
+    }
+
+    return results
+}
+
+@MainActor func cursorPrefixFirstClauseCorrespondingCount(
+    firstClauseResults: [Candidate],
+    originalComposingText: ComposingText,
+    previewComposingText: ComposingText
+) -> Int? {
+    var resolutionCache: [String: CandidateDisplayResolution] = [:]
+    return cursorPrefixFirstClauseCorrespondingCount(
+        firstClauseResults: firstClauseResults,
+        originalComposingText: originalComposingText,
+        previewComposingText: previewComposingText,
+        resolutionCache: &resolutionCache
+    )
+}
+
+@MainActor func cursorPrefixFirstClauseCorrespondingCount(
+    firstClauseResults: [Candidate],
+    originalComposingText: ComposingText,
+    previewComposingText: ComposingText,
+    resolutionCache: inout [String: CandidateDisplayResolution]
+) -> Int? {
+    let inputCount = originalComposingText.input.count
+    var splitBoundary: CursorPrefixBoundaryCandidate?
+    var fallbackBoundary: CursorPrefixBoundaryCandidate?
+
+    for (index, candidate) in firstClauseResults.enumerated() {
+        let resolution = resolveCandidateCompositionForDisplay(
+            originalComposingText: originalComposingText,
+            previewComposingText: previewComposingText,
+            candidateComposingCount: candidate.composingCount,
+            resolutionCache: &resolutionCache
+        )
+        guard resolution.correspondingCount > 0 else {
+            continue
+        }
+
+        let boundary = CursorPrefixBoundaryCandidate(
+            index: index,
+            correspondingCount: resolution.correspondingCount,
+            score: cursorPrefixBoundaryScore(
+                candidate: candidate,
+                candidateIndex: index,
+                resolution: resolution,
+                previewHiragana: previewComposingText.convertTarget
+            )
+        )
+
+        if resolution.correspondingCount < inputCount,
+           preferCursorPrefixBoundary(boundary, over: splitBoundary)
+        {
+            splitBoundary = boundary
+        }
+        if preferCursorPrefixBoundary(boundary, over: fallbackBoundary) {
+            fallbackBoundary = boundary
+        }
+    }
+
+    return splitBoundary?.correspondingCount ?? fallbackBoundary?.correspondingCount
+}
+
+@MainActor func makeCursorPrefixExactClauseComposingText(
+    prefixComposingText: ComposingText,
+    correspondingCount: Int
+) -> ComposingText {
+    var clauseComposingText = ComposingText()
+    let count = clampedCorrespondingCount(
+        composingText: prefixComposingText,
+        rawCount: correspondingCount
+    )
+    clauseComposingText.insertAtCursorPosition(
+        Array(prefixComposingText.input.prefix(count))
+    )
+    return clauseComposingText
 }
 
 @MainActor func getOptions(context: String = "") -> ConvertRequestOptions {
@@ -830,27 +1212,72 @@ func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutab
     serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates begin useZenzai=\(useZenzai) syntheticEndOfText=\(previewState.syntheticEndOfText)")
     let requestStart = ProcessInfo.processInfo.systemUptime
     let converted = converter.requestCandidates(previewPrefixComposingText, options: options)
+    var cursorPrefixResolutionCache: [String: CandidateDisplayResolution] = [:]
+    let firstClauseCorrespondingCount = cursorPrefixFirstClauseCorrespondingCount(
+        firstClauseResults: converted.firstClauseResults,
+        originalComposingText: prefixComposingText,
+        previewComposingText: previewPrefixComposingText,
+        resolutionCache: &cursorPrefixResolutionCache
+    )
+    let preliminaryCursorPrefixResults = cursorPrefixCandidateDisplayResults(
+        mainResults: converted.mainResults,
+        firstClauseResults: converted.firstClauseResults,
+        firstClauseCorrespondingCount: firstClauseCorrespondingCount,
+        originalComposingText: prefixComposingText,
+        previewComposingText: previewPrefixComposingText,
+        previewHiragana: previewPrefixHiragana,
+        resolutionCache: &cursorPrefixResolutionCache
+    )
+    let shouldRequestExactClauseResults = preliminaryCursorPrefixResults.count < cursorPrefixExactClauseSupplementCandidateThreshold
+    var exactClauseResults: [Candidate] = []
+    if let firstClauseCorrespondingCount, shouldRequestExactClauseResults {
+        let exactClauseComposingText = makeCursorPrefixExactClauseComposingText(
+            prefixComposingText: prefixComposingText,
+            correspondingCount: firstClauseCorrespondingCount
+        )
+        let exactClausePreviewState = makeCandidatePreviewComposingText(
+            from: exactClauseComposingText
+        )
+        exactClauseResults = converter.requestCandidates(
+            exactClausePreviewState.composingText,
+            options: options
+        ).mainResults
+    }
+    let cursorPrefixResults = exactClauseResults.isEmpty
+        ? preliminaryCursorPrefixResults
+        : cursorPrefixCandidateDisplayResults(
+            mainResults: converted.mainResults,
+            firstClauseResults: converted.firstClauseResults,
+            exactClauseResults: exactClauseResults,
+            firstClauseCorrespondingCount: firstClauseCorrespondingCount,
+            originalComposingText: prefixComposingText,
+            previewComposingText: previewPrefixComposingText,
+            previewHiragana: previewPrefixHiragana,
+            resolutionCache: &cursorPrefixResolutionCache
+        )
     let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
-    serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates returned candidateCount=\(converted.mainResults.count) elapsed_ms=\(requestMs)")
+    serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates returned candidateCount=\(cursorPrefixResults.count) firstClauseCandidateCount=\(converted.firstClauseResults.count) mainCandidateCount=\(converted.mainResults.count) exactClauseCandidateCount=\(exactClauseResults.count) elapsed_ms=\(requestMs)")
     var result: [FFICandidate] = []
 
-    for i in 0..<converted.mainResults.count {
-        let candidate = converted.mainResults[i]
-        serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)/\(converted.mainResults.count)] start")
+    for i in 0..<cursorPrefixResults.count {
+        let cursorPrefixResult = cursorPrefixResults[i]
+        let candidate = cursorPrefixResult.candidate
+        serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)/\(cursorPrefixResults.count)] start")
 
-        let text = strdup(constructCandidateString(candidate: candidate, hiragana: previewPrefixHiragana))
+        let text = strdup(cursorPrefixResult.displayText)
         serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)] textReady")
         let hiragana = strdup(previewPrefixHiragana + suffixAfterCursor)
         let resolvedCandidate = resolveCandidateCompositionForDisplay(
             originalComposingText: prefixComposingText,
             previewComposingText: previewPrefixComposingText,
-            candidateComposingCount: candidate.composingCount
+            candidateComposingCount: candidate.composingCount,
+            resolutionCache: &cursorPrefixResolutionCache
         )
         let correspondingCount = resolvedCandidate.correspondingCount
         debugLogResolvedCorrespondingCount(
             scope: "GetComposedTextForCursorPrefix",
             candidateIndex: i,
-            candidateTotal: converted.mainResults.count,
+            candidateTotal: cursorPrefixResults.count,
             candidateComposingCount: candidate.composingCount,
             resolvedCorrespondingCount: correspondingCount,
             inputCount: prefixComposingText.input.count,
