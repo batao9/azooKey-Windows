@@ -196,10 +196,10 @@ impl ClauseState {
         input: ClauseTransitionInput,
         backend: &mut B,
     ) -> Result<ClauseTransition> {
-        let _ = input.candidates.as_ref();
+        let candidates = input.candidates;
         let effect = match command {
             ClauseCommand::StartClauseNavigation => {
-                Self::ensure_clause_navigation_ready(state, backend)?
+                Self::ensure_clause_navigation_ready(state, backend, candidates)?
             }
             ClauseCommand::MoveBy(direction) => Self::apply_move_clause(state, backend, direction)?,
             ClauseCommand::MoveLeft => Self::apply_move_clause(state, backend, -1)?,
@@ -223,9 +223,7 @@ impl ClauseState {
     pub(crate) fn transition_without_backend(
         state: &mut ClauseActionStateMut<'_>,
         command: ClauseCommand<'_>,
-        input: ClauseTransitionInput,
     ) -> ClauseTransition {
-        let _ = input.candidates.as_ref();
         let effect = match command {
             ClauseCommand::SetSelection(selection) => Self::apply_set_selection(state, selection),
             ClauseCommand::CommitAll
@@ -255,6 +253,7 @@ impl ClauseState {
     pub(crate) fn ensure_clause_navigation_ready<B: ClauseActionBackend>(
         state: &mut ClauseActionStateMut<'_>,
         backend: &mut B,
+        candidates: Option<Candidates>,
     ) -> Result<ClauseActionEffect> {
         if ClauseState::is_clause_navigation_state_active(state)
             || state.candidates.texts.is_empty()
@@ -267,7 +266,10 @@ impl ClauseState {
             return Ok(ClauseActionEffect::skipped());
         }
 
-        let navigation_candidates = backend.move_cursor(0)?;
+        let navigation_candidates = match candidates {
+            Some(candidates) => candidates,
+            None => backend.move_cursor(0)?,
+        };
         let Some(mut selected) =
             TextServiceFactory::select_navigation_candidate_for_current_preview(
                 &navigation_candidates,

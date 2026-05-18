@@ -1272,12 +1272,8 @@ impl TextServiceFactory {
         state: &mut ClauseActionStateMut<'_>,
         selection: &SetSelectionType,
     ) -> ClauseActionEffect {
-        ClauseState::transition_without_backend(
-            state,
-            ClauseCommand::SetSelection(selection),
-            ClauseTransitionInput::default(),
-        )
-        .effect
+        ClauseState::transition_without_backend(state, ClauseCommand::SetSelection(selection))
+            .effect
     }
 
     #[inline]
@@ -1325,32 +1321,48 @@ impl TextServiceFactory {
 
     #[inline]
     fn current_raw_input_suffix(raw_input: &str, corresponding_count: i32) -> String {
-        let chars = raw_input.chars().collect::<Vec<_>>();
-        let split_at = (corresponding_count.max(0) as usize).min(chars.len());
-        let adjusted_split_at = Self::adjust_single_n_raw_input_boundary(&chars, split_at);
+        let split_at = Self::byte_index_after_chars(raw_input, corresponding_count.max(0) as usize);
+        let adjusted_split_at = Self::adjust_single_n_raw_input_boundary(raw_input, split_at);
 
-        chars[adjusted_split_at..].iter().collect()
+        raw_input[adjusted_split_at..].to_string()
     }
 
     #[inline]
-    fn adjust_single_n_raw_input_boundary(raw_input_chars: &[char], split_at: usize) -> usize {
-        if split_at == 0 || split_at >= raw_input_chars.len() {
+    fn byte_index_after_chars(text: &str, char_count: usize) -> usize {
+        if char_count == 0 {
+            return 0;
+        }
+
+        text.char_indices()
+            .nth(char_count)
+            .map(|(byte_index, _)| byte_index)
+            .unwrap_or(text.len())
+    }
+
+    #[inline]
+    fn adjust_single_n_raw_input_boundary(raw_input: &str, split_at: usize) -> usize {
+        if split_at == 0 || split_at >= raw_input.len() || !raw_input.is_char_boundary(split_at) {
             return split_at;
         }
 
-        let consumed = raw_input_chars[split_at - 1];
-        let next = raw_input_chars[split_at];
+        let Some(consumed) = raw_input[..split_at].chars().next_back() else {
+            return split_at;
+        };
+        let Some(next) = raw_input[split_at..].chars().next() else {
+            return split_at;
+        };
         if !Self::is_ascii_romaji_consonant(consumed) || !Self::is_ascii_romaji_vowel(next) {
             return split_at;
         }
 
-        if raw_input_chars[..split_at - 1]
-            .iter()
+        if raw_input[..split_at]
+            .chars()
             .rev()
+            .skip(1)
             .find(|ch| ch.is_ascii_alphabetic())
             .is_some_and(|ch| ch.eq_ignore_ascii_case(&'n'))
         {
-            split_at - 1
+            split_at - consumed.len_utf8()
         } else {
             split_at
         }
@@ -3689,7 +3701,6 @@ impl TextServiceFactory {
                         let transition = ClauseState::transition_without_backend(
                             &mut state,
                             ClauseCommand::SetSelection(selection),
-                            ClauseTransitionInput::default(),
                         );
                         let effect = transition.effect;
                         ClauseState::write_back(state);

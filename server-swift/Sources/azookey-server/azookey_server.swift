@@ -431,7 +431,7 @@ private func adjustedCorrespondingCountForDelayedSingleN(
     originalComposingText: ComposingText,
     previewComposingText: ComposingText,
     candidateComposingCount: ComposingCount
-) -> (correspondingCount: Int, remainingConvertTarget: String) {
+) -> CandidateDisplayResolution {
     let originalResolution = resolveCandidateComposition(
         composingText: originalComposingText,
         candidateComposingCount: candidateComposingCount
@@ -443,11 +443,16 @@ private func adjustedCorrespondingCountForDelayedSingleN(
 
     return (
         correspondingCount: originalResolution.correspondingCount,
-        remainingConvertTarget: previewResolution.remainingConvertTarget
+        remainingConvertTarget: previewResolution.remainingConvertTarget,
+        remainingConvertTargetCount: previewResolution.remainingConvertTarget.count
     )
 }
 
-typealias CandidateDisplayResolution = (correspondingCount: Int, remainingConvertTarget: String)
+typealias CandidateDisplayResolution = (
+    correspondingCount: Int,
+    remainingConvertTarget: String,
+    remainingConvertTargetCount: Int
+)
 
 struct CursorPrefixCandidateResult {
     let candidate: Candidate
@@ -458,6 +463,36 @@ private struct CursorPrefixBoundaryCandidate {
     let index: Int
     let correspondingCount: Int
     let score: Int
+}
+
+private struct CursorPrefixBoundaryScoringContext {
+    let previewHiragana: String
+    let previewHiraganaBoundaries: [String.Index]
+
+    init(previewHiragana: String) {
+        self.previewHiragana = previewHiragana
+
+        var boundaries = [String.Index]()
+        boundaries.append(previewHiragana.startIndex)
+
+        var index = previewHiragana.startIndex
+        while index < previewHiragana.endIndex {
+            index = previewHiragana.index(after: index)
+            boundaries.append(index)
+        }
+        self.previewHiraganaBoundaries = boundaries
+    }
+
+    var previewHiraganaCount: Int {
+        max(0, previewHiraganaBoundaries.count - 1)
+    }
+
+    func boundaryIndex(afterCharacters count: Int) -> String.Index? {
+        guard count >= 0, count < previewHiraganaBoundaries.count else {
+            return nil
+        }
+        return previewHiraganaBoundaries[count]
+    }
 }
 
 private let cursorPrefixClauseTerminalSuffixes = [
@@ -473,18 +508,46 @@ private let cursorPrefixClauseTerminalSuffixes = [
     "ない",
 ]
 
-private func candidateRubyBoundarySet(_ candidate: Candidate) -> Set<Int> {
-    var boundaries = Set<Int>()
+private func cursorPrefixHasCandidateRubyBoundary(
+    candidate: Candidate,
+    prefixSurfaceCount: Int
+) -> Bool {
     var cursor = 0
     for element in candidate.data {
         cursor += element.ruby.count
-        boundaries.insert(cursor)
+        if cursor == prefixSurfaceCount {
+            return true
+        }
+        if cursor > prefixSurfaceCount {
+            return false
+        }
     }
-    return boundaries
+    return false
 }
 
-private func cursorPrefixTerminalPhraseBonus(prefixHiragana: String) -> Int {
-    cursorPrefixClauseTerminalSuffixes.contains { prefixHiragana.hasSuffix($0) } ? 120 : 0
+private func cursorPrefixTerminalPhraseBonus(
+    context: CursorPrefixBoundaryScoringContext,
+    prefixSurfaceCount: Int
+) -> Int {
+    guard let prefixEndIndex = context.boundaryIndex(afterCharacters: prefixSurfaceCount) else {
+        return 0
+    }
+
+    for suffix in cursorPrefixClauseTerminalSuffixes {
+        let suffixCount = suffix.count
+        guard prefixSurfaceCount >= suffixCount else {
+            continue
+        }
+
+        let suffixStartIndex = context.previewHiragana.index(
+            prefixEndIndex,
+            offsetBy: -suffixCount
+        )
+        if context.previewHiragana[suffixStartIndex..<prefixEndIndex].elementsEqual(suffix) {
+            return 120
+        }
+    }
+    return 0
 }
 
 private func cursorPrefixTokenBoundaryPenalty(
@@ -497,19 +560,24 @@ private func cursorPrefixTokenBoundaryPenalty(
         return 0
     }
 
-    return candidateRubyBoundarySet(candidate).contains(prefixSurfaceCount) ? 0 : 160
+    return cursorPrefixHasCandidateRubyBoundary(
+        candidate: candidate,
+        prefixSurfaceCount: prefixSurfaceCount
+    ) ? 0 : 160
 }
 
 private func cursorPrefixBoundaryScore(
     candidate: Candidate,
     candidateIndex: Int,
     resolution: CandidateDisplayResolution,
-    previewHiragana: String
+    context: CursorPrefixBoundaryScoringContext
 ) -> Int {
-    let remainingCount = resolution.remainingConvertTarget.count
-    let prefixSurfaceCount = max(0, previewHiragana.count - remainingCount)
-    let prefixHiragana = String(previewHiragana.prefix(prefixSurfaceCount))
-    let terminalBonus = cursorPrefixTerminalPhraseBonus(prefixHiragana: prefixHiragana)
+    let remainingCount = resolution.remainingConvertTargetCount
+    let prefixSurfaceCount = max(0, context.previewHiraganaCount - remainingCount)
+    let terminalBonus = cursorPrefixTerminalPhraseBonus(
+        context: context,
+        prefixSurfaceCount: prefixSurfaceCount
+    )
     let tokenBoundaryPenalty = cursorPrefixTokenBoundaryPenalty(
         candidate: candidate,
         prefixSurfaceCount: prefixSurfaceCount
@@ -703,6 +771,9 @@ private func preferCursorPrefixBoundary(
     resolutionCache: inout [String: CandidateDisplayResolution]
 ) -> Int? {
     let inputCount = originalComposingText.input.count
+    let scoringContext = CursorPrefixBoundaryScoringContext(
+        previewHiragana: previewComposingText.convertTarget
+    )
     var splitBoundary: CursorPrefixBoundaryCandidate?
     var fallbackBoundary: CursorPrefixBoundaryCandidate?
 
@@ -724,7 +795,7 @@ private func preferCursorPrefixBoundary(
                 candidate: candidate,
                 candidateIndex: index,
                 resolution: resolution,
-                previewHiragana: previewComposingText.convertTarget
+                context: scoringContext
             )
         )
 
