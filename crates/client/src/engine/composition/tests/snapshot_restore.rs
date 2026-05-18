@@ -114,6 +114,142 @@ fn move_clause_right_restores_future_clause_without_dropping_following_clauses()
     );
 }
 
+struct RichNavigationAfterShrinkBackend {
+    shrink_candidates: Candidates,
+    navigation_candidates: Candidates,
+}
+
+impl ClauseActionBackend for RichNavigationAfterShrinkBackend {
+    fn move_cursor(&mut self, offset: i32) -> anyhow::Result<Candidates> {
+        if offset == 0 {
+            Ok(self.navigation_candidates.clone())
+        } else {
+            Ok(self.shrink_candidates.clone())
+        }
+    }
+
+    fn shrink_text(&mut self, _offset: i32) -> anyhow::Result<Candidates> {
+        Ok(self.shrink_candidates.clone())
+    }
+}
+
+#[test]
+fn move_clause_right_prefers_rich_navigation_candidates_after_two_clause_shrink() {
+    let mut preview = "いい加減".to_string();
+    let mut suffix = "統一しろ".to_string();
+    let mut raw_input = "iikagentouitusiro".to_string();
+    let mut raw_hiragana = "いいかげんとういつしろ".to_string();
+    let mut fixed_prefix = String::new();
+    let mut corresponding_count = 7;
+    let mut selection_index = 0;
+    let mut current_candidates =
+        candidates(&["いい加減"], &["統一しろ"], "いいかげんとういつしろ", &[7]);
+    let mut clause_snapshots = Vec::new();
+    let mut future_clause_snapshots = Vec::new();
+    let mut current_clause_is_split_derived = true;
+    let mut current_clause_is_direct_split_remainder = false;
+    let mut current_clause_has_split_left_neighbor = false;
+    let mut current_clause_split_group_id = None;
+    let mut next_split_group_id = 1;
+    let mut state = ClauseActionStateMut {
+        preview: &mut preview,
+        suffix: &mut suffix,
+        raw_input: &mut raw_input,
+        raw_hiragana: &mut raw_hiragana,
+        fixed_prefix: &mut fixed_prefix,
+        corresponding_count: &mut corresponding_count,
+        selection_index: &mut selection_index,
+        candidates: &mut current_candidates,
+        clause_snapshots: &mut clause_snapshots,
+        future_clause_snapshots: &mut future_clause_snapshots,
+        current_clause_is_split_derived: &mut current_clause_is_split_derived,
+        current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+        current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+        current_clause_split_group_id: &mut current_clause_split_group_id,
+        next_split_group_id: &mut next_split_group_id,
+    };
+    let mut backend = RichNavigationAfterShrinkBackend {
+        shrink_candidates: candidates(&["統一しろ"], &[""], "とういつしろ", &[10]),
+        navigation_candidates: candidates(
+            &["統一しろ", "とういつしろ", "トウイツしろ"],
+            &["", "", ""],
+            "とういつしろ",
+            &[10, 10, 10],
+        ),
+    };
+
+    let effect = ClauseState::apply_move_clause(&mut state, &mut backend, 1)
+        .expect("move right should succeed");
+
+    assert!(effect.applied);
+    assert_eq!(
+        state.candidates.texts,
+        vec!["統一しろ", "とういつしろ", "トウイツしろ"]
+    );
+}
+
+#[test]
+fn auto_split_future_snapshot_preserves_rich_candidates_for_exact_two_clause_suffix() {
+    let mut preview = "いい加減".to_string();
+    let mut suffix = "統一しろ".to_string();
+    let mut raw_input = "iikagentouitusiro".to_string();
+    let mut raw_hiragana = "いいかげんとういつしろ".to_string();
+    let mut fixed_prefix = String::new();
+    let mut corresponding_count = 7;
+    let mut selection_index = 0;
+    let mut current_candidates =
+        candidates(&["いい加減"], &["統一しろ"], "いいかげんとういつしろ", &[7]);
+    let mut clause_snapshots = Vec::new();
+    let mut future_clause_snapshots = Vec::new();
+    let mut current_clause_is_split_derived = true;
+    let mut current_clause_is_direct_split_remainder = false;
+    let mut current_clause_has_split_left_neighbor = false;
+    let mut current_clause_split_group_id = Some(1);
+    let mut next_split_group_id = 2;
+    let mut state = ClauseActionStateMut {
+        preview: &mut preview,
+        suffix: &mut suffix,
+        raw_input: &mut raw_input,
+        raw_hiragana: &mut raw_hiragana,
+        fixed_prefix: &mut fixed_prefix,
+        corresponding_count: &mut corresponding_count,
+        selection_index: &mut selection_index,
+        candidates: &mut current_candidates,
+        clause_snapshots: &mut clause_snapshots,
+        future_clause_snapshots: &mut future_clause_snapshots,
+        current_clause_is_split_derived: &mut current_clause_is_split_derived,
+        current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+        current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+        current_clause_split_group_id: &mut current_clause_split_group_id,
+        next_split_group_id: &mut next_split_group_id,
+    };
+    let suffix_candidates = candidates(
+        &["統一しろ", "統一し路", "とういつしろ", "統一白"],
+        &["", "", "", ""],
+        "とういつしろ",
+        &[10, 10, 10, 10],
+    );
+    let mut backend = RichNavigationAfterShrinkBackend {
+        shrink_candidates: suffix_candidates.clone(),
+        navigation_candidates: suffix_candidates,
+    };
+
+    TextServiceFactory::rebuild_future_clause_snapshots_from_backend(&mut state, &mut backend)
+        .expect("future snapshots should rebuild");
+
+    let snapshot = state
+        .future_clause_snapshots
+        .last()
+        .expect("future suffix snapshot");
+    assert_eq!(snapshot.raw_input, "touitusiro");
+    assert_eq!(snapshot.raw_hiragana, "とういつしろ");
+    assert_eq!(
+        snapshot.candidates.texts,
+        vec!["統一しろ", "統一し路", "とういつしろ", "統一白"]
+    );
+    assert!(!snapshot.is_conservative);
+}
+
 #[test]
 fn move_clause_right_restores_split_group_from_actual_future_clause() {
     let split_group_id = 3;
@@ -210,6 +346,100 @@ fn adjust_boundary_without_existing_future_cache_does_not_capture_initial_split_
         "いかげんとういつしろ",
         false,
         None,
+    );
+
+    assert!(future.is_empty());
+}
+
+#[test]
+fn auto_split_bootstrap_uses_raw_suffix_hint_when_input_count_is_not_kana_count() {
+    let mut future = Vec::new();
+
+    TextServiceFactory::maybe_push_split_future_clause_snapshot(
+        &mut future,
+        "iikagentouitusiro",
+        "いいかげんとういつしろ",
+        7,
+        "とういつしろ",
+        true,
+        Some(1),
+    );
+
+    let snapshot = future
+        .last()
+        .expect("auto split should cache the remaining clause");
+    assert_eq!(snapshot.raw_input, "touitusiro");
+    assert_eq!(snapshot.raw_hiragana, "とういつしろ");
+    assert_eq!(snapshot.clause_preview, "とういつしろ");
+}
+
+#[test]
+fn auto_split_bootstrap_recovers_single_n_boundary_consumed_consonant() {
+    let mut future = Vec::new();
+
+    TextServiceFactory::maybe_push_split_future_clause_snapshot(
+        &mut future,
+        "iikagentouitusiro",
+        "いいかげんとういつしろ",
+        8,
+        "とういつしろ",
+        true,
+        Some(1),
+    );
+
+    let snapshot = future
+        .last()
+        .expect("single-n auto split should recover the consonant after n");
+    assert_eq!(snapshot.raw_input, "touitusiro");
+    assert_eq!(snapshot.raw_hiragana, "とういつしろ");
+    assert_eq!(snapshot.clause_preview, "とういつしろ");
+}
+
+#[test]
+fn exact_suffix_does_not_trigger_single_n_recovery() {
+    assert_eq!(
+        TextServiceFactory::recover_single_n_raw_hiragana_suffix(
+            "いいかげんとういつしろ",
+            "とういつしろ",
+        ),
+        None
+    );
+}
+
+#[test]
+fn auto_split_bootstrap_keeps_double_n_suffix_boundary() {
+    let mut future = Vec::new();
+
+    TextServiceFactory::maybe_push_split_future_clause_snapshot(
+        &mut future,
+        "iikagenntouitusiro",
+        "いいかげんとういつしろ",
+        8,
+        "とういつしろ",
+        true,
+        Some(1),
+    );
+
+    let snapshot = future
+        .last()
+        .expect("double-n auto split should cache the same remaining clause");
+    assert_eq!(snapshot.raw_input, "touitusiro");
+    assert_eq!(snapshot.raw_hiragana, "とういつしろ");
+    assert_eq!(snapshot.clause_preview, "とういつしろ");
+}
+
+#[test]
+fn auto_split_bootstrap_does_not_cache_untrusted_display_suffix() {
+    let mut future = Vec::new();
+
+    TextServiceFactory::maybe_push_split_future_clause_snapshot(
+        &mut future,
+        "iikagentouitusiro",
+        "いいかげんとういつしろ",
+        7,
+        "横溢しろ",
+        true,
+        Some(1),
     );
 
     assert!(future.is_empty());
