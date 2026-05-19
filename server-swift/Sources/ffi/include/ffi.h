@@ -3,7 +3,9 @@
 
 #include <stdio.h>
 
-#endif /* ffi_h */
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 struct FFICandidate {
     char *text;
@@ -11,3 +13,12 @@ struct FFICandidate {
     char *hiragana;
     int correspondingCount;
 };
+
+void FreeCString(char *ptr);
+void FreeCandidateList(struct FFICandidate **ptr, int length);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* ffi_h */

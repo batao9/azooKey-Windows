@@ -1191,10 +1191,51 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
     let pointer = UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>.allocate(capacity: list.count)
     for (i, item) in list.enumerated() {
-        pointer[i] = UnsafeMutablePointer<FFICandidate>.allocate(capacity: 1)
-        pointer[i]?.pointee = item
+        let candidatePtr = UnsafeMutablePointer<FFICandidate>.allocate(capacity: 1)
+        candidatePtr.initialize(to: item)
+        pointer.advanced(by: i).initialize(to: candidatePtr)
     }
     return pointer
+}
+
+@_silgen_name("FreeCString")
+public func free_c_string(_ ptr: UnsafeMutablePointer<CChar>?) {
+    guard let ptr else {
+        return
+    }
+    free(ptr)
+}
+
+@_silgen_name("FreeCandidateList")
+public func free_candidate_list(
+    _ ptr: UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>?,
+    _ length: Int32
+) {
+    guard let ptr else {
+        return
+    }
+
+    guard length > 0 else {
+        ptr.deinitialize(count: 0)
+        ptr.deallocate()
+        return
+    }
+
+    for index in 0..<Int(length) {
+        guard let candidatePtr = ptr[index] else {
+            continue
+        }
+
+        let candidate = candidatePtr.pointee
+        free(candidate.text)
+        free(candidate.subtext)
+        free(candidate.hiragana)
+        candidatePtr.deinitialize(count: 1)
+        candidatePtr.deallocate()
+    }
+
+    ptr.deinitialize(count: Int(length))
+    ptr.deallocate()
 }
 
 @_silgen_name("GetComposedText")

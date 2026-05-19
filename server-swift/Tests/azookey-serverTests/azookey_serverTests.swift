@@ -1,4 +1,5 @@
 import Foundation
+import ffi
 import KanaKanjiConverterModule
 import Testing
 @testable import azookey_server
@@ -75,6 +76,34 @@ private func testCandidate(
             )
         ]
     )
+}
+
+@Test func ffiFreeCStringAcceptsNullAndAllocatedStrings() async throws {
+    free_c_string(nil)
+
+    let text = try #require(_strdup("azookey"))
+    free_c_string(text)
+}
+
+@Test func ffiFreeCandidateListAcceptsNullEmptyAndPopulatedLists() async throws {
+    free_candidate_list(nil, 0)
+
+    let emptyList = to_list_pointer([])
+    free_candidate_list(emptyList, 0)
+
+    let text = try #require(_strdup("candidate"))
+    let subtext = try #require(_strdup("remaining"))
+    let hiragana = try #require(_strdup("かな"))
+    let candidates = [
+        FFICandidate(
+            text: text,
+            subtext: subtext,
+            hiragana: hiragana,
+            correspondingCount: 1
+        )
+    ]
+
+    free_candidate_list(to_list_pointer(candidates), Int32(candidates.count))
 }
 
 @Test func supportsNextInputCarryForTsuRules() async throws {
