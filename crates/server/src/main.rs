@@ -124,7 +124,81 @@ unsafe extern "C" {
     fn HasActiveComposition() -> bool;
     fn GetComposedText(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
     fn GetComposedTextForCursorPrefix(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
+    fn FreeCString(ptr: *mut c_char);
+    fn FreeCandidateList(ptr: *mut *mut FFICandidate, length: c_int);
     fn LoadConfig();
+}
+
+struct OwnedFfiString {
+    ptr: *mut c_char,
+}
+
+impl OwnedFfiString {
+    unsafe fn from_raw(scope: &str, ptr: *mut c_char) -> Result<Self, String> {
+        if ptr.is_null() {
+            return Err(format!("[{scope}] Swift FFI returned null pointer"));
+        }
+
+        Ok(Self { ptr })
+    }
+
+    fn to_string_lossy(&self) -> String {
+        unsafe { CStr::from_ptr(self.ptr as *const c_char) }
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+impl Drop for OwnedFfiString {
+    fn drop(&mut self) {
+        unsafe {
+            FreeCString(self.ptr);
+        }
+    }
+}
+
+struct OwnedFfiCandidates {
+    ptr: *mut *mut FFICandidate,
+    length: c_int,
+}
+
+impl OwnedFfiCandidates {
+    unsafe fn from_raw(
+        scope: &str,
+        ptr: *mut *mut FFICandidate,
+        length: c_int,
+    ) -> Result<Self, String> {
+        if length < 0 {
+            if !ptr.is_null() {
+                FreeCandidateList(ptr, 0);
+            }
+            return Err(format!("[{scope}] invalid negative length: {length}"));
+        }
+
+        if length > 0 && ptr.is_null() {
+            return Err(format!(
+                "[{scope}] null candidate list pointer (length={length})"
+            ));
+        }
+
+        Ok(Self { ptr, length })
+    }
+
+    fn len(&self) -> usize {
+        self.length as usize
+    }
+
+    unsafe fn candidate_ptr(&self, index: usize) -> *mut FFICandidate {
+        *self.ptr.add(index)
+    }
+}
+
+impl Drop for OwnedFfiCandidates {
+    fn drop(&mut self) {
+        unsafe {
+            FreeCandidateList(self.ptr, self.length);
+        }
+    }
 }
 
 fn next_request_id() -> u64 {
@@ -236,15 +310,8 @@ fn cstring_from_input(scope: &str, value: &str) -> Result<CString, String> {
 }
 
 fn ffi_text_result(scope: &str, result: *mut c_char) -> Result<String, String> {
-    if result.is_null() {
-        return Err(format!("[{scope}] Swift FFI returned null pointer"));
-    }
-
-    let text = unsafe { CStr::from_ptr(result as *const c_char) }
-        .to_string_lossy()
-        .into_owned();
-
-    Ok(text)
+    let result = unsafe { OwnedFfiString::from_raw(scope, result)? };
+    Ok(result.to_string_lossy())
 }
 
 fn i8_offset_from_i32(scope: &str, raw: i32) -> Result<i8, Status> {
@@ -366,93 +433,85 @@ fn update_active_composition_state(text: &str) {
 }
 
 fn get_composed_text(use_cursor_prefix: bool) -> Result<ComposedText, String> {
-    unsafe {
-        let mut length: c_int = 0;
-        let result = if use_cursor_prefix {
+    let mut length: c_int = 0;
+    let result = unsafe {
+        if use_cursor_prefix {
             GetComposedTextForCursorPrefix(&mut length)
         } else {
             GetComposedText(&mut length)
+        }
+    };
+    let call_name = if use_cursor_prefix {
+        "GetComposedTextForCursorPrefix"
+    } else {
+        "GetComposedText"
+    };
+    let candidates = unsafe { OwnedFfiCandidates::from_raw(call_name, result, length)? };
+    let length = candidates.len();
+
+    let mut suggestions = Vec::with_capacity(length);
+    let mut hiragana = None;
+    log_event_lazy!(
+        ServerLogLevel::Debug,
+        "[{call_name}] candidate_count={length}"
+    );
+
+    for index in 0..length {
+        let candidate_ptr = unsafe { candidates.candidate_ptr(index) };
+        if candidate_ptr.is_null() {
+            log_event(
+                ServerLogLevel::Warn,
+                &format!("[{call_name}] candidate[{index}] is null and skipped"),
+            );
+            continue;
+        }
+
+        let candidate = unsafe { (*candidate_ptr).clone() };
+        if candidate.text.is_null() || candidate.subtext.is_null() {
+            log_event(
+                ServerLogLevel::Warn,
+                &format!(
+                    "[{call_name}] candidate[{index}] has null text/subtext pointer and was skipped"
+                ),
+            );
+            continue;
+        }
+
+        if hiragana.is_none() && !candidate.hiragana.is_null() {
+            hiragana = Some(
+                unsafe { CStr::from_ptr(candidate.hiragana) }
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+
+        let text = unsafe { CStr::from_ptr(candidate.text) }
+            .to_string_lossy()
+            .into_owned();
+        let subtext = unsafe { CStr::from_ptr(candidate.subtext) }
+            .to_string_lossy()
+            .into_owned();
+        let corresponding_count = candidate.corresponding_count;
+
+        let suggestion = Suggestion {
+            text,
+            subtext,
+            corresponding_count,
         };
-        let call_name = if use_cursor_prefix {
-            "GetComposedTextForCursorPrefix"
-        } else {
-            "GetComposedText"
-        };
-        if length < 0 {
-            return Err(format!("[{call_name}] invalid negative length: {length}"));
+
+        if suggestions
+            .iter()
+            .any(|s: &Suggestion| s.text == suggestion.text)
+        {
+            continue;
         }
-
-        let length = length as usize;
-        if length > 0 && result.is_null() {
-            return Err(format!(
-                "[{call_name}] null candidate list pointer (length={length})"
-            ));
-        }
-
-        let mut suggestions = Vec::with_capacity(length);
-        let mut hiragana = None;
-        log_event_lazy!(
-            ServerLogLevel::Debug,
-            "[{call_name}] candidate_count={length}"
-        );
-
-        for index in 0..length {
-            let candidate_ptr = *result.add(index);
-            if candidate_ptr.is_null() {
-                log_event(
-                    ServerLogLevel::Warn,
-                    &format!("[{call_name}] candidate[{index}] is null and skipped"),
-                );
-                continue;
-            }
-
-            let candidate = (*candidate_ptr).clone();
-            if candidate.text.is_null() || candidate.subtext.is_null() {
-                log_event(
-                    ServerLogLevel::Warn,
-                    &format!(
-                        "[{call_name}] candidate[{index}] has null text/subtext pointer and was skipped"
-                    ),
-                );
-                continue;
-            }
-
-            if hiragana.is_none() && !candidate.hiragana.is_null() {
-                hiragana = Some(
-                    CStr::from_ptr(candidate.hiragana)
-                        .to_string_lossy()
-                        .into_owned(),
-                );
-            }
-
-            let text = CStr::from_ptr(candidate.text)
-                .to_string_lossy()
-                .into_owned();
-            let subtext = CStr::from_ptr(candidate.subtext)
-                .to_string_lossy()
-                .into_owned();
-            let corresponding_count = candidate.corresponding_count;
-
-            let suggestion = Suggestion {
-                text,
-                subtext,
-                corresponding_count,
-            };
-
-            if suggestions
-                .iter()
-                .any(|s: &Suggestion| s.text == suggestion.text)
-            {
-                continue;
-            }
-            suggestions.push(suggestion);
-        }
-
-        Ok(ComposedText {
-            hiragana,
-            suggestions,
-        })
+        suggestions.push(suggestion);
     }
+
+    Ok(ComposedText {
+        hiragana,
+        suggestions,
+    })
 }
 
 fn shrink_text(offset: i8) -> Result<RawComposingText, String> {
