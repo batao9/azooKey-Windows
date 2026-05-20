@@ -157,6 +157,9 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                 <script>
                     function updateCandidates(candidates) {
                         const candidateList = document.getElementById('candidate-list');
+                        if (!candidateList || !Array.isArray(candidates)) {
+                            return;
+                        }
 
                         const existingItems = Array.from(candidateList.children);
 
@@ -177,22 +180,37 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
 
                     function updateSelection(index) {
                         const candidateList = document.getElementById('candidate-list');
+                        if (!candidateList || candidateList.children.length === 0) {
+                            return;
+                        }
+
+                        const childCount = candidateList.children.length;
+                        const numericIndex = Number(index);
+                        const safeIndex = Number.isFinite(numericIndex)
+                            ? Math.min(Math.max(Math.trunc(numericIndex), 0), childCount - 1)
+                            : 0;
+
                         const selected = candidateList.querySelector('[data-selected]');
                         if (selected) {
                             selected.removeAttribute('data-selected');
                         }
                         
-                        candidateList.children[index].setAttribute('data-selected', '');
+                        const target = candidateList.children[safeIndex];
+                        target.setAttribute('data-selected', '');
                         
                         const itemHeight = candidateList.children[0].offsetHeight;
+                        if (itemHeight <= 0) {
+                            return;
+                        }
                         const visibleItems = Math.floor(candidateList.clientHeight / itemHeight);
                         
                         const groupSize = 5;
-                        const groupIndex = Math.floor(index / groupSize);
+                        const groupIndex = Math.floor(safeIndex / groupSize);
                         const scrollToIndex = groupIndex * groupSize;
+                        const scrollTarget = candidateList.children[scrollToIndex];
                         
-                        if (index === scrollToIndex || !isElementInView(candidateList.children[index], candidateList)) {
-                            candidateList.children[scrollToIndex].scrollIntoView({ behavior: "instant", block: "start", inline: "start" });
+                        if (scrollTarget && (safeIndex === scrollToIndex || !isElementInView(target, candidateList))) {
+                            scrollTarget.scrollIntoView({ behavior: "instant", block: "start", inline: "start" });
                         }
                     }
                     

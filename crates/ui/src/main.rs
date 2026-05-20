@@ -1,7 +1,6 @@
 use std::cmp::max;
 use std::sync::Arc;
 
-use anyhow::Context as _;
 use azookey_server::TonicNamedPipeServer;
 use ipc::{WindowAction, WindowController, WindowService};
 use shared::proto::window_service_server::WindowServiceServer;
@@ -9,7 +8,7 @@ use tao::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use tao::platform::windows::{EventLoopBuilderExtWindows, WindowExtWindows};
 use tao::{
     event::{Event, StartCause, WindowEvent},
-    event_loop::{ControlFlow, EventLoopBuilder},
+    event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
 };
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -49,6 +48,18 @@ fn place_candidate_windows(
         (rect.left - INDICATOR_WINDOW_LEFT_OFFSET) as f64,
         rect.bottom as f64,
     ));
+}
+
+fn send_user_event(proxy: &EventLoopProxy<UserEvent>, event: UserEvent) {
+    if let Err(error) = proxy.send_event(event) {
+        eprintln!("Warning: Failed to send UI event: {error:?}");
+    }
+}
+
+fn evaluate_script(webview: &wry::WebView, script: &str) {
+    if let Err(error) = webview.evaluate_script(script) {
+        eprintln!("Warning: Failed to evaluate WebView script: {error:?}");
+    }
 }
 
 #[derive(Debug)]
@@ -93,16 +104,14 @@ async fn main() -> anyhow::Result<()> {
     let candidate_window = candidate::create_candidate_window(&event_loop)?;
     let candidate_webview_builder = candidate::create_candidate_webview()?;
     let candidate_webview = candidate_webview_builder
-        .with_devtools(true)
+        .with_devtools(cfg!(debug_assertions))
         .with_ipc_handler(move |message| {
             if let Ok(message) = serde_json::from_str::<serde_json::Value>(message.body()) {
                 if let Some(type_value) = message.get("type") {
                     if type_value == "resize" {
                         if let Some(height) = message.get("height") {
                             let height = height.as_f64().unwrap_or(0.0);
-                            proxy_clone
-                                .send_event(UserEvent::UpdateHeight(height as i32))
-                                .unwrap();
+                            send_user_event(&proxy_clone, UserEvent::UpdateHeight(height as i32));
                         }
                     }
                 }
@@ -117,54 +126,7 @@ async fn main() -> anyhow::Result<()> {
     let proxy_clone = event_loop_proxy.clone();
     tokio::spawn(async move {
         while let Some(action) = rx.recv().await {
-            match action {
-                WindowAction::Show => {
-                    proxy_clone
-                        .send_event(UserEvent::WindowAction(WindowAction::Show))
-                        .unwrap();
-                }
-                WindowAction::Hide => {
-                    proxy_clone
-                        .send_event(UserEvent::WindowAction(WindowAction::Hide))
-                        .unwrap();
-                }
-                WindowAction::SetPosition {
-                    top,
-                    left,
-                    bottom,
-                    right,
-                } => {
-                    proxy_clone
-                        .send_event(UserEvent::WindowAction(WindowAction::SetPosition {
-                            top,
-                            left,
-                            bottom,
-                            right,
-                        }))
-                        .unwrap();
-                }
-                WindowAction::SetCandidate { candidates } => {
-                    proxy_clone
-                        .send_event(UserEvent::WindowAction(WindowAction::SetCandidate {
-                            candidates,
-                        }))
-                        .unwrap();
-                }
-                WindowAction::SetSelection { index } => {
-                    proxy_clone
-                        .send_event(UserEvent::WindowAction(WindowAction::SetSelection {
-                            index,
-                        }))
-                        .unwrap();
-                }
-                WindowAction::SetInputMode(input_method) => {
-                    proxy_clone
-                        .send_event(UserEvent::WindowAction(WindowAction::SetInputMode(
-                            input_method,
-                        )))
-                        .unwrap();
-                }
-            }
+            send_user_event(&proxy_clone, UserEvent::WindowAction(action));
         }
     });
 
@@ -183,19 +145,24 @@ async fn main() -> anyhow::Result<()> {
             } => *control_flow = ControlFlow::Exit,
             Event::UserEvent(script) => match script {
                 UserEvent::UpdateCandidates(candidates) => {
-                    candidate_webview
-                        .evaluate_script(&format!("updateCandidates({})", candidates))
-                        .unwrap();
+                    evaluate_script(
+                        &candidate_webview,
+                        &format!("updateCandidates({})", candidates),
+                    );
                 }
                 UserEvent::UpdateSelection(index) => {
-                    candidate_webview
-                        .evaluate_script(&format!("updateSelection({})", index))
-                        .unwrap();
+                    evaluate_script(&candidate_webview, &format!("updateSelection({})", index));
                 }
                 UserEvent::UpdateInputMethod(input_method) => {
-                    indicator_webview
-                        .evaluate_script(&format!("updateInputMethod(\"{}\")", input_method))
-                        .unwrap();
+                    match serde_json::to_string(&input_method) {
+                        Ok(input_method) => evaluate_script(
+                            &indicator_webview,
+                            &format!("updateInputMethod({})", input_method),
+                        ),
+                        Err(error) => {
+                            eprintln!("Warning: Failed to serialize input method: {error:?}");
+                        }
+                    }
                 }
                 UserEvent::UpdateHeight(height) => {
                     let width = candidate_window.inner_size().width as i32;
@@ -287,26 +254,29 @@ async fn main() -> anyhow::Result<()> {
                                 height as u32,
                             ));
 
-                            let candidates = serde_json::to_string(&candidates)
-                                .context("Failed to serialize candidates")
-                                .unwrap();
-
-                            event_loop_proxy
-                                .send_event(UserEvent::UpdateCandidates(candidates))
-                                .unwrap();
+                            match serde_json::to_string(&candidates) {
+                                Ok(candidates) => {
+                                    send_user_event(
+                                        &event_loop_proxy,
+                                        UserEvent::UpdateCandidates(candidates),
+                                    );
+                                }
+                                Err(error) => {
+                                    eprintln!("Warning: Failed to serialize candidates: {error:?}");
+                                }
+                            }
                             if let Some(rect) = last_candidate_rect {
                                 place_candidate_windows(&candidate_window, &indicator_window, rect);
                             }
                         }
                         WindowAction::SetSelection { index } => {
-                            event_loop_proxy
-                                .send_event(UserEvent::UpdateSelection(index))
-                                .unwrap();
+                            send_user_event(&event_loop_proxy, UserEvent::UpdateSelection(index));
                         }
                         WindowAction::SetInputMode(input_method) => {
-                            event_loop_proxy
-                                .send_event(UserEvent::UpdateInputMethod(input_method))
-                                .unwrap();
+                            send_user_event(
+                                &event_loop_proxy,
+                                UserEvent::UpdateInputMethod(input_method),
+                            );
 
                             let task_guard = task_guard.try_lock();
 
