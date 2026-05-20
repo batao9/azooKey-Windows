@@ -1,5 +1,8 @@
 # azooKey for Windows
 
+> [!IMPORTANT]
+> このリポジトリは [fkunn1326/azooKey-Windows](https://github.com/fkunn1326/azooKey-Windows) からの fork です。
+
 [AzooKeyKanaKanjiConverter](https://github.com/azooKey/AzooKeyKanaKanjiConverter)を利用したWindows版IMEです。
 
 > [!WARNING]
@@ -7,7 +10,7 @@
 
 # インストール方法
 [Release](https://github.com/batao9/azooKey-Windows/releases)からazookey-setup.exeをダウンロードし、インストーラーを実行してください。
-こちらは fkunn1326/azooKey-Windows の fork ですので注意してください。
+こちらは [fkunn1326/azooKey-Windows](https://github.com/fkunn1326/azooKey-Windows) の fork ですので注意してください。
 
 # 機能
 
@@ -136,6 +139,30 @@ regsvr32.exe "path/to/build/x86/azookey_windows.dll" /s
 #### 開発時のヒント
 - 開発は仮想マシンまたは専用のPCで行うことを推奨します。IMEがクラッシュするとWindowsがフリーズする可能性があります。
 - IMEを解除する際、IMEを使用中のアプリケーション（メモ帳など）を終了しないと、解除できないことがあります。
+
+### VMを使った開発
+
+Windows IME はホスト環境への影響が大きいため、VirtualBox 上にビルド用 VM と検証用 VM を用意して開発することを推奨します。
+
+- ビルド用 VM: Rust / Swift for Windows / Node.js / Inno Setup など、ビルドに必要なツールをインストールします。
+- 検証用 VM: インストーラーを実行し、IME の登録・入力・設定画面などを確認します。
+
+VM の名前、スナップショット名、SSH 接続先、鍵パスなどは環境ごとに異なるため、リポジトリには固定していません。`scripts/` のスクリプトを使う場合は `VM_NAME`、`SNAPSHOT_NAME`、`SSH_USER`、`SSH_PORT`、`SSH_KEY` などを環境変数で指定してください。`.local/` に同じ用途のスクリプトがある場合は、環境固有の設定が入っている可能性があるため `.local/` 側を優先して使います。
+
+代表的な実行例:
+
+```sh
+# ビルド用 VM でインストーラーを作成
+scripts/vm_build.sh <branch>
+
+# ビルド用 VM で client の composition 関連 test を実行
+scripts/vm_test_client_composition.sh <branch> [cargo-test-filter|skip] [swift-test-filter|all|skip]
+
+# 検証用 VM にインストーラーをサイレントインストール
+scripts/vm_stage_for_manual_test.sh <installer-path|latest>
+```
+
+検証用 VM はクリーンなスナップショットから起動し、インストールログを `.local/logs/` に回収します。手動確認を続ける場合は `SHUTDOWN_AFTER_INSTALL=0` を指定して、インストール後も VM を起動したままにできます。
 
 # 関連
 
