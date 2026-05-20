@@ -4,61 +4,59 @@
 
 ## 基本ルール
 
-- `origin` に push して GitHub CI でビルドする。
-- 機能ごとに独立したブランチで開発する。
+- 開発は機能・修正ごとに独立したブランチで行う。
+- `master` へ直接コミットしない。開発前に `master` を最新化し、そこから作業ブランチを作成する。
+- 変更後は必要なローカル検証を行い、`origin` へ push して GitHub CI で確認する。
+- VM 名、スナップショット名、SSH 接続先、鍵パスなどの環境依存値はリポジトリに固定しない。必要に応じて環境変数または `.local/` のローカルスクリプトで指定する。
 
 ## ブランチ構成
 
 - `master`
-  - fork 運用専用変更を置く基底ブランチ。
-  - 例: `AGENTS.md`, `.github/workflows`, `.gitignore`, ローカル運用スクリプト。
-- `pr-base`
-  - `upstream/master` 同期専用。直接開発しない。
+  - メインブランチ。直接開発しない。
+  - 開発前に最新化し、`master` から機能開発用またはバグ修正用のブランチを切る。
 - `feature/<feature>`
-  - 機能開発用ブランチ。`master` から切る。
+  - 機能開発用ブランチ。
+  - 対応する issue がある場合は `feature/<issue-number>-<feature>` の形式にする。
 - `fix/<issue>`
   - バグ修正用ブランチ。
+  - 対応する issue がある場合は `fix/<issue-number>-<issue>` の形式にする。
 
 ## 開発フロー
 
-1. `master` から `feature/<feature>` を作成する。
-2. VM によってビルドを行い、 VM で動作を検証する。
-3. 動作確認後 `origin/feature/<feature>` に push し、CI で検証する。
-4. CIでのビルドを実機にインストールして動作を確認する。
-4. `origin/master` へ PR を出す。
+1. `master` を最新化する。
+2. `master` から作業ブランチを作成する。
+3. 実装し、変更範囲に応じた test を追加・更新する。
+4. VM ビルド、VM test、インストール検証など、変更に必要な確認を行う。
+5. `origin/<branch>` に push し、GitHub CI の結果を確認する。
+6. 必要に応じて CI で生成したビルドを実機にインストールし、動作を確認する。
+7. `origin/master` へ PR を出す。
 
 ## ビルド / 検証
 
-- VM によってビルドを行い、 VM で動作を検証する。
-- 検証後 `origin` に push して GitHub CI でビルドする。
+- 正式なビルド判定は GitHub CI とする。
+- ローカル確認として、可能なら Windows VM 上でビルド・test・インストール検証を行う。
+- VM 操作用スクリプトは `scripts/` または `.local/` のものを使う。`.local/` に同じ用途のスクリプトがある場合は、環境固有の設定を含む可能性があるため `.local/` を優先する。
+- 公開用スクリプトは環境依存値を持たない。`VM_NAME`、`SNAPSHOT_NAME`、`SSH_USER`、`SSH_PORT`、`SSH_KEY`、必要に応じて `SSH_HOST` や `VBOX_MANAGE` を環境変数で指定して実行する。
+
+代表的な実行方法:
+
+- VM ビルド: `scripts/vm_build.sh <branch>`
+- `client` クレートの composition / clause adjustment / stateful test: `scripts/vm_test_client_composition.sh <branch> [cargo-test-filter|skip] [swift-test-filter|all|skip]`
+- インストーラーの無人ステージング: `scripts/vm_stage_for_manual_test.sh <installer-path|latest>`
+
+`.local/` 側に対応するスクリプトがある場合の例:
+
+- VM ビルド: `.local/vm_build_master.sh <branch>`
+- VM test: `.local/vm_test_client_composition.sh <branch> [cargo-test-filter|skip] [swift-test-filter|all|skip]`
+- インストール検証: `.local/vm_stage_for_manual_test.sh <installer-path|latest>`
+
+VM ビルドでは、指定ブランチと現在ブランチが一致していることを確認する。成果物は `.local/artifacts/` に回収する。可能なら検証前後に指定スナップショットへ復元し、VM をクリーンな状態に戻す。
+
+インストール検証では、クリーンなスナップショットへ復元してから VM を起動し、インストーラーを転送してサイレント実行する。インストールログは `.local/logs/` に回収する。
 
 ## テスト方針
 
 - 変更に応じて必要な test を実装する。バグ修正では、まず再現 test や回帰 test の追加を優先する。
 - 実装変更後は、変更範囲に対応する test を実行し、pass を確認してから次の段階へ進む。
-- `client` クレートの composition / clause adjustment / stateful test に関わる変更では、可能なら `.local/vm_test_client_composition.sh <branch> [test-filter]` を実行して Windows VM 上で確認する。
-- push 前の事前確認として、可能なら `.local/vm_build_master.sh <branch>` を実行し、ビルド成功を確認する。
-
-## ローカルVMビルド（任意）
-
-- 正式なビルド判定は GitHub CI とする。
-- push 前の事前確認として、可能であればローカル VM でのビルドを実行する。
-- ローカル VM ビルドの実行インターフェースは `.local/vm_build_master.sh <branch>` とする。
-- ローカル VM ビルドスクリプトは、少なくとも以下を満たすこと。
-  - 指定ブランチと現在ブランチが一致しない場合は失敗させる。
-  - 作業ツリーがクリーンでない場合は失敗させる。
-  - 成果物は `.local/artifacts/` に回収する。
-  - 成功時・失敗時ともに、終了時に既定スナップショットへ復元してクリーン状態へ戻す。
-
-## ローカル無人ステージング（任意）
-
-- push 前の追加確認として、可能であればローカル VM でインストーラーの無人ステージングを行う。
-- 無人ステージングの実行インターフェースは `.local/vm_stage_for_manual_test.sh <installer-path|latest>` とする。
-- ローカル無人ステージングスクリプトは、少なくとも以下を満たすこと。
-  - 検証用 VM をクリーンなスナップショットへ復元してから起動する。
-  - インストーラーを VM へ転送し、サイレント実行でインストールする。
-  - VC++ ランタイムなど、インストーラーが前提とする依存物は事前導入済みスナップショットを再利用する。
-  - インストールログは `.local/logs/` に回収する。
-  - 成功後は VM を起動したままにして、手動確認へ引き継げる状態にする。
-- 無人ステージングで利用する VM 名、スナップショット名、SSH 接続先、鍵パスなどの環境依存値は `AGENTS.md` に固定せず、スクリプト側の環境変数で上書き可能にする。
-- `installer/Installer.iss` から内側インストーラーを起動する場合は、無人ステージングを妨げないサイレント引数を維持する。
+- `client` クレートの composition / clause adjustment / stateful test に関わる変更では、可能なら VM 上の test スクリプトを実行する。
+- push 前の事前確認として、可能なら VM ビルドを実行し、ビルド成功を確認する。
