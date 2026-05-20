@@ -41,52 +41,52 @@ pub struct WindowService {
     pub controller: WindowController,
 }
 
+impl WindowService {
+    async fn send_action(&self, action: WindowAction) -> Result<Response<EmptyResponse>, Status> {
+        self.controller
+            .sender
+            .send(action)
+            .await
+            .map_err(|_| Status::internal("window event channel is closed"))?;
+
+        Ok(Response::new(EmptyResponse {}))
+    }
+}
+
 #[tonic::async_trait]
 impl WindowServiceProto for WindowService {
     async fn show_window(
         &self,
         _request: Request<EmptyResponse>,
     ) -> Result<Response<EmptyResponse>, Status> {
-        self.controller
-            .sender
-            .send(WindowAction::Show)
-            .await
-            .unwrap();
-        Ok(Response::new(EmptyResponse {}))
+        self.send_action(WindowAction::Show).await
     }
 
     async fn hide_window(
         &self,
         _request: Request<EmptyResponse>,
     ) -> Result<Response<EmptyResponse>, Status> {
-        self.controller
-            .sender
-            .send(WindowAction::Hide)
-            .await
-            .unwrap();
-        Ok(Response::new(EmptyResponse {}))
+        self.send_action(WindowAction::Hide).await
     }
     async fn set_window_position(
         &self,
         request: Request<SetPositionRequest>,
     ) -> Result<Response<EmptyResponse>, Status> {
-        let position = request.into_inner().position.unwrap();
+        let position = request
+            .into_inner()
+            .position
+            .ok_or_else(|| Status::invalid_argument("position is required"))?;
         let top = position.top;
         let left = position.left;
         let bottom = position.bottom;
         let right = position.right;
-        self.controller
-            .sender
-            .send(WindowAction::SetPosition {
-                top,
-                left,
-                bottom,
-                right,
-            })
-            .await
-            .unwrap();
-
-        Ok(Response::new(EmptyResponse {}))
+        self.send_action(WindowAction::SetPosition {
+            top,
+            left,
+            bottom,
+            right,
+        })
+        .await
     }
 
     async fn set_candidate(
@@ -95,15 +95,10 @@ impl WindowServiceProto for WindowService {
     ) -> Result<Response<EmptyResponse>, Status> {
         let candidate = request.into_inner().candidates;
 
-        self.controller
-            .sender
-            .send(WindowAction::SetCandidate {
-                candidates: candidate,
-            })
-            .await
-            .unwrap();
-
-        Ok(Response::new(EmptyResponse {}))
+        self.send_action(WindowAction::SetCandidate {
+            candidates: candidate,
+        })
+        .await
     }
 
     async fn set_selection(
@@ -111,13 +106,7 @@ impl WindowServiceProto for WindowService {
         request: Request<SetSelectionRequest>,
     ) -> Result<Response<EmptyResponse>, Status> {
         let index = request.into_inner().index;
-        self.controller
-            .sender
-            .send(WindowAction::SetSelection { index })
-            .await
-            .unwrap();
-
-        Ok(Response::new(EmptyResponse {}))
+        self.send_action(WindowAction::SetSelection { index }).await
     }
 
     async fn set_input_mode(
@@ -125,12 +114,77 @@ impl WindowServiceProto for WindowService {
         request: Request<SetInputModeRequest>,
     ) -> Result<Response<EmptyResponse>, Status> {
         let mode = request.into_inner().mode;
-        self.controller
-            .sender
-            .send(WindowAction::SetInputMode(mode))
-            .await
-            .unwrap();
+        self.send_action(WindowAction::SetInputMode(mode)).await
+    }
+}
 
-        Ok(Response::new(EmptyResponse {}))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::proto::WindowPosition;
+    use tonic::Code;
+
+    fn service_with_receiver() -> (WindowService, mpsc::Receiver<WindowAction>) {
+        let (sender, receiver) = mpsc::channel(1);
+        (
+            WindowService {
+                controller: WindowController::new(sender),
+            },
+            receiver,
+        )
+    }
+
+    #[tokio::test]
+    async fn set_window_position_without_position_returns_invalid_argument() {
+        let (service, _receiver) = service_with_receiver();
+
+        let error = service
+            .set_window_position(Request::new(SetPositionRequest { position: None }))
+            .await
+            .expect_err("missing position should be rejected");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn set_window_position_sends_action() {
+        let (service, mut receiver) = service_with_receiver();
+
+        service
+            .set_window_position(Request::new(SetPositionRequest {
+                position: Some(WindowPosition {
+                    top: 1,
+                    left: 2,
+                    bottom: 3,
+                    right: 4,
+                }),
+            }))
+            .await
+            .expect("valid position should be sent");
+
+        match receiver.recv().await.expect("action should be queued") {
+            WindowAction::SetPosition {
+                top,
+                left,
+                bottom,
+                right,
+            } => {
+                assert_eq!((top, left, bottom, right), (1, 2, 3, 4));
+            }
+            action => panic!("unexpected action: {action:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_channel_returns_internal_status() {
+        let (service, receiver) = service_with_receiver();
+        drop(receiver);
+
+        let error = service
+            .show_window(Request::new(EmptyResponse {}))
+            .await
+            .expect_err("closed channel should be reported as a gRPC error");
+
+        assert_eq!(error.code(), Code::Internal);
     }
 }
