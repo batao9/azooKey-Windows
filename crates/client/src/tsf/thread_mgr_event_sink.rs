@@ -14,25 +14,13 @@ use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
 
 impl TextServiceFactory {
     pub fn set_keyboard_disabled_state(&self, disabled: bool) -> Result<()> {
-        let (changed, ipc_service) = {
-            let mut state = IMEState::get()?;
-            let changed = state.keyboard_disabled != disabled;
-            state.keyboard_disabled = disabled;
-            let ipc_service = if disabled {
-                state.ipc_service.clone()
-            } else {
-                None
-            };
-
-            (changed, ipc_service)
-        };
+        let (changed, ipc_service) = IMEState::set_keyboard_disabled_and_clone_ipc(disabled)?;
 
         if let Some(mut ipc_service) = ipc_service {
             let _ = ipc_service.hide_window();
             let _ = ipc_service.set_candidates(vec![]);
 
-            let mut state = IMEState::get()?;
-            state.ipc_service = Some(ipc_service);
+            IMEState::set_ipc_service(ipc_service)?;
         }
 
         if changed {
@@ -88,8 +76,8 @@ impl ITfThreadMgrEventSink_Impl for TextServiceFactory_Impl {
 
         if focus.is_none() {
             let mut text_service = self.borrow_mut()?;
-            text_service.context = None;
             let _ = text_service.unadvise_text_layout_sink();
+            text_service.context = None;
         }
 
         Ok(())
