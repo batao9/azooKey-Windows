@@ -6,7 +6,8 @@
 #define MyAppName "Azookey"
 #define MyAppPublisher "batao9"
 #define MyAppURL "https://github.com/batao9/azooKey-Windows/"
-#define MyNsisInstallerName "Azookey_" + MyAppVersion + "_x64-setup.exe"
+#define MySettingsAppName "frontend.exe"
+#define MyLegacyNsisUninstallKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\Azookey"
 
 [Setup]
 ; NOTE: The value of AppId uniquely identifies this application. Do not use the same AppId value in installers for other applications.
@@ -43,10 +44,19 @@ Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
 [Files]
 Source: "../build/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey.dll"; Flags: ignoreversion regserver 64bit
 Source: "../build/x86/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey32.dll"; Flags: ignoreversion regserver 32bit
-Source: "../build/*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "../target/release/bundle/nsis/{#MyNsisInstallerName}"; Flags: dontcopy noencryption
+Source: "../build/{#MySettingsAppName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "../build/*"; DestDir: "{app}"; Excludes: "{#MySettingsAppName}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "./Azookey Startup.xml"; Flags: dontcopy noencryption
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
+
+[InstallDelete]
+Type: files; Name: "{app}\uninstall.exe"
+
+[Registry]
+Root: HKCU; Subkey: "{#MyLegacyNsisUninstallKey}"; Flags: deletekey
+Root: HKLM; Subkey: "{#MyLegacyNsisUninstallKey}"; Flags: deletekey
+Root: HKLM32; Subkey: "{#MyLegacyNsisUninstallKey}"; Flags: deletekey
+Root: HKLM64; Subkey: "{#MyLegacyNsisUninstallKey}"; Flags: deletekey
 
 [Run]
 Filename: "icacls"; \
@@ -66,13 +76,9 @@ Filename: "schtasks"; \
 [Code]
 function InitializeSetup: Boolean;
 begin
-  ExtractTemporaryFile('{#MyNsisInstallerName}');
   Dependency_AddVC2015To2022x64;
   Dependency_AddVC2015To2022x86;
-  Dependency_Add('{#MyNsisInstallerName}',
-    '/S',
-    'Azookey',
-    '', '', True, False);
+  Dependency_AddWebView2;
 
   Result := True;
 end;
@@ -138,25 +144,27 @@ begin
   end;
 end;
 
-procedure UninstallAzookey();
-var
-  UninstallString: string;
-  Dummy: Integer;
+procedure WriteInstallMetadata();
 begin
-  if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\Azookey', 'UninstallString', UninstallString) then
-  begin
-    if UninstallString <> '' then
-    begin
-      ShellExec('', UninstallString, '', '', SW_HIDE, ewWaitUntilTerminated, Dummy);
-    end;
-  end;
+  RegWriteStringValue(
+    HKLM,
+    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{80B746D4-D74D-4345-8F81-47E06BCAB515}_is1',
+    'InstallLocation',
+    ExpandConstant('{app}')
+  );
+  RegWriteStringValue(
+    HKLM,
+    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{80B746D4-D74D-4345-8F81-47E06BCAB515}_is1',
+    'MainBinaryName',
+    '{#MySettingsAppName}'
+  );
 end;
-
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
+    WriteInstallMetadata();
     CreateVbsFile();
     UpdateTaskXml();
   end;
@@ -166,12 +174,4 @@ procedure CurPageChanged(CurPageID: Integer);
 begin
   if CurPageID = wpFinished then
     WizardForm.RunList.Visible := False;
-end;
-
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
-begin
-  if CurUninstallStep = usPostUninstall then
-  begin
-    UninstallAzookey();
-  end;
 end;

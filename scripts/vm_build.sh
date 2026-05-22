@@ -572,14 +572,6 @@ Write-Host "running npm ci"
 npm.cmd ci --prefer-offline --no-audit
 
 Set-Location $SourceDir
-Write-Host "forcing tauri bundle target to nsis for local VM build"
-$tauriConfigPath = Join-Path $SourceDir "frontend\\src-tauri\\tauri.conf.json"
-$tauriConfigRaw = Get-Content $tauriConfigPath -Raw
-if ($tauriConfigRaw -match '"targets"\s*:\s*"all"') {
-  $tauriConfigRaw = $tauriConfigRaw -replace '"targets"\s*:\s*"all"', '"targets": "nsis"'
-  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-  [System.IO.File]::WriteAllText($tauriConfigPath, $tauriConfigRaw, $utf8NoBom)
-}
 Write-Host "running cargo make build --release"
 cargo make build --release
 

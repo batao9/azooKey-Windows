@@ -12,6 +12,7 @@ SSH_KEY="${SSH_KEY:-}"
 VBOX_MANAGE="${VBOX_MANAGE:-}"
 INSTALL_TIMEOUT_SEC="${INSTALL_TIMEOUT_SEC:-1200}"
 SHUTDOWN_AFTER_INSTALL="${SHUTDOWN_AFTER_INSTALL:-1}"
+UNINSTALL_AFTER_INSTALL="${UNINSTALL_AFTER_INSTALL:-0}"
 
 if [[ -z "$VBOX_MANAGE" ]]; then
   if command -v VBoxManage >/dev/null 2>&1; then
@@ -40,10 +41,12 @@ REMOTE_TMP_WIN="C:\\Users\\$SSH_USER\\AppData\\Local\\Temp"
 REMOTE_INSTALLER_WIN="$REMOTE_TMP_WIN\\azookey-setup-under-test.exe"
 REMOTE_PS_WIN="$REMOTE_TMP_WIN\\azookey-install-under-test.ps1"
 REMOTE_INSTALL_LOG_WIN="$REMOTE_TMP_WIN\\azookey-install-under-test.log"
+REMOTE_UNINSTALL_LOG_WIN="$REMOTE_TMP_WIN\\azookey-uninstall-under-test.log"
 
 REMOTE_INSTALLER_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-setup-under-test.exe"
 REMOTE_PS_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-install-under-test.ps1"
 REMOTE_INSTALL_LOG_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-install-under-test.log"
+REMOTE_UNINSTALL_LOG_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-uninstall-under-test.log"
 
 SESSION_KNOWN_HOSTS="$(mktemp /tmp/vm-stage-known-hosts.XXXXXX)"
 TMP_REMOTE_PS=""
@@ -238,7 +241,9 @@ create_install_ps1() {
 param(
   [Parameter(Mandatory = $true)][string]$InstallerPath,
   [Parameter(Mandatory = $true)][string]$InstallLogPath,
-  [Parameter(Mandatory = $true)][int]$InstallerTimeoutSec
+  [Parameter(Mandatory = $true)][string]$UninstallLogPath,
+  [Parameter(Mandatory = $true)][int]$InstallerTimeoutSec,
+  [switch]$UninstallAfterInstall
 )
 
 $ErrorActionPreference = "Stop"
@@ -292,6 +297,70 @@ function Stop-ProcessTree {
   Stop-Process -Id $RootPid -Force -ErrorAction SilentlyContinue
 }
 
+function Get-AzookeyUninstallEntries {
+  @(
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+  ) | ForEach-Object {
+    Get-ItemProperty -Path $_ -ErrorAction SilentlyContinue
+  } | Where-Object {
+    $_.DisplayName -like "*Azookey*"
+  }
+}
+
+function Normalize-RegistryPath {
+  param([Parameter(Mandatory = $true)][string]$Path)
+  $Path.Trim().Trim('"')
+}
+
+function Assert-RequiredInstallFiles {
+  param([Parameter(Mandatory = $true)][string]$InstallLocation)
+
+  $requiredPaths = @(
+    "frontend.exe",
+    "azookey-server.exe",
+    "ui.exe",
+    "launcher.exe",
+    "azookey.dll",
+    "azookey32.dll",
+    "launch.vbs",
+    "Dictionary",
+    "EmojiDictionary",
+    "zenz.gguf",
+    "llama_cpu",
+    "llama_cuda",
+    "llama_vulkan"
+  )
+
+  $missing = @()
+  foreach ($relativePath in $requiredPaths) {
+    $path = Join-Path $InstallLocation $relativePath
+    if (!(Test-Path $path)) {
+      $missing += $relativePath
+    }
+  }
+
+  if ($missing.Count -gt 0) {
+    throw "Required installed files are missing: $($missing -join ', ')"
+  }
+}
+
+function Test-WebView2RuntimeInstalled {
+  $clientId = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+  foreach ($key in @(
+    "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$clientId",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$clientId"
+  )) {
+    $value = Get-ItemProperty -Path $key -Name "pv" -ErrorAction SilentlyContinue
+    if ($value -and ![string]::IsNullOrWhiteSpace($value.pv)) {
+      return $true
+    }
+  }
+
+  return $false
+}
+
 if (-not (Test-VCRuntimeInstalled -Arch "x64")) {
   throw "VC++ runtime x64 is missing. Restore a VC-ready snapshot first."
 }
@@ -320,21 +389,74 @@ if ($proc.ExitCode -ne 0) {
   throw "Installer failed. ExitCode=$($proc.ExitCode)"
 }
 
-$entries = @(
-  "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-  "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
-  "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
-) | ForEach-Object {
-  Get-ItemProperty -Path $_ -ErrorAction SilentlyContinue
-} | Where-Object {
-  $_.DisplayName -like "*Azookey*"
-}
+$entries = @(Get-AzookeyUninstallEntries)
 
 if (-not $entries) {
   throw "Azookey uninstall entry not found after install."
 }
+if ($entries.Count -ne 1) {
+  throw "Expected exactly one Azookey uninstall entry after install, found $($entries.Count)."
+}
 
-Write-Host "install complete. entries found: $($entries.Count)"
+$entry = $entries[0]
+if ([string]::IsNullOrWhiteSpace($entry.InstallLocation)) {
+  throw "Azookey uninstall entry does not contain InstallLocation."
+}
+if ($entry.MainBinaryName -ne "frontend.exe") {
+  throw "Azookey uninstall entry MainBinaryName is not frontend.exe: $($entry.MainBinaryName)"
+}
+
+$installLocation = Normalize-RegistryPath -Path $entry.InstallLocation
+Assert-RequiredInstallFiles -InstallLocation $installLocation
+if (-not (Test-WebView2RuntimeInstalled)) {
+  throw "WebView2 Runtime is missing after install."
+}
+
+Write-Host "install complete. entry found: $($entry.PSChildName)"
+Write-Host "install location: $installLocation"
+Write-Host "WebView2 Runtime installed"
+
+if ($UninstallAfterInstall) {
+  $uninstallCommand = $entry.UninstallString
+
+  if ([string]::IsNullOrWhiteSpace($uninstallCommand)) {
+    throw "Azookey uninstall command not found."
+  }
+
+  $uninstallerPath = Normalize-RegistryPath -Path $uninstallCommand
+  $uninstallArgs = @(
+    "/VERYSILENT",
+    "/SUPPRESSMSGBOXES",
+    "/NORESTART",
+    "/LOG=$UninstallLogPath"
+  )
+
+  Write-Host "uninstalling: $uninstallerPath"
+  $uninstallProc = Start-Process -FilePath $uninstallerPath -ArgumentList $uninstallArgs -PassThru
+  if (-not $uninstallProc.WaitForExit($InstallerTimeoutSec * 1000)) {
+    Stop-ProcessTree -RootPid $uninstallProc.Id
+    throw "Uninstaller timed out."
+  }
+  Write-Host "uninstaller exit code: $($uninstallProc.ExitCode)"
+
+  if ($uninstallProc.ExitCode -ne 0) {
+    throw "Uninstaller failed. ExitCode=$($uninstallProc.ExitCode)"
+  }
+
+  $remainingEntries = @(Get-AzookeyUninstallEntries)
+  if ($remainingEntries.Count -ne 0) {
+    throw "Azookey uninstall entry still exists after uninstall. Count=$($remainingEntries.Count)"
+  }
+
+  foreach ($relativePath in @("frontend.exe", "azookey.dll", "azookey32.dll", "launcher.exe")) {
+    $path = Join-Path $installLocation $relativePath
+    if (Test-Path $path) {
+      throw "Installed file still exists after uninstall: $path"
+    }
+  }
+
+  Write-Host "uninstall complete. entries found: 0"
+}
 PS1
 }
 
@@ -354,7 +476,13 @@ main() {
 
   log "VM でインストーラーを実行します（サイレント）"
   local install_rc=0
-  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -InstallerPath \"$REMOTE_INSTALLER_WIN\" -InstallLogPath \"$REMOTE_INSTALL_LOG_WIN\" -InstallerTimeoutSec $INSTALL_TIMEOUT_SEC" || install_rc=$?
+  local uninstall_switch=""
+  case "${UNINSTALL_AFTER_INSTALL,,}" in
+    1|true|yes|on)
+      uninstall_switch="-UninstallAfterInstall"
+      ;;
+  esac
+  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -InstallerPath \"$REMOTE_INSTALLER_WIN\" -InstallLogPath \"$REMOTE_INSTALL_LOG_WIN\" -UninstallLogPath \"$REMOTE_UNINSTALL_LOG_WIN\" -InstallerTimeoutSec $INSTALL_TIMEOUT_SEC $uninstall_switch" || install_rc=$?
   if [[ "$install_rc" -ne 0 ]]; then
     log "インストーラー実行が失敗しました。ログ回収と VM 後処理を継続します: exit=$install_rc"
   fi
@@ -366,6 +494,16 @@ main() {
     log "インストールログを回収しました: $local_log"
   else
     log "インストールログの回収に失敗しました（処理は継続）"
+  fi
+
+  if [[ -n "$uninstall_switch" ]]; then
+    local local_uninstall_log
+    local_uninstall_log="$LOG_DIR/vm-uninstall-$ts.log"
+    if scp_from_vm "$REMOTE_UNINSTALL_LOG_SCP" "$local_uninstall_log" >/dev/null 2>&1; then
+      log "アンインストールログを回収しました: $local_uninstall_log"
+    else
+      log "アンインストールログの回収に失敗しました（処理は継続）"
+    fi
   fi
 
   case "${SHUTDOWN_AFTER_INSTALL,,}" in

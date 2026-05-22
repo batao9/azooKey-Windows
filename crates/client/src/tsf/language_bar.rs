@@ -62,7 +62,10 @@ const INFO: TF_LANGBARITEMINFO = TF_LANGBARITEMINFO {
 const SETTINGS_MENU_ID: usize = 1;
 const SETTINGS_APP_DIRNAME: &str = "Azookey";
 const SETTINGS_APP_FILENAME: &str = "frontend.exe";
-const SETTINGS_APP_UNINSTALL_SUBKEY: PCWSTR =
+const SETTINGS_APP_INNO_UNINSTALL_SUBKEY: PCWSTR = w!(
+    r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{80B746D4-D74D-4345-8F81-47E06BCAB515}_is1"
+);
+const SETTINGS_APP_LEGACY_NSIS_UNINSTALL_SUBKEY: PCWSTR =
     w!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Azookey");
 const SETTINGS_APP_INSTALL_LOCATION_VALUE: PCWSTR = w!("InstallLocation");
 const SETTINGS_APP_MAIN_BINARY_NAME_VALUE: PCWSTR = w!("MainBinaryName");
@@ -423,39 +426,81 @@ fn resolve_settings_app_path() -> Result<SettingsAppPath> {
 fn resolve_settings_app_path_candidates() -> Result<Vec<SettingsAppPath>> {
     let mut candidates = Vec::new();
 
-    for (hkey, flags, source) in [
+    for (hkey, flags, subkey, source) in [
         (
             HKEY_CURRENT_USER,
             REG_ROUTINE_FLAGS(0),
-            "HKCU uninstall key",
+            SETTINGS_APP_INNO_UNINSTALL_SUBKEY,
+            "HKCU Inno uninstall key",
         ),
         (
             HKEY_CURRENT_USER,
             RRF_SUBKEY_WOW6464KEY,
-            "HKCU 64-bit uninstall key",
+            SETTINGS_APP_INNO_UNINSTALL_SUBKEY,
+            "HKCU 64-bit Inno uninstall key",
         ),
         (
             HKEY_CURRENT_USER,
             RRF_SUBKEY_WOW6432KEY,
-            "HKCU 32-bit uninstall key",
+            SETTINGS_APP_INNO_UNINSTALL_SUBKEY,
+            "HKCU 32-bit Inno uninstall key",
         ),
         (
             HKEY_LOCAL_MACHINE,
             REG_ROUTINE_FLAGS(0),
-            "HKLM uninstall key",
+            SETTINGS_APP_INNO_UNINSTALL_SUBKEY,
+            "HKLM Inno uninstall key",
         ),
         (
             HKEY_LOCAL_MACHINE,
             RRF_SUBKEY_WOW6464KEY,
-            "HKLM 64-bit uninstall key",
+            SETTINGS_APP_INNO_UNINSTALL_SUBKEY,
+            "HKLM 64-bit Inno uninstall key",
         ),
         (
             HKEY_LOCAL_MACHINE,
             RRF_SUBKEY_WOW6432KEY,
-            "HKLM 32-bit uninstall key",
+            SETTINGS_APP_INNO_UNINSTALL_SUBKEY,
+            "HKLM 32-bit Inno uninstall key",
+        ),
+        (
+            HKEY_CURRENT_USER,
+            REG_ROUTINE_FLAGS(0),
+            SETTINGS_APP_LEGACY_NSIS_UNINSTALL_SUBKEY,
+            "HKCU legacy NSIS uninstall key",
+        ),
+        (
+            HKEY_CURRENT_USER,
+            RRF_SUBKEY_WOW6464KEY,
+            SETTINGS_APP_LEGACY_NSIS_UNINSTALL_SUBKEY,
+            "HKCU 64-bit legacy NSIS uninstall key",
+        ),
+        (
+            HKEY_CURRENT_USER,
+            RRF_SUBKEY_WOW6432KEY,
+            SETTINGS_APP_LEGACY_NSIS_UNINSTALL_SUBKEY,
+            "HKCU 32-bit legacy NSIS uninstall key",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            REG_ROUTINE_FLAGS(0),
+            SETTINGS_APP_LEGACY_NSIS_UNINSTALL_SUBKEY,
+            "HKLM legacy NSIS uninstall key",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            RRF_SUBKEY_WOW6464KEY,
+            SETTINGS_APP_LEGACY_NSIS_UNINSTALL_SUBKEY,
+            "HKLM 64-bit legacy NSIS uninstall key",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            RRF_SUBKEY_WOW6432KEY,
+            SETTINGS_APP_LEGACY_NSIS_UNINSTALL_SUBKEY,
+            "HKLM 32-bit legacy NSIS uninstall key",
         ),
     ] {
-        match resolve_settings_app_path_from_uninstall_key(hkey, flags, source) {
+        match resolve_settings_app_path_from_uninstall_key(hkey, flags, subkey, source) {
             Ok(Some(settings_path)) => candidates.push(settings_path),
             Ok(None) => {}
             Err(error) => {
@@ -470,25 +515,18 @@ fn resolve_settings_app_path_candidates() -> Result<Vec<SettingsAppPath>> {
 fn resolve_settings_app_path_from_uninstall_key(
     hkey: HKEY,
     flags: REG_ROUTINE_FLAGS,
+    subkey: PCWSTR,
     source: &'static str,
 ) -> Result<Option<SettingsAppPath>> {
-    let install_location = match read_registry_string(
-        hkey,
-        SETTINGS_APP_UNINSTALL_SUBKEY,
-        SETTINGS_APP_INSTALL_LOCATION_VALUE,
-        flags,
-    )? {
-        Some(install_location) => install_location,
-        None => return Ok(None),
-    };
+    let install_location =
+        match read_registry_string(hkey, subkey, SETTINGS_APP_INSTALL_LOCATION_VALUE, flags)? {
+            Some(install_location) => install_location,
+            None => return Ok(None),
+        };
 
-    let main_binary_name = read_registry_string(
-        hkey,
-        SETTINGS_APP_UNINSTALL_SUBKEY,
-        SETTINGS_APP_MAIN_BINARY_NAME_VALUE,
-        flags,
-    )?
-    .unwrap_or_else(|| SETTINGS_APP_FILENAME.to_string());
+    let main_binary_name =
+        read_registry_string(hkey, subkey, SETTINGS_APP_MAIN_BINARY_NAME_VALUE, flags)?
+            .unwrap_or_else(|| SETTINGS_APP_FILENAME.to_string());
 
     let settings_path =
         resolve_settings_app_path_from_install_location(&install_location, &main_binary_name)?;
@@ -690,7 +728,7 @@ mod tests {
         let candidates = vec![
             SettingsAppPath {
                 path: PathBuf::from("C:/Old/Azookey/frontend.exe"),
-                source: "HKCU uninstall key",
+                source: "HKCU Inno uninstall key",
             },
             SettingsAppPath {
                 path: PathBuf::from("C:/Users/test/AppData/Local/Azookey/frontend.exe"),
@@ -714,7 +752,7 @@ mod tests {
     fn select_existing_settings_app_path_reports_all_missing_candidates() {
         let candidates = vec![SettingsAppPath {
             path: PathBuf::from("C:/Old/Azookey/frontend.exe"),
-            source: "HKCU uninstall key",
+            source: "HKCU Inno uninstall key",
         }];
 
         let error = select_existing_settings_app_path(candidates, |_| false)
@@ -722,7 +760,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("HKCU uninstall key=C:/Old/Azookey/frontend.exe"));
+            .contains("HKCU Inno uninstall key=C:/Old/Azookey/frontend.exe"));
     }
 
     #[test]
