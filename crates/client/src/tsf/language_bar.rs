@@ -74,12 +74,9 @@ static MENU_OWNER_WINDOW_CLASS_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
 impl TextServiceFactory_Impl {
     fn toggle_input_mode(&self) -> Result<()> {
-        let mode = {
-            let ime_mode = &IMEState::get()?.input_mode;
-            match ime_mode {
-                InputMode::Latin => InputMode::Kana,
-                InputMode::Kana => InputMode::Latin,
-            }
+        let mode = match IMEState::input_mode()? {
+            InputMode::Latin => InputMode::Kana,
+            InputMode::Kana => InputMode::Latin,
         };
 
         let actions = vec![ClientAction::SetIMEMode(mode)];
@@ -114,7 +111,7 @@ impl ITfLangBarItem_Impl for TextServiceFactory_Impl {
 
     #[macros::anyhow]
     fn GetStatus(&self) -> Result<u32> {
-        if IMEState::get()?.keyboard_disabled {
+        if IMEState::keyboard_disabled()? {
             Ok(TF_LBI_STATUS_DISABLED)
         } else {
             Ok(0)
@@ -136,7 +133,7 @@ impl ITfLangBarItem_Impl for TextServiceFactory_Impl {
 impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     fn OnClick(&self, click: TfLBIClick, pt: &POINT, _prcarea: *const RECT) -> Result<()> {
-        if IMEState::get()?.keyboard_disabled {
+        if IMEState::keyboard_disabled()? {
             return Ok(());
         }
 
@@ -162,11 +159,11 @@ impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     fn GetIcon(&self) -> Result<HICON> {
         let dll_module = DllModule::get()?;
-        let state = &IMEState::get()?;
-        let input_mode = if state.keyboard_disabled {
-            &InputMode::Latin
+        let keyboard_disabled = IMEState::keyboard_disabled()?;
+        let input_mode = if keyboard_disabled {
+            InputMode::Latin
         } else {
-            &state.input_mode
+            IMEState::input_mode()?
         };
         let theme = get_theme()?;
 

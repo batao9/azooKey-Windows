@@ -34,7 +34,7 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         // initialize ipc_service
         if let Ok(mut ipc_service) = ipc_service::IPCService::new() {
             ipc_service.append_text("".to_string())?;
-            IMEState::get()?.ipc_service = Some(ipc_service);
+            IMEState::set_ipc_service(ipc_service)?;
         } else {
             // Activate() should not return an error
             // if Activate() returns an error, the icon of the previously activated TextService will be displayed, which may confuse the user
@@ -66,8 +66,8 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
                 &ITfThreadMgrEventSink::IID,
                 &text_service.this::<ITfThreadMgrEventSink>()?,
             )?;
-            IMEState::get()?
-                .cookies
+            text_service
+                .sink_cookies
                 .insert(ITfThreadMgrEventSink::IID, cookie);
         };
 
@@ -77,8 +77,8 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
                 &ITfThreadFocusSink::IID,
                 &text_service.this::<ITfThreadFocusSink>()?,
             )?;
-            IMEState::get()?
-                .cookies
+            text_service
+                .sink_cookies
                 .insert(ITfThreadFocusSink::IID, cookie);
         };
 
@@ -156,14 +156,17 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         // remove thread manager event sink
         tracing::debug!("UnadviseThreadMgrEventSink");
         unsafe {
-            if let Some(cookie) = IMEState::get()?.cookies.remove(&ITfThreadMgrEventSink::IID) {
+            if let Some(cookie) = text_service
+                .sink_cookies
+                .remove(&ITfThreadMgrEventSink::IID)
+            {
                 thread_mgr.cast::<ITfSource>()?.UnadviseSink(cookie)?;
             }
         };
 
         tracing::debug!("UnadviseThreadFocusSink");
         unsafe {
-            if let Some(cookie) = IMEState::get()?.cookies.remove(&ITfThreadFocusSink::IID) {
+            if let Some(cookie) = text_service.sink_cookies.remove(&ITfThreadFocusSink::IID) {
                 thread_mgr.cast::<ITfSource>()?.UnadviseSink(cookie)?;
             }
         };
