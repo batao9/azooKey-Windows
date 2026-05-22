@@ -35,6 +35,28 @@ pub(super) use clause_state::{
     ClauseCommand, ClauseState, ClauseTransitionInput, MoveClauseProgressMarker,
 };
 
+pub(crate) struct CompositionReducer;
+
+impl CompositionReducer {
+    pub(crate) fn plan_actions_for_user_action(
+        composition: &Composition,
+        action: &UserAction,
+        mode: &InputMode,
+        is_shift_pressed: bool,
+        app_config: &AppConfig,
+        start_temporary_latin: bool,
+    ) -> Option<(CompositionState, Vec<ClientAction>)> {
+        TextServiceFactory::plan_actions_for_user_action(
+            composition,
+            action,
+            mode,
+            is_shift_pressed,
+            app_config,
+            start_temporary_latin,
+        )
+    }
+}
+
 #[derive(Default, Clone, PartialEq, Debug)]
 pub enum CompositionState {
     #[default]
@@ -2861,7 +2883,7 @@ impl TextServiceFactory {
         let (composition, mode) = {
             let text_service = self.borrow()?;
             let composition = text_service.borrow_composition()?.clone();
-            let mode = IMEState::get()?.input_mode.clone();
+            let mode = IMEState::input_mode()?;
             (composition, mode)
         };
         let start_temporary_latin = !composition.temporary_latin
@@ -2891,7 +2913,7 @@ impl TextServiceFactory {
             UserAction::try_from(wparam.0)?
         };
 
-        let Some((transition, mut actions)) = Self::plan_actions_for_user_action(
+        let Some((transition, mut actions)) = CompositionReducer::plan_actions_for_user_action(
             &composition,
             &action,
             &mode,
@@ -3057,18 +3079,14 @@ impl TextServiceFactory {
             }
         }
 
-        let ipc_service = IMEState::get()
-            .ok()
-            .and_then(|state| state.ipc_service.clone());
+        let ipc_service = IMEState::ipc_service().ok().flatten();
 
         if let Some(mut ipc_service) = ipc_service {
             let _ = ipc_service.hide_window();
             let _ = ipc_service.set_candidates(vec![]);
             let _ = ipc_service.clear_text();
 
-            if let Ok(mut ime_state) = IMEState::get() {
-                ime_state.ipc_service = Some(ipc_service);
-            }
+            let _ = IMEState::set_ipc_service(ipc_service);
         }
     }
 
@@ -3082,7 +3100,7 @@ impl TextServiceFactory {
         let (composition, mode) = {
             let text_service = self.borrow()?;
             let composition = text_service.borrow_composition()?.clone();
-            let mode = IMEState::get()?.input_mode.clone();
+            let mode = IMEState::input_mode()?;
             (composition, mode)
         };
         let app_config = AppConfig::read();
@@ -3106,10 +3124,7 @@ impl TextServiceFactory {
         let mut selection_index = composition.selection_index;
         let mut temporary_latin = composition.temporary_latin;
         let mut temporary_latin_shift_pending = composition.temporary_latin_shift_pending;
-        let mut ipc_service = IMEState::get()?
-            .ipc_service
-            .clone()
-            .context("ipc_service is None")?;
+        let mut ipc_service = IMEState::ipc_service()?.context("ipc_service is None")?;
         let mut transition = transition;
         let mut deferred_clause_navigation_ready_sync_update_pos = None;
 
@@ -3632,10 +3647,7 @@ impl TextServiceFactory {
                     self.update_pos()?;
                     self.end_composition()?;
 
-                    {
-                        let mut ime_state = IMEState::get()?;
-                        ime_state.input_mode = mode.clone();
-                    }
+                    IMEState::set_input_mode(mode.clone())?;
 
                     // update the language bar
                     self.update_lang_bar()?;
@@ -3927,10 +3939,11 @@ impl TextServiceFactory {
         drop(composition);
         drop(text_service);
 
-        if let Ok(mut ime_state) = IMEState::get() {
-            ime_state.ipc_service = Some(ipc_service);
-        } else {
-            tracing::warn!("Failed to persist updated IPC service into IMEState");
+        if let Err(error) = IMEState::set_ipc_service(ipc_service) {
+            tracing::warn!(
+                ?error,
+                "Failed to persist updated IPC service into IMEState"
+            );
         }
 
         Ok(())

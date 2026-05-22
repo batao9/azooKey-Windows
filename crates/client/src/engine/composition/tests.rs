@@ -1,6 +1,7 @@
 use super::{
     Candidates, ClauseActionBackend, ClauseActionEffect, ClauseActionStateMut, ClauseSnapshot,
-    ClauseState, Composition, CompositionState, FutureClauseSnapshot, TextServiceFactory,
+    ClauseState, Composition, CompositionReducer, CompositionState, FutureClauseSnapshot,
+    TextServiceFactory,
 };
 use crate::engine::{
     client_action::{ClientAction, SetSelectionType, SetTextType},
@@ -59,6 +60,27 @@ mod integration_patterns;
 mod snapshot_restore;
 pub(super) mod stateful_harness;
 mod symbol_and_width;
+
+#[test]
+fn reducer_plans_composition_start_without_tsf_or_ipc_state() {
+    let (_, actions) = CompositionReducer::plan_actions_for_user_action(
+        &Composition::default(),
+        &UserAction::Input('a'),
+        &InputMode::Kana,
+        false,
+        &AppConfig::default(),
+        false,
+    )
+    .expect("input should start composition");
+
+    assert_eq!(
+        actions,
+        vec![
+            ClientAction::StartComposition,
+            ClientAction::AppendText("a".to_string())
+        ]
+    );
+}
 
 #[test]
 fn delayed_candidate_window_does_not_show_on_composition_start() {

@@ -180,7 +180,7 @@ impl TextServiceFactory {
                 return Ok(());
             };
 
-            let Some(mut ipc_service) = IMEState::get()?.ipc_service.clone() else {
+            let Some(mut ipc_service) = IMEState::ipc_service()? else {
                 return Ok(());
             };
 
