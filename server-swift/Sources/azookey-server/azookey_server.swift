@@ -2,18 +2,16 @@ import KanaKanjiConverterModule
 import Foundation
 import ffi
 
-private let fallbackDictionaryURL: URL = {
-    let temporaryDirectory = FileManager.default.temporaryDirectory
-    let url = temporaryDirectory
-        .appendingPathComponent("Azookey")
-        .appendingPathComponent("FallbackDictionary", isDirectory: true)
-    do {
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        return url
-    } catch {
-        return temporaryDirectory
+private func executableDirectoryURL() -> URL? {
+    guard let executablePath = CommandLine.arguments.first, !executablePath.isEmpty else {
+        return nil
     }
-}()
+    return URL(filePath: executablePath).deletingLastPathComponent()
+}
+
+private let fallbackDictionaryURL =
+    executableDirectoryURL()?.appendingPathComponent("Dictionary", isDirectory: true)
+    ?? URL(filePath: FileManager.default.currentDirectoryPath)
 
 @MainActor var converterDictionaryURL = fallbackDictionaryURL
 @MainActor var converterPreloadDictionary = false
@@ -79,8 +77,7 @@ private func serverLogPath() -> URL {
             .appendingPathComponent(serverLogFileName)
     }
 
-    return FileManager.default.temporaryDirectory
-        .appendingPathComponent("Azookey")
+    return (executableDirectoryURL() ?? URL(filePath: FileManager.default.currentDirectoryPath))
         .appendingPathComponent("logs")
         .appendingPathComponent(serverLogFileName)
 }
@@ -138,6 +135,10 @@ private func serverLog(_ level: String = "INFO", _ message: @autoclosure () -> S
         dictionaryURL: converterDictionaryURL,
         preloadDictionary: converterPreloadDictionary
     )
+}
+
+@MainActor private func converterRuntimeDirectoryURL() -> URL {
+    execURL.appendingPathComponent("EngineRuntime", isDirectory: true)
 }
 
 func normalizedZenzaiBackend(_ backend: String?) -> String {
@@ -241,10 +242,15 @@ private func cpuZenzaiBackendSupportedFromEnvironment() -> Bool {
         return
     }
 
-    let fileURL = FileManager.default.temporaryDirectory
+    let runtimeDirectoryURL = converterRuntimeDirectoryURL()
+    let fileURL = runtimeDirectoryURL
         .appendingPathComponent("azookey-romaji-\(UUID().uuidString).tsv")
 
     do {
+        try FileManager.default.createDirectory(
+            at: runtimeDirectoryURL,
+            withIntermediateDirectories: true
+        )
         try content.write(to: fileURL, atomically: true, encoding: .utf8)
         defer {
             try? FileManager.default.removeItem(at: fileURL)
@@ -849,8 +855,8 @@ private func preferCursorPrefixBoundary(
         requireEnglishPrediction: .disabled,
         keyboardLanguage: .ja_JP,
         learningType: .nothing,
-        memoryDirectoryURL: URL(filePath: "./test"),
-        sharedContainerURL: URL(filePath: "./test"),
+        memoryDirectoryURL: converterRuntimeDirectoryURL(),
+        sharedContainerURL: converterRuntimeDirectoryURL(),
         textReplacer: .init {
             return execURL.appendingPathComponent("EmojiDictionary").appendingPathComponent("emoji_all_E15.1.txt")
         },

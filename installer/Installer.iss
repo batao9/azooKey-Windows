@@ -101,6 +101,7 @@ Type: filesandordirs; Name: "{app}\llama_cpu"
 Type: filesandordirs; Name: "{app}\llama_cuda"
 Type: filesandordirs; Name: "{app}\llama_vulkan"
 Type: filesandordirs; Name: "{app}\logs"
+Type: filesandordirs; Name: "{app}\EngineRuntime"
 Type: filesandordirs; Name: "{app}\ui.exe.WebView2"
 
 [Code]

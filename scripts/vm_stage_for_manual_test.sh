@@ -413,6 +413,31 @@ function Ensure-SettingsFileForUninstallVerification {
   }
 }
 
+function Assert-NoExternalAzookeyDirectoriesAfterUninstall {
+  param([Parameter(Mandatory = $true)][string]$InstallLocation)
+
+  $candidateRoots = @()
+  if (![string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    $candidateRoots += Join-Path $env:LOCALAPPDATA "Azookey"
+  }
+  foreach ($tempRoot in @($env:TEMP, $env:TMP)) {
+    if (![string]::IsNullOrWhiteSpace($tempRoot)) {
+      $candidateRoots += Join-Path $tempRoot "Azookey"
+    }
+  }
+
+  foreach ($path in @($candidateRoots | Select-Object -Unique)) {
+    if ($path -eq $InstallLocation) {
+      continue
+    }
+    if (Test-Path -LiteralPath $path) {
+      throw "Unexpected external Azookey directory remains after uninstall: $path"
+    }
+  }
+
+  Write-Host "no external Azookey directories remain after uninstall"
+}
+
 if (-not (Test-VCRuntimeInstalled -Arch "x64")) {
   throw "VC++ runtime x64 is missing. Restore a VC-ready snapshot first."
 }
@@ -502,6 +527,7 @@ if ($UninstallAfterInstall) {
   }
 
   Wait-ForUninstallerSelfCleanup -InstallLocation $installLocation
+  Assert-NoExternalAzookeyDirectoriesAfterUninstall -InstallLocation $installLocation
   foreach ($relativePath in @("frontend.exe", "azookey.dll", "azookey32.dll", "launcher.exe")) {
     $path = Join-Path $installLocation $relativePath
     if (Test-Path $path) {

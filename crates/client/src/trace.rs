@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::path::PathBuf;
 use tracing::field::{Field, Visit};
 use tracing_core::LevelFilter;
 use tracing_subscriber::filter::Targets;
@@ -9,7 +10,6 @@ use crate::extension::StringExt as _;
 use crate::globals::DllModule;
 use crate::tracing_chrome::{ChromeLayerBuilder, EventOrSpan};
 
-const LOG_FOLDER: &str = "D:/azookey-windows/logs";
 pub struct StringVisitor<'a> {
     string: &'a mut String,
 }
@@ -25,6 +25,18 @@ impl<'a> Visit for StringVisitor<'a> {
 
 pub fn diagnostic_log(_message: impl AsRef<str>) {}
 
+fn resolve_trace_log_folder() -> PathBuf {
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        return PathBuf::from(appdata).join("Azookey").join("logs");
+    }
+
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("logs")
+}
+
 pub fn setup_logger() -> anyhow::Result<()> {
     diagnostic_log("setup_logger called");
     #[cfg(not(debug_assertions))]
@@ -32,7 +44,9 @@ pub fn setup_logger() -> anyhow::Result<()> {
         return Ok(());
     }
     let timestamp = chrono::Local::now().format("%Y-%m-%d-%H.%M.%S");
-    let path = format!("{}/{}.json", LOG_FOLDER, timestamp);
+    let log_folder = resolve_trace_log_folder();
+    let _ = std::fs::create_dir_all(&log_folder);
+    let path = log_folder.join(format!("{}.json", timestamp));
 
     let writer = {
         if let Ok(file) = std::fs::File::create(&path) {
