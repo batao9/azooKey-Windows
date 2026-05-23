@@ -413,6 +413,23 @@ function Ensure-SettingsFileForUninstallVerification {
   }
 }
 
+function Ensure-GeneratedAppDataForUninstallVerification {
+  param([Parameter(Mandatory = $true)][string]$InstallLocation)
+
+  foreach ($relativePath in @(
+    "EngineRuntime",
+    "frontend.exe.WebView2",
+    "logs",
+    "ui.exe.WebView2"
+  )) {
+    $dir = Join-Path $InstallLocation $relativePath
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    Set-Content -LiteralPath (Join-Path $dir "uninstall-sentinel.txt") -Encoding UTF8 -Value "generated app data cleanup sentinel"
+  }
+
+  Write-Host "created generated app data sentinels for uninstall verification"
+}
+
 function Assert-NoExternalAzookeyDirectoriesAfterUninstall {
   param([Parameter(Mandatory = $true)][string]$InstallLocation)
 
@@ -495,6 +512,7 @@ Write-Host "WebView2 Runtime installed"
 
 if ($UninstallAfterInstall) {
   Ensure-SettingsFileForUninstallVerification -InstallLocation $installLocation
+  Ensure-GeneratedAppDataForUninstallVerification -InstallLocation $installLocation
   $uninstallCommand = $entry.UninstallString
 
   if ([string]::IsNullOrWhiteSpace($uninstallCommand)) {
