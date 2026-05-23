@@ -172,8 +172,15 @@ var
 begin
   Result := True;
 
+  if not RegKeyExists(RootKey, '{#MyLegacyNsisUninstallKey}') then
+  begin
+    Exit;
+  end;
+
   if not RegQueryStringValue(RootKey, '{#MyLegacyNsisUninstallKey}', 'UninstallString', UninstallString) then
   begin
+    SuppressibleMsgBox('旧バージョンのアンインストール情報が壊れているため、更新を続行できません。旧バージョンを手動でアンインストールしてから再度実行してください。', mbError, MB_OK, IDOK);
+    Result := False;
     Exit;
   end;
 
@@ -201,6 +208,8 @@ begin
   if (UninstallExe = '') or (not FileExists(UninstallExe)) then
   begin
     Log('Legacy NSIS uninstaller was registered but not found under ' + RootName + ': ' + UninstallString);
+    SuppressibleMsgBox('旧バージョンのアンインストーラーが見つからないため、更新を続行できません: ' + UninstallString, mbError, MB_OK, IDOK);
+    Result := False;
     Exit;
   end;
 

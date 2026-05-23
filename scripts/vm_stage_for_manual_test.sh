@@ -14,6 +14,7 @@ INSTALL_TIMEOUT_SEC="${INSTALL_TIMEOUT_SEC:-1200}"
 SHUTDOWN_AFTER_INSTALL="${SHUTDOWN_AFTER_INSTALL:-1}"
 UNINSTALL_AFTER_INSTALL="${UNINSTALL_AFTER_INSTALL:-0}"
 VERIFY_LEGACY_NSIS_MIGRATION="${VERIFY_LEGACY_NSIS_MIGRATION:-0}"
+VERIFY_MISSING_LEGACY_NSIS_UNINSTALLER="${VERIFY_MISSING_LEGACY_NSIS_UNINSTALLER:-0}"
 VERIFY_LOCKED_FILE_UPGRADE="${VERIFY_LOCKED_FILE_UPGRADE:-0}"
 
 if [[ -z "$VBOX_MANAGE" ]]; then
@@ -246,6 +247,7 @@ param(
   [Parameter(Mandatory = $true)][string]$UninstallLogPath,
   [Parameter(Mandatory = $true)][int]$InstallerTimeoutSec,
   [switch]$VerifyLegacyNsisMigration,
+  [switch]$VerifyMissingLegacyNsisUninstaller,
   [switch]$VerifyLockedFileUpgrade,
   [switch]$UninstallAfterInstall
 )
@@ -399,6 +401,44 @@ function Assert-FakeLegacyNsisMigrated {
   }
 
   Write-Host "legacy NSIS install migrated before new install"
+}
+
+function Install-BrokenLegacyNsisInstall {
+  $legacyRoot = Join-Path $env:LOCALAPPDATA "Azookey"
+  $legacyUninstallKey = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Azookey"
+
+  Remove-Item -LiteralPath $legacyRoot -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $legacyUninstallKey -Recurse -Force -ErrorAction SilentlyContinue
+
+  New-Item -ItemType Directory -Force -Path $legacyRoot | Out-Null
+  Set-Content -LiteralPath (Join-Path $legacyRoot "legacy-payload.txt") -Encoding UTF8 -Value "legacy nsis payload without uninstaller"
+
+  New-Item -ItemType Directory -Force -Path $legacyUninstallKey | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "DisplayName" -Value "Azookey" -PropertyType String -Force | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "Publisher" -Value "batao9" -PropertyType String -Force | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "DisplayVersion" -Value "0.1.0-legacy-broken" -PropertyType String -Force | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "InstallLocation" -Value "`"$legacyRoot`"" -PropertyType String -Force | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "UninstallString" -Value "`"$(Join-Path $legacyRoot "uninstall.exe")`"" -PropertyType String -Force | Out-Null
+
+  Write-Host "created broken legacy NSIS install without uninstaller: $legacyRoot"
+}
+
+function Assert-BrokenLegacyNsisInstallPreserved {
+  $legacyRoot = Join-Path $env:LOCALAPPDATA "Azookey"
+  $legacyUninstallKey = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Azookey"
+  $legacyPayload = Join-Path $legacyRoot "legacy-payload.txt"
+
+  if (!(Test-Path -LiteralPath $legacyRoot)) {
+    throw "Broken legacy NSIS install directory was removed after failed migration: $legacyRoot"
+  }
+  if (!(Test-Path -LiteralPath $legacyPayload)) {
+    throw "Broken legacy NSIS payload was removed after failed migration: $legacyPayload"
+  }
+  if (!(Test-Path -LiteralPath $legacyUninstallKey)) {
+    throw "Broken legacy NSIS uninstall key was removed after failed migration: $legacyUninstallKey"
+  }
+
+  Write-Host "broken legacy NSIS install preserved after migration failure"
 }
 
 function Assert-RequiredInstallFiles {
@@ -663,6 +703,9 @@ if (-not (Test-VCRuntimeInstalled -Arch "x86")) {
 if ($VerifyLegacyNsisMigration) {
   Install-FakeLegacyNsisInstall
 }
+if ($VerifyMissingLegacyNsisUninstaller) {
+  Install-BrokenLegacyNsisInstall
+}
 
 $args = @(
   "/SP-",
@@ -680,6 +723,15 @@ if (-not $proc.WaitForExit($InstallerTimeoutSec * 1000)) {
   throw "Installer timed out."
 }
 Write-Host "installer exit code: $($proc.ExitCode)"
+
+if ($VerifyMissingLegacyNsisUninstaller) {
+  if ($proc.ExitCode -eq 0) {
+    throw "Installer succeeded even though the legacy NSIS uninstaller is missing."
+  }
+  Assert-BrokenLegacyNsisInstallPreserved
+  Write-Host "missing legacy NSIS uninstaller aborted install as expected"
+  exit 0
+}
 
 if ($proc.ExitCode -ne 0) {
   throw "Installer failed. ExitCode=$($proc.ExitCode)"
@@ -790,6 +842,7 @@ main() {
   local install_rc=0
   local uninstall_switch=""
   local legacy_nsis_switch=""
+  local missing_legacy_nsis_uninstaller_switch=""
   local locked_file_upgrade_switch=""
   case "${UNINSTALL_AFTER_INSTALL,,}" in
     1|true|yes|on)
@@ -801,12 +854,17 @@ main() {
       legacy_nsis_switch="-VerifyLegacyNsisMigration"
       ;;
   esac
+  case "${VERIFY_MISSING_LEGACY_NSIS_UNINSTALLER,,}" in
+    1|true|yes|on)
+      missing_legacy_nsis_uninstaller_switch="-VerifyMissingLegacyNsisUninstaller"
+      ;;
+  esac
   case "${VERIFY_LOCKED_FILE_UPGRADE,,}" in
     1|true|yes|on)
       locked_file_upgrade_switch="-VerifyLockedFileUpgrade"
       ;;
   esac
-  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -InstallerPath \"$REMOTE_INSTALLER_WIN\" -InstallLogPath \"$REMOTE_INSTALL_LOG_WIN\" -UninstallLogPath \"$REMOTE_UNINSTALL_LOG_WIN\" -InstallerTimeoutSec $INSTALL_TIMEOUT_SEC $legacy_nsis_switch $locked_file_upgrade_switch $uninstall_switch" || install_rc=$?
+  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -InstallerPath \"$REMOTE_INSTALLER_WIN\" -InstallLogPath \"$REMOTE_INSTALL_LOG_WIN\" -UninstallLogPath \"$REMOTE_UNINSTALL_LOG_WIN\" -InstallerTimeoutSec $INSTALL_TIMEOUT_SEC $legacy_nsis_switch $missing_legacy_nsis_uninstaller_switch $locked_file_upgrade_switch $uninstall_switch" || install_rc=$?
   if [[ "$install_rc" -ne 0 ]]; then
     log "インストーラー実行が失敗しました。ログ回収と VM 後処理を継続します: exit=$install_rc"
   fi
