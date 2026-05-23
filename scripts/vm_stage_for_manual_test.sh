@@ -14,6 +14,7 @@ INSTALL_TIMEOUT_SEC="${INSTALL_TIMEOUT_SEC:-1200}"
 SHUTDOWN_AFTER_INSTALL="${SHUTDOWN_AFTER_INSTALL:-1}"
 UNINSTALL_AFTER_INSTALL="${UNINSTALL_AFTER_INSTALL:-0}"
 VERIFY_LEGACY_NSIS_MIGRATION="${VERIFY_LEGACY_NSIS_MIGRATION:-0}"
+VERIFY_LOCKED_FILE_UPGRADE="${VERIFY_LOCKED_FILE_UPGRADE:-0}"
 
 if [[ -z "$VBOX_MANAGE" ]]; then
   if command -v VBoxManage >/dev/null 2>&1; then
@@ -245,6 +246,7 @@ param(
   [Parameter(Mandatory = $true)][string]$UninstallLogPath,
   [Parameter(Mandatory = $true)][int]$InstallerTimeoutSec,
   [switch]$VerifyLegacyNsisMigration,
+  [switch]$VerifyLockedFileUpgrade,
   [switch]$UninstallAfterInstall
 )
 
@@ -540,6 +542,117 @@ function Assert-NoExternalAzookeyDirectoriesAfterUninstall {
   Write-Host "no external Azookey directories remain after uninstall"
 }
 
+function Start-ExclusiveFileLock {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  $readyPath = Join-Path $env:TEMP "azookey-file-lock-ready.txt"
+  $releasePath = Join-Path $env:TEMP "azookey-file-lock-release.txt"
+  $lockScriptPath = Join-Path $env:TEMP "azookey-file-lock.ps1"
+
+  Remove-Item -LiteralPath $readyPath, $releasePath, $lockScriptPath -Force -ErrorAction SilentlyContinue
+
+  @'
+param(
+  [Parameter(Mandatory = $true)][string]$Path,
+  [Parameter(Mandatory = $true)][string]$ReadyPath,
+  [Parameter(Mandatory = $true)][string]$ReleasePath
+)
+
+$ErrorActionPreference = "Stop"
+$stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+try {
+  Set-Content -LiteralPath $ReadyPath -Encoding UTF8 -Value "ready"
+  while (!(Test-Path -LiteralPath $ReleasePath)) {
+    Start-Sleep -Milliseconds 200
+  }
+} finally {
+  $stream.Dispose()
+}
+'@ | Set-Content -LiteralPath $lockScriptPath -Encoding UTF8
+
+  $proc = Start-Process -FilePath "powershell" -ArgumentList @(
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    $lockScriptPath,
+    "-Path",
+    $Path,
+    "-ReadyPath",
+    $readyPath,
+    "-ReleasePath",
+    $releasePath
+  ) -PassThru
+
+  $deadline = (Get-Date).AddSeconds(30)
+  while (!(Test-Path -LiteralPath $readyPath)) {
+    if ($proc.HasExited) {
+      throw "File lock helper exited before acquiring the lock. ExitCode=$($proc.ExitCode)"
+    }
+    if ((Get-Date) -ge $deadline) {
+      Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+      throw "Timed out waiting for file lock helper: $Path"
+    }
+    Start-Sleep -Milliseconds 200
+  }
+
+  [PSCustomObject]@{
+    Process = $proc
+    ReleasePath = $releasePath
+  }
+}
+
+function Stop-ExclusiveFileLock {
+  param([Parameter(Mandatory = $true)]$Lock)
+
+  Set-Content -LiteralPath $Lock.ReleasePath -Encoding UTF8 -Value "release"
+  if (-not $Lock.Process.WaitForExit(10000)) {
+    Stop-Process -Id $Lock.Process.Id -Force -ErrorAction SilentlyContinue
+    throw "File lock helper did not exit after release."
+  }
+}
+
+function Invoke-LockedFileUpgradeVerification {
+  param(
+    [Parameter(Mandatory = $true)][string]$InstallLocation,
+    [Parameter(Mandatory = $true)][string]$InstallerPath,
+    [Parameter(Mandatory = $true)][string]$InstallLogPath,
+    [Parameter(Mandatory = $true)][int]$InstallerTimeoutSec
+  )
+
+  $lockedDllPath = Join-Path $InstallLocation "azookey.dll"
+  $upgradeLogPath = [System.IO.Path]::ChangeExtension($InstallLogPath, ".upgrade.log")
+  $lock = Start-ExclusiveFileLock -Path $lockedDllPath
+
+  try {
+    $upgradeArgs = @(
+      "/SP-",
+      "/VERYSILENT",
+      "/SUPPRESSMSGBOXES",
+      "/NOCLOSEAPPLICATIONS",
+      "/NORESTART",
+      "/RESTARTEXITCODE=3010",
+      "/LOG=$upgradeLogPath"
+    )
+
+    Write-Host "reinstalling with locked file: $lockedDllPath"
+    $upgradeProc = Start-Process -FilePath $InstallerPath -ArgumentList $upgradeArgs -PassThru
+    if (-not $upgradeProc.WaitForExit($InstallerTimeoutSec * 1000)) {
+      Stop-ProcessTree -RootPid $upgradeProc.Id
+      throw "Locked-file upgrade installer timed out."
+    }
+    Write-Host "locked-file upgrade installer exit code: $($upgradeProc.ExitCode)"
+
+    if ($upgradeProc.ExitCode -ne 3010) {
+      throw "Expected locked-file upgrade to request restart with exit code 3010, got $($upgradeProc.ExitCode)."
+    }
+  } finally {
+    Stop-ExclusiveFileLock -Lock $lock
+  }
+
+  Write-Host "locked-file upgrade requested restart without blocking"
+}
+
 if (-not (Test-VCRuntimeInstalled -Arch "x64")) {
   throw "VC++ runtime x64 is missing. Restore a VC-ready snapshot first."
 }
@@ -602,6 +715,13 @@ if (-not (Test-WebView2RuntimeInstalled)) {
 Write-Host "install complete. entry found: $($entry.PSChildName)"
 Write-Host "install location: $installLocation"
 Write-Host "WebView2 Runtime installed"
+
+if ($VerifyLockedFileUpgrade) {
+  if ($UninstallAfterInstall) {
+    throw "VerifyLockedFileUpgrade cannot be combined with UninstallAfterInstall because the upgrade intentionally leaves pending reboot operations."
+  }
+  Invoke-LockedFileUpgradeVerification -InstallLocation $installLocation -InstallerPath $InstallerPath -InstallLogPath $InstallLogPath -InstallerTimeoutSec $InstallerTimeoutSec
+}
 
 if ($UninstallAfterInstall) {
   Ensure-SettingsFileForUninstallVerification -InstallLocation $installLocation
@@ -670,6 +790,7 @@ main() {
   local install_rc=0
   local uninstall_switch=""
   local legacy_nsis_switch=""
+  local locked_file_upgrade_switch=""
   case "${UNINSTALL_AFTER_INSTALL,,}" in
     1|true|yes|on)
       uninstall_switch="-UninstallAfterInstall"
@@ -680,7 +801,12 @@ main() {
       legacy_nsis_switch="-VerifyLegacyNsisMigration"
       ;;
   esac
-  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -InstallerPath \"$REMOTE_INSTALLER_WIN\" -InstallLogPath \"$REMOTE_INSTALL_LOG_WIN\" -UninstallLogPath \"$REMOTE_UNINSTALL_LOG_WIN\" -InstallerTimeoutSec $INSTALL_TIMEOUT_SEC $legacy_nsis_switch $uninstall_switch" || install_rc=$?
+  case "${VERIFY_LOCKED_FILE_UPGRADE,,}" in
+    1|true|yes|on)
+      locked_file_upgrade_switch="-VerifyLockedFileUpgrade"
+      ;;
+  esac
+  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -InstallerPath \"$REMOTE_INSTALLER_WIN\" -InstallLogPath \"$REMOTE_INSTALL_LOG_WIN\" -UninstallLogPath \"$REMOTE_UNINSTALL_LOG_WIN\" -InstallerTimeoutSec $INSTALL_TIMEOUT_SEC $legacy_nsis_switch $locked_file_upgrade_switch $uninstall_switch" || install_rc=$?
   if [[ "$install_rc" -ne 0 ]]; then
     log "インストーラー実行が失敗しました。ログ回収と VM 後処理を継続します: exit=$install_rc"
   fi

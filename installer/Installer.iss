@@ -37,15 +37,21 @@ OutputBaseFilename=azookey-setup
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
+CloseApplications=yes
+RestartApplications=no
 
 [Languages]
 Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
 
+[Messages]
+FinishedRestartLabel=Azookey の更新を完了するには、Windows の再起動が必要です。再起動後に新しいバージョンが有効になります。今すぐ再起動しますか?
+FinishedRestartMessage=Azookey の更新を完了するには、Windows の再起動が必要です。%n%n再起動後に新しいバージョンが有効になります。今すぐ再起動しますか?
+
 [Files]
-Source: "../build/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey.dll"; Flags: ignoreversion regserver 64bit
-Source: "../build/x86/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey32.dll"; Flags: ignoreversion regserver 32bit
-Source: "../build/{#MySettingsAppName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "../build/*"; DestDir: "{app}"; Excludes: "{#MySettingsAppName}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "../build/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey.dll"; Flags: ignoreversion regserver 64bit restartreplace uninsrestartdelete
+Source: "../build/x86/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey32.dll"; Flags: ignoreversion regserver 32bit restartreplace uninsrestartdelete
+Source: "../build/{#MySettingsAppName}"; DestDir: "{app}"; Flags: ignoreversion restartreplace uninsrestartdelete
+Source: "../build/*"; DestDir: "{app}"; Excludes: "{#MySettingsAppName}"; Flags: ignoreversion recursesubdirs createallsubdirs restartreplace uninsrestartdelete
 Source: "./Azookey Startup.xml"; Flags: dontcopy noencryption
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
@@ -242,6 +248,36 @@ begin
   Dependency_AddWebView2;
 
   Result := True;
+end;
+
+procedure StopAzookeyProcess(ImageName: String);
+var
+  ResultCode: Integer;
+begin
+  Exec('taskkill', '/F /T /IM "' + ImageName + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if ResultCode = 0 then
+  begin
+    Log('Stopped Azookey process before install: ' + ImageName);
+  end
+  else
+  begin
+    Log('Azookey process was not running before install: ' + ImageName + ' (taskkill exit code ' + IntToStr(ResultCode) + ')');
+  end;
+end;
+
+procedure StopAzookeyProcessesBeforeInstall();
+begin
+  StopAzookeyProcess('frontend.exe');
+  StopAzookeyProcess('azookey-server.exe');
+  StopAzookeyProcess('ui.exe');
+  StopAzookeyProcess('launcher.exe');
+end;
+
+<event('PrepareToInstall')>
+function Azookey_PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  StopAzookeyProcessesBeforeInstall();
+  Result := '';
 end;
 
 function UninstallNeedRestart(): Boolean;
