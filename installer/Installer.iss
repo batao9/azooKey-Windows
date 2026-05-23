@@ -69,9 +69,39 @@ Filename: "icacls"; \
   Flags: runhidden postinstall runascurrentuser
 
 [UninstallRun]
+Filename: "taskkill"; \
+  Parameters: "/F /T /IM ""frontend.exe"""; \
+  RunOnceId: "StopFrontend"; \
+  Flags: runhidden
+Filename: "taskkill"; \
+  Parameters: "/F /T /IM ""azookey-server.exe"""; \
+  RunOnceId: "StopAzookeyServer"; \
+  Flags: runhidden
+Filename: "taskkill"; \
+  Parameters: "/F /T /IM ""ui.exe"""; \
+  RunOnceId: "StopUi"; \
+  Flags: runhidden
+Filename: "taskkill"; \
+  Parameters: "/F /T /IM ""launcher.exe"""; \
+  RunOnceId: "StopLauncher"; \
+  Flags: runhidden
 Filename: "schtasks"; \
   Parameters: "/Delete /TN ""Azookey Startup"" /F"; \
+  RunOnceId: "DeleteStartupTask"; \
   Flags: runhidden runascurrentuser
+
+[UninstallDelete]
+Type: files; Name: "{app}\*.dll"
+Type: files; Name: "{app}\*.exe"
+Type: files; Name: "{app}\*.vbs"
+Type: files; Name: "{app}\*.gguf"
+Type: filesandordirs; Name: "{app}\Dictionary"
+Type: filesandordirs; Name: "{app}\EmojiDictionary"
+Type: filesandordirs; Name: "{app}\llama_cpu"
+Type: filesandordirs; Name: "{app}\llama_cuda"
+Type: filesandordirs; Name: "{app}\llama_vulkan"
+Type: filesandordirs; Name: "{app}\logs"
+Type: filesandordirs; Name: "{app}\ui.exe.WebView2"
 
 [Code]
 function InitializeSetup: Boolean;

@@ -361,6 +361,58 @@ function Test-WebView2RuntimeInstalled {
   return $false
 }
 
+function Assert-OnlySettingsRemainAfterUninstall {
+  param([Parameter(Mandatory = $true)][string]$InstallLocation)
+
+  if (!(Test-Path -LiteralPath $InstallLocation)) {
+    Write-Host "install directory removed after uninstall"
+    return
+  }
+
+  $allowedSettingsPath = Join-Path $InstallLocation "settings.json"
+  $remaining = @(
+    Get-ChildItem -LiteralPath $InstallLocation -Force -Recurse -ErrorAction SilentlyContinue |
+      Where-Object { $_.FullName -ne $allowedSettingsPath }
+  )
+
+  if ($remaining.Count -gt 0) {
+    $sample = @($remaining | Select-Object -First 20 | ForEach-Object {
+      $_.FullName.Substring($InstallLocation.Length).TrimStart("\")
+    })
+    throw "Unexpected files remain after uninstall: $($sample -join ', ')"
+  }
+
+  Write-Host "install directory contains only settings.json after uninstall"
+}
+
+function Wait-ForUninstallerSelfCleanup {
+  param([Parameter(Mandatory = $true)][string]$InstallLocation)
+
+  $deadline = (Get-Date).AddSeconds(30)
+  do {
+    $remainingUninstallerFiles = @()
+    foreach ($pattern in @("unins*.exe", "unins*.dat")) {
+      $remainingUninstallerFiles += @(
+        Get-ChildItem -Path (Join-Path $InstallLocation $pattern) -Force -ErrorAction SilentlyContinue
+      )
+    }
+    if ($remainingUninstallerFiles.Count -eq 0) {
+      return
+    }
+    Start-Sleep -Seconds 1
+  } while ((Get-Date) -lt $deadline)
+}
+
+function Ensure-SettingsFileForUninstallVerification {
+  param([Parameter(Mandatory = $true)][string]$InstallLocation)
+
+  $settingsPath = Join-Path $InstallLocation "settings.json"
+  if (!(Test-Path -LiteralPath $settingsPath)) {
+    Set-Content -LiteralPath $settingsPath -Encoding UTF8 -Value '{"createdBy":"vm_stage_for_manual_test"}'
+    Write-Host "created settings.json sentinel for uninstall verification"
+  }
+}
+
 if (-not (Test-VCRuntimeInstalled -Arch "x64")) {
   throw "VC++ runtime x64 is missing. Restore a VC-ready snapshot first."
 }
@@ -417,6 +469,7 @@ Write-Host "install location: $installLocation"
 Write-Host "WebView2 Runtime installed"
 
 if ($UninstallAfterInstall) {
+  Ensure-SettingsFileForUninstallVerification -InstallLocation $installLocation
   $uninstallCommand = $entry.UninstallString
 
   if ([string]::IsNullOrWhiteSpace($uninstallCommand)) {
@@ -448,6 +501,7 @@ if ($UninstallAfterInstall) {
     throw "Azookey uninstall entry still exists after uninstall. Count=$($remainingEntries.Count)"
   }
 
+  Wait-ForUninstallerSelfCleanup -InstallLocation $installLocation
   foreach ($relativePath in @("frontend.exe", "azookey.dll", "azookey32.dll", "launcher.exe")) {
     $path = Join-Path $installLocation $relativePath
     if (Test-Path $path) {
@@ -455,6 +509,7 @@ if ($UninstallAfterInstall) {
     }
   }
 
+  Assert-OnlySettingsRemainAfterUninstall -InstallLocation $installLocation
   Write-Host "uninstall complete. entries found: 0"
 }
 PS1
