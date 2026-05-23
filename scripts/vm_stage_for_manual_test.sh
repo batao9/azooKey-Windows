@@ -13,6 +13,7 @@ VBOX_MANAGE="${VBOX_MANAGE:-}"
 INSTALL_TIMEOUT_SEC="${INSTALL_TIMEOUT_SEC:-1200}"
 SHUTDOWN_AFTER_INSTALL="${SHUTDOWN_AFTER_INSTALL:-1}"
 UNINSTALL_AFTER_INSTALL="${UNINSTALL_AFTER_INSTALL:-0}"
+VERIFY_LEGACY_NSIS_MIGRATION="${VERIFY_LEGACY_NSIS_MIGRATION:-0}"
 
 if [[ -z "$VBOX_MANAGE" ]]; then
   if command -v VBoxManage >/dev/null 2>&1; then
@@ -243,6 +244,7 @@ param(
   [Parameter(Mandatory = $true)][string]$InstallLogPath,
   [Parameter(Mandatory = $true)][string]$UninstallLogPath,
   [Parameter(Mandatory = $true)][int]$InstallerTimeoutSec,
+  [switch]$VerifyLegacyNsisMigration,
   [switch]$UninstallAfterInstall
 )
 
@@ -312,6 +314,89 @@ function Get-AzookeyUninstallEntries {
 function Normalize-RegistryPath {
   param([Parameter(Mandatory = $true)][string]$Path)
   $Path.Trim().Trim('"')
+}
+
+function Install-FakeLegacyNsisInstall {
+  $legacyRoot = Join-Path $env:LOCALAPPDATA "Azookey"
+  $legacyUninstallKey = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Azookey"
+  $legacyStateKey = "HKCU:\SOFTWARE\batao9\Azookey"
+
+  Remove-Item -LiteralPath $legacyRoot -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $legacyUninstallKey -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $legacyStateKey -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath (Join-Path $env:TEMP "azookey-legacy-nsis-uninstalled.txt") -Force -ErrorAction SilentlyContinue
+
+  New-Item -ItemType Directory -Force -Path $legacyRoot | Out-Null
+  Set-Content -LiteralPath (Join-Path $legacyRoot "legacy-payload.txt") -Encoding UTF8 -Value "legacy nsis payload"
+
+  $fakeUninstallerSource = @"
+using System;
+using System.Diagnostics;
+using System.IO;
+using Microsoft.Win32;
+
+public static class Program {
+  public static int Main(string[] args) {
+    var installRoot = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
+    var sentinelPath = Path.Combine(Path.GetTempPath(), "azookey-legacy-nsis-uninstalled.txt");
+    File.WriteAllText(sentinelPath, string.Join(" ", args));
+    Registry.CurrentUser.DeleteSubKeyTree(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Azookey", false);
+    Registry.CurrentUser.DeleteSubKeyTree(@"SOFTWARE\batao9\Azookey", false);
+    Process.Start(new ProcessStartInfo("cmd.exe", "/C ping 127.0.0.1 -n 2 > nul & rmdir /S /Q \"" + installRoot + "\"") {
+      CreateNoWindow = true,
+      UseShellExecute = false,
+      WorkingDirectory = Path.GetTempPath()
+    });
+    return 0;
+  }
+}
+"@
+
+  Add-Type -TypeDefinition $fakeUninstallerSource -OutputAssembly (Join-Path $legacyRoot "uninstall.exe") -OutputType ConsoleApplication
+
+  New-Item -ItemType Directory -Force -Path $legacyUninstallKey | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "DisplayName" -Value "Azookey" -PropertyType String -Force | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "Publisher" -Value "batao9" -PropertyType String -Force | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "DisplayVersion" -Value "0.1.0-legacy" -PropertyType String -Force | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "InstallLocation" -Value "`"$legacyRoot`"" -PropertyType String -Force | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "UninstallString" -Value "`"$(Join-Path $legacyRoot "uninstall.exe")`"" -PropertyType String -Force | Out-Null
+
+  New-Item -ItemType Directory -Force -Path $legacyStateKey | Out-Null
+  Set-Item -Path $legacyStateKey -Value $legacyRoot
+
+  Write-Host "created fake legacy NSIS install: $legacyRoot"
+}
+
+function Assert-FakeLegacyNsisMigrated {
+  $legacyRoot = Join-Path $env:LOCALAPPDATA "Azookey"
+  $legacyUninstallKey = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Azookey"
+  $legacyStateKey = "HKCU:\SOFTWARE\batao9\Azookey"
+  $sentinelPath = Join-Path $env:TEMP "azookey-legacy-nsis-uninstalled.txt"
+
+  $deadline = (Get-Date).AddSeconds(30)
+  while ((Test-Path -LiteralPath $legacyRoot) -and ((Get-Date) -lt $deadline)) {
+    Start-Sleep -Seconds 1
+  }
+
+  if (Test-Path -LiteralPath $legacyRoot) {
+    throw "Legacy NSIS install directory remains after migration: $legacyRoot"
+  }
+  if (Test-Path -LiteralPath $legacyUninstallKey) {
+    throw "Legacy NSIS uninstall key remains after migration: $legacyUninstallKey"
+  }
+  if (Test-Path -LiteralPath $legacyStateKey) {
+    throw "Legacy NSIS state key remains after migration: $legacyStateKey"
+  }
+  if (!(Test-Path -LiteralPath $sentinelPath)) {
+    throw "Legacy NSIS uninstaller was not executed."
+  }
+
+  $sentinel = Get-Content -LiteralPath $sentinelPath -Raw
+  if ($sentinel -notmatch "(^|\s)/S(\s|$)") {
+    throw "Legacy NSIS uninstaller was not invoked silently: $sentinel"
+  }
+
+  Write-Host "legacy NSIS install migrated before new install"
 }
 
 function Assert-RequiredInstallFiles {
@@ -462,6 +547,10 @@ if (-not (Test-VCRuntimeInstalled -Arch "x86")) {
   throw "VC++ runtime x86 is missing. Restore a VC-ready snapshot first."
 }
 
+if ($VerifyLegacyNsisMigration) {
+  Install-FakeLegacyNsisInstall
+}
+
 $args = @(
   "/SP-",
   "/VERYSILENT",
@@ -481,6 +570,10 @@ Write-Host "installer exit code: $($proc.ExitCode)"
 
 if ($proc.ExitCode -ne 0) {
   throw "Installer failed. ExitCode=$($proc.ExitCode)"
+}
+
+if ($VerifyLegacyNsisMigration) {
+  Assert-FakeLegacyNsisMigrated
 }
 
 $entries = @(Get-AzookeyUninstallEntries)
@@ -576,12 +669,18 @@ main() {
   log "VM でインストーラーを実行します（サイレント）"
   local install_rc=0
   local uninstall_switch=""
+  local legacy_nsis_switch=""
   case "${UNINSTALL_AFTER_INSTALL,,}" in
     1|true|yes|on)
       uninstall_switch="-UninstallAfterInstall"
       ;;
   esac
-  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -InstallerPath \"$REMOTE_INSTALLER_WIN\" -InstallLogPath \"$REMOTE_INSTALL_LOG_WIN\" -UninstallLogPath \"$REMOTE_UNINSTALL_LOG_WIN\" -InstallerTimeoutSec $INSTALL_TIMEOUT_SEC $uninstall_switch" || install_rc=$?
+  case "${VERIFY_LEGACY_NSIS_MIGRATION,,}" in
+    1|true|yes|on)
+      legacy_nsis_switch="-VerifyLegacyNsisMigration"
+      ;;
+  esac
+  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -InstallerPath \"$REMOTE_INSTALLER_WIN\" -InstallLogPath \"$REMOTE_INSTALL_LOG_WIN\" -UninstallLogPath \"$REMOTE_UNINSTALL_LOG_WIN\" -InstallerTimeoutSec $INSTALL_TIMEOUT_SEC $legacy_nsis_switch $uninstall_switch" || install_rc=$?
   if [[ "$install_rc" -ne 0 ]]; then
     log "インストーラー実行が失敗しました。ログ回収と VM 後処理を継続します: exit=$install_rc"
   fi

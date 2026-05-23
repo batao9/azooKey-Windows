@@ -106,8 +106,137 @@ Type: filesandordirs; Name: "{app}\frontend.exe.WebView2"
 Type: filesandordirs; Name: "{app}\ui.exe.WebView2"
 
 [Code]
+function RemoveSurroundingQuotes(Value: String): String;
+begin
+  Result := Trim(Value);
+  if (Length(Result) >= 2) and (Copy(Result, 1, 1) = '"') and (Copy(Result, Length(Result), 1) = '"') then
+  begin
+    Result := Copy(Result, 2, Length(Result) - 2);
+  end;
+end;
+
+function ExtractExecutablePath(Command: String): String;
+var
+  Value: String;
+  QuoteIndex: Integer;
+  SpaceIndex: Integer;
+begin
+  Value := Trim(Command);
+  Result := '';
+
+  if Value = '' then
+  begin
+    Exit;
+  end;
+
+  if Copy(Value, 1, 1) = '"' then
+  begin
+    Value := Copy(Value, 2, Length(Value) - 1);
+    QuoteIndex := Pos('"', Value);
+    if QuoteIndex > 0 then
+    begin
+      Result := Copy(Value, 1, QuoteIndex - 1);
+    end
+    else
+    begin
+      Result := Value;
+    end;
+  end
+  else
+  begin
+    SpaceIndex := Pos(' ', Value);
+    if SpaceIndex > 0 then
+    begin
+      Result := Copy(Value, 1, SpaceIndex - 1);
+    end
+    else
+    begin
+      Result := Value;
+    end;
+  end;
+end;
+
+function UninstallLegacyNsisFromRoot(RootKey: Integer; RootName: String): Boolean;
+var
+  InstallLocation: String;
+  UninstallString: String;
+  UninstallExe: String;
+  UninstallParams: String;
+  ResultCode: Integer;
+begin
+  Result := True;
+
+  if not RegQueryStringValue(RootKey, '{#MyLegacyNsisUninstallKey}', 'UninstallString', UninstallString) then
+  begin
+    Exit;
+  end;
+
+  UninstallExe := '';
+  InstallLocation := '';
+
+  if RegQueryStringValue(RootKey, '{#MyLegacyNsisUninstallKey}', 'InstallLocation', InstallLocation) then
+  begin
+    InstallLocation := RemoveSurroundingQuotes(InstallLocation);
+    if InstallLocation <> '' then
+    begin
+      UninstallExe := InstallLocation + '\uninstall.exe';
+      if not FileExists(UninstallExe) then
+      begin
+        UninstallExe := '';
+      end;
+    end;
+  end;
+
+  if UninstallExe = '' then
+  begin
+    UninstallExe := ExtractExecutablePath(UninstallString);
+  end;
+
+  if (UninstallExe = '') or (not FileExists(UninstallExe)) then
+  begin
+    Log('Legacy NSIS uninstaller was registered but not found under ' + RootName + ': ' + UninstallString);
+    Exit;
+  end;
+
+  UninstallParams := '/S';
+  if InstallLocation <> '' then
+  begin
+    UninstallParams := UninstallParams + ' _?=' + InstallLocation;
+  end;
+
+  Log('Running legacy NSIS uninstaller from ' + RootName + ': ' + UninstallExe + ' ' + UninstallParams);
+  if not Exec(UninstallExe, UninstallParams, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    SuppressibleMsgBox('旧バージョンのアンインストーラーを実行できませんでした: ' + UninstallExe, mbError, MB_OK, IDOK);
+    Result := False;
+    Exit;
+  end;
+
+  if ResultCode <> 0 then
+  begin
+    SuppressibleMsgBox('旧バージョンのアンインストールに失敗しました。終了コード: ' + IntToStr(ResultCode), mbError, MB_OK, IDOK);
+    Result := False;
+    Exit;
+  end;
+end;
+
+function UninstallLegacyNsisInstall(): Boolean;
+begin
+  Result :=
+    UninstallLegacyNsisFromRoot(HKCU, 'HKCU') and
+    UninstallLegacyNsisFromRoot(HKLM, 'HKLM') and
+    UninstallLegacyNsisFromRoot(HKLM32, 'HKLM32') and
+    UninstallLegacyNsisFromRoot(HKLM64, 'HKLM64');
+end;
+
 function InitializeSetup: Boolean;
 begin
+  if not UninstallLegacyNsisInstall() then
+  begin
+    Result := False;
+    Exit;
+  end;
+
   Dependency_AddVC2015To2022x64;
   Dependency_AddVC2015To2022x86;
   Dependency_AddWebView2;
