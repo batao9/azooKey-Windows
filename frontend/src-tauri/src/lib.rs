@@ -1,7 +1,7 @@
 mod ipc;
 
 use serde::{Deserialize, Serialize};
-use shared::{AppConfig, ConfigRecovery, RomajiRule};
+use shared::{AppConfig, AppConfigLoadResult, ConfigError, ConfigRecovery, RomajiRule};
 use std::{path::PathBuf, sync::Mutex};
 
 #[derive(Debug)]
@@ -15,7 +15,10 @@ impl AppState {
     fn new() -> Self {
         let (settings, startup_notice) = match AppConfig::new_with_recovery() {
             Ok(result) => {
-                let notice = result.recovery.as_ref().map(notice_from_recovery);
+                if let Some(error) = result.rewrite_error.as_ref() {
+                    eprintln!("Failed to rewrite loaded settings: {}", error);
+                }
+                let notice = notice_from_load_result(&result);
                 (result.config, notice)
             }
             Err(error) => {
@@ -68,6 +71,36 @@ fn notice_from_recovery(recovery: &ConfigRecovery) -> ConfigStartupNotice {
         kind: "recovered".to_string(),
         message: "壊れた設定ファイルを退避し、既定値で起動しました。".to_string(),
         backup_path: Some(recovery.backup_path.display().to_string()),
+    }
+}
+
+fn notice_from_rewrite_error(error: &ConfigError) -> ConfigStartupNotice {
+    ConfigStartupNotice {
+        kind: "rewrite_error".to_string(),
+        message: format!("設定は読み込めましたが、設定ファイルの保存に失敗しました: {error}"),
+        backup_path: None,
+    }
+}
+
+fn notice_from_recovered_rewrite_error(
+    recovery: &ConfigRecovery,
+    error: &ConfigError,
+) -> ConfigStartupNotice {
+    ConfigStartupNotice {
+        kind: "recovered_rewrite_error".to_string(),
+        message: format!(
+            "壊れた設定ファイルを退避しましたが、既定値設定の保存に失敗しました: {error}"
+        ),
+        backup_path: Some(recovery.backup_path.display().to_string()),
+    }
+}
+
+fn notice_from_load_result(result: &AppConfigLoadResult) -> Option<ConfigStartupNotice> {
+    match (&result.recovery, &result.rewrite_error) {
+        (Some(recovery), Some(error)) => Some(notice_from_recovered_rewrite_error(recovery, error)),
+        (Some(recovery), None) => Some(notice_from_recovery(recovery)),
+        (None, Some(error)) => Some(notice_from_rewrite_error(error)),
+        (None, None) => None,
     }
 }
 
@@ -207,6 +240,7 @@ mod tests {
     use std::{
         env,
         ffi::OsString,
+        io,
         path::Path,
         sync::{Mutex, MutexGuard, OnceLock},
     };
@@ -309,5 +343,23 @@ mod tests {
             notice.backup_path.as_deref(),
             Some("settings.json.broken-20260524120000")
         );
+    }
+
+    #[test]
+    fn rewrite_error_notice_keeps_loaded_config_message() {
+        let result = AppConfigLoadResult {
+            config: AppConfig::default(),
+            recovery: None,
+            rewrite_error: Some(ConfigError::WriteTemp {
+                path: PathBuf::from("settings.json.tmp-test"),
+                source: io::Error::new(io::ErrorKind::PermissionDenied, "test write failure"),
+            }),
+        };
+
+        let notice = notice_from_load_result(&result).unwrap();
+
+        assert_eq!(notice.kind, "rewrite_error");
+        assert!(notice.message.contains("設定は読み込めました"));
+        assert!(notice.backup_path.is_none());
     }
 }

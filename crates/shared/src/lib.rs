@@ -121,10 +121,11 @@ pub struct ConfigRecovery {
     pub backup_path: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AppConfigLoadResult {
     pub config: AppConfig,
     pub recovery: Option<ConfigRecovery>,
+    pub rewrite_error: Option<ConfigError>,
 }
 
 pub const CHARACTER_WIDTH_SYMBOL_DEFAULTS: [(&str, bool); 42] = [
@@ -440,7 +441,7 @@ mod tests {
     use std::{
         env,
         ffi::OsString,
-        fs,
+        fs, io,
         path::Path,
         sync::{Mutex, MutexGuard, OnceLock},
     };
@@ -581,6 +582,32 @@ mod tests {
 
         assert_eq!(migrated.version, CONFIG_VERSION);
         assert_eq!(migrated.general.numpad_input, NumpadInputMode::DirectInput);
+    }
+
+    #[test]
+    fn new_with_recovery_keeps_loaded_config_when_rewrite_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_root = temp.path().join("Azookey");
+        fs::create_dir_all(&config_root).unwrap();
+        let config_path = config_root.join(SETTINGS_FILENAME);
+        let mut config = AppConfig::default();
+        config.zenzai.enable = true;
+        fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let result = AppConfig::new_with_recovery_from_root(&config_root, |_| {
+            Err(ConfigError::WriteTemp {
+                path: config_root.join("settings.json.tmp-test"),
+                source: io::Error::new(io::ErrorKind::PermissionDenied, "test write failure"),
+            })
+        })
+        .unwrap();
+
+        assert!(result.config.zenzai.enable);
+        assert!(result.recovery.is_none());
+        assert!(matches!(
+            result.rewrite_error,
+            Some(ConfigError::WriteTemp { .. })
+        ));
     }
 
     #[test]
@@ -795,7 +822,14 @@ impl AppConfig {
 
     pub fn new_with_recovery() -> Result<AppConfigLoadResult, ConfigError> {
         let config_root = get_config_root()?;
-        ensure_config_dir(&config_root)?;
+        Self::new_with_recovery_from_root(&config_root, |config| config.write())
+    }
+
+    fn new_with_recovery_from_root(
+        config_root: &Path,
+        rewrite_config: impl FnOnce(&AppConfig) -> Result<(), ConfigError>,
+    ) -> Result<AppConfigLoadResult, ConfigError> {
+        ensure_config_dir(config_root)?;
         let config_path = config_root.join(SETTINGS_FILENAME);
 
         let (config, recovery) = if !config_path.exists() {
@@ -823,8 +857,12 @@ impl AppConfig {
             }
         };
 
-        config.write()?;
-        Ok(AppConfigLoadResult { config, recovery })
+        let rewrite_error = rewrite_config(&config).err();
+        Ok(AppConfigLoadResult {
+            config,
+            recovery,
+            rewrite_error,
+        })
     }
 }
 
