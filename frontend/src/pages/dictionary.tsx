@@ -5,6 +5,7 @@ import { Plus, Save, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { saveConfigWithToast } from "@/lib/config";
 
 type DictionaryEntry = {
     reading: string;
@@ -136,10 +137,13 @@ export const Dictionary = () => {
 
         setIsSaving(true);
         try {
-            const config = await invoke<any>("get_config");
-            config.user_dictionary = config.user_dictionary ?? {};
-            config.user_dictionary.entries = normalized;
-            await invoke("update_config", { newConfig: config });
+            const config = await saveConfigWithToast((config) => {
+                config.user_dictionary = config.user_dictionary ?? {};
+                config.user_dictionary.entries = normalized;
+            }, "ユーザ辞書の保存に失敗しました");
+            if (!config) {
+                return;
+            }
             setEntries(normalized);
             toast("ユーザ辞書を保存しました");
         } catch (_error) {

@@ -12,6 +12,7 @@ import { Zenzai } from "@/pages/zenzai"
 import { About } from "@/pages/about"
 import { Dictionary } from "@/pages/dictionary"
 import { Toaster } from "@/components/ui/sonner"
+import { showConfigStartupNoticeOnce } from "@/lib/config"
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
@@ -34,3 +35,5 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     </SidebarProvider>
   </React.StrictMode>,
 );
+
+void showConfigStartupNoticeOnce();

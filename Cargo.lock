@@ -1172,6 +1172,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-fs",
  "tauri-plugin-opener",
+ "tempfile",
  "tokio",
  "tonic",
  "tower 0.5.2",
@@ -3603,11 +3604,14 @@ dependencies = [
 name = "shared"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "prost",
  "serde",
  "serde_json",
+ "tempfile",
  "tonic",
  "tonic-build",
+ "windows",
 ]
 
 [[package]]
