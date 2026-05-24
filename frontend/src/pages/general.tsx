@@ -14,6 +14,7 @@ import {
     SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { saveConfigWithToast } from "@/lib/config";
 
 type WidthMode = "half" | "full";
 
@@ -292,17 +293,8 @@ export const General = () => {
         return () => cancelAnimationFrame(rafId);
     }, [isRomajiEditorOpen, pendingFocusNewRow, romajiDraftRows.length]);
 
-    const updateConfig = async (updater: (config: any) => void) => {
-        try {
-            const data = await invoke<any>("get_config");
-            updater(data);
-            await invoke("update_config", { newConfig: data });
-            return data;
-        } catch (_error) {
-            toast("設定の更新に失敗しました");
-            return null;
-        }
-    };
+    const updateConfig = (updater: (config: any) => void) =>
+        saveConfigWithToast(updater);
 
     const handleCtrlSpaceToggle = async () => {
         const nextValue = !shortcutValue.ctrlSpaceToggle;

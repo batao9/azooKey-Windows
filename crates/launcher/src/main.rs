@@ -4,7 +4,10 @@ use std::process::{Child, Command, Stdio};
 use std::{env, thread};
 
 fn main() -> anyhow::Result<()> {
-    let config = AppConfig::new();
+    let config = AppConfig::new().unwrap_or_else(|error| {
+        eprintln!("[launcher] Failed to load settings; using defaults: {error}");
+        AppConfig::default()
+    });
     let cpu_backend_supported = zenzai_cpu_backend_supported();
     env::set_var(
         "AZOOKEY_ZENZAI_CPU_SUPPORTED",

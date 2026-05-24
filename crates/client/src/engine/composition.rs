@@ -149,6 +149,13 @@ impl TextServiceFactory {
     const MOVE_CURSOR_POP_CLAUSE_SNAPSHOT: i32 = 127;
     const MOVE_CLAUSE_TO_LAST: i32 = i32::MAX;
 
+    fn load_app_config_or_default() -> AppConfig {
+        AppConfig::read().unwrap_or_else(|error| {
+            tracing::error!("Failed to load settings; using defaults: {error}");
+            AppConfig::default()
+        })
+    }
+
     #[inline]
     fn is_ctrl_pressed() -> bool {
         VK_CONTROL.is_pressed() || VK_LCONTROL.is_pressed() || VK_RCONTROL.is_pressed()
@@ -2856,7 +2863,7 @@ impl TextServiceFactory {
         let is_shift_right = is_shift_pressed && wparam.0 == 0x27;
         let is_shift_key = Self::is_shift_key(wparam);
         let is_alt_backquote = Self::is_alt_backquote(wparam, lparam);
-        let app_config = AppConfig::read();
+        let app_config = Self::load_app_config_or_default();
 
         // check shortcut keys
         if is_ctrl_pressed && !is_ctrl_space && !is_alt_backquote && !is_ctrl_enter && !is_ctrl_down
@@ -3103,7 +3110,7 @@ impl TextServiceFactory {
             let mode = IMEState::input_mode()?;
             (composition, mode)
         };
-        let app_config = AppConfig::read();
+        let app_config = Self::load_app_config_or_default();
 
         let mut preview = composition.preview.clone();
         let mut suffix = composition.suffix.clone();

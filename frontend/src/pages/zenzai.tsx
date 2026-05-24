@@ -17,6 +17,7 @@ import {
     TooltipProvider,
     TooltipTrigger,
 } from "@/components/ui/tooltip"
+import { saveConfigWithToast } from "@/lib/config";
 
 const ToolTipSelectItem = ({
     name,
@@ -82,17 +83,8 @@ export const Zenzai = () => {
         })
     }, []);
 
-    const updateConfig = async (updater: (config: any) => void) => {
-        try {
-            const data = await invoke<any>("get_config");
-            updater(data);
-            await invoke("update_config", { newConfig: data });
-            return data;
-        } catch (error) {
-            toast("設定の更新に失敗しました");
-            return null;
-        }
-    };
+    const updateConfig = (updater: (config: any) => void) =>
+        saveConfigWithToast(updater);
 
     const handleZenzaiChange = async () => {
         const data = await updateConfig((data) => {

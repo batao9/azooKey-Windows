@@ -8,3 +8,4 @@ logs/*
 *.gguf
 *.dll
 *.lib
+.codex

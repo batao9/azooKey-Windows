@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    env, error, fmt, fs, io,
+    path::{Path, PathBuf},
+};
 
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/azookey.rs"));
@@ -8,13 +12,120 @@ pub mod proto {
         tonic::include_file_descriptor_set!("azookey_service_descriptor");
 }
 
-fn get_config_root() -> PathBuf {
-    let appdata = PathBuf::from(std::env::var("APPDATA").unwrap());
-    appdata.join("Azookey")
+fn get_config_root() -> Result<PathBuf, ConfigError> {
+    let appdata = env::var_os("APPDATA").ok_or(ConfigError::MissingAppData)?;
+    Ok(PathBuf::from(appdata).join("Azookey"))
 }
 
 const SETTINGS_FILENAME: &str = "settings.json";
 const CONFIG_VERSION: &str = "0.1.2";
+
+#[derive(Debug)]
+pub enum ConfigError {
+    MissingAppData,
+    CreateDir {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Read {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Parse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    Backup {
+        from: PathBuf,
+        to: PathBuf,
+        source: io::Error,
+    },
+    Serialize {
+        source: serde_json::Error,
+    },
+    WriteTemp {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Persist {
+        from: PathBuf,
+        to: PathBuf,
+        source: io::Error,
+    },
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigError::MissingAppData => write!(f, "APPDATA is not set"),
+            ConfigError::CreateDir { path, source } => {
+                write!(
+                    f,
+                    "failed to create config directory {}: {}",
+                    path.display(),
+                    source
+                )
+            }
+            ConfigError::Read { path, source } => {
+                write!(f, "failed to read config {}: {}", path.display(), source)
+            }
+            ConfigError::Parse { path, source } => {
+                write!(f, "failed to parse config {}: {}", path.display(), source)
+            }
+            ConfigError::Backup { from, to, source } => write!(
+                f,
+                "failed to back up corrupted config {} to {}: {}",
+                from.display(),
+                to.display(),
+                source
+            ),
+            ConfigError::Serialize { source } => {
+                write!(f, "failed to serialize config: {}", source)
+            }
+            ConfigError::WriteTemp { path, source } => {
+                write!(
+                    f,
+                    "failed to write temporary config {}: {}",
+                    path.display(),
+                    source
+                )
+            }
+            ConfigError::Persist { from, to, source } => write!(
+                f,
+                "failed to replace config {} with {}: {}",
+                to.display(),
+                from.display(),
+                source
+            ),
+        }
+    }
+}
+
+impl error::Error for ConfigError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            ConfigError::MissingAppData => None,
+            ConfigError::CreateDir { source, .. }
+            | ConfigError::Read { source, .. }
+            | ConfigError::Backup { source, .. }
+            | ConfigError::WriteTemp { source, .. }
+            | ConfigError::Persist { source, .. } => Some(source),
+            ConfigError::Parse { source, .. } | ConfigError::Serialize { source } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfigRecovery {
+    pub original_path: PathBuf,
+    pub backup_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppConfigLoadResult {
+    pub config: AppConfig,
+    pub recovery: Option<ConfigRecovery>,
+}
 
 pub const CHARACTER_WIDTH_SYMBOL_DEFAULTS: [(&str, bool); 42] = [
     ("0", false),
@@ -323,7 +434,63 @@ pub fn zenzai_cpu_backend_supported() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::GeneralConfig;
+    use super::{
+        AppConfig, ConfigError, GeneralConfig, NumpadInputMode, CONFIG_VERSION, SETTINGS_FILENAME,
+    };
+    use std::{
+        env,
+        ffi::OsString,
+        fs,
+        path::Path,
+        sync::{Mutex, MutexGuard, OnceLock},
+    };
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    struct AppDataGuard {
+        _guard: MutexGuard<'static, ()>,
+        previous: Option<OsString>,
+    }
+
+    impl AppDataGuard {
+        fn set(path: &Path) -> Self {
+            let guard = env_lock();
+            let previous = env::var_os("APPDATA");
+            unsafe {
+                env::set_var("APPDATA", path);
+            }
+            Self {
+                _guard: guard,
+                previous,
+            }
+        }
+
+        fn unset() -> Self {
+            let guard = env_lock();
+            let previous = env::var_os("APPDATA");
+            unsafe {
+                env::remove_var("APPDATA");
+            }
+            Self {
+                _guard: guard,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for AppDataGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => env::set_var("APPDATA", value),
+                    None => env::remove_var("APPDATA"),
+                }
+            }
+        }
+    }
 
     #[test]
     fn candidate_window_delay_defaults_to_off() {
@@ -347,6 +514,109 @@ mod tests {
         assert!(deserialized.punctuation_commit_punctuation);
         assert!(deserialized.punctuation_commit_exclamation);
         assert!(deserialized.punctuation_commit_question);
+    }
+
+    #[test]
+    fn new_creates_default_settings_when_file_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let _appdata = AppDataGuard::set(temp.path());
+
+        let result = AppConfig::new_with_recovery().unwrap();
+        let config_path = temp.path().join("Azookey").join(SETTINGS_FILENAME);
+
+        assert!(result.recovery.is_none());
+        assert_eq!(result.config.version, CONFIG_VERSION);
+        assert!(config_path.exists());
+
+        let saved: AppConfig = serde_json::from_str(&fs::read_to_string(config_path).unwrap())
+            .expect("saved default config should be valid JSON");
+        assert_eq!(saved.version, CONFIG_VERSION);
+    }
+
+    #[test]
+    fn corrupted_settings_are_backed_up_and_default_settings_are_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let _appdata = AppDataGuard::set(temp.path());
+        let config_root = temp.path().join("Azookey");
+        fs::create_dir_all(&config_root).unwrap();
+        let config_path = config_root.join(SETTINGS_FILENAME);
+        fs::write(&config_path, "{not valid json").unwrap();
+
+        let result = AppConfig::new_with_recovery().unwrap();
+        let recovery = result
+            .recovery
+            .expect("broken settings should produce recovery metadata");
+
+        assert_eq!(recovery.original_path, config_path);
+        assert!(recovery.backup_path.exists());
+        assert!(recovery
+            .backup_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("settings.json.broken-"));
+        assert_eq!(
+            fs::read_to_string(recovery.backup_path).unwrap(),
+            "{not valid json"
+        );
+
+        let saved: AppConfig = serde_json::from_str(&fs::read_to_string(config_path).unwrap())
+            .expect("recreated settings should be valid JSON");
+        assert_eq!(saved.version, CONFIG_VERSION);
+    }
+
+    #[test]
+    fn read_migrates_valid_legacy_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let _appdata = AppDataGuard::set(temp.path());
+        let config_root = temp.path().join("Azookey");
+        fs::create_dir_all(&config_root).unwrap();
+        let config_path = config_root.join(SETTINGS_FILENAME);
+        let mut legacy = AppConfig::default();
+        legacy.version = "0.1.1".to_string();
+        legacy.general.numpad_input = NumpadInputMode::AlwaysHalf;
+        fs::write(&config_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let migrated = AppConfig::read().unwrap();
+
+        assert_eq!(migrated.version, CONFIG_VERSION);
+        assert_eq!(migrated.general.numpad_input, NumpadInputMode::DirectInput);
+    }
+
+    #[test]
+    fn write_persists_valid_json_without_temp_file_leftover() {
+        let temp = tempfile::tempdir().unwrap();
+        let _appdata = AppDataGuard::set(temp.path());
+        let mut config = AppConfig::default();
+        config.zenzai.enable = true;
+
+        config.write().unwrap();
+
+        let config_root = temp.path().join("Azookey");
+        let saved: AppConfig =
+            serde_json::from_str(&fs::read_to_string(config_root.join(SETTINGS_FILENAME)).unwrap())
+                .expect("written settings should be valid JSON");
+        assert!(saved.zenzai.enable);
+        let temp_files = fs::read_dir(config_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("settings.json.tmp-")
+            })
+            .count();
+        assert_eq!(temp_files, 0);
+    }
+
+    #[test]
+    fn missing_appdata_returns_config_error() {
+        let _appdata = AppDataGuard::unset();
+
+        let error = AppConfig::read().expect_err("APPDATA absence should not panic");
+
+        assert!(matches!(error, ConfigError::MissingAppData));
     }
 }
 
@@ -484,61 +754,217 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    pub fn write(&self) {
-        let config_path = get_config_root().join(SETTINGS_FILENAME);
-        let config_str = serde_json::to_string_pretty(self).unwrap();
-        std::fs::write(config_path, config_str).unwrap();
-    }
+    pub fn write(&self) -> Result<(), ConfigError> {
+        let config_root = get_config_root()?;
+        ensure_config_dir(&config_root)?;
+        let config_path = config_root.join(SETTINGS_FILENAME);
+        let temp_path = temporary_config_path(&config_root);
+        let config_str = serde_json::to_string_pretty(self)
+            .map_err(|source| ConfigError::Serialize { source })?;
 
-    pub fn read() -> Self {
-        let config_path = get_config_root().join(SETTINGS_FILENAME);
-        if !config_path.exists() {
-            return AppConfig::default();
-        }
-        let config_str = std::fs::read_to_string(config_path).unwrap();
-        let mut config: AppConfig = serde_json::from_str(&config_str).unwrap();
-
-        if config.version != CONFIG_VERSION {
-            config.general.numpad_input = match config.general.numpad_input {
-                // 旧仕様との互換: always_half(直接入力) -> direct_input
-                NumpadInputMode::AlwaysHalf => NumpadInputMode::DirectInput,
-                // 旧仕様との互換: follow_input_mode(変換待ち半角) -> always_half
-                NumpadInputMode::FollowInputMode => NumpadInputMode::AlwaysHalf,
-                NumpadInputMode::DirectInput => NumpadInputMode::DirectInput,
-            };
-
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&config_str) {
-                let legacy = value
-                    .get("character_width")
-                    .cloned()
-                    .and_then(|cw| serde_json::from_value::<LegacyCharacterWidthConfig>(cw).ok())
-                    .unwrap_or(LegacyCharacterWidthConfig {
-                        symbol_fullwidth: config.character_width.symbol_fullwidth.clone(),
-                    });
-                let legacy_groups = legacy_groups_from_symbol_fullwidth(&legacy.symbol_fullwidth);
-
-                if config.character_width.groups == legacy_groups {
-                    config.character_width.groups = CharacterWidthGroups::default();
-                }
+        write_temp_config(&temp_path, config_str.as_bytes())?;
+        replace_config_file(&temp_path, &config_path).map_err(|source| {
+            let _ = fs::remove_file(&temp_path);
+            ConfigError::Persist {
+                from: temp_path.clone(),
+                to: config_path,
+                source,
             }
+        })?;
 
-            config
-                .romaji_table
-                .rows
-                .retain(|row| !is_legacy_removed_default_row(row));
-            config.version = CONFIG_VERSION.to_string();
-        }
-
-        config
+        Ok(())
     }
 
-    pub fn new() -> Self {
-        let config_path = get_config_root();
+    pub fn read() -> Result<Self, ConfigError> {
+        let config_path = get_config_root()?.join(SETTINGS_FILENAME);
         if !config_path.exists() {
-            std::fs::create_dir_all(&config_path).unwrap();
+            return Ok(AppConfig::default());
         }
-        let config = AppConfig::read();
-        config.write();
-        config
+        let config_str = fs::read_to_string(&config_path).map_err(|source| ConfigError::Read {
+            path: config_path.clone(),
+            source,
+        })?;
+        let config = parse_config(&config_path, &config_str)?;
+
+        Ok(config)
     }
+
+    pub fn new() -> Result<Self, ConfigError> {
+        Ok(Self::new_with_recovery()?.config)
+    }
+
+    pub fn new_with_recovery() -> Result<AppConfigLoadResult, ConfigError> {
+        let config_root = get_config_root()?;
+        ensure_config_dir(&config_root)?;
+        let config_path = config_root.join(SETTINGS_FILENAME);
+
+        let (config, recovery) = if !config_path.exists() {
+            (AppConfig::default(), None)
+        } else {
+            let config_str =
+                fs::read_to_string(&config_path).map_err(|source| ConfigError::Read {
+                    path: config_path.clone(),
+                    source,
+                })?;
+
+            match parse_config(&config_path, &config_str) {
+                Ok(config) => (config, None),
+                Err(ConfigError::Parse { .. }) => {
+                    let backup_path = backup_corrupted_config(&config_path)?;
+                    (
+                        AppConfig::default(),
+                        Some(ConfigRecovery {
+                            original_path: config_path.clone(),
+                            backup_path,
+                        }),
+                    )
+                }
+                Err(error) => return Err(error),
+            }
+        };
+
+        config.write()?;
+        Ok(AppConfigLoadResult { config, recovery })
+    }
+}
+
+fn parse_config(config_path: &Path, config_str: &str) -> Result<AppConfig, ConfigError> {
+    let mut config: AppConfig =
+        serde_json::from_str(config_str).map_err(|source| ConfigError::Parse {
+            path: config_path.to_path_buf(),
+            source,
+        })?;
+
+    if config.version != CONFIG_VERSION {
+        config.general.numpad_input = match config.general.numpad_input {
+            // 旧仕様との互換: always_half(直接入力) -> direct_input
+            NumpadInputMode::AlwaysHalf => NumpadInputMode::DirectInput,
+            // 旧仕様との互換: follow_input_mode(変換待ち半角) -> always_half
+            NumpadInputMode::FollowInputMode => NumpadInputMode::AlwaysHalf,
+            NumpadInputMode::DirectInput => NumpadInputMode::DirectInput,
+        };
+
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(config_str) {
+            let legacy = value
+                .get("character_width")
+                .cloned()
+                .and_then(|cw| serde_json::from_value::<LegacyCharacterWidthConfig>(cw).ok())
+                .unwrap_or(LegacyCharacterWidthConfig {
+                    symbol_fullwidth: config.character_width.symbol_fullwidth.clone(),
+                });
+            let legacy_groups = legacy_groups_from_symbol_fullwidth(&legacy.symbol_fullwidth);
+
+            if config.character_width.groups == legacy_groups {
+                config.character_width.groups = CharacterWidthGroups::default();
+            }
+        }
+
+        config
+            .romaji_table
+            .rows
+            .retain(|row| !is_legacy_removed_default_row(row));
+        config.version = CONFIG_VERSION.to_string();
+    }
+
+    Ok(config)
+}
+
+fn ensure_config_dir(config_root: &Path) -> Result<(), ConfigError> {
+    fs::create_dir_all(config_root).map_err(|source| ConfigError::CreateDir {
+        path: config_root.to_path_buf(),
+        source,
+    })
+}
+
+fn write_temp_config(temp_path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
+    let mut file = fs::File::create(temp_path).map_err(|source| ConfigError::WriteTemp {
+        path: temp_path.to_path_buf(),
+        source,
+    })?;
+    use std::io::Write as _;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|source| ConfigError::WriteTemp {
+            path: temp_path.to_path_buf(),
+            source,
+        })
+}
+
+fn temporary_config_path(config_root: &Path) -> PathBuf {
+    let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S%f");
+    config_root.join(format!(
+        "{SETTINGS_FILENAME}.tmp-{}-{timestamp}",
+        std::process::id()
+    ))
+}
+
+fn backup_corrupted_config(config_path: &Path) -> Result<PathBuf, ConfigError> {
+    let base_name = format!(
+        "{SETTINGS_FILENAME}.broken-{}",
+        chrono::Local::now().format("%Y%m%d%H%M%S")
+    );
+    let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
+
+    for index in 0..1000 {
+        let candidate = if index == 0 {
+            parent.join(&base_name)
+        } else {
+            parent.join(format!("{base_name}-{index}"))
+        };
+
+        if candidate.exists() {
+            continue;
+        }
+
+        fs::rename(config_path, &candidate).map_err(|source| ConfigError::Backup {
+            from: config_path.to_path_buf(),
+            to: candidate.clone(),
+            source,
+        })?;
+        return Ok(candidate);
+    }
+
+    let fallback = parent.join(format!("{base_name}-overflow"));
+    fs::rename(config_path, &fallback).map_err(|source| ConfigError::Backup {
+        from: config_path.to_path_buf(),
+        to: fallback.clone(),
+        source,
+    })?;
+    Ok(fallback)
+}
+
+#[cfg(not(windows))]
+fn replace_config_file(temp_path: &Path, config_path: &Path) -> io::Result<()> {
+    fs::rename(temp_path, config_path)
+}
+
+#[cfg(windows)]
+fn replace_config_file(temp_path: &Path, config_path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows::{
+        core::PCWSTR,
+        Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        },
+    };
+
+    let from: Vec<u16> = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let to: Vec<u16> = config_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        MoveFileExW(
+            PCWSTR(from.as_ptr()),
+            PCWSTR(to.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))
 }
