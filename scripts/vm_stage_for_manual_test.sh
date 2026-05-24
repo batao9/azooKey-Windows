@@ -12,6 +12,10 @@ SSH_KEY="${SSH_KEY:-}"
 VBOX_MANAGE="${VBOX_MANAGE:-}"
 INSTALL_TIMEOUT_SEC="${INSTALL_TIMEOUT_SEC:-1200}"
 SHUTDOWN_AFTER_INSTALL="${SHUTDOWN_AFTER_INSTALL:-1}"
+UNINSTALL_AFTER_INSTALL="${UNINSTALL_AFTER_INSTALL:-0}"
+VERIFY_LEGACY_NSIS_MIGRATION="${VERIFY_LEGACY_NSIS_MIGRATION:-0}"
+VERIFY_MISSING_LEGACY_NSIS_UNINSTALLER="${VERIFY_MISSING_LEGACY_NSIS_UNINSTALLER:-0}"
+VERIFY_LOCKED_FILE_UPGRADE="${VERIFY_LOCKED_FILE_UPGRADE:-0}"
 
 if [[ -z "$VBOX_MANAGE" ]]; then
   if command -v VBoxManage >/dev/null 2>&1; then
@@ -40,10 +44,12 @@ REMOTE_TMP_WIN="C:\\Users\\$SSH_USER\\AppData\\Local\\Temp"
 REMOTE_INSTALLER_WIN="$REMOTE_TMP_WIN\\azookey-setup-under-test.exe"
 REMOTE_PS_WIN="$REMOTE_TMP_WIN\\azookey-install-under-test.ps1"
 REMOTE_INSTALL_LOG_WIN="$REMOTE_TMP_WIN\\azookey-install-under-test.log"
+REMOTE_UNINSTALL_LOG_WIN="$REMOTE_TMP_WIN\\azookey-uninstall-under-test.log"
 
 REMOTE_INSTALLER_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-setup-under-test.exe"
 REMOTE_PS_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-install-under-test.ps1"
 REMOTE_INSTALL_LOG_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-install-under-test.log"
+REMOTE_UNINSTALL_LOG_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-uninstall-under-test.log"
 
 SESSION_KNOWN_HOSTS="$(mktemp /tmp/vm-stage-known-hosts.XXXXXX)"
 TMP_REMOTE_PS=""
@@ -238,7 +244,12 @@ create_install_ps1() {
 param(
   [Parameter(Mandatory = $true)][string]$InstallerPath,
   [Parameter(Mandatory = $true)][string]$InstallLogPath,
-  [Parameter(Mandatory = $true)][int]$InstallerTimeoutSec
+  [Parameter(Mandatory = $true)][string]$UninstallLogPath,
+  [Parameter(Mandatory = $true)][int]$InstallerTimeoutSec,
+  [switch]$VerifyLegacyNsisMigration,
+  [switch]$VerifyMissingLegacyNsisUninstaller,
+  [switch]$VerifyLockedFileUpgrade,
+  [switch]$UninstallAfterInstall
 )
 
 $ErrorActionPreference = "Stop"
@@ -292,11 +303,408 @@ function Stop-ProcessTree {
   Stop-Process -Id $RootPid -Force -ErrorAction SilentlyContinue
 }
 
+function Get-AzookeyUninstallEntries {
+  @(
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+  ) | ForEach-Object {
+    Get-ItemProperty -Path $_ -ErrorAction SilentlyContinue
+  } | Where-Object {
+    $_.DisplayName -like "*Azookey*"
+  }
+}
+
+function Normalize-RegistryPath {
+  param([Parameter(Mandatory = $true)][string]$Path)
+  $Path.Trim().Trim('"')
+}
+
+function Install-FakeLegacyNsisInstall {
+  $legacyRoot = Join-Path $env:LOCALAPPDATA "Azookey"
+  $legacyUninstallKey = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Azookey"
+  $legacyStateKey = "HKCU:\SOFTWARE\batao9\Azookey"
+
+  Remove-Item -LiteralPath $legacyRoot -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $legacyUninstallKey -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $legacyStateKey -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath (Join-Path $env:TEMP "azookey-legacy-nsis-uninstalled.txt") -Force -ErrorAction SilentlyContinue
+
+  New-Item -ItemType Directory -Force -Path $legacyRoot | Out-Null
+  Set-Content -LiteralPath (Join-Path $legacyRoot "legacy-payload.txt") -Encoding UTF8 -Value "legacy nsis payload"
+
+  $fakeUninstallerSource = @"
+using System;
+using System.Diagnostics;
+using System.IO;
+using Microsoft.Win32;
+
+public static class Program {
+  public static int Main(string[] args) {
+    var installRoot = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
+    var sentinelPath = Path.Combine(Path.GetTempPath(), "azookey-legacy-nsis-uninstalled.txt");
+    File.WriteAllText(sentinelPath, string.Join(" ", args));
+    Registry.CurrentUser.DeleteSubKeyTree(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Azookey", false);
+    Registry.CurrentUser.DeleteSubKeyTree(@"SOFTWARE\batao9\Azookey", false);
+    Process.Start(new ProcessStartInfo("cmd.exe", "/C ping 127.0.0.1 -n 2 > nul & rmdir /S /Q \"" + installRoot + "\"") {
+      CreateNoWindow = true,
+      UseShellExecute = false,
+      WorkingDirectory = Path.GetTempPath()
+    });
+    return 0;
+  }
+}
+"@
+
+  Add-Type -TypeDefinition $fakeUninstallerSource -OutputAssembly (Join-Path $legacyRoot "uninstall.exe") -OutputType ConsoleApplication
+
+  New-Item -ItemType Directory -Force -Path $legacyUninstallKey | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "DisplayName" -Value "Azookey" -PropertyType String -Force | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "Publisher" -Value "batao9" -PropertyType String -Force | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "DisplayVersion" -Value "0.1.0-legacy" -PropertyType String -Force | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "InstallLocation" -Value "`"$legacyRoot`"" -PropertyType String -Force | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "UninstallString" -Value "`"$(Join-Path $legacyRoot "uninstall.exe")`"" -PropertyType String -Force | Out-Null
+
+  New-Item -ItemType Directory -Force -Path $legacyStateKey | Out-Null
+  Set-Item -Path $legacyStateKey -Value $legacyRoot
+
+  Write-Host "created fake legacy NSIS install: $legacyRoot"
+}
+
+function Assert-FakeLegacyNsisMigrated {
+  $legacyRoot = Join-Path $env:LOCALAPPDATA "Azookey"
+  $legacyUninstallKey = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Azookey"
+  $legacyStateKey = "HKCU:\SOFTWARE\batao9\Azookey"
+  $sentinelPath = Join-Path $env:TEMP "azookey-legacy-nsis-uninstalled.txt"
+
+  $deadline = (Get-Date).AddSeconds(30)
+  while ((Test-Path -LiteralPath $legacyRoot) -and ((Get-Date) -lt $deadline)) {
+    Start-Sleep -Seconds 1
+  }
+
+  if (Test-Path -LiteralPath $legacyRoot) {
+    throw "Legacy NSIS install directory remains after migration: $legacyRoot"
+  }
+  if (Test-Path -LiteralPath $legacyUninstallKey) {
+    throw "Legacy NSIS uninstall key remains after migration: $legacyUninstallKey"
+  }
+  if (Test-Path -LiteralPath $legacyStateKey) {
+    throw "Legacy NSIS state key remains after migration: $legacyStateKey"
+  }
+  if (!(Test-Path -LiteralPath $sentinelPath)) {
+    throw "Legacy NSIS uninstaller was not executed."
+  }
+
+  $sentinel = Get-Content -LiteralPath $sentinelPath -Raw
+  if ($sentinel -notmatch "(^|\s)/S(\s|$)") {
+    throw "Legacy NSIS uninstaller was not invoked silently: $sentinel"
+  }
+
+  Write-Host "legacy NSIS install migrated before new install"
+}
+
+function Install-BrokenLegacyNsisInstall {
+  $legacyRoot = Join-Path $env:LOCALAPPDATA "Azookey"
+  $legacyUninstallKey = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Azookey"
+
+  Remove-Item -LiteralPath $legacyRoot -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $legacyUninstallKey -Recurse -Force -ErrorAction SilentlyContinue
+
+  New-Item -ItemType Directory -Force -Path $legacyRoot | Out-Null
+  Set-Content -LiteralPath (Join-Path $legacyRoot "legacy-payload.txt") -Encoding UTF8 -Value "legacy nsis payload without uninstaller"
+
+  New-Item -ItemType Directory -Force -Path $legacyUninstallKey | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "DisplayName" -Value "Azookey" -PropertyType String -Force | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "Publisher" -Value "batao9" -PropertyType String -Force | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "DisplayVersion" -Value "0.1.0-legacy-broken" -PropertyType String -Force | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "InstallLocation" -Value "`"$legacyRoot`"" -PropertyType String -Force | Out-Null
+  New-ItemProperty -Path $legacyUninstallKey -Name "UninstallString" -Value "`"$(Join-Path $legacyRoot "uninstall.exe")`"" -PropertyType String -Force | Out-Null
+
+  Write-Host "created broken legacy NSIS install without uninstaller: $legacyRoot"
+}
+
+function Assert-BrokenLegacyNsisInstallPreserved {
+  $legacyRoot = Join-Path $env:LOCALAPPDATA "Azookey"
+  $legacyUninstallKey = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Azookey"
+  $legacyPayload = Join-Path $legacyRoot "legacy-payload.txt"
+
+  if (!(Test-Path -LiteralPath $legacyRoot)) {
+    throw "Broken legacy NSIS install directory was removed after failed migration: $legacyRoot"
+  }
+  if (!(Test-Path -LiteralPath $legacyPayload)) {
+    throw "Broken legacy NSIS payload was removed after failed migration: $legacyPayload"
+  }
+  if (!(Test-Path -LiteralPath $legacyUninstallKey)) {
+    throw "Broken legacy NSIS uninstall key was removed after failed migration: $legacyUninstallKey"
+  }
+
+  Write-Host "broken legacy NSIS install preserved after migration failure"
+}
+
+function Assert-RequiredInstallFiles {
+  param([Parameter(Mandatory = $true)][string]$InstallLocation)
+
+  $requiredPaths = @(
+    "frontend.exe",
+    "azookey-server.exe",
+    "ui.exe",
+    "launcher.exe",
+    "azookey.dll",
+    "azookey32.dll",
+    "launch.vbs",
+    "Dictionary",
+    "EmojiDictionary",
+    "zenz.gguf",
+    "llama_cpu",
+    "llama_cuda",
+    "llama_vulkan"
+  )
+
+  $missing = @()
+  foreach ($relativePath in $requiredPaths) {
+    $path = Join-Path $InstallLocation $relativePath
+    if (!(Test-Path $path)) {
+      $missing += $relativePath
+    }
+  }
+
+  if ($missing.Count -gt 0) {
+    throw "Required installed files are missing: $($missing -join ', ')"
+  }
+}
+
+function Test-WebView2RuntimeInstalled {
+  $clientId = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+  foreach ($key in @(
+    "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$clientId",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$clientId"
+  )) {
+    $value = Get-ItemProperty -Path $key -Name "pv" -ErrorAction SilentlyContinue
+    if ($value -and ![string]::IsNullOrWhiteSpace($value.pv)) {
+      return $true
+    }
+  }
+
+  return $false
+}
+
+function Assert-OnlySettingsRemainAfterUninstall {
+  param([Parameter(Mandatory = $true)][string]$InstallLocation)
+
+  if (!(Test-Path -LiteralPath $InstallLocation)) {
+    Write-Host "install directory removed after uninstall"
+    return
+  }
+
+  $allowedSettingsPath = Join-Path $InstallLocation "settings.json"
+  $remaining = @(
+    Get-ChildItem -LiteralPath $InstallLocation -Force -Recurse -ErrorAction SilentlyContinue |
+      Where-Object { $_.FullName -ne $allowedSettingsPath }
+  )
+
+  if ($remaining.Count -gt 0) {
+    $sample = @($remaining | Select-Object -First 20 | ForEach-Object {
+      $_.FullName.Substring($InstallLocation.Length).TrimStart("\")
+    })
+    throw "Unexpected files remain after uninstall: $($sample -join ', ')"
+  }
+
+  Write-Host "install directory contains only settings.json after uninstall"
+}
+
+function Wait-ForUninstallerSelfCleanup {
+  param([Parameter(Mandatory = $true)][string]$InstallLocation)
+
+  $deadline = (Get-Date).AddSeconds(30)
+  do {
+    $remainingUninstallerFiles = @()
+    foreach ($pattern in @("unins*.exe", "unins*.dat")) {
+      $remainingUninstallerFiles += @(
+        Get-ChildItem -Path (Join-Path $InstallLocation $pattern) -Force -ErrorAction SilentlyContinue
+      )
+    }
+    if ($remainingUninstallerFiles.Count -eq 0) {
+      return
+    }
+    Start-Sleep -Seconds 1
+  } while ((Get-Date) -lt $deadline)
+}
+
+function Ensure-SettingsFileForUninstallVerification {
+  param([Parameter(Mandatory = $true)][string]$InstallLocation)
+
+  $settingsPath = Join-Path $InstallLocation "settings.json"
+  if (!(Test-Path -LiteralPath $settingsPath)) {
+    Set-Content -LiteralPath $settingsPath -Encoding UTF8 -Value '{"createdBy":"vm_stage_for_manual_test"}'
+    Write-Host "created settings.json sentinel for uninstall verification"
+  }
+}
+
+function Ensure-GeneratedAppDataForUninstallVerification {
+  param([Parameter(Mandatory = $true)][string]$InstallLocation)
+
+  foreach ($relativePath in @(
+    "EngineRuntime",
+    "frontend.exe.WebView2",
+    "logs",
+    "ui.exe.WebView2"
+  )) {
+    $dir = Join-Path $InstallLocation $relativePath
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    Set-Content -LiteralPath (Join-Path $dir "uninstall-sentinel.txt") -Encoding UTF8 -Value "generated app data cleanup sentinel"
+  }
+
+  Write-Host "created generated app data sentinels for uninstall verification"
+}
+
+function Assert-NoExternalAzookeyDirectoriesAfterUninstall {
+  param([Parameter(Mandatory = $true)][string]$InstallLocation)
+
+  $candidateRoots = @()
+  if (![string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    $candidateRoots += Join-Path $env:LOCALAPPDATA "Azookey"
+  }
+  foreach ($tempRoot in @($env:TEMP, $env:TMP)) {
+    if (![string]::IsNullOrWhiteSpace($tempRoot)) {
+      $candidateRoots += Join-Path $tempRoot "Azookey"
+    }
+  }
+
+  foreach ($path in @($candidateRoots | Select-Object -Unique)) {
+    if ($path -eq $InstallLocation) {
+      continue
+    }
+    if (Test-Path -LiteralPath $path) {
+      throw "Unexpected external Azookey directory remains after uninstall: $path"
+    }
+  }
+
+  Write-Host "no external Azookey directories remain after uninstall"
+}
+
+function Start-ExclusiveFileLock {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  $readyPath = Join-Path $env:TEMP "azookey-file-lock-ready.txt"
+  $releasePath = Join-Path $env:TEMP "azookey-file-lock-release.txt"
+  $lockScriptPath = Join-Path $env:TEMP "azookey-file-lock.ps1"
+
+  Remove-Item -LiteralPath $readyPath, $releasePath, $lockScriptPath -Force -ErrorAction SilentlyContinue
+
+  @'
+param(
+  [Parameter(Mandatory = $true)][string]$Path,
+  [Parameter(Mandatory = $true)][string]$ReadyPath,
+  [Parameter(Mandatory = $true)][string]$ReleasePath
+)
+
+$ErrorActionPreference = "Stop"
+$stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+try {
+  Set-Content -LiteralPath $ReadyPath -Encoding UTF8 -Value "ready"
+  while (!(Test-Path -LiteralPath $ReleasePath)) {
+    Start-Sleep -Milliseconds 200
+  }
+} finally {
+  $stream.Dispose()
+}
+'@ | Set-Content -LiteralPath $lockScriptPath -Encoding UTF8
+
+  $proc = Start-Process -FilePath "powershell" -ArgumentList @(
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    $lockScriptPath,
+    "-Path",
+    $Path,
+    "-ReadyPath",
+    $readyPath,
+    "-ReleasePath",
+    $releasePath
+  ) -PassThru
+
+  $deadline = (Get-Date).AddSeconds(30)
+  while (!(Test-Path -LiteralPath $readyPath)) {
+    if ($proc.HasExited) {
+      throw "File lock helper exited before acquiring the lock. ExitCode=$($proc.ExitCode)"
+    }
+    if ((Get-Date) -ge $deadline) {
+      Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+      throw "Timed out waiting for file lock helper: $Path"
+    }
+    Start-Sleep -Milliseconds 200
+  }
+
+  [PSCustomObject]@{
+    Process = $proc
+    ReleasePath = $releasePath
+  }
+}
+
+function Stop-ExclusiveFileLock {
+  param([Parameter(Mandatory = $true)]$Lock)
+
+  Set-Content -LiteralPath $Lock.ReleasePath -Encoding UTF8 -Value "release"
+  if (-not $Lock.Process.WaitForExit(10000)) {
+    Stop-Process -Id $Lock.Process.Id -Force -ErrorAction SilentlyContinue
+    throw "File lock helper did not exit after release."
+  }
+}
+
+function Invoke-LockedFileUpgradeVerification {
+  param(
+    [Parameter(Mandatory = $true)][string]$InstallLocation,
+    [Parameter(Mandatory = $true)][string]$InstallerPath,
+    [Parameter(Mandatory = $true)][string]$InstallLogPath,
+    [Parameter(Mandatory = $true)][int]$InstallerTimeoutSec
+  )
+
+  $lockedDllPath = Join-Path $InstallLocation "azookey.dll"
+  $upgradeLogPath = [System.IO.Path]::ChangeExtension($InstallLogPath, ".upgrade.log")
+  $lock = Start-ExclusiveFileLock -Path $lockedDllPath
+
+  try {
+    $upgradeArgs = @(
+      "/SP-",
+      "/VERYSILENT",
+      "/SUPPRESSMSGBOXES",
+      "/NOCLOSEAPPLICATIONS",
+      "/NORESTART",
+      "/RESTARTEXITCODE=3010",
+      "/LOG=$upgradeLogPath"
+    )
+
+    Write-Host "reinstalling with locked file: $lockedDllPath"
+    $upgradeProc = Start-Process -FilePath $InstallerPath -ArgumentList $upgradeArgs -PassThru
+    if (-not $upgradeProc.WaitForExit($InstallerTimeoutSec * 1000)) {
+      Stop-ProcessTree -RootPid $upgradeProc.Id
+      throw "Locked-file upgrade installer timed out."
+    }
+    Write-Host "locked-file upgrade installer exit code: $($upgradeProc.ExitCode)"
+
+    if ($upgradeProc.ExitCode -ne 3010) {
+      throw "Expected locked-file upgrade to request restart with exit code 3010, got $($upgradeProc.ExitCode)."
+    }
+  } finally {
+    Stop-ExclusiveFileLock -Lock $lock
+  }
+
+  Write-Host "locked-file upgrade requested restart without blocking"
+}
+
 if (-not (Test-VCRuntimeInstalled -Arch "x64")) {
   throw "VC++ runtime x64 is missing. Restore a VC-ready snapshot first."
 }
 if (-not (Test-VCRuntimeInstalled -Arch "x86")) {
   throw "VC++ runtime x86 is missing. Restore a VC-ready snapshot first."
+}
+
+if ($VerifyLegacyNsisMigration) {
+  Install-FakeLegacyNsisInstall
+}
+if ($VerifyMissingLegacyNsisUninstaller) {
+  Install-BrokenLegacyNsisInstall
 }
 
 $args = @(
@@ -316,25 +724,103 @@ if (-not $proc.WaitForExit($InstallerTimeoutSec * 1000)) {
 }
 Write-Host "installer exit code: $($proc.ExitCode)"
 
+if ($VerifyMissingLegacyNsisUninstaller) {
+  if ($proc.ExitCode -eq 0) {
+    throw "Installer succeeded even though the legacy NSIS uninstaller is missing."
+  }
+  Assert-BrokenLegacyNsisInstallPreserved
+  Write-Host "missing legacy NSIS uninstaller aborted install as expected"
+  exit 0
+}
+
 if ($proc.ExitCode -ne 0) {
   throw "Installer failed. ExitCode=$($proc.ExitCode)"
 }
 
-$entries = @(
-  "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-  "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
-  "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
-) | ForEach-Object {
-  Get-ItemProperty -Path $_ -ErrorAction SilentlyContinue
-} | Where-Object {
-  $_.DisplayName -like "*Azookey*"
+if ($VerifyLegacyNsisMigration) {
+  Assert-FakeLegacyNsisMigrated
 }
+
+$entries = @(Get-AzookeyUninstallEntries)
 
 if (-not $entries) {
   throw "Azookey uninstall entry not found after install."
 }
+if ($entries.Count -ne 1) {
+  throw "Expected exactly one Azookey uninstall entry after install, found $($entries.Count)."
+}
 
-Write-Host "install complete. entries found: $($entries.Count)"
+$entry = $entries[0]
+if ([string]::IsNullOrWhiteSpace($entry.InstallLocation)) {
+  throw "Azookey uninstall entry does not contain InstallLocation."
+}
+if ($entry.MainBinaryName -ne "frontend.exe") {
+  throw "Azookey uninstall entry MainBinaryName is not frontend.exe: $($entry.MainBinaryName)"
+}
+
+$installLocation = Normalize-RegistryPath -Path $entry.InstallLocation
+Assert-RequiredInstallFiles -InstallLocation $installLocation
+if (-not (Test-WebView2RuntimeInstalled)) {
+  throw "WebView2 Runtime is missing after install."
+}
+
+Write-Host "install complete. entry found: $($entry.PSChildName)"
+Write-Host "install location: $installLocation"
+Write-Host "WebView2 Runtime installed"
+
+if ($VerifyLockedFileUpgrade) {
+  if ($UninstallAfterInstall) {
+    throw "VerifyLockedFileUpgrade cannot be combined with UninstallAfterInstall because the upgrade intentionally leaves pending reboot operations."
+  }
+  Invoke-LockedFileUpgradeVerification -InstallLocation $installLocation -InstallerPath $InstallerPath -InstallLogPath $InstallLogPath -InstallerTimeoutSec $InstallerTimeoutSec
+}
+
+if ($UninstallAfterInstall) {
+  Ensure-SettingsFileForUninstallVerification -InstallLocation $installLocation
+  Ensure-GeneratedAppDataForUninstallVerification -InstallLocation $installLocation
+  $uninstallCommand = $entry.UninstallString
+
+  if ([string]::IsNullOrWhiteSpace($uninstallCommand)) {
+    throw "Azookey uninstall command not found."
+  }
+
+  $uninstallerPath = Normalize-RegistryPath -Path $uninstallCommand
+  $uninstallArgs = @(
+    "/VERYSILENT",
+    "/SUPPRESSMSGBOXES",
+    "/NORESTART",
+    "/LOG=$UninstallLogPath"
+  )
+
+  Write-Host "uninstalling: $uninstallerPath"
+  $uninstallProc = Start-Process -FilePath $uninstallerPath -ArgumentList $uninstallArgs -PassThru
+  if (-not $uninstallProc.WaitForExit($InstallerTimeoutSec * 1000)) {
+    Stop-ProcessTree -RootPid $uninstallProc.Id
+    throw "Uninstaller timed out."
+  }
+  Write-Host "uninstaller exit code: $($uninstallProc.ExitCode)"
+
+  if ($uninstallProc.ExitCode -ne 0) {
+    throw "Uninstaller failed. ExitCode=$($uninstallProc.ExitCode)"
+  }
+
+  $remainingEntries = @(Get-AzookeyUninstallEntries)
+  if ($remainingEntries.Count -ne 0) {
+    throw "Azookey uninstall entry still exists after uninstall. Count=$($remainingEntries.Count)"
+  }
+
+  Wait-ForUninstallerSelfCleanup -InstallLocation $installLocation
+  Assert-NoExternalAzookeyDirectoriesAfterUninstall -InstallLocation $installLocation
+  foreach ($relativePath in @("frontend.exe", "azookey.dll", "azookey32.dll", "launcher.exe")) {
+    $path = Join-Path $installLocation $relativePath
+    if (Test-Path $path) {
+      throw "Installed file still exists after uninstall: $path"
+    }
+  }
+
+  Assert-OnlySettingsRemainAfterUninstall -InstallLocation $installLocation
+  Write-Host "uninstall complete. entries found: 0"
+}
 PS1
 }
 
@@ -354,7 +840,31 @@ main() {
 
   log "VM でインストーラーを実行します（サイレント）"
   local install_rc=0
-  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -InstallerPath \"$REMOTE_INSTALLER_WIN\" -InstallLogPath \"$REMOTE_INSTALL_LOG_WIN\" -InstallerTimeoutSec $INSTALL_TIMEOUT_SEC" || install_rc=$?
+  local uninstall_switch=""
+  local legacy_nsis_switch=""
+  local missing_legacy_nsis_uninstaller_switch=""
+  local locked_file_upgrade_switch=""
+  case "${UNINSTALL_AFTER_INSTALL,,}" in
+    1|true|yes|on)
+      uninstall_switch="-UninstallAfterInstall"
+      ;;
+  esac
+  case "${VERIFY_LEGACY_NSIS_MIGRATION,,}" in
+    1|true|yes|on)
+      legacy_nsis_switch="-VerifyLegacyNsisMigration"
+      ;;
+  esac
+  case "${VERIFY_MISSING_LEGACY_NSIS_UNINSTALLER,,}" in
+    1|true|yes|on)
+      missing_legacy_nsis_uninstaller_switch="-VerifyMissingLegacyNsisUninstaller"
+      ;;
+  esac
+  case "${VERIFY_LOCKED_FILE_UPGRADE,,}" in
+    1|true|yes|on)
+      locked_file_upgrade_switch="-VerifyLockedFileUpgrade"
+      ;;
+  esac
+  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -InstallerPath \"$REMOTE_INSTALLER_WIN\" -InstallLogPath \"$REMOTE_INSTALL_LOG_WIN\" -UninstallLogPath \"$REMOTE_UNINSTALL_LOG_WIN\" -InstallerTimeoutSec $INSTALL_TIMEOUT_SEC $legacy_nsis_switch $missing_legacy_nsis_uninstaller_switch $locked_file_upgrade_switch $uninstall_switch" || install_rc=$?
   if [[ "$install_rc" -ne 0 ]]; then
     log "インストーラー実行が失敗しました。ログ回収と VM 後処理を継続します: exit=$install_rc"
   fi
@@ -366,6 +876,16 @@ main() {
     log "インストールログを回収しました: $local_log"
   else
     log "インストールログの回収に失敗しました（処理は継続）"
+  fi
+
+  if [[ -n "$uninstall_switch" ]]; then
+    local local_uninstall_log
+    local_uninstall_log="$LOG_DIR/vm-uninstall-$ts.log"
+    if scp_from_vm "$REMOTE_UNINSTALL_LOG_SCP" "$local_uninstall_log" >/dev/null 2>&1; then
+      log "アンインストールログを回収しました: $local_uninstall_log"
+    else
+      log "アンインストールログの回収に失敗しました（処理は継続）"
+    fi
   fi
 
   case "${SHUTDOWN_AFTER_INSTALL,,}" in

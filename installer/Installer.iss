@@ -6,7 +6,8 @@
 #define MyAppName "Azookey"
 #define MyAppPublisher "batao9"
 #define MyAppURL "https://github.com/batao9/azooKey-Windows/"
-#define MyNsisInstallerName "Azookey_" + MyAppVersion + "_x64-setup.exe"
+#define MySettingsAppName "frontend.exe"
+#define MyLegacyNsisUninstallKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\Azookey"
 
 [Setup]
 ; NOTE: The value of AppId uniquely identifies this application. Do not use the same AppId value in installers for other applications.
@@ -36,17 +37,32 @@ OutputBaseFilename=azookey-setup
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
+CloseApplications=yes
+RestartApplications=no
 
 [Languages]
 Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
 
+[Messages]
+FinishedRestartLabel=Azookey の更新を完了するには、Windows の再起動が必要です。再起動後に新しいバージョンが有効になります。今すぐ再起動しますか?
+FinishedRestartMessage=Azookey の更新を完了するには、Windows の再起動が必要です。%n%n再起動後に新しいバージョンが有効になります。今すぐ再起動しますか?
+
 [Files]
-Source: "../build/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey.dll"; Flags: ignoreversion regserver 64bit
-Source: "../build/x86/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey32.dll"; Flags: ignoreversion regserver 32bit
-Source: "../build/*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "../target/release/bundle/nsis/{#MyNsisInstallerName}"; Flags: dontcopy noencryption
+Source: "../build/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey.dll"; Flags: ignoreversion regserver 64bit restartreplace uninsrestartdelete
+Source: "../build/x86/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey32.dll"; Flags: ignoreversion regserver 32bit restartreplace uninsrestartdelete
+Source: "../build/{#MySettingsAppName}"; DestDir: "{app}"; Flags: ignoreversion restartreplace uninsrestartdelete
+Source: "../build/*"; DestDir: "{app}"; Excludes: "{#MySettingsAppName}"; Flags: ignoreversion recursesubdirs createallsubdirs restartreplace uninsrestartdelete
 Source: "./Azookey Startup.xml"; Flags: dontcopy noencryption
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
+
+[InstallDelete]
+Type: files; Name: "{app}\uninstall.exe"
+
+[Registry]
+Root: HKCU; Subkey: "{#MyLegacyNsisUninstallKey}"; Flags: deletekey
+Root: HKLM; Subkey: "{#MyLegacyNsisUninstallKey}"; Flags: deletekey
+Root: HKLM32; Subkey: "{#MyLegacyNsisUninstallKey}"; Flags: deletekey
+Root: HKLM64; Subkey: "{#MyLegacyNsisUninstallKey}"; Flags: deletekey
 
 [Run]
 Filename: "icacls"; \
@@ -59,22 +75,218 @@ Filename: "icacls"; \
   Flags: runhidden postinstall runascurrentuser
 
 [UninstallRun]
+Filename: "taskkill"; \
+  Parameters: "/F /T /IM ""frontend.exe"""; \
+  RunOnceId: "StopFrontend"; \
+  Flags: runhidden
+Filename: "taskkill"; \
+  Parameters: "/F /T /IM ""azookey-server.exe"""; \
+  RunOnceId: "StopAzookeyServer"; \
+  Flags: runhidden
+Filename: "taskkill"; \
+  Parameters: "/F /T /IM ""ui.exe"""; \
+  RunOnceId: "StopUi"; \
+  Flags: runhidden
+Filename: "taskkill"; \
+  Parameters: "/F /T /IM ""launcher.exe"""; \
+  RunOnceId: "StopLauncher"; \
+  Flags: runhidden
 Filename: "schtasks"; \
   Parameters: "/Delete /TN ""Azookey Startup"" /F"; \
+  RunOnceId: "DeleteStartupTask"; \
   Flags: runhidden runascurrentuser
 
+[UninstallDelete]
+Type: files; Name: "{app}\*.dll"
+Type: files; Name: "{app}\*.exe"
+Type: files; Name: "{app}\*.vbs"
+Type: files; Name: "{app}\*.gguf"
+Type: filesandordirs; Name: "{app}\Dictionary"
+Type: filesandordirs; Name: "{app}\EmojiDictionary"
+Type: filesandordirs; Name: "{app}\llama_cpu"
+Type: filesandordirs; Name: "{app}\llama_cuda"
+Type: filesandordirs; Name: "{app}\llama_vulkan"
+Type: filesandordirs; Name: "{app}\logs"
+Type: filesandordirs; Name: "{app}\EngineRuntime"
+Type: filesandordirs; Name: "{app}\frontend.exe.WebView2"
+Type: filesandordirs; Name: "{app}\ui.exe.WebView2"
+
 [Code]
+function RemoveSurroundingQuotes(Value: String): String;
+begin
+  Result := Trim(Value);
+  if (Length(Result) >= 2) and (Copy(Result, 1, 1) = '"') and (Copy(Result, Length(Result), 1) = '"') then
+  begin
+    Result := Copy(Result, 2, Length(Result) - 2);
+  end;
+end;
+
+function ExtractExecutablePath(Command: String): String;
+var
+  Value: String;
+  QuoteIndex: Integer;
+  SpaceIndex: Integer;
+begin
+  Value := Trim(Command);
+  Result := '';
+
+  if Value = '' then
+  begin
+    Exit;
+  end;
+
+  if Copy(Value, 1, 1) = '"' then
+  begin
+    Value := Copy(Value, 2, Length(Value) - 1);
+    QuoteIndex := Pos('"', Value);
+    if QuoteIndex > 0 then
+    begin
+      Result := Copy(Value, 1, QuoteIndex - 1);
+    end
+    else
+    begin
+      Result := Value;
+    end;
+  end
+  else
+  begin
+    SpaceIndex := Pos(' ', Value);
+    if SpaceIndex > 0 then
+    begin
+      Result := Copy(Value, 1, SpaceIndex - 1);
+    end
+    else
+    begin
+      Result := Value;
+    end;
+  end;
+end;
+
+function UninstallLegacyNsisFromRoot(RootKey: Integer; RootName: String): Boolean;
+var
+  InstallLocation: String;
+  UninstallString: String;
+  UninstallExe: String;
+  UninstallParams: String;
+  ResultCode: Integer;
+begin
+  Result := True;
+
+  if not RegKeyExists(RootKey, '{#MyLegacyNsisUninstallKey}') then
+  begin
+    Exit;
+  end;
+
+  if not RegQueryStringValue(RootKey, '{#MyLegacyNsisUninstallKey}', 'UninstallString', UninstallString) then
+  begin
+    SuppressibleMsgBox('旧バージョンのアンインストール情報が壊れているため、更新を続行できません。旧バージョンを手動でアンインストールしてから再度実行してください。', mbError, MB_OK, IDOK);
+    Result := False;
+    Exit;
+  end;
+
+  UninstallExe := '';
+  InstallLocation := '';
+
+  if RegQueryStringValue(RootKey, '{#MyLegacyNsisUninstallKey}', 'InstallLocation', InstallLocation) then
+  begin
+    InstallLocation := RemoveSurroundingQuotes(InstallLocation);
+    if InstallLocation <> '' then
+    begin
+      UninstallExe := InstallLocation + '\uninstall.exe';
+      if not FileExists(UninstallExe) then
+      begin
+        UninstallExe := '';
+      end;
+    end;
+  end;
+
+  if UninstallExe = '' then
+  begin
+    UninstallExe := ExtractExecutablePath(UninstallString);
+  end;
+
+  if (UninstallExe = '') or (not FileExists(UninstallExe)) then
+  begin
+    Log('Legacy NSIS uninstaller was registered but not found under ' + RootName + ': ' + UninstallString);
+    SuppressibleMsgBox('旧バージョンのアンインストーラーが見つからないため、更新を続行できません: ' + UninstallString, mbError, MB_OK, IDOK);
+    Result := False;
+    Exit;
+  end;
+
+  UninstallParams := '/S';
+  if InstallLocation <> '' then
+  begin
+    UninstallParams := UninstallParams + ' _?=' + InstallLocation;
+  end;
+
+  Log('Running legacy NSIS uninstaller from ' + RootName + ': ' + UninstallExe + ' ' + UninstallParams);
+  if not Exec(UninstallExe, UninstallParams, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    SuppressibleMsgBox('旧バージョンのアンインストーラーを実行できませんでした: ' + UninstallExe, mbError, MB_OK, IDOK);
+    Result := False;
+    Exit;
+  end;
+
+  if ResultCode <> 0 then
+  begin
+    SuppressibleMsgBox('旧バージョンのアンインストールに失敗しました。終了コード: ' + IntToStr(ResultCode), mbError, MB_OK, IDOK);
+    Result := False;
+    Exit;
+  end;
+end;
+
+function UninstallLegacyNsisInstall(): Boolean;
+begin
+  Result :=
+    UninstallLegacyNsisFromRoot(HKCU, 'HKCU') and
+    UninstallLegacyNsisFromRoot(HKLM, 'HKLM') and
+    UninstallLegacyNsisFromRoot(HKLM32, 'HKLM32') and
+    UninstallLegacyNsisFromRoot(HKLM64, 'HKLM64');
+end;
+
 function InitializeSetup: Boolean;
 begin
-  ExtractTemporaryFile('{#MyNsisInstallerName}');
+  if not UninstallLegacyNsisInstall() then
+  begin
+    Result := False;
+    Exit;
+  end;
+
   Dependency_AddVC2015To2022x64;
   Dependency_AddVC2015To2022x86;
-  Dependency_Add('{#MyNsisInstallerName}',
-    '/S',
-    'Azookey',
-    '', '', True, False);
+  Dependency_AddWebView2;
 
   Result := True;
+end;
+
+procedure StopAzookeyProcess(ImageName: String);
+var
+  ResultCode: Integer;
+begin
+  Exec('taskkill', '/F /T /IM "' + ImageName + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if ResultCode = 0 then
+  begin
+    Log('Stopped Azookey process before install: ' + ImageName);
+  end
+  else
+  begin
+    Log('Azookey process was not running before install: ' + ImageName + ' (taskkill exit code ' + IntToStr(ResultCode) + ')');
+  end;
+end;
+
+procedure StopAzookeyProcessesBeforeInstall();
+begin
+  StopAzookeyProcess('frontend.exe');
+  StopAzookeyProcess('azookey-server.exe');
+  StopAzookeyProcess('ui.exe');
+  StopAzookeyProcess('launcher.exe');
+end;
+
+<event('PrepareToInstall')>
+function Azookey_PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  StopAzookeyProcessesBeforeInstall();
+  Result := '';
 end;
 
 function UninstallNeedRestart(): Boolean;
@@ -138,25 +350,27 @@ begin
   end;
 end;
 
-procedure UninstallAzookey();
-var
-  UninstallString: string;
-  Dummy: Integer;
+procedure WriteInstallMetadata();
 begin
-  if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\Azookey', 'UninstallString', UninstallString) then
-  begin
-    if UninstallString <> '' then
-    begin
-      ShellExec('', UninstallString, '', '', SW_HIDE, ewWaitUntilTerminated, Dummy);
-    end;
-  end;
+  RegWriteStringValue(
+    HKLM,
+    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{80B746D4-D74D-4345-8F81-47E06BCAB515}_is1',
+    'InstallLocation',
+    ExpandConstant('{app}')
+  );
+  RegWriteStringValue(
+    HKLM,
+    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{80B746D4-D74D-4345-8F81-47E06BCAB515}_is1',
+    'MainBinaryName',
+    '{#MySettingsAppName}'
+  );
 end;
-
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
+    WriteInstallMetadata();
     CreateVbsFile();
     UpdateTaskXml();
   end;
@@ -166,12 +380,4 @@ procedure CurPageChanged(CurPageID: Integer);
 begin
   if CurPageID = wpFinished then
     WizardForm.RunList.Visible := False;
-end;
-
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
-begin
-  if CurUninstallStep = usPostUninstall then
-  begin
-    UninstallAzookey();
-  end;
 end;

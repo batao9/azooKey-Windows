@@ -219,8 +219,10 @@ fn resolve_server_log_path() -> PathBuf {
             .join("logs")
             .join(SERVER_LOG_FILE_NAME)
     } else {
-        std::env::temp_dir()
-            .join("Azookey")
+        std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."))
             .join("logs")
             .join(SERVER_LOG_FILE_NAME)
     }

@@ -127,6 +127,8 @@ cargo make build [--debug/--release]
 
 `build`フォルダーが作成され、ビルドされた実行ファイルが格納されます。
 
+配布用インストーラーは Inno Setup で作成する `build/azookey-setup.exe` の 1 種類です。Tauri は設定アプリ `frontend.exe` のビルドにのみ使用し、Tauri/NSIS インストーラーは生成・同梱しません。`frontend.exe` を含むアプリ本体、IME DLL、サーバー、UI、ランチャー、辞書、Zenzai model、llama backend は Inno installer が `{userappdata}\Azookey` に配置します。
+
 `launcher.exe`を管理者権限で実行すると、azookeyの変換エンジンが起動します。
 
 また、IMEを登録する際は以下のように`regsvr32.exe`を使用して登録する必要があります。
@@ -160,9 +162,12 @@ scripts/vm_test_client_composition.sh <branch> [cargo-test-filter|skip] [swift-t
 
 # 検証用 VM にインストーラーをサイレントインストール
 scripts/vm_stage_for_manual_test.sh <installer-path|latest>
+
+# インストール後にサイレントアンインストールまで確認
+UNINSTALL_AFTER_INSTALL=1 scripts/vm_stage_for_manual_test.sh <installer-path|latest>
 ```
 
-検証用 VM はクリーンなスナップショットから起動し、インストールログを `.local/logs/` に回収します。手動確認を続ける場合は `SHUTDOWN_AFTER_INSTALL=0` を指定して、インストール後も VM を起動したままにできます。
+検証用 VM はクリーンなスナップショットから起動し、インストールログを `.local/logs/` に回収します。`UNINSTALL_AFTER_INSTALL=1` を指定した場合はアンインストールログも回収します。手動確認を続ける場合は `SHUTDOWN_AFTER_INSTALL=0` を指定して、インストール後も VM を起動したままにできます。
 
 # 関連
 
