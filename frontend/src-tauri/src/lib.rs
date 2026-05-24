@@ -99,10 +99,9 @@ fn update_config_impl(
     state: &AppState,
     new_config: AppConfig,
 ) -> Result<UpdateConfigResponse, String> {
-    new_config.write().map_err(|error| error.to_string())?;
-
     {
         let mut config = state.settings.lock().unwrap();
+        new_config.write().map_err(|error| error.to_string())?;
         *config = new_config;
     }
 
