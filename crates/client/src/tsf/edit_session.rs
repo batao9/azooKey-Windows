@@ -14,9 +14,10 @@ use windows::{
 
 use std::{cell::Cell, mem::ManuallyDrop, rc::Rc, time::Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::{engine::state::IMEState, extension::StringExt as _, globals::GUID_DISPLAY_ATTRIBUTE};
+use shared::proto::WindowPosition;
 
 use super::factory::TextServiceFactory;
 
@@ -283,13 +284,15 @@ impl TextServiceFactory {
     }
 
     #[tracing::instrument]
-    pub fn update_pos(&self) -> Result<()> {
+    pub fn candidate_window_position(&self) -> Result<Option<WindowPosition>> {
         {
             let mut text_service = match self.borrow_mut() {
                 Ok(text_service) => text_service,
                 Err(error) => {
-                    tracing::warn!("Skip update_pos due to borrow conflict: {error:?}");
-                    return Ok(());
+                    tracing::warn!(
+                        "Skip candidate_window_position due to borrow conflict: {error:?}"
+                    );
+                    return Ok(None);
                 }
             };
 
@@ -297,12 +300,12 @@ impl TextServiceFactory {
                 .update_pos_state
                 .try_begin_update(Instant::now())
             {
-                tracing::debug!("Skip re-entrant update_pos call");
-                return Ok(());
+                tracing::debug!("Skip re-entrant candidate_window_position call");
+                return Ok(None);
             }
         }
 
-        let result: Result<()> = (|| {
+        let result: Result<Option<WindowPosition>> = (|| {
             let (tid, context, tip_composition) = {
                 let text_service = self.borrow()?;
                 let composition = text_service.borrow_composition()?;
@@ -314,7 +317,7 @@ impl TextServiceFactory {
             };
 
             if let Some(tip_composition) = tip_composition {
-                edit_session(
+                let position = edit_session(
                     tid,
                     context.clone(),
                     Rc::new({
@@ -324,28 +327,23 @@ impl TextServiceFactory {
                             let view = context.GetActiveView()?;
                             let range = tip_composition.GetRange()?;
 
-                            let Some(mut ipc_service) = IMEState::ipc_service()? else {
-                                return Ok(());
-                            };
-
                             let mut rect = RECT::default();
                             let mut clipped = false.into();
                             view.GetTextExt(cookie, &range, &mut rect, &mut clipped)?;
 
-                            ipc_service.set_window_position(
-                                rect.top,
-                                rect.left,
-                                rect.bottom,
-                                rect.right,
-                            )?;
-
-                            Ok(())
+                            Ok(WindowPosition {
+                                top: rect.top,
+                                left: rect.left,
+                                bottom: rect.bottom,
+                                right: rect.right,
+                            })
                         }
                     }),
                 )?;
+                Ok(position)
+            } else {
+                Ok(None)
             }
-
-            Ok(())
         })();
 
         match self.borrow_mut() {
@@ -357,10 +355,23 @@ impl TextServiceFactory {
             }
         }
 
-        if let Err(error) = result {
-            tracing::warn!("Failed to update composition window position: {error:?}");
+        match result {
+            Ok(position) => Ok(position),
+            Err(error) => {
+                tracing::warn!("Failed to obtain composition window position: {error:?}");
+                Ok(None)
+            }
         }
+    }
 
+    #[tracing::instrument]
+    pub fn update_pos(&self) -> Result<()> {
+        if let Some(position) = self.candidate_window_position()? {
+            if let Some(mut ipc_service) = IMEState::ipc_service()? {
+                ipc_service.update_candidate_window(None, Some(position), None, None, None)?;
+                IMEState::set_ipc_service(ipc_service)?;
+            }
+        }
         Ok(())
     }
 }

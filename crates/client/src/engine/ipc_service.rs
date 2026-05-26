@@ -370,6 +370,29 @@ impl IPCService {
 
         Ok(())
     }
+
+    #[tracing::instrument(skip(candidates))]
+    pub fn update_candidate_window(
+        &mut self,
+        visible: Option<bool>,
+        position: Option<shared::proto::WindowPosition>,
+        candidates: Option<Vec<String>>,
+        selected_index: Option<i32>,
+        input_mode: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let request = tonic::Request::new(shared::proto::UpdateCandidateWindowRequest {
+            visible,
+            position,
+            candidates: candidates.map(|candidates| shared::proto::CandidateList { candidates }),
+            selected_index,
+            input_mode: input_mode.map(ToString::to_string),
+        });
+        self.runtime
+            .clone()
+            .block_on(self.window_client.update_candidate_window(request))?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
