@@ -1,6 +1,6 @@
 use shared::proto::{
     window_service_server::WindowService as WindowServiceProto, EmptyResponse, SetCandidateRequest,
-    SetInputModeRequest, SetPositionRequest, SetSelectionRequest,
+    SetInputModeRequest, SetPositionRequest, SetSelectionRequest, UpdateCandidateWindowRequest,
 };
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
@@ -34,6 +34,21 @@ pub enum WindowAction {
         candidates: Vec<String>,
     },
     SetInputMode(String),
+    UpdateCandidateWindow {
+        visible: Option<bool>,
+        position: Option<WindowPositionAction>,
+        candidates: Option<Vec<String>>,
+        selected_index: Option<i32>,
+        input_mode: Option<String>,
+    },
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct WindowPositionAction {
+    pub top: i32,
+    pub left: i32,
+    pub bottom: i32,
+    pub right: i32,
 }
 
 #[derive(Debug)]
@@ -116,6 +131,31 @@ impl WindowServiceProto for WindowService {
         let mode = request.into_inner().mode;
         self.send_action(WindowAction::SetInputMode(mode)).await
     }
+
+    async fn update_candidate_window(
+        &self,
+        request: Request<UpdateCandidateWindowRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let request = request.into_inner();
+        let position = request.position.map(|position| WindowPositionAction {
+            top: position.top,
+            left: position.left,
+            bottom: position.bottom,
+            right: position.right,
+        });
+        let candidates = request
+            .candidates
+            .map(|candidate_list| candidate_list.candidates);
+
+        self.send_action(WindowAction::UpdateCandidateWindow {
+            visible: request.visible,
+            position,
+            candidates,
+            selected_index: request.selected_index,
+            input_mode: request.input_mode,
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -170,6 +210,50 @@ mod tests {
                 right,
             } => {
                 assert_eq!((top, left, bottom, right), (1, 2, 3, 4));
+            }
+            action => panic!("unexpected action: {action:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_candidate_window_sends_batched_action() {
+        let (service, mut receiver) = service_with_receiver();
+
+        service
+            .update_candidate_window(Request::new(UpdateCandidateWindowRequest {
+                visible: Some(true),
+                position: Some(WindowPosition {
+                    top: 1,
+                    left: 2,
+                    bottom: 3,
+                    right: 4,
+                }),
+                candidates: Some(shared::proto::CandidateList {
+                    candidates: vec!["候補".to_string()],
+                }),
+                selected_index: Some(0),
+                input_mode: Some("あ".to_string()),
+            }))
+            .await
+            .expect("batched update should be sent");
+
+        match receiver.recv().await.expect("action should be queued") {
+            WindowAction::UpdateCandidateWindow {
+                visible,
+                position,
+                candidates,
+                selected_index,
+                input_mode,
+            } => {
+                assert_eq!(visible, Some(true));
+                let position = position.expect("position should be included");
+                assert_eq!(
+                    (position.top, position.left, position.bottom, position.right),
+                    (1, 2, 3, 4)
+                );
+                assert_eq!(candidates, Some(vec!["候補".to_string()]));
+                assert_eq!(selected_index, Some(0));
+                assert_eq!(input_mode, Some("あ".to_string()));
             }
             action => panic!("unexpected action: {action:?}"),
         }

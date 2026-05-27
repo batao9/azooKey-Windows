@@ -1316,11 +1316,37 @@ impl TextServiceFactory {
         update_pos: bool,
     ) -> Result<()> {
         self.set_text(preview, suffix)?;
-        ipc_service.set_candidates(candidates.texts.clone())?;
-        ipc_service.set_selection(selection_index)?;
-        if update_pos {
-            self.update_pos()?;
-        }
+        self.sync_candidate_window_update(
+            ipc_service,
+            candidates,
+            selection_index,
+            None,
+            update_pos,
+        )?;
+        Ok(())
+    }
+
+    #[inline]
+    fn sync_candidate_window_update(
+        &self,
+        ipc_service: &mut IPCService,
+        candidates: &Candidates,
+        selection_index: i32,
+        visible: Option<bool>,
+        update_pos: bool,
+    ) -> Result<()> {
+        let position = if update_pos {
+            self.candidate_window_position()?
+        } else {
+            None
+        };
+        ipc_service.update_candidate_window(
+            visible,
+            position,
+            Some(candidates.texts.clone()),
+            Some(selection_index),
+            None,
+        )?;
         Ok(())
     }
 
@@ -1328,16 +1354,19 @@ impl TextServiceFactory {
     fn sync_candidate_window_after_text_update(
         &self,
         ipc_service: &mut IPCService,
+        candidates: &Candidates,
+        selection_index: i32,
         app_config: &AppConfig,
         transition: &CompositionState,
     ) -> Result<()> {
-        self.update_pos()?;
-        if !app_config.general.show_candidate_window_after_space
+        let visible = if !app_config.general.show_candidate_window_after_space
             && *transition != CompositionState::None
         {
-            ipc_service.show_window()?;
-        }
-        Ok(())
+            Some(true)
+        } else {
+            None
+        };
+        self.sync_candidate_window_update(ipc_service, candidates, selection_index, visible, true)
     }
 
     #[inline]
@@ -3089,8 +3118,8 @@ impl TextServiceFactory {
         let ipc_service = IMEState::ipc_service().ok().flatten();
 
         if let Some(mut ipc_service) = ipc_service {
-            let _ = ipc_service.hide_window();
-            let _ = ipc_service.set_candidates(vec![]);
+            let _ =
+                ipc_service.update_candidate_window(Some(false), None, Some(vec![]), Some(0), None);
             let _ = ipc_service.clear_text();
 
             let _ = IMEState::set_ipc_service(ipc_service);
@@ -3142,12 +3171,12 @@ impl TextServiceFactory {
                 ClientAction::StartComposition => {
                     self.start_composition()?;
                     if app_config.general.show_candidate_window_after_space {
-                        ipc_service.hide_window()?;
+                        ipc_service.update_candidate_window(Some(false), None, None, None, None)?;
                     }
                 }
                 ClientAction::ShowCandidateWindow => {
-                    self.update_pos()?;
-                    ipc_service.show_window()?;
+                    let position = self.candidate_window_position()?;
+                    ipc_service.update_candidate_window(Some(true), position, None, None, None)?;
                 }
                 ClientAction::EndComposition => {
                     self.end_composition()?;
@@ -3167,8 +3196,13 @@ impl TextServiceFactory {
                     current_clause_has_split_left_neighbor = false;
                     current_clause_split_group_id = None;
                     next_split_group_id = 0;
-                    ipc_service.hide_window()?;
-                    ipc_service.set_candidates(vec![])?;
+                    ipc_service.update_candidate_window(
+                        Some(false),
+                        None,
+                        Some(vec![]),
+                        Some(0),
+                        None,
+                    )?;
                     ipc_service.clear_text()?;
                 }
                 ClientAction::AppendText(text) => {
@@ -3202,10 +3236,10 @@ impl TextServiceFactory {
                         raw_hiragana = selected.hiragana;
 
                         self.set_text(&preview, &suffix)?;
-                        ipc_service.set_candidates(candidates.texts.clone())?;
-                        ipc_service.set_selection(selection_index)?;
                         self.sync_candidate_window_after_text_update(
                             &mut ipc_service,
+                            &candidates,
+                            selection_index,
                             &app_config,
                             &transition,
                         )?;
@@ -3231,10 +3265,10 @@ impl TextServiceFactory {
                         raw_hiragana = selected.hiragana;
 
                         self.set_text(&preview, &suffix)?;
-                        ipc_service.set_candidates(candidates.texts.clone())?;
-                        ipc_service.set_selection(selection_index)?;
                         self.sync_candidate_window_after_text_update(
                             &mut ipc_service,
+                            &candidates,
+                            selection_index,
                             &app_config,
                             &transition,
                         )?;
@@ -3261,10 +3295,10 @@ impl TextServiceFactory {
                         raw_hiragana = selected.hiragana;
 
                         self.set_text(&preview, &suffix)?;
-                        ipc_service.set_candidates(candidates.texts.clone())?;
-                        ipc_service.set_selection(selection_index)?;
                         self.sync_candidate_window_after_text_update(
                             &mut ipc_service,
+                            &candidates,
+                            selection_index,
                             &app_config,
                             &transition,
                         )?;
@@ -3296,8 +3330,13 @@ impl TextServiceFactory {
                         raw_hiragana = selected.hiragana;
 
                         self.set_text(&preview, &suffix)?;
-                        ipc_service.set_candidates(candidates.texts.clone())?;
-                        ipc_service.set_selection(selection_index)?;
+                        self.sync_candidate_window_update(
+                            &mut ipc_service,
+                            &candidates,
+                            selection_index,
+                            None,
+                            false,
+                        )?;
                     } else {
                         // Server side text is fully removed. Close TSF composition too
                         // so preedit text does not linger in an inconsistent state.
@@ -3324,8 +3363,13 @@ impl TextServiceFactory {
                             self.set_text(&committed_prefix, "")?;
                         }
                         self.end_composition()?;
-                        ipc_service.hide_window()?;
-                        ipc_service.set_candidates(vec![])?;
+                        ipc_service.update_candidate_window(
+                            Some(false),
+                            None,
+                            Some(vec![]),
+                            Some(0),
+                            None,
+                        )?;
                         ipc_service.clear_text()?;
 
                         preview.clear();
@@ -3342,9 +3386,13 @@ impl TextServiceFactory {
                         raw_hiragana = selected.hiragana;
 
                         self.set_text(&preview, &suffix)?;
-                        ipc_service.set_candidates(candidates.texts.clone())?;
-                        ipc_service.set_selection(selection_index)?;
-                        self.update_pos()?;
+                        self.sync_candidate_window_update(
+                            &mut ipc_service,
+                            &candidates,
+                            selection_index,
+                            None,
+                            true,
+                        )?;
                     }
                 }
                 ClientAction::EnsureClauseNavigationReady => {
@@ -3651,7 +3699,7 @@ impl TextServiceFactory {
                 }
                 ClientAction::SetIMEMode(mode) => {
                     self.start_composition()?;
-                    self.update_pos()?;
+                    let position = self.candidate_window_position()?;
                     self.end_composition()?;
 
                     IMEState::set_input_mode(mode.clone())?;
@@ -3664,7 +3712,7 @@ impl TextServiceFactory {
                         InputMode::Kana => "あ",
                     };
 
-                    ipc_service.set_input_mode(mode)?;
+                    ipc_service.update_candidate_window(None, position, None, None, Some(mode))?;
 
                     selection_index = 0;
                     corresponding_count = 0;
@@ -3806,9 +3854,13 @@ impl TextServiceFactory {
                         suffix = selected.sub_text.clone();
                         raw_hiragana = selected.hiragana;
 
-                        ipc_service.set_candidates(candidates.texts.clone())?;
-                        ipc_service.set_selection(selection_index)?;
-                        self.update_pos()?;
+                        self.sync_candidate_window_update(
+                            &mut ipc_service,
+                            &candidates,
+                            selection_index,
+                            None,
+                            true,
+                        )?;
                     }
 
                     transition = CompositionState::Composing;
@@ -3843,9 +3895,13 @@ impl TextServiceFactory {
                         suffix = selected.sub_text.clone();
                         raw_hiragana = selected.hiragana;
 
-                        ipc_service.set_candidates(candidates.texts.clone())?;
-                        ipc_service.set_selection(selection_index)?;
-                        self.update_pos()?;
+                        self.sync_candidate_window_update(
+                            &mut ipc_service,
+                            &candidates,
+                            selection_index,
+                            None,
+                            true,
+                        )?;
                     }
 
                     transition = CompositionState::Composing;
@@ -3880,9 +3936,13 @@ impl TextServiceFactory {
                         suffix = selected.sub_text.clone();
                         raw_hiragana = selected.hiragana;
 
-                        ipc_service.set_candidates(candidates.texts.clone())?;
-                        ipc_service.set_selection(selection_index)?;
-                        self.update_pos()?;
+                        self.sync_candidate_window_update(
+                            &mut ipc_service,
+                            &candidates,
+                            selection_index,
+                            None,
+                            true,
+                        )?;
                     }
 
                     transition = CompositionState::Composing;

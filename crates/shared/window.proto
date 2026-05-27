@@ -20,6 +20,11 @@ message SetCandidateRequest {
   repeated string candidates = 1;
 }
 
+// 変換候補一覧を候補ウィンドウ更新に含めるためのメッセージ
+message CandidateList {
+  repeated string candidates = 1;
+}
+
 // 変換候補を選択するメッセージ
 message SetSelectionRequest {
   int32 index = 1;
@@ -27,6 +32,15 @@ message SetSelectionRequest {
 
 message SetInputModeRequest {
   string mode = 1;
+}
+
+// 候補ウィンドウの状態をまとめて更新するメッセージ
+message UpdateCandidateWindowRequest {
+  optional bool visible = 1;
+  WindowPosition position = 2;
+  CandidateList candidates = 3;
+  optional int32 selected_index = 4;
+  optional string input_mode = 5;
 }
 
 // 候補ウィンドウ制御に対する空のレスポンス
@@ -40,4 +54,5 @@ service WindowService {
   rpc SetSelection (SetSelectionRequest) returns (EmptyResponse); // 変換候補を選択
   rpc SetWindowPosition (SetPositionRequest) returns (EmptyResponse); // ウィンドウの位置を設定
   rpc SetInputMode (SetInputModeRequest) returns (EmptyResponse); // 変換モードの設定
+  rpc UpdateCandidateWindow (UpdateCandidateWindowRequest) returns (EmptyResponse); // 候補ウィンドウ状態をまとめて更新
 }

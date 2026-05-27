@@ -17,8 +17,8 @@ impl TextServiceFactory {
         let (changed, ipc_service) = IMEState::set_keyboard_disabled_and_clone_ipc(disabled)?;
 
         if let Some(mut ipc_service) = ipc_service {
-            let _ = ipc_service.hide_window();
-            let _ = ipc_service.set_candidates(vec![]);
+            let _ =
+                ipc_service.update_candidate_window(Some(false), None, Some(vec![]), Some(0), None);
 
             IMEState::set_ipc_service(ipc_service)?;
         }
