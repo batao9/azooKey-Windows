@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
-import { ExternalLink, Keyboard, RefreshCcw, Table2, Trash2 } from "lucide-react";
+import { Download, Keyboard, RefreshCcw, Table2, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -49,6 +49,23 @@ type RomajiRow = {
     output: string;
     next_input: string;
 };
+
+type UpdateCheckResponse = {
+    current_version: string;
+    latest_version: string;
+    latest_tag: string;
+    release_name: string;
+    release_url: string;
+    update_available: boolean;
+};
+
+type UpdateStatus =
+    | "idle"
+    | "checking"
+    | "available"
+    | "not_available"
+    | "starting"
+    | "error";
 
 const DEFAULT_GENERAL_CONFIG: GeneralConfigState = {
     punctuation_style: "touten_kuten",
@@ -235,7 +252,11 @@ export const General = () => {
     const [romajiDraftRows, setRomajiDraftRows] = useState<RomajiRow[]>([]);
     const [defaultRomajiRows, setDefaultRomajiRows] = useState<RomajiRow[]>([]);
     const [appVersion, setAppVersion] = useState<string | null>(null);
+    const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
+    const [updateCheck, setUpdateCheck] = useState<UpdateCheckResponse | null>(null);
+    const [updateError, setUpdateError] = useState<string | null>(null);
     const [pendingFocusNewRow, setPendingFocusNewRow] = useState(false);
+    const didCheckUpdatesOnStartup = useRef(false);
     const romajiEditorScrollRef = useRef<HTMLDivElement | null>(null);
     const romajiInputRefs = useRef<Array<HTMLInputElement | null>>([]);
 
@@ -269,6 +290,11 @@ export const General = () => {
             .catch(() => {
                 setAppVersion(null);
             });
+
+        if (!didCheckUpdatesOnStartup.current) {
+            didCheckUpdatesOnStartup.current = true;
+            void checkUpdates(false);
+        }
     }, []);
 
     useEffect(() => {
@@ -295,6 +321,85 @@ export const General = () => {
 
     const updateConfig = (updater: (config: any) => void) =>
         saveConfigWithToast(updater);
+
+    const checkUpdates = async (showToast: boolean) => {
+        setUpdateStatus("checking");
+        setUpdateError(null);
+        try {
+            const data = await invoke<UpdateCheckResponse>("check_for_updates");
+            setUpdateCheck(data);
+            setUpdateStatus(data.update_available ? "available" : "not_available");
+            if (showToast) {
+                toast(
+                    data.update_available
+                        ? `v${data.latest_version} にアップデートできます`
+                        : "最新版を利用中です",
+                );
+            }
+            return data;
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            setUpdateError(message);
+            setUpdateStatus("error");
+            if (showToast) {
+                toast("更新の確認に失敗しました", {
+                    description: message,
+                });
+            }
+            return null;
+        }
+    };
+
+    const startUpdate = async () => {
+        setUpdateStatus("starting");
+        setUpdateError(null);
+        try {
+            await invoke("start_update");
+            toast("アップデートを開始しました");
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            setUpdateError(message);
+            setUpdateStatus(updateCheck?.update_available ? "available" : "error");
+            toast("アップデートを開始できませんでした", {
+                description: message,
+            });
+        }
+    };
+
+    const handleUpdateButton = async () => {
+        if (updateStatus === "available") {
+            await startUpdate();
+            return;
+        }
+
+        await checkUpdates(true);
+    };
+
+    const updateButtonLabel = (() => {
+        if (updateStatus === "checking") {
+            return "確認中";
+        }
+        if (updateStatus === "starting") {
+            return "アップデートを開始中";
+        }
+        if (updateStatus === "available") {
+            return "最新版にアップデート";
+        }
+        return "更新を確認";
+    })();
+
+    const updateDescription = (() => {
+        if (updateStatus === "available" && updateCheck) {
+            return `v${updateCheck.latest_version} が利用できます`;
+        }
+        if (updateStatus === "not_available") {
+            return "最新版を利用中です";
+        }
+        if (updateStatus === "error") {
+            return "更新を確認できませんでした";
+        }
+        return null;
+    })();
 
     const handleCtrlSpaceToggle = async () => {
         const nextValue = !shortcutValue.ctrlSpaceToggle;
@@ -477,17 +582,24 @@ export const General = () => {
                             <p className="text-sm font-medium leading-none">
                                 {appVersion ? `v${appVersion}` : "v-"}
                             </p>
+                            {updateDescription ? (
+                                <p className="text-xs text-muted-foreground">
+                                    {updateDescription}
+                                </p>
+                            ) : null}
+                            {updateError ? (
+                                <p className="text-xs text-destructive">
+                                    {updateError}
+                                </p>
+                            ) : null}
                         </div>
-                        <Button variant="secondary">
-                            <a
-                                href="https://github.com/batao9/azooKey-Windows/releases"
-                                className="flex items-center gap-x-2"
-                                target="_blank"
-                                rel="noopener noreferrer"
-                            >
-                                <ExternalLink />
-                                更新を確認する
-                            </a>
+                        <Button
+                            variant={updateStatus === "available" ? "default" : "secondary"}
+                            onClick={() => void handleUpdateButton()}
+                            disabled={updateStatus === "checking" || updateStatus === "starting"}
+                        >
+                            {updateStatus === "available" ? <Download /> : <RefreshCcw />}
+                            {updateButtonLabel}
                         </Button>
                     </div>
                 </section>

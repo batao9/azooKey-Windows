@@ -1,4 +1,5 @@
 mod ipc;
+mod updater;
 
 use serde::{Deserialize, Serialize};
 use shared::{AppConfig, AppConfigLoadResult, ConfigError, ConfigRecovery, RomajiRule};
@@ -215,6 +216,25 @@ fn get_default_romaji_rows() -> Vec<RomajiRule> {
     shared::get_default_romaji_rows()
 }
 
+#[tauri::command]
+async fn check_for_updates() -> Result<updater::UpdateCheckResponse, String> {
+    updater::check_for_updates()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn start_update() -> Result<updater::UpdateStartResponse, String> {
+    updater::download_and_launch_update()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn take_update_install_result() -> Result<Option<updater::UpdateInstallResult>, String> {
+    updater::take_update_install_result().map_err(|error| error.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = AppState::new();
@@ -228,7 +248,10 @@ pub fn run() {
             take_config_startup_notice,
             update_config,
             check_capability,
-            get_default_romaji_rows
+            get_default_romaji_rows,
+            check_for_updates,
+            start_update,
+            take_update_install_result
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
