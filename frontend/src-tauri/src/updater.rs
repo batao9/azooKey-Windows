@@ -257,24 +257,32 @@ async fn download_file_with_sha256(
     destination: &Path,
 ) -> Result<String> {
     cleanup_download_paths(destination);
-    let bytes = client
+    let mut response = client
         .get(url)
         .send()
         .await
         .with_context(|| format!("failed to download {url}"))?
         .error_for_status()
-        .with_context(|| format!("download failed: {url}"))?
-        .bytes()
-        .await
-        .with_context(|| format!("failed to read binary response: {url}"))?;
-
+        .with_context(|| format!("download failed: {url}"))?;
+    let partial = partial_download_path(destination);
+    let mut file = fs::File::create(&partial)
+        .with_context(|| format!("failed to create installer: {}", partial.display()))?;
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("failed to read binary response: {url}"))?
+    {
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .with_context(|| format!("failed to write installer: {}", partial.display()))?;
+    }
+    file.flush()
+        .with_context(|| format!("failed to flush installer: {}", partial.display()))?;
+    drop(file);
+
     let digest = hasher.finalize();
     let hash = format_sha256(&digest);
-    let partial = partial_download_path(destination);
-    fs::write(&partial, &bytes)
-        .with_context(|| format!("failed to write installer: {}", partial.display()))?;
     fs::rename(&partial, destination).with_context(|| {
         format!(
             "failed to move installer into place: {}",
@@ -427,6 +435,7 @@ try {
     "/VERYSILENT",
     "/SUPPRESSMSGBOXES",
     "/NORESTART",
+    "/RESTARTEXITCODE=3010",
     "/LOG=$InstallLogPath"
   )
   $proc = Start-Process -FilePath $InstallerPath -ArgumentList $installerArgs -Wait -PassThru
@@ -643,6 +652,12 @@ mod tests {
 
         assert!(!installer.exists());
         assert!(!partial.exists());
+    }
+
+    #[test]
+    fn helper_requests_restart_exit_code() {
+        assert!(INSTALLER_HELPER_PS1.contains(r#""/NORESTART""#));
+        assert!(INSTALLER_HELPER_PS1.contains(r#""/RESTARTEXITCODE=3010""#));
     }
 
     #[test]

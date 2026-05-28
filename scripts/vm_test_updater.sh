@@ -232,7 +232,7 @@ function Test-ReleaseDownload {
 
   if ($RunInstaller) {
     $logPath = Join-Path $WorkDir "$Prefix-install.log"
-    $proc = Start-Process -FilePath $installerPath -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=$logPath") -Wait -PassThru
+    $proc = Start-Process -FilePath $installerPath -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/RESTARTEXITCODE=3010", "/LOG=$logPath") -Wait -PassThru
     if (($proc.ExitCode -ne 0) -and ($proc.ExitCode -ne 3010)) {
       throw "$Prefix installer failed: exit=$($proc.ExitCode)"
     }
