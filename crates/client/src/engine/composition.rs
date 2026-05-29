@@ -126,6 +126,12 @@ pub struct FutureClauseSnapshot {
     candidates: Candidates,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct ClauseNavigationReadyUiSync {
+    update_pos: bool,
+    visible: Option<bool>,
+}
+
 impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     fn OnCompositionTerminated(
@@ -1313,6 +1319,7 @@ impl TextServiceFactory {
         candidates: &Candidates,
         selection_index: i32,
         ipc_service: &mut IPCService,
+        visible: Option<bool>,
         update_pos: bool,
     ) -> Result<()> {
         self.set_text(preview, suffix)?;
@@ -1320,7 +1327,7 @@ impl TextServiceFactory {
             ipc_service,
             candidates,
             selection_index,
-            None,
+            visible,
             update_pos,
         )?;
         Ok(())
@@ -2442,14 +2449,27 @@ impl TextServiceFactory {
     }
 
     #[inline]
-    fn deferred_clause_navigation_ready_sync_update_pos(
-        deferred_update_pos: Option<bool>,
+    fn clause_navigation_ready_ui_sync(
+        effect: ClauseActionEffect,
+    ) -> Option<ClauseNavigationReadyUiSync> {
+        effect.applied.then_some(ClauseNavigationReadyUiSync {
+            update_pos: effect.update_pos,
+            visible: Some(true),
+        })
+    }
+
+    #[inline]
+    fn deferred_clause_navigation_ready_ui_sync_after_move(
+        deferred_sync: Option<ClauseNavigationReadyUiSync>,
         move_effect: ClauseActionEffect,
-    ) -> Option<bool> {
+    ) -> Option<ClauseNavigationReadyUiSync> {
         if move_effect.applied {
-            None
+            deferred_sync.map(|sync| ClauseNavigationReadyUiSync {
+                update_pos: move_effect.update_pos,
+                visible: sync.visible,
+            })
         } else {
-            deferred_update_pos
+            deferred_sync
         }
     }
 
@@ -3162,7 +3182,7 @@ impl TextServiceFactory {
         let mut temporary_latin_shift_pending = composition.temporary_latin_shift_pending;
         let mut ipc_service = IMEState::ipc_service()?.context("ipc_service is None")?;
         let mut transition = transition;
-        let mut deferred_clause_navigation_ready_sync_update_pos = None;
+        let mut deferred_clause_navigation_ready_ui_sync = None;
 
         self.update_context(&preview)?;
 
@@ -3442,9 +3462,9 @@ impl TextServiceFactory {
                     if effect.applied {
                         let defer_ui_sync =
                             Self::should_defer_clause_navigation_ready_sync(actions, action_index);
+                        let ready_ui_sync = Self::clause_navigation_ready_ui_sync(effect);
                         if defer_ui_sync {
-                            deferred_clause_navigation_ready_sync_update_pos =
-                                Some(effect.update_pos);
+                            deferred_clause_navigation_ready_ui_sync = ready_ui_sync;
                             Self::log_clause_action_state(
                                 "defer",
                                 action,
@@ -3468,6 +3488,7 @@ impl TextServiceFactory {
                             &candidates,
                             selection_index,
                             &mut ipc_service,
+                            ready_ui_sync.and_then(|sync| sync.visible),
                             effect.update_pos,
                         )?;
                         Self::log_clause_action_state(
@@ -3545,9 +3566,9 @@ impl TextServiceFactory {
                         effect
                     };
 
-                    let deferred_sync_update_pos =
-                        Self::deferred_clause_navigation_ready_sync_update_pos(
-                            deferred_clause_navigation_ready_sync_update_pos.take(),
+                    let deferred_ready_ui_sync =
+                        Self::deferred_clause_navigation_ready_ui_sync_after_move(
+                            deferred_clause_navigation_ready_ui_sync.take(),
                             effect,
                         );
                     if effect.applied {
@@ -3557,6 +3578,7 @@ impl TextServiceFactory {
                             &candidates,
                             selection_index,
                             &mut ipc_service,
+                            deferred_ready_ui_sync.and_then(|sync| sync.visible),
                             effect.update_pos,
                         )?;
                         Self::log_clause_action_state(
@@ -3573,14 +3595,15 @@ impl TextServiceFactory {
                             &clause_snapshots,
                             &future_clause_snapshots,
                         );
-                    } else if let Some(update_pos) = deferred_sync_update_pos {
+                    } else if let Some(sync) = deferred_ready_ui_sync {
                         self.sync_clause_action_ui(
                             &preview,
                             &suffix,
                             &candidates,
                             selection_index,
                             &mut ipc_service,
-                            update_pos,
+                            sync.visible,
+                            sync.update_pos,
                         )?;
                         Self::log_clause_action_state(
                             "after-deferred",
@@ -3664,6 +3687,7 @@ impl TextServiceFactory {
                             &candidates,
                             selection_index,
                             &mut ipc_service,
+                            None,
                             effect.update_pos,
                         )?;
                         Self::log_clause_action_state(
@@ -3781,6 +3805,7 @@ impl TextServiceFactory {
                             &candidates,
                             selection_index,
                             &mut ipc_service,
+                            None,
                             effect.update_pos,
                         )?;
                         Self::log_clause_action_state(
