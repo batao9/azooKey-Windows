@@ -13,6 +13,16 @@ type UpdateConfigResponse = {
     message?: string | null;
 };
 
+type UpdateInstallResult = {
+    status: string;
+    exit_code?: number | null;
+    needs_restart: boolean;
+    message: string;
+    completed_at: string;
+    installer_path?: string | null;
+    install_log_path?: string | null;
+};
+
 const SERVER_APPLY_WARNING =
     "設定を保存しましたが、IME への反映に失敗しました。再起動後に反映されます。";
 
@@ -33,6 +43,30 @@ export const showConfigStartupNoticeOnce = async () => {
         });
     } catch (_error) {
         // Startup notice is best effort; normal settings loading still handles errors.
+    }
+};
+
+export const showUpdateInstallResultOnce = async () => {
+    try {
+        const result = await invoke<UpdateInstallResult | null>(
+            "take_update_install_result",
+        );
+        if (!result) {
+            return;
+        }
+
+        toast(result.message, {
+            description: result.needs_restart
+                ? "再起動後に新しいバージョンが有効になります"
+                : result.status === "failed"
+                  ? result.install_log_path
+                      ? `ログ: ${result.install_log_path}`
+                      : undefined
+                  : undefined,
+            duration: result.status === "failed" || result.needs_restart ? 12000 : 6000,
+        });
+    } catch (_error) {
+        // Update result notification is best effort.
     }
 };
 
