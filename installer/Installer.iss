@@ -47,6 +47,9 @@ Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
 FinishedRestartLabel=Azookey の更新を完了するには、Windows の再起動が必要です。再起動後に新しいバージョンが有効になります。今すぐ再起動しますか?
 FinishedRestartMessage=Azookey の更新を完了するには、Windows の再起動が必要です。%n%n再起動後に新しいバージョンが有効になります。今すぐ再起動しますか?
 
+[Tasks]
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
+
 [Files]
 Source: "../build/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey.dll"; Flags: ignoreversion regserver 64bit restartreplace uninsrestartdelete
 Source: "../build/x86/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey32.dll"; Flags: ignoreversion regserver 32bit restartreplace uninsrestartdelete
@@ -54,6 +57,9 @@ Source: "../build/{#MySettingsAppName}"; DestDir: "{app}"; Flags: ignoreversion 
 Source: "../build/*"; DestDir: "{app}"; Excludes: "{#MySettingsAppName}"; Flags: ignoreversion recursesubdirs createallsubdirs restartreplace uninsrestartdelete
 Source: "./Azookey Startup.xml"; Flags: dontcopy noencryption
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
+
+[Icons]
+Name: "{userdesktop}\{#MyAppName}"; Filename: "{app}\{#MySettingsAppName}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [InstallDelete]
 Type: files; Name: "{app}\uninstall.exe"
