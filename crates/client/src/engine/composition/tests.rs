@@ -1,7 +1,7 @@
 use super::{
-    Candidates, ClauseActionBackend, ClauseActionEffect, ClauseActionStateMut, ClauseSnapshot,
-    ClauseState, Composition, CompositionReducer, CompositionState, FutureClauseSnapshot,
-    TextServiceFactory,
+    Candidates, ClauseActionBackend, ClauseActionEffect, ClauseActionStateMut,
+    ClauseNavigationReadyUiSync, ClauseSnapshot, ClauseState, Composition, CompositionReducer,
+    CompositionState, FutureClauseSnapshot, TextServiceFactory,
 };
 use crate::engine::{
     client_action::{ClientAction, SetSelectionType, SetTextType},
@@ -171,20 +171,43 @@ fn initial_left_arrow_defers_clause_navigation_ready_ui_sync_until_last_clause()
 }
 
 #[test]
-fn skipped_move_to_last_flushes_deferred_clause_navigation_ready_ui_sync() {
+fn applied_clause_navigation_ready_sync_shows_candidate_window() {
     assert_eq!(
-        TextServiceFactory::deferred_clause_navigation_ready_sync_update_pos(
-            Some(true),
-            ClauseActionEffect::skipped()
-        ),
-        Some(true)
+        TextServiceFactory::clause_navigation_ready_ui_sync(ClauseActionEffect::applied(true)),
+        Some(ClauseNavigationReadyUiSync {
+            update_pos: true,
+            visible: Some(true),
+        })
     );
     assert_eq!(
-        TextServiceFactory::deferred_clause_navigation_ready_sync_update_pos(
-            Some(true),
-            ClauseActionEffect::applied(true)
-        ),
+        TextServiceFactory::clause_navigation_ready_ui_sync(ClauseActionEffect::skipped()),
         None
+    );
+}
+
+#[test]
+fn deferred_clause_navigation_ready_sync_preserves_candidate_window_show_request() {
+    let deferred_sync = Some(ClauseNavigationReadyUiSync {
+        update_pos: true,
+        visible: Some(true),
+    });
+
+    assert_eq!(
+        TextServiceFactory::deferred_clause_navigation_ready_ui_sync_after_move(
+            deferred_sync,
+            ClauseActionEffect::skipped()
+        ),
+        deferred_sync
+    );
+    assert_eq!(
+        TextServiceFactory::deferred_clause_navigation_ready_ui_sync_after_move(
+            deferred_sync,
+            ClauseActionEffect::applied(false)
+        ),
+        Some(ClauseNavigationReadyUiSync {
+            update_pos: false,
+            visible: Some(true),
+        })
     );
 }
 
