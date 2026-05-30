@@ -50,6 +50,20 @@ fn single_symbol_romaji_output_ignores_multi_character_rule() {
 }
 
 #[test]
+fn single_symbol_romaji_output_preserves_row_order_for_symbol_variants() {
+    let rows = vec![row("\\", "BACKSLASH", ""), row("￥", "YEN", "")];
+    let output = TextServiceFactory::single_symbol_romaji_output("￥", &rows);
+    assert_eq!(output, Some("BACKSLASH".to_string()));
+}
+
+#[test]
+fn symbol_fallback_uses_trimmed_romaji_prefix_lookup() {
+    let rows = vec![row(" z/", "・", "")];
+    let should_apply = TextServiceFactory::should_apply_symbol_fallback("z", "/", &rows);
+    assert!(!should_apply);
+}
+
+#[test]
 fn zenzai_symbol_input_prefers_explicit_single_symbol_rule() {
     let mut app_config = AppConfig::default();
     app_config.zenzai.enable = true;

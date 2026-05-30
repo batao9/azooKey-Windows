@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use crate::{
     engine::user_action::UserAction,
     extension::VKeyExt as _,
@@ -46,14 +48,134 @@ impl CompositionReducer {
         app_config: &AppConfig,
         start_temporary_latin: bool,
     ) -> Option<(CompositionState, Vec<ClientAction>)> {
-        TextServiceFactory::plan_actions_for_user_action(
+        let romaji_lookup = RomajiLookup::from_rows(&app_config.romaji_table.rows);
+        TextServiceFactory::plan_actions_for_user_action_with_lookup(
             composition,
             action,
             mode,
             is_shift_pressed,
             app_config,
+            &romaji_lookup,
             start_temporary_latin,
         )
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RomajiLookup {
+    max_input_len: usize,
+    max_multi_char_input_len: usize,
+    prefix_set: HashSet<String>,
+    multi_char_prefix_set: HashSet<String>,
+    single_symbol_outputs: HashMap<char, String>,
+    single_symbol_output_order: HashMap<char, usize>,
+}
+
+impl RomajiLookup {
+    fn from_rows(rows: &[RomajiRule]) -> Self {
+        let mut lookup = Self::default();
+
+        for (row_index, row) in rows.iter().enumerate() {
+            let input = row.input.trim();
+            if input.is_empty() {
+                continue;
+            }
+
+            let input_len = input.chars().count();
+            lookup.max_input_len = lookup.max_input_len.max(input_len);
+            Self::insert_prefixes(input, &mut lookup.prefix_set);
+
+            if input_len > 1 {
+                lookup.max_multi_char_input_len = lookup.max_multi_char_input_len.max(input_len);
+                Self::insert_prefixes(input, &mut lookup.multi_char_prefix_set);
+            } else if row.next_input.trim().is_empty() && !row.output.is_empty() {
+                if let Some(symbol) = Self::single_char(input) {
+                    lookup
+                        .single_symbol_outputs
+                        .entry(symbol)
+                        .or_insert_with(|| row.output.clone());
+                    lookup
+                        .single_symbol_output_order
+                        .entry(symbol)
+                        .or_insert(row_index);
+                }
+            }
+        }
+
+        lookup
+    }
+
+    fn insert_prefixes(input: &str, prefixes: &mut HashSet<String>) {
+        let mut end = 0;
+        for ch in input.chars() {
+            end += ch.len_utf8();
+            prefixes.insert(input[..end].to_string());
+        }
+    }
+
+    fn single_char(input: &str) -> Option<char> {
+        let mut chars = input.chars();
+        let ch = chars.next()?;
+        chars.next().is_none().then_some(ch)
+    }
+
+    fn has_romaji_table_context(&self, raw_input_before: &str, symbol: char) -> bool {
+        self.has_context(
+            raw_input_before,
+            symbol,
+            self.max_input_len,
+            &self.prefix_set,
+        )
+    }
+
+    fn has_multi_character_romaji_context(&self, raw_input_before: &str, symbol: char) -> bool {
+        self.has_context(
+            raw_input_before,
+            symbol,
+            self.max_multi_char_input_len,
+            &self.multi_char_prefix_set,
+        )
+    }
+
+    fn has_context(
+        &self,
+        raw_input_before: &str,
+        symbol: char,
+        max_input_len: usize,
+        prefixes: &HashSet<String>,
+    ) -> bool {
+        if max_input_len == 0 || prefixes.is_empty() {
+            return false;
+        }
+
+        let mut tail: Vec<char> = raw_input_before
+            .chars()
+            .rev()
+            .take(max_input_len.saturating_sub(1))
+            .collect();
+        tail.reverse();
+
+        let mut combined = String::with_capacity(raw_input_before.len() + symbol.len_utf8());
+        for ch in tail {
+            combined.push(ch);
+        }
+        combined.push(symbol);
+
+        combined
+            .char_indices()
+            .any(|(suffix_start, _)| prefixes.contains(&combined[suffix_start..]))
+    }
+
+    fn single_symbol_output(&self, symbols: &[char]) -> Option<String> {
+        symbols
+            .iter()
+            .filter_map(|symbol| {
+                let order = self.single_symbol_output_order.get(symbol)?;
+                let output = self.single_symbol_outputs.get(symbol)?;
+                Some((*order, output))
+            })
+            .min_by_key(|(order, _)| *order)
+            .map(|(_, output)| output.clone())
     }
 }
 
@@ -353,49 +475,17 @@ impl TextServiceFactory {
         symbol: char,
         romaji_rows: &[RomajiRule],
     ) -> bool {
-        if romaji_rows.is_empty() {
-            return false;
-        }
+        let romaji_lookup = RomajiLookup::from_rows(romaji_rows);
+        Self::has_romaji_table_context_with_lookup(raw_input_before, symbol, &romaji_lookup)
+    }
 
-        let mut combined = String::with_capacity(raw_input_before.len() + symbol.len_utf8());
-        combined.push_str(raw_input_before);
-        combined.push(symbol);
-
-        let combined_chars: Vec<char> = combined.chars().collect();
-        let max_row_len = romaji_rows
-            .iter()
-            .map(|row| row.input.chars().count())
-            .max()
-            .unwrap_or(0);
-
-        if max_row_len == 0 {
-            return false;
-        }
-
-        let start_index = combined_chars.len().saturating_sub(max_row_len);
-        for suffix_start in start_index..combined_chars.len() {
-            let suffix: String = combined_chars[suffix_start..].iter().collect();
-            if suffix.is_empty() {
-                continue;
-            }
-
-            if romaji_rows
-                .iter()
-                .filter_map(|row| {
-                    let trimmed = row.input.trim();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed)
-                    }
-                })
-                .any(|input| input.starts_with(&suffix))
-            {
-                return true;
-            }
-        }
-
-        false
+    #[inline]
+    fn has_romaji_table_context_with_lookup(
+        raw_input_before: &str,
+        symbol: char,
+        romaji_lookup: &RomajiLookup,
+    ) -> bool {
+        romaji_lookup.has_romaji_table_context(raw_input_before, symbol)
     }
 
     #[inline]
@@ -404,13 +494,23 @@ impl TextServiceFactory {
         input: &str,
         romaji_rows: &[RomajiRule],
     ) -> bool {
+        let romaji_lookup = RomajiLookup::from_rows(romaji_rows);
+        Self::should_apply_symbol_fallback_with_lookup(raw_input_before, input, &romaji_lookup)
+    }
+
+    #[inline]
+    fn should_apply_symbol_fallback_with_lookup(
+        raw_input_before: &str,
+        input: &str,
+        romaji_lookup: &RomajiLookup,
+    ) -> bool {
         let Some(symbols) = Self::single_symbol_candidates(input) else {
             return false;
         };
 
-        !symbols
-            .iter()
-            .any(|symbol| Self::has_romaji_table_context(raw_input_before, *symbol, romaji_rows))
+        !symbols.iter().any(|symbol| {
+            Self::has_romaji_table_context_with_lookup(raw_input_before, *symbol, romaji_lookup)
+        })
     }
 
     #[inline]
@@ -419,49 +519,21 @@ impl TextServiceFactory {
         symbol: char,
         romaji_rows: &[RomajiRule],
     ) -> bool {
-        if romaji_rows.is_empty() {
-            return false;
-        }
+        let romaji_lookup = RomajiLookup::from_rows(romaji_rows);
+        Self::has_multi_character_romaji_context_with_lookup(
+            raw_input_before,
+            symbol,
+            &romaji_lookup,
+        )
+    }
 
-        let mut combined = String::with_capacity(raw_input_before.len() + symbol.len_utf8());
-        combined.push_str(raw_input_before);
-        combined.push(symbol);
-
-        let combined_chars: Vec<char> = combined.chars().collect();
-        let max_row_len = romaji_rows
-            .iter()
-            .map(|row| row.input.chars().count())
-            .max()
-            .unwrap_or(0);
-
-        if max_row_len <= 1 {
-            return false;
-        }
-
-        let start_index = combined_chars.len().saturating_sub(max_row_len);
-        for suffix_start in start_index..combined_chars.len() {
-            let suffix: String = combined_chars[suffix_start..].iter().collect();
-            if suffix.is_empty() {
-                continue;
-            }
-
-            if romaji_rows
-                .iter()
-                .filter_map(|row| {
-                    let trimmed = row.input.trim();
-                    if trimmed.is_empty() || trimmed.chars().count() <= 1 {
-                        None
-                    } else {
-                        Some(trimmed)
-                    }
-                })
-                .any(|input| input.starts_with(&suffix))
-            {
-                return true;
-            }
-        }
-
-        false
+    #[inline]
+    fn has_multi_character_romaji_context_with_lookup(
+        raw_input_before: &str,
+        symbol: char,
+        romaji_lookup: &RomajiLookup,
+    ) -> bool {
+        romaji_lookup.has_multi_character_romaji_context(raw_input_before, symbol)
     }
 
     #[inline]
@@ -480,22 +552,17 @@ impl TextServiceFactory {
 
     #[inline]
     fn single_symbol_romaji_output(input: &str, romaji_rows: &[RomajiRule]) -> Option<String> {
+        let romaji_lookup = RomajiLookup::from_rows(romaji_rows);
+        Self::single_symbol_romaji_output_with_lookup(input, &romaji_lookup)
+    }
+
+    #[inline]
+    fn single_symbol_romaji_output_with_lookup(
+        input: &str,
+        romaji_lookup: &RomajiLookup,
+    ) -> Option<String> {
         let symbols = Self::single_symbol_candidates(input)?;
-
-        romaji_rows.iter().find_map(|row| {
-            if !row.next_input.trim().is_empty() || row.output.is_empty() {
-                return None;
-            }
-
-            let trimmed = row.input.trim();
-            let mut chars = trimmed.chars();
-            let symbol = chars.next()?;
-            if chars.next().is_some() {
-                return None;
-            }
-
-            symbols.contains(&symbol).then(|| row.output.clone())
-        })
+        romaji_lookup.single_symbol_output(&symbols)
     }
 
     #[inline]
@@ -504,21 +571,37 @@ impl TextServiceFactory {
         input: &str,
         app_config: &AppConfig,
     ) -> Option<String> {
+        let romaji_lookup = RomajiLookup::from_rows(&app_config.romaji_table.rows);
+        Self::resolve_symbol_input_text_with_lookup(
+            raw_input_before,
+            input,
+            app_config,
+            &romaji_lookup,
+        )
+    }
+
+    #[inline]
+    fn resolve_symbol_input_text_with_lookup(
+        raw_input_before: &str,
+        input: &str,
+        app_config: &AppConfig,
+        romaji_lookup: &RomajiLookup,
+    ) -> Option<String> {
         let symbols = Self::single_symbol_candidates(input)?;
         let is_zenzai_enabled = Self::effective_zenzai_runtime_enabled(app_config);
         if is_zenzai_enabled {
             if symbols.iter().any(|symbol| {
-                Self::has_multi_character_romaji_context(
+                Self::has_multi_character_romaji_context_with_lookup(
                     raw_input_before,
                     *symbol,
-                    &app_config.romaji_table.rows,
+                    romaji_lookup,
                 )
             }) {
                 return None;
             }
 
             if let Some(mapped) =
-                Self::single_symbol_romaji_output(input, &app_config.romaji_table.rows)
+                Self::single_symbol_romaji_output_with_lookup(input, romaji_lookup)
             {
                 return Some(mapped);
             }
@@ -531,11 +614,7 @@ impl TextServiceFactory {
             ));
         }
 
-        if Self::should_apply_symbol_fallback(
-            raw_input_before,
-            input,
-            &app_config.romaji_table.rows,
-        ) {
+        if Self::should_apply_symbol_fallback_with_lookup(raw_input_before, input, romaji_lookup) {
             return Some(convert_kana_symbol(
                 input,
                 &app_config.general,
@@ -2324,12 +2403,14 @@ impl TextServiceFactory {
         mode: &InputMode,
         raw_input_before: &str,
         app_config: &AppConfig,
+        romaji_lookup: &RomajiLookup,
     ) -> Option<String> {
         if !Self::punctuation_commit_action_target_enabled(
             action,
             mode,
             raw_input_before,
             app_config,
+            romaji_lookup,
         ) {
             return None;
         }
@@ -2337,7 +2418,11 @@ impl TextServiceFactory {
         match action {
             UserAction::Input(ch) => {
                 let input = ch.to_string();
-                Some(Self::punctuation_commit_text_for_input(&input, app_config))
+                Some(Self::punctuation_commit_text_for_input(
+                    &input,
+                    app_config,
+                    romaji_lookup,
+                ))
             }
             UserAction::NumpadSymbol(symbol) => Some(
                 Self::numpad_text_for_mode(*symbol, app_config.general.numpad_input, false)
@@ -2348,10 +2433,14 @@ impl TextServiceFactory {
     }
 
     #[inline]
-    fn punctuation_commit_text_for_input(input: &str, app_config: &AppConfig) -> String {
+    fn punctuation_commit_text_for_input(
+        input: &str,
+        app_config: &AppConfig,
+        romaji_lookup: &RomajiLookup,
+    ) -> String {
         if Self::effective_zenzai_runtime_enabled(app_config) {
             if let Some(mapped) =
-                Self::single_symbol_romaji_output(input, &app_config.romaji_table.rows)
+                Self::single_symbol_romaji_output_with_lookup(input, romaji_lookup)
             {
                 return mapped;
             }
@@ -2371,6 +2460,7 @@ impl TextServiceFactory {
         mode: &InputMode,
         raw_input_before: &str,
         app_config: &AppConfig,
+        romaji_lookup: &RomajiLookup,
     ) -> bool {
         if !app_config.general.punctuation_commit || *mode != InputMode::Kana {
             return false;
@@ -2379,18 +2469,18 @@ impl TextServiceFactory {
         match action {
             UserAction::Input(ch) => {
                 Self::punctuation_commit_target_enabled(*ch, app_config)
-                    && !Self::has_multi_character_romaji_context(
+                    && !Self::has_multi_character_romaji_context_with_lookup(
                         raw_input_before,
                         *ch,
-                        &app_config.romaji_table.rows,
+                        romaji_lookup,
                     )
             }
             UserAction::NumpadSymbol(symbol) => {
                 Self::punctuation_commit_target_enabled(*symbol, app_config)
-                    && !Self::has_multi_character_romaji_context(
+                    && !Self::has_multi_character_romaji_context_with_lookup(
                         raw_input_before,
                         *symbol,
-                        &app_config.romaji_table.rows,
+                        romaji_lookup,
                     )
             }
             _ => false,
@@ -2480,6 +2570,28 @@ impl TextServiceFactory {
         mode: &InputMode,
         is_shift_pressed: bool,
         app_config: &AppConfig,
+        start_temporary_latin: bool,
+    ) -> Option<(CompositionState, Vec<ClientAction>)> {
+        let romaji_lookup = RomajiLookup::from_rows(&app_config.romaji_table.rows);
+        Self::plan_actions_for_user_action_with_lookup(
+            composition,
+            action,
+            mode,
+            is_shift_pressed,
+            app_config,
+            &romaji_lookup,
+            start_temporary_latin,
+        )
+    }
+
+    #[inline]
+    fn plan_actions_for_user_action_with_lookup(
+        composition: &Composition,
+        action: &UserAction,
+        mode: &InputMode,
+        is_shift_pressed: bool,
+        app_config: &AppConfig,
+        romaji_lookup: &RomajiLookup,
         start_temporary_latin: bool,
     ) -> Option<(CompositionState, Vec<ClientAction>)> {
         let result = match composition.state {
@@ -2580,6 +2692,7 @@ impl TextServiceFactory {
                         mode,
                         &composition.raw_input,
                         app_config,
+                        romaji_lookup,
                     ) =>
                 {
                     let text = Self::punctuation_commit_text_for_action(
@@ -2587,6 +2700,7 @@ impl TextServiceFactory {
                         mode,
                         &composition.raw_input,
                         app_config,
+                        romaji_lookup,
                     )?;
                     Some(Self::punctuation_commit_actions(text))
                 }
@@ -2736,6 +2850,7 @@ impl TextServiceFactory {
                         mode,
                         &composition.raw_input,
                         app_config,
+                        romaji_lookup,
                     ) =>
                 {
                     let text = Self::punctuation_commit_text_for_action(
@@ -2743,6 +2858,7 @@ impl TextServiceFactory {
                         mode,
                         &composition.raw_input,
                         app_config,
+                        romaji_lookup,
                     )?;
                     Some(Self::punctuation_commit_actions(text))
                 }
@@ -3160,6 +3276,7 @@ impl TextServiceFactory {
             (composition, mode)
         };
         let app_config = Self::load_app_config_or_default();
+        let romaji_lookup = RomajiLookup::from_rows(&app_config.romaji_table.rows);
 
         let mut preview = composition.preview.clone();
         let mut suffix = composition.suffix.clone();
@@ -3232,9 +3349,12 @@ impl TextServiceFactory {
                         &mut ipc_service,
                     )?;
                     let resolved_symbol_text = match mode {
-                        InputMode::Kana => {
-                            Self::resolve_symbol_input_text(&raw_input, text, &app_config)
-                        }
+                        InputMode::Kana => Self::resolve_symbol_input_text_with_lookup(
+                            &raw_input,
+                            text,
+                            &app_config,
+                            &romaji_lookup,
+                        ),
                         InputMode::Latin => None,
                     };
                     let text = match mode {
@@ -3853,9 +3973,12 @@ impl TextServiceFactory {
                     let shrunk_raw_input =
                         Self::current_raw_input_suffix(&raw_input, corresponding_count);
                     let resolved_symbol_text = match mode {
-                        InputMode::Kana => {
-                            Self::resolve_symbol_input_text(&shrunk_raw_input, text, &app_config)
-                        }
+                        InputMode::Kana => Self::resolve_symbol_input_text_with_lookup(
+                            &shrunk_raw_input,
+                            text,
+                            &app_config,
+                            &romaji_lookup,
+                        ),
                         InputMode::Latin => None,
                     };
                     let mut updated_raw_input = shrunk_raw_input.clone();

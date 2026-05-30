@@ -129,6 +129,13 @@ static HALF_FULL_CONFIGURABLE: LazyLock<HashMap<&'static str, &'static str>> =
 static SYMBOL_FULLWIDTH_DEFAULTS: LazyLock<HashMap<&'static str, bool>> =
     LazyLock::new(|| HashMap::from(CHARACTER_WIDTH_SYMBOL_DEFAULTS));
 
+static SYMBOL_FULLWIDTH_DEFAULTS_CHAR: LazyLock<HashMap<char, bool>> = LazyLock::new(|| {
+    SYMBOL_FULLWIDTH_DEFAULTS
+        .iter()
+        .filter_map(|(key, value)| single_char(key).map(|key| (key, *value)))
+        .collect()
+});
+
 static HALF_FULL: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
     HashMap::from([
         ("a", "ａ"),
@@ -160,35 +167,50 @@ static HALF_FULL: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(
     ])
 });
 
+static HALF_FULL_AZOOKEY_CHAR: LazyLock<HashMap<char, char>> =
+    LazyLock::new(|| single_char_map(&HALF_FULL_AZOOKEY));
+
+static FULL_HALF_AZOOKEY_CHAR: LazyLock<HashMap<char, char>> = LazyLock::new(|| {
+    HALF_FULL_AZOOKEY_CHAR
+        .iter()
+        .map(|(half, full)| (*full, *half))
+        .collect()
+});
+
+static HALF_FULL_CONFIGURABLE_CHAR: LazyLock<HashMap<char, char>> =
+    LazyLock::new(|| single_char_map(&HALF_FULL_CONFIGURABLE));
+
+static HALF_FULL_CHAR: LazyLock<HashMap<char, char>> =
+    LazyLock::new(|| single_char_map(&HALF_FULL));
+
+fn single_char(value: &str) -> Option<char> {
+    let mut chars = value.chars();
+    let ch = chars.next()?;
+    chars.next().is_none().then_some(ch)
+}
+
+fn single_char_map(map: &HashMap<&'static str, &'static str>) -> HashMap<char, char> {
+    map.iter()
+        .filter_map(|(half, full)| Some((single_char(half)?, single_char(full)?)))
+        .collect()
+}
+
 pub fn to_halfwidth(s: &str) -> String {
     s.chars()
-        .map(|c| {
-            let key = c.to_string();
-            if let Some((&k, _)) = HALF_FULL_AZOOKEY.iter().find(|(_, &v)| v == key) {
-                k.to_string()
-            } else {
-                c.to_string()
-            }
-        })
+        .map(|c| FULL_HALF_AZOOKEY_CHAR.get(&c).copied().unwrap_or(c))
         .collect()
 }
 
 pub fn to_fullwidth(s: &str, process_alphabet: bool) -> String {
     s.chars()
         .map(|c| {
-            let key = c.to_string();
-
             if process_alphabet {
-                if let Some(&v) = HALF_FULL.get(key.as_str()) {
-                    return v.to_string();
+                if let Some(&v) = HALF_FULL_CHAR.get(&c) {
+                    return v;
                 }
             }
 
-            if let Some(&v) = HALF_FULL_AZOOKEY.get(key.as_str()) {
-                v.to_string()
-            } else {
-                c.to_string()
-            }
+            HALF_FULL_AZOOKEY_CHAR.get(&c).copied().unwrap_or(c)
         })
         .collect()
 }
@@ -200,26 +222,19 @@ pub fn to_fullwidth_with_config(
 ) -> String {
     s.chars()
         .map(|c| {
-            let key = c.to_string();
-
             if process_alphabet {
-                if let Some(&v) = HALF_FULL.get(key.as_str()) {
-                    return v.to_string();
+                if let Some(&v) = HALF_FULL_CHAR.get(&c) {
+                    return v;
                 }
             }
 
-            if let Some(&v) = HALF_FULL_CONFIGURABLE.get(key.as_str()) {
-                let is_fullwidth = symbol_fullwidth
-                    .get(key.as_str())
-                    .copied()
-                    .or_else(|| SYMBOL_FULLWIDTH_DEFAULTS.get(key.as_str()).copied())
-                    .unwrap_or(false);
-                if is_fullwidth {
-                    return v.to_string();
+            if let Some(&v) = HALF_FULL_CONFIGURABLE_CHAR.get(&c) {
+                if symbol_fullwidth_enabled(c, symbol_fullwidth) {
+                    return v;
                 }
             }
 
-            c.to_string()
+            c
         })
         .collect()
 }
@@ -236,52 +251,52 @@ pub fn convert_kana_symbol(
         .map(|c| {
             let key = normalize_input_key(c);
 
-            let base = apply_basic_setting(&key, general)
+            let base = apply_basic_setting(key, general)
                 .map(str::to_string)
                 .unwrap_or_else(|| {
-                    legacy_fullwidth_or_half(&key, &character_width.symbol_fullwidth)
+                    legacy_fullwidth_or_half(key, &character_width.symbol_fullwidth)
                 });
 
-            apply_width_groups_with_source_key(&base, &key, groups)
+            apply_width_groups_with_source_key(&base, key, groups)
         })
         .collect::<Vec<_>>()
         .join("")
 }
 
-fn normalize_input_key(c: char) -> String {
+fn normalize_input_key(c: char) -> char {
     match c {
-        'ˆ' | '＾' => "^".to_string(),
-        '〜' | '～' => "~".to_string(),
-        '＼' | '￥' | '¥' => "\\".to_string(),
-        '，' => ",".to_string(),
-        '．' => ".".to_string(),
-        '”' => "\"".to_string(),
-        '’' => "'".to_string(),
-        _ => c.to_string(),
+        'ˆ' | '＾' => '^',
+        '〜' | '～' => '~',
+        '＼' | '￥' | '¥' => '\\',
+        '，' => ',',
+        '．' => '.',
+        '”' => '"',
+        '’' => '\'',
+        _ => c,
     }
 }
 
-fn apply_basic_setting(key: &str, general: &GeneralConfig) -> Option<&'static str> {
+fn apply_basic_setting(key: char, general: &GeneralConfig) -> Option<&'static str> {
     match key {
-        "," => Some(match general.punctuation_style {
+        ',' => Some(match general.punctuation_style {
             PunctuationStyle::ToutenKuten | PunctuationStyle::ToutenFullwidthPeriod => "、",
             PunctuationStyle::FullwidthCommaFullwidthPeriod
             | PunctuationStyle::FullwidthCommaKuten => "，",
         }),
-        "." => Some(match general.punctuation_style {
+        '.' => Some(match general.punctuation_style {
             PunctuationStyle::ToutenKuten | PunctuationStyle::FullwidthCommaKuten => "。",
             PunctuationStyle::FullwidthCommaFullwidthPeriod
             | PunctuationStyle::ToutenFullwidthPeriod => "．",
         }),
-        "[" => Some(match general.symbol_style {
+        '[' => Some(match general.symbol_style {
             SymbolStyle::CornerBracketMiddleDot | SymbolStyle::CornerBracketBackslash => "「",
             SymbolStyle::SquareBracketBackslash | SymbolStyle::SquareBracketMiddleDot => "［",
         }),
-        "]" => Some(match general.symbol_style {
+        ']' => Some(match general.symbol_style {
             SymbolStyle::CornerBracketMiddleDot | SymbolStyle::CornerBracketBackslash => "」",
             SymbolStyle::SquareBracketBackslash | SymbolStyle::SquareBracketMiddleDot => "］",
         }),
-        "/" => Some(match general.symbol_style {
+        '/' => Some(match general.symbol_style {
             SymbolStyle::CornerBracketMiddleDot | SymbolStyle::SquareBracketMiddleDot => "・",
             SymbolStyle::SquareBracketBackslash | SymbolStyle::CornerBracketBackslash => "／",
         }),
@@ -289,19 +304,26 @@ fn apply_basic_setting(key: &str, general: &GeneralConfig) -> Option<&'static st
     }
 }
 
-fn legacy_fullwidth_or_half(key: &str, symbol_fullwidth: &HashMap<String, bool>) -> String {
-    if let Some(&fullwidth) = HALF_FULL_CONFIGURABLE.get(key) {
-        let is_fullwidth = symbol_fullwidth
-            .get(key)
-            .copied()
-            .or_else(|| SYMBOL_FULLWIDTH_DEFAULTS.get(key).copied())
-            .unwrap_or(false);
-        if is_fullwidth {
+fn legacy_fullwidth_or_half(key: char, symbol_fullwidth: &HashMap<String, bool>) -> String {
+    if let Some(&fullwidth) = HALF_FULL_CONFIGURABLE_CHAR.get(&key) {
+        if symbol_fullwidth_enabled(key, symbol_fullwidth) {
             return fullwidth.to_string();
         }
     }
 
     key.to_string()
+}
+
+fn symbol_fullwidth_enabled(key: char, symbol_fullwidth: &HashMap<String, bool>) -> bool {
+    let mut buffer = [0; 4];
+    let key = key.encode_utf8(&mut buffer);
+    symbol_fullwidth
+        .get(key)
+        .copied()
+        .or_else(|| {
+            single_char(key).and_then(|key| SYMBOL_FULLWIDTH_DEFAULTS_CHAR.get(&key).copied())
+        })
+        .unwrap_or(false)
 }
 
 fn apply_width_groups(text: &str, groups: &CharacterWidthGroups) -> String {
@@ -312,10 +334,10 @@ fn apply_width_groups(text: &str, groups: &CharacterWidthGroups) -> String {
 
 fn apply_width_groups_with_source_key(
     text: &str,
-    source_key: &str,
+    source_key: char,
     groups: &CharacterWidthGroups,
 ) -> String {
-    if source_key == "/" {
+    if source_key == '/' {
         return text
             .chars()
             .map(|c| match c {
@@ -467,6 +489,23 @@ mod tests {
 
         let output = convert_kana_symbol("?", &general, &config, &rows);
         assert_eq!(output, "?");
+    }
+
+    #[test]
+    fn halfwidth_conversion_uses_reverse_symbol_lookup() {
+        assert_eq!(to_halfwidth("！？￥「」"), r"!?\[]");
+    }
+
+    #[test]
+    fn configurable_fullwidth_conversion_uses_direct_symbol_lookup() {
+        let mut symbol_fullwidth = shared::default_symbol_fullwidth_map();
+        symbol_fullwidth.insert("1".to_string(), true);
+        symbol_fullwidth.insert("!".to_string(), true);
+
+        assert_eq!(
+            to_fullwidth_with_config("a1!", true, &symbol_fullwidth),
+            "ａ１！"
+        );
     }
 
     #[test]
