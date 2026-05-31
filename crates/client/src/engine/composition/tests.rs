@@ -136,6 +136,44 @@ fn delayed_candidate_window_shows_when_space_opens_preview() {
 }
 
 #[test]
+fn ctrl_conversion_shortcuts_are_handled_as_function_keys() {
+    let cases = [
+        (0x55, Function::Six, SetTextType::Hiragana),
+        (0x49, Function::Seven, SetTextType::Katakana),
+        (0x4F, Function::Eight, SetTextType::HalfKatakana),
+        (0x50, Function::Nine, SetTextType::FullLatin),
+        (0x54, Function::Ten, SetTextType::HalfLatin),
+    ];
+
+    for (key_code, function, set_text_type) in cases {
+        assert_eq!(
+            TextServiceFactory::ctrl_conversion_shortcut_function(key_code, true, false),
+            Some(function)
+        );
+        assert_eq!(
+            TextServiceFactory::set_text_type_for_function(function),
+            set_text_type
+        );
+    }
+}
+
+#[test]
+fn ctrl_conversion_shortcuts_do_not_capture_non_ctrl_or_alt_modified_keys() {
+    assert_eq!(
+        TextServiceFactory::ctrl_conversion_shortcut_function(0x55, false, false),
+        None
+    );
+    assert_eq!(
+        TextServiceFactory::ctrl_conversion_shortcut_function(0x55, true, true),
+        None
+    );
+    assert_eq!(
+        TextServiceFactory::ctrl_conversion_shortcut_function(0x41, true, false),
+        None
+    );
+}
+
+#[test]
 fn right_arrow_prepares_clause_navigation_without_initial_move() {
     let composition = Composition {
         state: CompositionState::Composing,

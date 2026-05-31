@@ -33,7 +33,7 @@ pub enum Navigation {
     Right,
 }
 
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Function {
     Six,
     Seven,
@@ -42,9 +42,52 @@ pub enum Function {
     Ten,
 }
 
+impl Function {
+    pub(crate) fn from_ctrl_shortcut_key_code(key_code: usize) -> Option<Self> {
+        match key_code {
+            0x55 => Some(Self::Six),   // Ctrl+U
+            0x49 => Some(Self::Seven), // Ctrl+I
+            0x4F => Some(Self::Eight), // Ctrl+O
+            0x50 => Some(Self::Nine),  // Ctrl+P
+            0x54 => Some(Self::Ten),   // Ctrl+T
+            _ => None,
+        }
+    }
+}
+
 #[inline]
 fn is_ctrl_pressed() -> bool {
     VK_CONTROL.is_pressed() || VK_LCONTROL.is_pressed() || VK_RCONTROL.is_pressed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Function;
+
+    #[test]
+    fn ctrl_shortcut_keys_map_to_conversion_functions() {
+        assert_eq!(
+            Function::from_ctrl_shortcut_key_code(0x55),
+            Some(Function::Six)
+        );
+        assert_eq!(
+            Function::from_ctrl_shortcut_key_code(0x49),
+            Some(Function::Seven)
+        );
+        assert_eq!(
+            Function::from_ctrl_shortcut_key_code(0x4F),
+            Some(Function::Eight)
+        );
+        assert_eq!(
+            Function::from_ctrl_shortcut_key_code(0x50),
+            Some(Function::Nine)
+        );
+        assert_eq!(
+            Function::from_ctrl_shortcut_key_code(0x54),
+            Some(Function::Ten)
+        );
+        assert_eq!(Function::from_ctrl_shortcut_key_code(0x41), None);
+    }
 }
 
 fn clear_dead_key_state(key_state: &[u8; 256]) {
