@@ -290,6 +290,11 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn is_alt_pressed() -> bool {
+        VK_MENU.is_pressed() || VK_LMENU.is_pressed() || VK_RMENU.is_pressed()
+    }
+
+    #[inline]
     fn is_shift_pressed() -> bool {
         VK_SHIFT.is_pressed()
     }
@@ -302,6 +307,30 @@ impl TextServiceFactory {
     #[inline]
     fn is_shift_alphabet_shortcut(wparam: WPARAM, is_shift_pressed: bool) -> bool {
         is_shift_pressed && (0x41..=0x5A).contains(&wparam.0)
+    }
+
+    #[inline]
+    fn ctrl_conversion_shortcut_function(
+        key_code: usize,
+        is_ctrl_pressed: bool,
+        is_alt_pressed: bool,
+    ) -> Option<Function> {
+        if is_ctrl_pressed && !is_alt_pressed {
+            Function::from_ctrl_shortcut_key_code(key_code)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn set_text_type_for_function(function: Function) -> SetTextType {
+        match function {
+            Function::Six => SetTextType::Hiragana,
+            Function::Seven => SetTextType::Katakana,
+            Function::Eight => SetTextType::HalfKatakana,
+            Function::Nine => SetTextType::FullLatin,
+            Function::Ten => SetTextType::HalfLatin,
+        }
     }
 
     #[inline]
@@ -2818,28 +2847,12 @@ impl TextServiceFactory {
                     CompositionState::Previewing,
                     Self::candidate_preview_actions(app_config),
                 )),
-                UserAction::Function(key) => match key {
-                    Function::Six => Some((
-                        CompositionState::Previewing,
-                        vec![ClientAction::SetTextWithType(SetTextType::Hiragana)],
-                    )),
-                    Function::Seven => Some((
-                        CompositionState::Previewing,
-                        vec![ClientAction::SetTextWithType(SetTextType::Katakana)],
-                    )),
-                    Function::Eight => Some((
-                        CompositionState::Previewing,
-                        vec![ClientAction::SetTextWithType(SetTextType::HalfKatakana)],
-                    )),
-                    Function::Nine => Some((
-                        CompositionState::Previewing,
-                        vec![ClientAction::SetTextWithType(SetTextType::FullLatin)],
-                    )),
-                    Function::Ten => Some((
-                        CompositionState::Previewing,
-                        vec![ClientAction::SetTextWithType(SetTextType::HalfLatin)],
-                    )),
-                },
+                UserAction::Function(key) => Some((
+                    CompositionState::Previewing,
+                    vec![ClientAction::SetTextWithType(
+                        Self::set_text_type_for_function(*key),
+                    )],
+                )),
                 _ => None,
             },
             CompositionState::Previewing => match action {
@@ -2971,28 +2984,12 @@ impl TextServiceFactory {
                     CompositionState::Previewing,
                     Self::candidate_preview_actions(app_config),
                 )),
-                UserAction::Function(key) => match key {
-                    Function::Six => Some((
-                        CompositionState::Previewing,
-                        vec![ClientAction::SetTextWithType(SetTextType::Hiragana)],
-                    )),
-                    Function::Seven => Some((
-                        CompositionState::Previewing,
-                        vec![ClientAction::SetTextWithType(SetTextType::Katakana)],
-                    )),
-                    Function::Eight => Some((
-                        CompositionState::Previewing,
-                        vec![ClientAction::SetTextWithType(SetTextType::HalfKatakana)],
-                    )),
-                    Function::Nine => Some((
-                        CompositionState::Previewing,
-                        vec![ClientAction::SetTextWithType(SetTextType::FullLatin)],
-                    )),
-                    Function::Ten => Some((
-                        CompositionState::Previewing,
-                        vec![ClientAction::SetTextWithType(SetTextType::HalfLatin)],
-                    )),
-                },
+                UserAction::Function(key) => Some((
+                    CompositionState::Previewing,
+                    vec![ClientAction::SetTextWithType(
+                        Self::set_text_type_for_function(*key),
+                    )],
+                )),
                 _ => None,
             },
             CompositionState::Selecting => None,
@@ -3020,10 +3017,13 @@ impl TextServiceFactory {
         }
 
         let is_ctrl_pressed = Self::is_ctrl_pressed();
+        let is_alt_pressed = Self::is_alt_pressed();
         let is_shift_pressed = Self::is_shift_pressed();
         let is_ctrl_space = is_ctrl_pressed && wparam.0 == 0x20;
         let is_ctrl_enter = is_ctrl_pressed && wparam.0 == 0x0D;
         let is_ctrl_down = is_ctrl_pressed && wparam.0 == 0x28;
+        let ctrl_conversion_function =
+            Self::ctrl_conversion_shortcut_function(wparam.0, is_ctrl_pressed, is_alt_pressed);
         let is_shift_left = is_shift_pressed && wparam.0 == 0x25;
         let is_shift_right = is_shift_pressed && wparam.0 == 0x27;
         let is_shift_key = Self::is_shift_key(wparam);
@@ -3031,7 +3031,12 @@ impl TextServiceFactory {
         let app_config = Self::load_app_config_or_default();
 
         // check shortcut keys
-        if is_ctrl_pressed && !is_ctrl_space && !is_alt_backquote && !is_ctrl_enter && !is_ctrl_down
+        if is_ctrl_pressed
+            && !is_ctrl_space
+            && !is_alt_backquote
+            && !is_ctrl_enter
+            && !is_ctrl_down
+            && ctrl_conversion_function.is_none()
         {
             self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(wparam))?;
             return Ok(None);
@@ -3077,6 +3082,8 @@ impl TextServiceFactory {
             UserAction::CommitFirstClause
         } else if is_ctrl_down {
             UserAction::CommitAndNextClause
+        } else if let Some(function) = ctrl_conversion_function {
+            UserAction::Function(function)
         } else if is_shift_left {
             UserAction::AdjustClauseBoundary(-1)
         } else if is_shift_right {

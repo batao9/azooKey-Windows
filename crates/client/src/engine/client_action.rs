@@ -37,9 +37,9 @@ pub enum SetSelectionType {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SetTextType {
-    Hiragana,     // F6
-    Katakana,     // F7
-    HalfKatakana, // F8
-    FullLatin,    // F9
-    HalfLatin,    // F10
+    Hiragana,     // F6 / Ctrl+U
+    Katakana,     // F7 / Ctrl+I
+    HalfKatakana, // F8 / Ctrl+O
+    FullLatin,    // F9 / Ctrl+P
+    HalfLatin,    // F10 / Ctrl+T
 }
