@@ -363,11 +363,13 @@ fn launch_installer_helper(
     result_path: &Path,
     install_log_path: &Path,
 ) -> Result<()> {
-    let script_path = installer_path
+    let staging_dir = installer_path
         .parent()
-        .ok_or_else(|| anyhow!("installer path has no parent"))?
-        .join("azookey-update-helper.ps1");
-    write_installer_helper_script(&script_path)?;
+        .ok_or_else(|| anyhow!("installer path has no parent"))?;
+    let helper_script_path = staging_dir.join("azookey-update-helper.ps1");
+    let launcher_script_path = staging_dir.join("azookey-update-launcher.ps1");
+    write_installer_helper_script(&helper_script_path)?;
+    write_installer_launcher_script(&launcher_script_path)?;
 
     let status = Command::new("powershell")
         .arg("-NoProfile")
@@ -376,17 +378,22 @@ fn launch_installer_helper(
         .arg("-WindowStyle")
         .arg("Hidden")
         .arg("-File")
-        .arg(&script_path)
+        .arg(&launcher_script_path)
+        .arg("-HelperPath")
+        .arg(&helper_script_path)
         .arg("-InstallerPath")
         .arg(installer_path)
         .arg("-ResultPath")
         .arg(result_path)
         .arg("-InstallLogPath")
         .arg(install_log_path)
-        .spawn()
-        .context("failed to launch updater helper")?;
+        .status()
+        .context("failed to launch updater helper launcher")?;
 
-    drop(status);
+    if !status.success() {
+        return Err(anyhow!("updater helper launcher failed: {status}"));
+    }
+
     Ok(())
 }
 
@@ -397,6 +404,60 @@ fn write_installer_helper_script(script_path: &Path) -> Result<()> {
         .with_context(|| format!("failed to write updater helper: {}", script_path.display()))?;
     Ok(())
 }
+
+fn write_installer_launcher_script(script_path: &Path) -> Result<()> {
+    let mut file = fs::File::create(script_path).with_context(|| {
+        format!(
+            "failed to create updater helper launcher: {}",
+            script_path.display()
+        )
+    })?;
+    file.write_all(INSTALLER_LAUNCHER_PS1.as_bytes())
+        .with_context(|| {
+            format!(
+                "failed to write updater helper launcher: {}",
+                script_path.display()
+            )
+        })?;
+    Ok(())
+}
+
+const INSTALLER_LAUNCHER_PS1: &str = r#"
+param(
+  [Parameter(Mandatory = $true)][string]$HelperPath,
+  [Parameter(Mandatory = $true)][string]$InstallerPath,
+  [Parameter(Mandatory = $true)][string]$ResultPath,
+  [Parameter(Mandatory = $true)][string]$InstallLogPath
+)
+
+$ErrorActionPreference = "Stop"
+
+function Quote-ProcessArgument {
+  param([Parameter(Mandatory = $true)][string]$Value)
+  '"' + ($Value -replace '"', '\"') + '"'
+}
+
+$helperArgs = @(
+  "-NoProfile",
+  "-ExecutionPolicy",
+  "Bypass",
+  "-WindowStyle",
+  "Hidden",
+  "-File",
+  (Quote-ProcessArgument $HelperPath),
+  "-InstallerPath",
+  (Quote-ProcessArgument $InstallerPath),
+  "-ResultPath",
+  (Quote-ProcessArgument $ResultPath),
+  "-InstallLogPath",
+  (Quote-ProcessArgument $InstallLogPath)
+)
+
+# Keep the long-running helper out of frontend.exe's process tree. The installer
+# intentionally stops frontend.exe before replacing files, and taskkill /T would
+# otherwise kill the updater helper and its installer child.
+Start-Process -FilePath "powershell.exe" -ArgumentList $helperArgs -WindowStyle Hidden | Out-Null
+"#;
 
 const INSTALLER_HELPER_PS1: &str = r#"
 param(
@@ -430,15 +491,28 @@ function Write-UpdateResult {
   [System.IO.File]::WriteAllText($ResultPath, $json, $utf8NoBom)
 }
 
+function Test-IsProcessElevated {
+  $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+  $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
+  $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 try {
   $installerArgs = @(
-    "/VERYSILENT",
-    "/SUPPRESSMSGBOXES",
-    "/NORESTART",
     "/RESTARTEXITCODE=3010",
     "/LOG=$InstallLogPath"
   )
-  $proc = Start-Process -FilePath $InstallerPath -ArgumentList $installerArgs -Wait -PassThru
+  $startProcessArgs = @{
+    FilePath = $InstallerPath
+    ArgumentList = $installerArgs
+    Wait = $true
+    PassThru = $true
+  }
+  if (-not (Test-IsProcessElevated)) {
+    $startProcessArgs["Verb"] = "RunAs"
+  }
+
+  $proc = Start-Process @startProcessArgs
   if ($proc.ExitCode -eq 0) {
     Write-UpdateResult -Status "success" -ExitCode $proc.ExitCode -NeedsRestart $false -Message "更新が完了しました。"
     exit 0
@@ -655,9 +729,27 @@ mod tests {
     }
 
     #[test]
-    fn helper_requests_restart_exit_code() {
-        assert!(INSTALLER_HELPER_PS1.contains(r#""/NORESTART""#));
+    fn helper_launches_installer_with_visible_ui() {
+        assert!(!INSTALLER_HELPER_PS1.contains(r#""/VERYSILENT""#));
+        assert!(!INSTALLER_HELPER_PS1.contains(r#""/SUPPRESSMSGBOXES""#));
+        assert!(!INSTALLER_HELPER_PS1.contains(r#""/NORESTART""#));
         assert!(INSTALLER_HELPER_PS1.contains(r#""/RESTARTEXITCODE=3010""#));
+        assert!(INSTALLER_HELPER_PS1.contains(r#""/LOG=$InstallLogPath""#));
+    }
+
+    #[test]
+    fn helper_elevates_installer_when_needed() {
+        assert!(INSTALLER_HELPER_PS1.contains("Test-IsProcessElevated"));
+        assert!(INSTALLER_HELPER_PS1.contains(r#"$startProcessArgs["Verb"] = "RunAs""#));
+        assert!(INSTALLER_HELPER_PS1.contains("Start-Process @startProcessArgs"));
+    }
+
+    #[test]
+    fn launcher_starts_helper_as_separate_process() {
+        assert!(INSTALLER_LAUNCHER_PS1.contains("Start-Process"));
+        assert!(INSTALLER_LAUNCHER_PS1.contains(r#""powershell.exe""#));
+        assert!(INSTALLER_LAUNCHER_PS1.contains("Quote-ProcessArgument $HelperPath"));
+        assert!(!INSTALLER_LAUNCHER_PS1.contains("-Wait"));
     }
 
     #[test]
