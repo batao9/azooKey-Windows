@@ -82,7 +82,7 @@ Filename: "icacls"; \
 
 [UninstallRun]
 Filename: "taskkill"; \
-  Parameters: "/F /T /IM ""frontend.exe"""; \
+  Parameters: "/F /IM ""frontend.exe"""; \
   RunOnceId: "StopFrontend"; \
   Flags: runhidden
 Filename: "taskkill"; \
@@ -265,11 +265,19 @@ begin
   Result := True;
 end;
 
-procedure StopAzookeyProcess(ImageName: String);
+procedure StopAzookeyProcess(ImageName: String; KillProcessTree: Boolean);
 var
+  Parameters: String;
   ResultCode: Integer;
 begin
-  Exec('taskkill', '/F /T /IM "' + ImageName + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Parameters := '/F ';
+  if KillProcessTree then
+  begin
+    Parameters := Parameters + '/T ';
+  end;
+  Parameters := Parameters + '/IM "' + ImageName + '"';
+
+  Exec('taskkill', Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   if ResultCode = 0 then
   begin
     Log('Stopped Azookey process before install: ' + ImageName);
@@ -282,10 +290,10 @@ end;
 
 procedure StopAzookeyProcessesBeforeInstall();
 begin
-  StopAzookeyProcess('frontend.exe');
-  StopAzookeyProcess('azookey-server.exe');
-  StopAzookeyProcess('ui.exe');
-  StopAzookeyProcess('launcher.exe');
+  StopAzookeyProcess('frontend.exe', False);
+  StopAzookeyProcess('azookey-server.exe', True);
+  StopAzookeyProcess('ui.exe', True);
+  StopAzookeyProcess('launcher.exe', True);
 end;
 
 <event('PrepareToInstall')>
