@@ -85,6 +85,11 @@ Filename: "taskkill"; \
   Parameters: "/F /IM ""frontend.exe"""; \
   RunOnceId: "StopFrontend"; \
   Flags: runhidden
+; Stop launcher before server so the watchdog cannot respawn it during uninstall.
+Filename: "taskkill"; \
+  Parameters: "/F /T /IM ""launcher.exe"""; \
+  RunOnceId: "StopLauncher"; \
+  Flags: runhidden
 Filename: "taskkill"; \
   Parameters: "/F /T /IM ""azookey-server.exe"""; \
   RunOnceId: "StopAzookeyServer"; \
@@ -92,10 +97,6 @@ Filename: "taskkill"; \
 Filename: "taskkill"; \
   Parameters: "/F /T /IM ""ui.exe"""; \
   RunOnceId: "StopUi"; \
-  Flags: runhidden
-Filename: "taskkill"; \
-  Parameters: "/F /T /IM ""launcher.exe"""; \
-  RunOnceId: "StopLauncher"; \
   Flags: runhidden
 Filename: "schtasks"; \
   Parameters: "/Delete /TN ""Azookey Startup"" /F"; \
@@ -291,9 +292,10 @@ end;
 procedure StopAzookeyProcessesBeforeInstall();
 begin
   StopAzookeyProcess('frontend.exe', False);
+  // Stop launcher before server so the watchdog cannot respawn it during install/update.
+  StopAzookeyProcess('launcher.exe', True);
   StopAzookeyProcess('azookey-server.exe', True);
   StopAzookeyProcess('ui.exe', True);
-  StopAzookeyProcess('launcher.exe', True);
 end;
 
 <event('PrepareToInstall')>
