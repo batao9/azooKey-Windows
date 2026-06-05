@@ -1,13 +1,35 @@
 use shared::{zenzai_cpu_backend_supported, AppConfig};
+use std::collections::VecDeque;
+use std::ffi::c_void;
 use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::ptr::addr_of_mut;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
 use std::{env, thread};
 
+use anyhow::Context as _;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use windows::{
+    core::w,
+    Win32::Security::{
+        Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION},
+        PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    },
+};
+
+const SERVER_RESTART_DELAY: Duration = Duration::from_secs(1);
+const SERVER_RESTART_WINDOW: Duration = Duration::from_secs(60);
+const SERVER_RESTART_BURST_LIMIT: usize = 5;
+const SERVER_RESTART_COOLDOWN: Duration = Duration::from_secs(30);
+const SERVER_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const LAUNCHER_PIPE_PATH: &str = r"\\.\pipe\azookey_launcher";
+const LAUNCHER_RESTART_COMMAND: &str = "restart-server";
+const LAUNCHER_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn main() -> anyhow::Result<()> {
-    let config = AppConfig::new().unwrap_or_else(|error| {
-        eprintln!("[launcher] Failed to load settings; using defaults: {error}");
-        AppConfig::default()
-    });
     let cpu_backend_supported = zenzai_cpu_backend_supported();
     env::set_var(
         "AZOOKEY_ZENZAI_CPU_SUPPORTED",
@@ -15,66 +37,378 @@ fn main() -> anyhow::Result<()> {
     );
 
     let exe_path = env::current_exe()?.parent().unwrap().to_path_buf();
-    let backend_dir = match config.zenzai.backend.as_str() {
-        "cpu" => "llama_cpu",
-        "cuda" => "llama_cuda",
-        "vulkan" => "llama_vulkan",
-        _ => "llama_cpu",
-    };
+    let (command_tx, command_rx) = mpsc::channel();
+    start_launcher_command_listener(command_tx);
 
-    let backend_path = exe_path.join(backend_dir);
-    let backend_path_str = backend_path.to_string_lossy();
+    let server_exe_path = exe_path.clone();
+    let server_handle = thread::spawn(move || {
+        if let Err(error) =
+            watch_server_process(&server_exe_path, cpu_backend_supported, command_rx)
+        {
+            eprintln!("[launcher] server watchdog stopped: {error:?}");
+        }
+    });
 
-    let mut new_path = env::var("PATH").unwrap_or_else(|_| String::new());
-    new_path = format!("{};{}", backend_path_str, new_path);
-    env::set_var("PATH", &new_path);
+    let mut ui = start_ui_process(&exe_path)?;
+    let ui_status = ui.wait().context("Failed to wait for ui.exe")?;
+    eprintln!("[launcher] ui.exe exited: {ui_status}");
+
+    let _ = server_handle.join();
+
+    Ok(())
+}
+
+fn watch_server_process(
+    install_dir: &Path,
+    cpu_backend_supported: bool,
+    command_rx: Receiver<LauncherCommand>,
+) -> anyhow::Result<()> {
+    let mut recent_restarts = VecDeque::new();
+
+    loop {
+        let mut server = start_server_process(install_dir, cpu_backend_supported)?;
+        let status = wait_for_server_exit_or_restart_request(&mut server, &command_rx)?;
+        match status {
+            ServerExit::Exited(status) => {
+                eprintln!("[launcher] azookey-server.exe exited: {status}");
+            }
+            ServerExit::RestartRequested(status) => {
+                eprintln!("[launcher] azookey-server.exe restarted by request: {status}");
+            }
+        }
+
+        let now = Instant::now();
+        recent_restarts.push_back(now);
+        while recent_restarts
+            .front()
+            .is_some_and(|started| now.duration_since(*started) > SERVER_RESTART_WINDOW)
+        {
+            recent_restarts.pop_front();
+        }
+
+        if recent_restarts.len() >= SERVER_RESTART_BURST_LIMIT {
+            eprintln!(
+                "[launcher] azookey-server.exe restarted too often; cooling down for {} seconds",
+                SERVER_RESTART_COOLDOWN.as_secs()
+            );
+            thread::sleep(SERVER_RESTART_COOLDOWN);
+            recent_restarts.clear();
+        } else {
+            thread::sleep(SERVER_RESTART_DELAY);
+        }
+    }
+}
+
+fn start_server_process(install_dir: &Path, cpu_backend_supported: bool) -> anyhow::Result<Child> {
+    let config = load_config();
 
     if config.zenzai.enable && config.zenzai.backend == "cpu" && !cpu_backend_supported {
         eprintln!("[launcher] CPU backend requires AVX support. Zenzai will fall back to standard conversion.");
     }
 
-    let server_process = start_process("azookey-server.exe", "[server]");
-    let ui_process = start_process("ui.exe", "[ui]");
+    let mut command = process_command_with_backend(install_dir, "azookey-server.exe", &config);
+    command.env(
+        "AZOOKEY_ZENZAI_CPU_SUPPORTED",
+        if cpu_backend_supported { "1" } else { "0" },
+    );
 
-    if let (Some(mut server), Some(mut ui)) = (server_process, ui_process) {
-        let server_handle = thread::spawn(move || server.wait());
-        let ui_handle = thread::spawn(move || ui.wait());
+    spawn_process(command, "azookey-server.exe", "[server]")
+}
 
-        let _ = server_handle.join();
-        let _ = ui_handle.join();
+fn start_ui_process(install_dir: &Path) -> anyhow::Result<Child> {
+    let config = load_config();
+    let command = process_command_with_backend(install_dir, "ui.exe", &config);
+    spawn_process(command, "ui.exe", "[ui]")
+}
+
+fn process_command_with_backend(install_dir: &Path, exe: &str, config: &AppConfig) -> Command {
+    let backend_path = install_dir.join(backend_dir(config));
+    let mut command = process_command(install_dir, exe);
+    command.env("PATH", prepend_to_path(&backend_path));
+    command
+}
+
+fn process_command(install_dir: &Path, exe: &str) -> Command {
+    let exe_path = install_dir.join(exe);
+    let mut command = if exe_path.is_file() {
+        Command::new(&exe_path)
+    } else {
+        Command::new(exe)
+    };
+    command.current_dir(install_dir);
+    command
+}
+
+fn spawn_process(mut command: Command, exe: &str, prefix: &str) -> anyhow::Result<Child> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed to start {exe}"))?;
+
+    if let Some(stdout) = child.stdout.take() {
+        let stdout_reader = BufReader::new(stdout);
+        let prefix_stdout = prefix.to_string();
+        thread::spawn(move || {
+            for line in stdout_reader.lines() {
+                if let Ok(line) = line {
+                    println!("{}: {}", prefix_stdout, line);
+                }
+            }
+        });
     }
+
+    if let Some(stderr) = child.stderr.take() {
+        let stderr_reader = BufReader::new(stderr);
+        let prefix_stderr = prefix.to_string();
+        thread::spawn(move || {
+            for line in stderr_reader.lines() {
+                if let Ok(line) = line {
+                    eprintln!("{}: {}", prefix_stderr, line);
+                }
+            }
+        });
+    }
+
+    Ok(child)
+}
+
+fn wait_for_server_exit_or_restart_request(
+    server: &mut Child,
+    command_rx: &Receiver<LauncherCommand>,
+) -> anyhow::Result<ServerExit> {
+    loop {
+        if let Some(status) = server
+            .try_wait()
+            .context("Failed to check azookey-server.exe status")?
+        {
+            return Ok(ServerExit::Exited(status));
+        }
+
+        match command_rx.recv_timeout(SERVER_WATCH_POLL_INTERVAL) {
+            Ok(LauncherCommand::RestartServer { reply }) => {
+                let result = terminate_server_child(server);
+                let reply_result = result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                let _ = reply.send(reply_result);
+                return result.map(ServerExit::RestartRequested);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                let status = server
+                    .wait()
+                    .context("Failed to wait for azookey-server.exe")?;
+                return Ok(ServerExit::Exited(status));
+            }
+        }
+    }
+}
+
+fn terminate_server_child(server: &mut Child) -> anyhow::Result<ExitStatus> {
+    if let Some(status) = server
+        .try_wait()
+        .context("Failed to check azookey-server.exe status")?
+    {
+        return Ok(status);
+    }
+
+    server
+        .kill()
+        .context("Failed to terminate azookey-server.exe")?;
+    server
+        .wait()
+        .context("Failed to wait for azookey-server.exe after restart request")
+}
+
+fn start_launcher_command_listener(command_tx: Sender<LauncherCommand>) {
+    thread::spawn(move || {
+        if let Err(error) = run_launcher_command_listener(command_tx) {
+            eprintln!("[launcher] command listener stopped: {error:?}");
+        }
+    });
+}
+
+fn run_launcher_command_listener(command_tx: Sender<LauncherCommand>) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async move {
+        let mut security_descriptor = PSECURITY_DESCRIPTOR::default();
+
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                w!("D:(A;;GA;;;AC)(A;;GA;;;RC)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;BU)S:(ML;;NW;;;LW)"),
+                SDDL_REVISION,
+                &mut security_descriptor,
+                None,
+            )
+            .context("Failed to create launcher pipe security descriptor")?;
+        }
+
+        let mut security_attributes = UnsafeSecurityAttributes(SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: security_descriptor.0,
+            bInheritHandle: false.into(),
+        });
+
+        let mut first_pipe_instance = true;
+        loop {
+            let mut pipe =
+                create_launcher_command_pipe(&mut security_attributes, first_pipe_instance)?;
+            first_pipe_instance = false;
+            pipe.connect()
+                .await
+                .context("Failed to connect launcher command pipe")?;
+
+            if let Err(error) = handle_launcher_command(&mut pipe, &command_tx).await {
+                eprintln!("[launcher] command failed: {error:?}");
+            }
+        }
+    })
+}
+
+fn create_launcher_command_pipe(
+    security_attributes: &mut UnsafeSecurityAttributes,
+    first_pipe_instance: bool,
+) -> anyhow::Result<NamedPipeServer> {
+    let mut options = ServerOptions::new();
+    if first_pipe_instance {
+        options.first_pipe_instance(true);
+    }
+
+    unsafe {
+        options
+            .create_with_security_attributes_raw(
+                LAUNCHER_PIPE_PATH,
+                addr_of_mut!(security_attributes.0) as *mut c_void,
+            )
+            .context("Failed to create launcher command pipe")
+    }
+}
+
+async fn handle_launcher_command(
+    pipe: &mut NamedPipeServer,
+    command_tx: &Sender<LauncherCommand>,
+) -> anyhow::Result<()> {
+    let mut buffer = [0u8; 256];
+    let size = pipe
+        .read(&mut buffer)
+        .await
+        .context("Failed to read launcher command")?;
+
+    let result = match parse_launcher_command(&buffer[..size]) {
+        Ok(LauncherCommandKind::RestartServer) => request_server_restart(command_tx),
+        Err(error) => Err(error),
+    };
+    let response = launcher_response(result);
+
+    pipe.write_all(response.as_bytes())
+        .await
+        .context("Failed to write launcher command response")?;
+    pipe.flush()
+        .await
+        .context("Failed to flush launcher command response")?;
 
     Ok(())
 }
 
-fn start_process(exe: &str, prefix: &str) -> Option<Child> {
-    let mut child = Command::new(exe)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect(&format!("Failed to start {}", exe));
+fn parse_launcher_command(bytes: &[u8]) -> anyhow::Result<LauncherCommandKind> {
+    match std::str::from_utf8(bytes)
+        .context("Launcher command is not UTF-8")?
+        .trim()
+    {
+        LAUNCHER_RESTART_COMMAND => Ok(LauncherCommandKind::RestartServer),
+        command => anyhow::bail!("Unknown launcher command: {command}"),
+    }
+}
 
-    let stdout = child.stdout.take().expect("Failed to capture stdout");
-    let stdout_reader = BufReader::new(stdout);
-    let prefix_stdout = prefix.to_string();
-    thread::spawn(move || {
-        for line in stdout_reader.lines() {
-            if let Ok(line) = line {
-                println!("{}: {}", prefix_stdout, line);
-            }
+fn request_server_restart(command_tx: &Sender<LauncherCommand>) -> anyhow::Result<()> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    command_tx
+        .send(LauncherCommand::RestartServer { reply: reply_tx })
+        .context("Server watchdog is not running")?;
+
+    match reply_rx.recv_timeout(LAUNCHER_COMMAND_TIMEOUT) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(message)) => anyhow::bail!(message),
+        Err(RecvTimeoutError::Timeout) => anyhow::bail!("Timed out waiting for server restart"),
+        Err(RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("Server watchdog stopped before restart completed")
         }
-    });
+    }
+}
 
-    let stderr = child.stderr.take().expect("Failed to capture stderr");
-    let stderr_reader = BufReader::new(stderr);
-    let prefix_stderr = prefix.to_string();
-    thread::spawn(move || {
-        for line in stderr_reader.lines() {
-            if let Ok(line) = line {
-                eprintln!("{}: {}", prefix_stderr, line);
-            }
-        }
-    });
+fn launcher_response(result: anyhow::Result<()>) -> String {
+    match result {
+        Ok(()) => "ok\n".to_string(),
+        Err(error) => format!("error:{error}\n"),
+    }
+}
 
-    Some(child)
+fn load_config() -> AppConfig {
+    AppConfig::new().unwrap_or_else(|error| {
+        eprintln!("[launcher] Failed to load settings; using defaults: {error}");
+        AppConfig::default()
+    })
+}
+
+fn backend_dir(config: &AppConfig) -> &'static str {
+    match config.zenzai.backend.as_str() {
+        "cuda" => "llama_cuda",
+        "vulkan" => "llama_vulkan",
+        _ => "llama_cpu",
+    }
+}
+
+fn prepend_to_path(path: &Path) -> String {
+    let existing = env::var("PATH").unwrap_or_default();
+    format!("{};{}", path.to_string_lossy(), existing)
+}
+
+#[derive(Debug)]
+enum ServerExit {
+    Exited(ExitStatus),
+    RestartRequested(ExitStatus),
+}
+
+enum LauncherCommand {
+    RestartServer {
+        reply: Sender<std::result::Result<(), String>>,
+    },
+}
+
+enum LauncherCommandKind {
+    RestartServer,
+}
+
+struct UnsafeSecurityAttributes(SECURITY_ATTRIBUTES);
+
+unsafe impl Send for UnsafeSecurityAttributes {}
+unsafe impl Sync for UnsafeSecurityAttributes {}
+
+#[cfg(test)]
+mod tests {
+    use super::{launcher_response, parse_launcher_command, LauncherCommandKind};
+
+    #[test]
+    fn parse_launcher_command_accepts_restart_server() {
+        assert!(matches!(
+            parse_launcher_command(b"restart-server\n").unwrap(),
+            LauncherCommandKind::RestartServer
+        ));
+    }
+
+    #[test]
+    fn parse_launcher_command_rejects_unknown_command() {
+        assert!(parse_launcher_command(b"stop-server\n").is_err());
+    }
+
+    #[test]
+    fn launcher_response_encodes_success_and_error() {
+        assert_eq!(launcher_response(Ok(())), "ok\n");
+        assert_eq!(
+            launcher_response(Err(anyhow::anyhow!("denied"))),
+            "error:denied\n"
+        );
+    }
 }

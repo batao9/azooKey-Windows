@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { Plus, Save, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { DebugSettings } from "@/components/debug-settings";
 import { Input } from "@/components/ui/input";
 import { saveConfigWithToast } from "@/lib/config";
 
@@ -237,6 +238,8 @@ export const Dictionary = () => {
                     </div>
                 )}
             </section>
+
+            <DebugSettings />
         </div>
     );
 };
