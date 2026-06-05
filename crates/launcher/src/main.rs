@@ -68,34 +68,49 @@ fn watch_server_process(
     loop {
         let mut server = start_server_process(install_dir, cpu_backend_supported)?;
         let status = wait_for_server_exit_or_restart_request(&mut server, &command_rx)?;
-        match status {
+        let restart_delay = match status {
             ServerExit::Exited(status) => {
                 eprintln!("[launcher] azookey-server.exe exited: {status}");
+                restart_delay_after_server_exit(&mut recent_restarts, false, Instant::now())
             }
             ServerExit::RestartRequested(status) => {
                 eprintln!("[launcher] azookey-server.exe restarted by request: {status}");
+                restart_delay_after_server_exit(&mut recent_restarts, true, Instant::now())
             }
-        }
+        };
 
-        let now = Instant::now();
-        recent_restarts.push_back(now);
-        while recent_restarts
-            .front()
-            .is_some_and(|started| now.duration_since(*started) > SERVER_RESTART_WINDOW)
-        {
-            recent_restarts.pop_front();
+        if let Some(delay) = restart_delay {
+            thread::sleep(delay);
         }
+    }
+}
 
-        if recent_restarts.len() >= SERVER_RESTART_BURST_LIMIT {
-            eprintln!(
-                "[launcher] azookey-server.exe restarted too often; cooling down for {} seconds",
-                SERVER_RESTART_COOLDOWN.as_secs()
-            );
-            thread::sleep(SERVER_RESTART_COOLDOWN);
-            recent_restarts.clear();
-        } else {
-            thread::sleep(SERVER_RESTART_DELAY);
-        }
+fn restart_delay_after_server_exit(
+    recent_restarts: &mut VecDeque<Instant>,
+    restart_requested: bool,
+    now: Instant,
+) -> Option<Duration> {
+    if restart_requested {
+        return None;
+    }
+
+    recent_restarts.push_back(now);
+    while recent_restarts
+        .front()
+        .is_some_and(|started| now.duration_since(*started) > SERVER_RESTART_WINDOW)
+    {
+        recent_restarts.pop_front();
+    }
+
+    if recent_restarts.len() >= SERVER_RESTART_BURST_LIMIT {
+        eprintln!(
+            "[launcher] azookey-server.exe restarted too often; cooling down for {} seconds",
+            SERVER_RESTART_COOLDOWN.as_secs()
+        );
+        recent_restarts.clear();
+        Some(SERVER_RESTART_COOLDOWN)
+    } else {
+        Some(SERVER_RESTART_DELAY)
     }
 }
 
@@ -388,7 +403,13 @@ unsafe impl Sync for UnsafeSecurityAttributes {}
 
 #[cfg(test)]
 mod tests {
-    use super::{launcher_response, parse_launcher_command, LauncherCommandKind};
+    use super::{
+        launcher_response, parse_launcher_command, restart_delay_after_server_exit,
+        LauncherCommandKind, SERVER_RESTART_BURST_LIMIT, SERVER_RESTART_COOLDOWN,
+        SERVER_RESTART_DELAY,
+    };
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn parse_launcher_command_accepts_restart_server() {
@@ -410,5 +431,55 @@ mod tests {
             launcher_response(Err(anyhow::anyhow!("denied"))),
             "error:denied\n"
         );
+    }
+
+    #[test]
+    fn requested_restarts_do_not_count_toward_crash_cooldown() {
+        let mut recent_restarts = VecDeque::new();
+        let start = Instant::now();
+
+        for offset in 0..SERVER_RESTART_BURST_LIMIT {
+            assert_eq!(
+                restart_delay_after_server_exit(
+                    &mut recent_restarts,
+                    true,
+                    start + Duration::from_secs(offset as u64)
+                ),
+                None
+            );
+        }
+
+        assert!(recent_restarts.is_empty());
+        assert_eq!(
+            restart_delay_after_server_exit(&mut recent_restarts, false, start),
+            Some(SERVER_RESTART_DELAY)
+        );
+    }
+
+    #[test]
+    fn unexpected_restarts_trigger_crash_cooldown() {
+        let mut recent_restarts = VecDeque::new();
+        let start = Instant::now();
+
+        for offset in 0..SERVER_RESTART_BURST_LIMIT - 1 {
+            assert_eq!(
+                restart_delay_after_server_exit(
+                    &mut recent_restarts,
+                    false,
+                    start + Duration::from_secs(offset as u64)
+                ),
+                Some(SERVER_RESTART_DELAY)
+            );
+        }
+
+        assert_eq!(
+            restart_delay_after_server_exit(
+                &mut recent_restarts,
+                false,
+                start + Duration::from_secs(SERVER_RESTART_BURST_LIMIT as u64)
+            ),
+            Some(SERVER_RESTART_COOLDOWN)
+        );
+        assert!(recent_restarts.is_empty());
     }
 }
