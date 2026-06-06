@@ -13,10 +13,18 @@ use anyhow::Context as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use windows::{
-    core::w,
-    Win32::Security::{
-        Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION},
-        PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    core::{PCWSTR, PWSTR},
+    Win32::{
+        Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL},
+        Security::{
+            Authorization::{
+                ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                SDDL_REVISION,
+            },
+            GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+            TOKEN_USER,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
     },
 };
 
@@ -248,17 +256,7 @@ fn start_launcher_command_listener(command_tx: Sender<LauncherCommand>) {
 fn run_launcher_command_listener(command_tx: Sender<LauncherCommand>) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
-        let mut security_descriptor = PSECURITY_DESCRIPTOR::default();
-
-        unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                w!("D:(A;;GA;;;AC)(A;;GA;;;RC)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;BU)S:(ML;;NW;;;LW)"),
-                SDDL_REVISION,
-                &mut security_descriptor,
-                None,
-            )
-            .context("Failed to create launcher pipe security descriptor")?;
-        }
+        let security_descriptor = create_launcher_pipe_security_descriptor()?;
 
         let mut security_attributes = UnsafeSecurityAttributes(SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -280,6 +278,73 @@ fn run_launcher_command_listener(command_tx: Sender<LauncherCommand>) -> anyhow:
             }
         }
     })
+}
+
+fn create_launcher_pipe_security_descriptor() -> anyhow::Result<PSECURITY_DESCRIPTOR> {
+    let user_sid = current_user_sid_string()?;
+    let sddl = launcher_pipe_sddl(&user_sid);
+    let sddl_wide = sddl.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let mut security_descriptor = PSECURITY_DESCRIPTOR::default();
+
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl_wide.as_ptr()),
+            SDDL_REVISION,
+            &mut security_descriptor,
+            None,
+        )
+        .context("Failed to create launcher pipe security descriptor")?;
+    }
+
+    Ok(security_descriptor)
+}
+
+fn launcher_pipe_sddl(user_sid: &str) -> String {
+    format!("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{user_sid})S:(ML;;NW;;;ME)")
+}
+
+fn current_user_sid_string() -> anyhow::Result<String> {
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+            .context("Failed to open current process token")?;
+
+        let result = user_sid_string_from_token(token);
+        let _ = CloseHandle(token);
+        result
+    }
+}
+
+fn user_sid_string_from_token(token: HANDLE) -> anyhow::Result<String> {
+    unsafe {
+        let mut token_info_length = 0;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut token_info_length);
+        anyhow::ensure!(
+            token_info_length > 0,
+            "Failed to get current user token SID size"
+        );
+
+        let mut token_info = vec![0u8; token_info_length as usize];
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(token_info.as_mut_ptr().cast()),
+            token_info_length,
+            &mut token_info_length,
+        )
+        .context("Failed to get current user token SID")?;
+
+        let token_user = &*(token_info.as_ptr() as *const TOKEN_USER);
+        let mut sid_string = PWSTR::null();
+        ConvertSidToStringSidW(token_user.User.Sid, &mut sid_string)
+            .context("Failed to convert current user SID to string")?;
+
+        let result = sid_string
+            .to_string()
+            .context("Failed to decode current user SID string");
+        let _ = LocalFree(HLOCAL(sid_string.as_ptr().cast()));
+        result
+    }
 }
 
 fn create_launcher_command_pipe(
@@ -404,9 +469,9 @@ unsafe impl Sync for UnsafeSecurityAttributes {}
 #[cfg(test)]
 mod tests {
     use super::{
-        launcher_response, parse_launcher_command, restart_delay_after_server_exit,
-        LauncherCommandKind, SERVER_RESTART_BURST_LIMIT, SERVER_RESTART_COOLDOWN,
-        SERVER_RESTART_DELAY,
+        launcher_pipe_sddl, launcher_response, parse_launcher_command,
+        restart_delay_after_server_exit, LauncherCommandKind, SERVER_RESTART_BURST_LIMIT,
+        SERVER_RESTART_COOLDOWN, SERVER_RESTART_DELAY,
     };
     use std::collections::VecDeque;
     use std::time::{Duration, Instant};
@@ -431,6 +496,20 @@ mod tests {
             launcher_response(Err(anyhow::anyhow!("denied"))),
             "error:denied\n"
         );
+    }
+
+    #[test]
+    fn launcher_pipe_sddl_is_limited_to_current_user_and_medium_integrity() {
+        let sddl = launcher_pipe_sddl("S-1-5-21-1-2-3-1001");
+
+        assert!(sddl.contains("(A;;GA;;;SY)"));
+        assert!(sddl.contains("(A;;GA;;;BA)"));
+        assert!(sddl.contains("(A;;GA;;;S-1-5-21-1-2-3-1001)"));
+        assert!(sddl.contains("S:(ML;;NW;;;ME)"));
+        assert!(!sddl.contains(";;;BU)"));
+        assert!(!sddl.contains(";;;AC)"));
+        assert!(!sddl.contains(";;;RC)"));
+        assert!(!sddl.contains(";;;LW)"));
     }
 
     #[test]
