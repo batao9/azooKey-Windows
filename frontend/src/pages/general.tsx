@@ -5,7 +5,6 @@ import { toast } from "sonner";
 import { Download, Keyboard, RefreshCcw, Table2, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { DebugSettings } from "@/components/debug-settings";
 import { Input } from "@/components/ui/input";
 import {
     Select,
@@ -857,7 +856,6 @@ export const General = () => {
                     </div>
                 </section>
 
-                <DebugSettings />
             </div>
 
             {isRomajiEditorOpen && (

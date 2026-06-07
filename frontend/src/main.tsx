@@ -11,6 +11,7 @@ import { Appearance } from "@/pages/appearance"
 import { Zenzai } from "@/pages/zenzai"
 import { About } from "@/pages/about"
 import { Dictionary } from "@/pages/dictionary"
+import { Debug } from "@/pages/debug"
 import { Toaster } from "@/components/ui/sonner"
 import { showConfigStartupNoticeOnce, showUpdateInstallResultOnce } from "@/lib/config"
 
@@ -26,6 +27,7 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
               <Route path="/appearance" element={<Appearance />} />
               <Route path="/zenzai" element={<Zenzai />} />
               <Route path="/dictionary" element={<Dictionary />} />
+              <Route path="/debug" element={<Debug />} />
               <Route path="/about" element={<About />} />
             </Routes>
             <Toaster />

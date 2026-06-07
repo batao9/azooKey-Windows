@@ -1,6 +1,5 @@
 import { Textarea } from "@/components/ui/textarea";
 import { Switch } from "@/components/ui/switch";
-import { DebugSettings } from "@/components/debug-settings";
 import { Bot, User, Cpu } from "lucide-react";
 import {
     Select,
@@ -176,7 +175,6 @@ export const Zenzai = () => {
                     </Select>
                 </div>
             </section>
-            <DebugSettings />
         </div>
     )
 }
