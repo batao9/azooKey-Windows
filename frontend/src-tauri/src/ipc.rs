@@ -51,9 +51,8 @@ impl IPCService {
                     let client = loop {
                         match ClientOptions::new().open(SERVER_PIPE_PATH) {
                             Ok(client) => break client,
-                            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => (),
                             Err(e)
-                                if should_retry_missing_pipe(
+                                if should_retry_pipe_connect_error(
                                     e.raw_os_error(),
                                     started_at,
                                     timeout,
@@ -78,7 +77,7 @@ impl IPCService {
     }
 }
 
-fn should_retry_missing_pipe(
+fn should_retry_pipe_connect_error(
     raw_os_error: Option<i32>,
     started_at: Instant,
     timeout: Duration,
@@ -89,6 +88,7 @@ fn should_retry_missing_pipe(
 
     raw_os_error == Some(ERROR_FILE_NOT_FOUND.0 as i32)
         || raw_os_error == Some(ERROR_PATH_NOT_FOUND.0 as i32)
+        || raw_os_error == Some(ERROR_PIPE_BUSY.0 as i32)
 }
 
 // implement methods to interact with kkc server
@@ -100,5 +100,61 @@ impl IPCService {
             .block_on(self.azookey_client.update_config(request))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        should_retry_pipe_connect_error, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+        ERROR_PIPE_BUSY,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn retries_missing_and_busy_pipe_errors_before_timeout() {
+        let started_at = Instant::now();
+        let timeout = Duration::from_secs(10);
+
+        assert!(should_retry_pipe_connect_error(
+            Some(ERROR_FILE_NOT_FOUND.0 as i32),
+            started_at,
+            timeout
+        ));
+        assert!(should_retry_pipe_connect_error(
+            Some(ERROR_PATH_NOT_FOUND.0 as i32),
+            started_at,
+            timeout
+        ));
+        assert!(should_retry_pipe_connect_error(
+            Some(ERROR_PIPE_BUSY.0 as i32),
+            started_at,
+            timeout
+        ));
+    }
+
+    #[test]
+    fn stops_retrying_busy_pipe_after_timeout() {
+        let timeout = Duration::from_secs(10);
+        let started_at = Instant::now() - timeout;
+
+        assert!(!should_retry_pipe_connect_error(
+            Some(ERROR_PIPE_BUSY.0 as i32),
+            started_at,
+            timeout
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_other_pipe_errors() {
+        let started_at = Instant::now();
+        let timeout = Duration::from_secs(10);
+
+        assert!(!should_retry_pipe_connect_error(
+            Some(5),
+            started_at,
+            timeout
+        ));
+        assert!(!should_retry_pipe_connect_error(None, started_at, timeout));
     }
 }
