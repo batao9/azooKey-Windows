@@ -23,7 +23,7 @@ pub struct IPCService {
 
 impl IPCService {
     pub fn new() -> Result<Self> {
-        Self::new_with_timeout(Duration::ZERO)
+        Self::new_inner(None)
     }
 
     #[cfg(test)]
@@ -42,6 +42,10 @@ impl IPCService {
     }
 
     pub fn new_with_timeout(timeout: Duration) -> Result<Self> {
+        Self::new_inner(Some(timeout))
+    }
+
+    fn new_inner(timeout: Option<Duration>) -> Result<Self> {
         let runtime = tokio::runtime::Runtime::new()?;
 
         let server_channel = runtime.block_on(
@@ -80,10 +84,12 @@ impl IPCService {
 fn should_retry_pipe_connect_error(
     raw_os_error: Option<i32>,
     started_at: Instant,
-    timeout: Duration,
+    timeout: Option<Duration>,
 ) -> bool {
-    if started_at.elapsed() >= timeout {
-        return false;
+    match timeout {
+        Some(timeout) if started_at.elapsed() >= timeout => return false,
+        Some(_) => {}
+        None => return raw_os_error == Some(ERROR_PIPE_BUSY.0 as i32),
     }
 
     raw_os_error == Some(ERROR_FILE_NOT_FOUND.0 as i32)
@@ -114,7 +120,7 @@ mod tests {
     #[test]
     fn retries_missing_and_busy_pipe_errors_before_timeout() {
         let started_at = Instant::now();
-        let timeout = Duration::from_secs(10);
+        let timeout = Some(Duration::from_secs(10));
 
         assert!(should_retry_pipe_connect_error(
             Some(ERROR_FILE_NOT_FOUND.0 as i32),
@@ -141,14 +147,41 @@ mod tests {
         assert!(!should_retry_pipe_connect_error(
             Some(ERROR_PIPE_BUSY.0 as i32),
             started_at,
-            timeout
+            Some(timeout)
+        ));
+    }
+
+    #[test]
+    fn retries_busy_pipe_without_timeout() {
+        let started_at = Instant::now();
+
+        assert!(should_retry_pipe_connect_error(
+            Some(ERROR_PIPE_BUSY.0 as i32),
+            started_at,
+            None
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_missing_pipe_without_timeout() {
+        let started_at = Instant::now();
+
+        assert!(!should_retry_pipe_connect_error(
+            Some(ERROR_FILE_NOT_FOUND.0 as i32),
+            started_at,
+            None
+        ));
+        assert!(!should_retry_pipe_connect_error(
+            Some(ERROR_PATH_NOT_FOUND.0 as i32),
+            started_at,
+            None
         ));
     }
 
     #[test]
     fn does_not_retry_other_pipe_errors() {
         let started_at = Instant::now();
-        let timeout = Duration::from_secs(10);
+        let timeout = Some(Duration::from_secs(10));
 
         assert!(!should_retry_pipe_connect_error(
             Some(5),
