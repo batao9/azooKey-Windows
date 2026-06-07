@@ -1,9 +1,12 @@
 mod ipc;
+mod server_process;
 mod updater;
 
 use serde::{Deserialize, Serialize};
 use shared::{AppConfig, AppConfigLoadResult, ConfigError, ConfigRecovery, RomajiRule};
-use std::{path::PathBuf, sync::Mutex};
+use std::{path::PathBuf, sync::Mutex, time::Duration};
+
+use anyhow::Context as _;
 
 #[derive(Debug)]
 pub struct AppState {
@@ -163,6 +166,23 @@ fn update_config_impl(
     })
 }
 
+#[tauri::command]
+fn restart_server(state: tauri::State<AppState>) -> Result<(), String> {
+    restart_server_impl(&state).map_err(|error| error.to_string())
+}
+
+fn restart_server_impl(state: &AppState) -> Result<(), anyhow::Error> {
+    let config = state.settings.lock().unwrap().clone();
+
+    server_process::restart_server(&config)?;
+
+    let ipc = ipc::IPCService::new_with_timeout(Duration::from_secs(10))
+        .context("Server restarted, but IPC reconnect failed")?;
+    *state.ipc.lock().unwrap() = Some(ipc);
+
+    Ok(())
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct Capability {
     cpu: bool,
@@ -251,26 +271,28 @@ pub fn run() {
             get_default_romaji_rows,
             check_for_updates,
             start_update,
-            take_update_install_result
+            take_update_install_result,
+            restart_server
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
 
 #[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        env,
-        ffi::OsString,
-        io,
-        path::Path,
-        sync::{Mutex, MutexGuard, OnceLock},
-    };
+    use std::{env, ffi::OsString, io, path::Path, sync::MutexGuard};
 
     fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        crate::test_env_lock()
     }
 
     struct AppDataGuard {
@@ -350,6 +372,20 @@ mod tests {
 
         assert!(error.contains("APPDATA"));
         assert!(!state.settings.lock().unwrap().zenzai.enable);
+    }
+
+    #[test]
+    fn restart_server_keeps_existing_ipc_when_restart_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let _appdata = AppDataGuard::set(temp.path());
+        let state = test_state();
+        *state.ipc.lock().unwrap() = Some(ipc::IPCService::new_for_test());
+
+        let error =
+            restart_server_impl(&state).expect_err("missing server exe should fail restart");
+
+        assert!(error.to_string().contains("Server executable not found"));
+        assert!(state.ipc.lock().unwrap().is_some());
     }
 
     #[test]

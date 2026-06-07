@@ -71,6 +71,7 @@ pub struct UpdateInstallResult {
     pub install_log_path: Option<String>,
 }
 
+#[derive(Debug)]
 struct ReleaseAssets {
     installer_url: String,
     sha256sums_url: String,
@@ -533,14 +534,10 @@ try {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        ffi::OsString,
-        sync::{Mutex, MutexGuard, OnceLock},
-    };
+    use std::{ffi::OsString, sync::MutexGuard};
 
     fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        crate::test_env_lock()
     }
 
     struct EnvGuard {

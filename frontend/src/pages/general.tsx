@@ -855,6 +855,7 @@ export const General = () => {
                         <Switch checked={shortcutValue.altBackquoteToggle} onCheckedChange={handleAltBackquoteToggle} />
                     </div>
                 </section>
+
             </div>
 
             {isRomajiEditorOpen && (

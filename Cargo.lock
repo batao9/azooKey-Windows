@@ -2166,6 +2166,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "shared",
+ "tokio",
+ "windows",
 ]
 
 [[package]]

@@ -237,6 +237,7 @@ export const Dictionary = () => {
                     </div>
                 )}
             </section>
+
         </div>
     );
 };
