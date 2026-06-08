@@ -23,6 +23,7 @@ enum InputStyle {
 message AppendTextRequest {
   string text_to_append = 1; // The text to append to the current content.
   InputStyle input_style = 2;
+  uint64 request_id = 3;
 }
 
 // Response message for AppendText.
@@ -31,7 +32,9 @@ message AppendTextResponse {
 }
 
 // Request message for RemoveText.
-message RemoveTextRequest {}
+message RemoveTextRequest {
+  uint64 request_id = 1;
+}
 
 // Response message for RemoveText.
 message RemoveTextResponse {
@@ -41,11 +44,13 @@ message RemoveTextResponse {
 // Request message for MoveCursor.
 message MoveCursorRequest {
   int32 offset = 1; // The new cursor position.
+  uint64 request_id = 2;
 }
 
 // Request message for ShrinkText.
 message ShrinkTextRequest {
   int32 offset = 1;
+  uint64 request_id = 2;
 }
 
 message ShrinkTextResponse {
@@ -58,19 +63,35 @@ message MoveCursorResponse {
 }
 
 // Request message for ClearText.
-message ClearTextRequest {}
+message ClearTextRequest {
+  uint64 request_id = 1;
+}
 
 // Response message for ClearText.
 message ClearTextResponse {}
 
 message SetContextRequest {
   string context = 1;
+  uint64 request_id = 2;
 }
 
 message SetContextResponse {}
 
-message UpdateConfigRequest {}
+message UpdateConfigRequest {
+  uint64 request_id = 1;
+}
 message UpdateConfigResponse {}
+
+message PerformanceLogRequest {
+  uint64 request_id = 1;
+  string component = 2;
+  string operation = 3;
+  string stage = 4;
+  uint64 elapsed_ms = 5;
+  string details = 6;
+}
+
+message PerformanceLogResponse {}
 
 
 // Service definition for text editing operations.
@@ -82,4 +103,5 @@ service AzookeyService {
   rpc ClearText (ClearTextRequest) returns (ClearTextResponse);
   rpc SetContext (SetContextRequest) returns (SetContextResponse);
   rpc UpdateConfig (UpdateConfigRequest) returns (UpdateConfigResponse);
+  rpc LogPerformance (PerformanceLogRequest) returns (PerformanceLogResponse);
 }

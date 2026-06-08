@@ -1,9 +1,19 @@
 use anyhow::Result;
 use hyper_util::rt::TokioIo;
-use shared::proto::{
-    azookey_service_client::AzookeyServiceClient, window_service_client::WindowServiceClient,
+use shared::{
+    proto::{
+        azookey_service_client::AzookeyServiceClient, window_service_client::WindowServiceClient,
+        PerformanceLogRequest,
+    },
+    AppConfig,
 };
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+    time::{Duration, Instant},
+};
 use tokio::{net::windows::named_pipe::ClientOptions, time};
 use tonic::transport::Endpoint;
 use tower::service_fn;
@@ -11,6 +21,16 @@ use windows::Win32::Foundation::ERROR_PIPE_BUSY;
 
 const INPUT_STYLE_ROMAN2KANA: i32 = 0;
 const INPUT_STYLE_DIRECT: i32 = 1;
+const CLIENT_LOG_CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+static CLIENT_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static CLIENT_LOG_CONFIG_CACHE: OnceLock<Mutex<ClientLogConfigCache>> = OnceLock::new();
+
+#[derive(Debug, Default)]
+struct ClientLogConfigCache {
+    last_checked: Option<Instant>,
+    enabled: bool,
+}
 
 // connect to kkc server
 #[derive(Debug, Clone)]
@@ -20,6 +40,7 @@ pub struct IPCService {
     // candidate window server client
     window_client: WindowServiceClient<tonic::transport::channel::Channel>,
     runtime: Arc<tokio::runtime::Runtime>,
+    performance_log_tx: tokio::sync::mpsc::UnboundedSender<PerformanceLogRequest>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -30,9 +51,41 @@ pub struct Candidates {
     pub corresponding_count: Vec<i32>,
 }
 
+fn next_request_id() -> u64 {
+    let counter = CLIENT_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    (u64::from(std::process::id()) << 32) | (counter & 0xffff_ffff)
+}
+
+fn client_log_config_cache() -> &'static Mutex<ClientLogConfigCache> {
+    CLIENT_LOG_CONFIG_CACHE.get_or_init(|| Mutex::new(ClientLogConfigCache::default()))
+}
+
+fn client_performance_log_enabled() -> bool {
+    let Ok(mut cache) = client_log_config_cache().lock() else {
+        return false;
+    };
+
+    let should_refresh = cache
+        .last_checked
+        .map(|last_checked| last_checked.elapsed() >= CLIENT_LOG_CONFIG_REFRESH_INTERVAL)
+        .unwrap_or(true);
+    if should_refresh {
+        cache.enabled = AppConfig::read()
+            .map(|config| config.debug.server_log_enabled)
+            .unwrap_or(false);
+        cache.last_checked = Some(Instant::now());
+    }
+
+    cache.enabled
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 impl IPCService {
     pub fn new() -> Result<Self> {
-        let runtime = tokio::runtime::Runtime::new()?;
+        let runtime = Arc::new(tokio::runtime::Runtime::new()?);
 
         let server_channel = runtime.block_on(
             Endpoint::try_from("http://[::]:50051")?.connect_with_connector(service_fn(
@@ -72,12 +125,26 @@ impl IPCService {
 
         let azookey_client = AzookeyServiceClient::new(server_channel);
         let window_client = WindowServiceClient::new(ui_channel);
+        let (performance_log_tx, mut performance_log_rx) =
+            tokio::sync::mpsc::unbounded_channel::<PerformanceLogRequest>();
+        let mut performance_log_client = azookey_client.clone();
+        runtime.spawn(async move {
+            while let Some(request) = performance_log_rx.recv().await {
+                if let Err(error) = performance_log_client
+                    .log_performance(tonic::Request::new(request))
+                    .await
+                {
+                    tracing::debug!("failed to write client performance log: {error:?}");
+                }
+            }
+        });
         tracing::debug!("Connected to server: {:?}", azookey_client);
 
         Ok(Self {
             azookey_client,
             window_client,
-            runtime: Arc::new(runtime),
+            runtime,
+            performance_log_tx,
         })
     }
 }
@@ -116,7 +183,34 @@ impl IPCService {
         self.azookey_client = refreshed.azookey_client;
         self.window_client = refreshed.window_client;
         self.runtime = refreshed.runtime;
+        self.performance_log_tx = refreshed.performance_log_tx;
         Ok(())
+    }
+
+    fn log_client_performance(
+        &mut self,
+        request_id: u64,
+        operation: &str,
+        stage: &str,
+        elapsed: Duration,
+        details: String,
+    ) {
+        if !client_performance_log_enabled() {
+            return;
+        }
+
+        let request = PerformanceLogRequest {
+            request_id,
+            component: "ime".to_string(),
+            operation: operation.to_string(),
+            stage: stage.to_string(),
+            elapsed_ms: duration_millis_u64(elapsed),
+            details,
+        };
+
+        if let Err(error) = self.performance_log_tx.send(request) {
+            tracing::debug!("failed to enqueue client performance log: {error:?}");
+        }
     }
 
     #[tracing::instrument]
@@ -175,12 +269,16 @@ impl IPCService {
         input_style: i32,
         previous_candidates: Option<&Candidates>,
     ) -> anyhow::Result<Candidates> {
+        let request_id = next_request_id();
+        let operation_start = Instant::now();
+        let input_len = text.chars().count();
         let send = |this: &mut Self| -> anyhow::Result<
             tonic::Response<shared::proto::AppendTextResponse>,
         > {
             let request = tonic::Request::new(shared::proto::AppendTextRequest {
                 text_to_append: text.clone(),
                 input_style,
+                request_id,
             });
 
             let response = this
@@ -208,6 +306,15 @@ impl IPCService {
                         tracing::error!(
                             "append_text IPC reconnect failed (style={input_style}): {reconnect_error:?}"
                         );
+                        self.log_client_performance(
+                            request_id,
+                            "append_text",
+                            "rpc_total",
+                            operation_start.elapsed(),
+                            format!(
+                                "status=error;phase=reconnect;input_len={input_len};input_style={input_style}"
+                            ),
+                        );
                         return Err(reconnect_error);
                     }
                 }
@@ -220,13 +327,32 @@ impl IPCService {
                                 "append_text recovered unchanged composition after reconnect (style={input_style}), retrying original input"
                             );
                             let retry_response = send(self)?;
-                            return Self::candidates_from_composing_text(
+                            let candidates = Self::candidates_from_composing_text(
                                 retry_response.into_inner().composing_text,
+                            )?;
+                            self.log_client_performance(
+                                request_id,
+                                "append_text",
+                                "rpc_total",
+                                operation_start.elapsed(),
+                                format!(
+                                    "status=success;retry=true;input_len={input_len};input_style={input_style}"
+                                ),
                             );
+                            return Ok(candidates);
                         }
 
                         tracing::info!(
                             "append_text recovered changed composition after reconnect (style={input_style}), reusing server state"
+                        );
+                        self.log_client_performance(
+                            request_id,
+                            "append_text",
+                            "rpc_total",
+                            operation_start.elapsed(),
+                            format!(
+                                "status=recovered_changed;input_len={input_len};input_style={input_style}"
+                            ),
                         );
                         return Ok(candidates);
                     }
@@ -234,61 +360,134 @@ impl IPCService {
                         tracing::error!(
                             "append_text refresh failed after reconnect (style={input_style}): {refresh_error:?}"
                         );
+                        self.log_client_performance(
+                            request_id,
+                            "append_text",
+                            "rpc_total",
+                            operation_start.elapsed(),
+                            format!(
+                                "status=error;phase=refresh;input_len={input_len};input_style={input_style}"
+                            ),
+                        );
                         return Err(refresh_error);
                     }
                 }
             }
         };
-        Self::candidates_from_composing_text(response.into_inner().composing_text)
+        let candidates =
+            Self::candidates_from_composing_text(response.into_inner().composing_text)?;
+        self.log_client_performance(
+            request_id,
+            "append_text",
+            "rpc_total",
+            operation_start.elapsed(),
+            format!("status=success;input_len={input_len};input_style={input_style}"),
+        );
+        Ok(candidates)
     }
 
     #[tracing::instrument]
     pub fn remove_text(&mut self) -> anyhow::Result<Candidates> {
-        let request = tonic::Request::new(shared::proto::RemoveTextRequest {});
+        let request_id = next_request_id();
+        let operation_start = Instant::now();
+        let request = tonic::Request::new(shared::proto::RemoveTextRequest { request_id });
         let response = self
             .runtime
             .clone()
             .block_on(self.azookey_client.remove_text(request))?;
-        Self::candidates_from_composing_text(response.into_inner().composing_text)
+        let candidates =
+            Self::candidates_from_composing_text(response.into_inner().composing_text)?;
+        self.log_client_performance(
+            request_id,
+            "remove_text",
+            "rpc_total",
+            operation_start.elapsed(),
+            "status=success".to_string(),
+        );
+        Ok(candidates)
     }
 
     #[tracing::instrument]
     pub fn clear_text(&mut self) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::ClearTextRequest {});
+        let request_id = next_request_id();
+        let operation_start = Instant::now();
+        let request = tonic::Request::new(shared::proto::ClearTextRequest { request_id });
         let _response = self
             .runtime
             .clone()
             .block_on(self.azookey_client.clear_text(request))?;
+        self.log_client_performance(
+            request_id,
+            "clear_text",
+            "rpc_total",
+            operation_start.elapsed(),
+            "status=success".to_string(),
+        );
 
         Ok(())
     }
 
     #[tracing::instrument]
     pub fn shrink_text(&mut self, offset: i32) -> anyhow::Result<Candidates> {
-        let request = tonic::Request::new(shared::proto::ShrinkTextRequest { offset });
+        let request_id = next_request_id();
+        let operation_start = Instant::now();
+        let request = tonic::Request::new(shared::proto::ShrinkTextRequest { offset, request_id });
         let response = self
             .runtime
             .clone()
             .block_on(self.azookey_client.shrink_text(request))?;
-        Self::candidates_from_composing_text(response.into_inner().composing_text)
+        let candidates =
+            Self::candidates_from_composing_text(response.into_inner().composing_text)?;
+        self.log_client_performance(
+            request_id,
+            "shrink_text",
+            "rpc_total",
+            operation_start.elapsed(),
+            format!("status=success;offset={offset}"),
+        );
+        Ok(candidates)
     }
 
     #[tracing::instrument]
     pub fn move_cursor(&mut self, offset: i32) -> anyhow::Result<Candidates> {
-        let request = tonic::Request::new(shared::proto::MoveCursorRequest { offset });
+        let request_id = next_request_id();
+        let operation_start = Instant::now();
+        let request = tonic::Request::new(shared::proto::MoveCursorRequest { offset, request_id });
         let response = self
             .runtime
             .clone()
             .block_on(self.azookey_client.move_cursor(request))?;
-        Self::candidates_from_composing_text(response.into_inner().composing_text)
+        let candidates =
+            Self::candidates_from_composing_text(response.into_inner().composing_text)?;
+        self.log_client_performance(
+            request_id,
+            "move_cursor",
+            "rpc_total",
+            operation_start.elapsed(),
+            format!("status=success;offset={offset}"),
+        );
+        Ok(candidates)
     }
 
     pub fn set_context(&mut self, context: String) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::SetContextRequest { context });
+        let request_id = next_request_id();
+        let operation_start = Instant::now();
+        let context_len = context.chars().count();
+        let request = tonic::Request::new(shared::proto::SetContextRequest {
+            context,
+            request_id,
+        });
         let _response = self
             .runtime
             .clone()
             .block_on(self.azookey_client.set_context(request))?;
+        self.log_client_performance(
+            request_id,
+            "set_context",
+            "rpc_total",
+            operation_start.elapsed(),
+            format!("status=success;context_len={context_len}"),
+        );
 
         Ok(())
     }

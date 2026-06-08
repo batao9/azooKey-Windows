@@ -6,33 +6,41 @@ use windows::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass, HIG
 use shared::proto::azookey_service_server::{AzookeyService, AzookeyServiceServer};
 use shared::proto::{
     AppendTextRequest, AppendTextResponse, ClearTextRequest, ClearTextResponse, ComposingText,
-    MoveCursorRequest, MoveCursorResponse, RemoveTextRequest, RemoveTextResponse,
-    ShrinkTextRequest, ShrinkTextResponse, Suggestion,
+    MoveCursorRequest, MoveCursorResponse, PerformanceLogRequest, PerformanceLogResponse,
+    RemoveTextRequest, RemoveTextResponse, ShrinkTextRequest, ShrinkTextResponse, Suggestion,
 };
+use shared::AppConfig;
 
 use std::{
     backtrace::Backtrace,
     ffi::{c_char, c_int, CStr, CString},
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{BufWriter, Write},
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, OnceLock,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const USE_ZENZAI: bool = true;
 const INPUT_STYLE_DIRECT: i32 = 1;
 const SERVER_LOG_FILE_NAME: &str = "server.log";
+const SERVER_PERFORMANCE_LOG_FILE_NAME: &str = "server-performance.tsv";
+const SERVER_PERFORMANCE_LOG_HEADER: &str =
+    "timestamp_ms\trequest_id\tcomponent\toperation\tstage\telapsed_ms\tdetails";
+const LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
+const LOG_FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const WARMUP_INTERVAL_SECS: u64 = 30;
 
-static SERVER_LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
-static SERVER_LOG_LEVEL: OnceLock<ServerLogLevel> = OnceLock::new();
+static SERVER_LOG_WORKER: OnceLock<ServerLogWorker> = OnceLock::new();
+static SERVER_LOG_ENABLED: AtomicBool = AtomicBool::new(false);
+static SERVER_PERFORMANCE_LOG_ENABLED: AtomicBool = AtomicBool::new(false);
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-static HAS_ACTIVE_COMPOSITION: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+const SERVER_GENERATED_REQUEST_ID_PREFIX: u64 = 1 << 63;
+static HAS_ACTIVE_COMPOSITION: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum ServerLogLevel {
@@ -44,26 +52,6 @@ enum ServerLogLevel {
 }
 
 impl ServerLogLevel {
-    fn from_label(label: &str) -> Self {
-        if label.eq_ignore_ascii_case("off") {
-            Self::Off
-        } else if label.eq_ignore_ascii_case("error") || label.eq_ignore_ascii_case("panic") {
-            Self::Error
-        } else if label.eq_ignore_ascii_case("warn") || label.eq_ignore_ascii_case("warning") {
-            Self::Warn
-        } else if label.eq_ignore_ascii_case("debug") {
-            Self::Debug
-        } else {
-            Self::Info
-        }
-    }
-
-    fn from_environment() -> Self {
-        std::env::var("AZOOKEY_SERVER_LOG_LEVEL")
-            .map(|value| Self::from_label(&value))
-            .unwrap_or(Self::Warn)
-    }
-
     fn as_str(self) -> &'static str {
         match self {
             Self::Off => "OFF",
@@ -75,12 +63,268 @@ impl ServerLogLevel {
     }
 }
 
-fn current_server_log_level() -> ServerLogLevel {
-    *SERVER_LOG_LEVEL.get_or_init(ServerLogLevel::from_environment)
+#[derive(Clone, Debug)]
+struct LogPaths {
+    server_log: PathBuf,
+    performance_log: PathBuf,
+}
+
+#[derive(Default)]
+struct ServerLogSinks {
+    normal: Option<RotatingLogSink>,
+    performance: Option<RotatingLogSink>,
+}
+
+impl ServerLogSinks {
+    fn flush_all(&mut self) {
+        if let Some(sink) = self.normal.as_mut() {
+            sink.flush();
+        }
+        if let Some(sink) = self.performance.as_mut() {
+            sink.flush();
+        }
+    }
+}
+
+struct ServerLogWorker {
+    sender: mpsc::Sender<ServerLogCommand>,
+}
+
+#[derive(Default)]
+struct ServerLogConfigureResult {
+    normal_enabled: bool,
+    performance_enabled: bool,
+}
+
+enum ServerLogCommand {
+    Configure {
+        paths: Option<LogPaths>,
+        ack: mpsc::Sender<ServerLogConfigureResult>,
+    },
+    WriteLog(String),
+    WritePerformance(String),
+    Flush(mpsc::Sender<()>),
+}
+
+struct RotatingLogSink {
+    path: PathBuf,
+    writer: BufWriter<File>,
+    bytes_written: u64,
+    header: Option<&'static str>,
+    last_flush: Instant,
+}
+
+impl RotatingLogSink {
+    fn open(path: PathBuf, header: Option<&'static str>) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        rotate_existing_log_if_needed(&path)?;
+
+        let bytes_written = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        let needs_header = header.is_some() && bytes_written == 0;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut sink = Self {
+            path,
+            writer: BufWriter::new(file),
+            bytes_written,
+            header,
+            last_flush: Instant::now(),
+        };
+
+        if needs_header {
+            if let Some(header) = sink.header {
+                sink.write_raw_line(header)?;
+                sink.flush();
+            }
+        }
+
+        Ok(sink)
+    }
+
+    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        let line_bytes = line.len() as u64 + 1;
+        if self.bytes_written.saturating_add(line_bytes) > LOG_MAX_BYTES {
+            self.rotate()?;
+        }
+
+        self.write_raw_line(line)?;
+        if self.last_flush.elapsed() >= LOG_FLUSH_INTERVAL {
+            self.flush();
+        }
+
+        Ok(())
+    }
+
+    fn write_raw_line(&mut self, line: &str) -> std::io::Result<()> {
+        self.writer.write_all(line.as_bytes())?;
+        self.writer.write_all(b"\n")?;
+        self.bytes_written = self.bytes_written.saturating_add(line.len() as u64 + 1);
+        Ok(())
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        self.flush();
+        let rotated_path = rotated_log_path(&self.path);
+        match fs::remove_file(&rotated_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        match fs::rename(&self.path, rotated_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        self.writer = BufWriter::new(file);
+        self.bytes_written = 0;
+        self.last_flush = Instant::now();
+
+        if let Some(header) = self.header {
+            self.write_raw_line(header)?;
+        }
+
+        Ok(())
+    }
+
+    fn flush(&mut self) {
+        let _ = self.writer.flush();
+        self.last_flush = Instant::now();
+    }
+}
+
+fn rotated_log_path(path: &std::path::Path) -> PathBuf {
+    let Some(file_name) = path.file_name() else {
+        return path.with_extension("1");
+    };
+    let mut rotated_file_name = file_name.to_os_string();
+    rotated_file_name.push(".1");
+    path.with_file_name(rotated_file_name)
+}
+
+fn rotate_existing_log_if_needed(path: &std::path::Path) -> std::io::Result<()> {
+    let Ok(metadata) = path.metadata() else {
+        return Ok(());
+    };
+
+    if metadata.len() <= LOG_MAX_BYTES {
+        return Ok(());
+    }
+
+    let rotated_path = rotated_log_path(path);
+    match fs::remove_file(&rotated_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::rename(path, rotated_path)
+}
+
+fn server_log_worker() -> &'static ServerLogWorker {
+    SERVER_LOG_WORKER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("azookey-server-log-writer".to_owned())
+            .spawn(move || server_log_worker_loop(receiver))
+            .expect("failed to spawn azookey server log writer");
+        ServerLogWorker { sender }
+    })
+}
+
+fn server_log_worker_loop(receiver: mpsc::Receiver<ServerLogCommand>) {
+    let mut sinks = ServerLogSinks::default();
+
+    loop {
+        match receiver.recv_timeout(LOG_FLUSH_INTERVAL) {
+            Ok(command) => handle_server_log_command(&mut sinks, command),
+            Err(mpsc::RecvTimeoutError::Timeout) => sinks.flush_all(),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                sinks.flush_all();
+                break;
+            }
+        }
+    }
+}
+
+fn handle_server_log_command(sinks: &mut ServerLogSinks, command: ServerLogCommand) {
+    match command {
+        ServerLogCommand::Configure { paths, ack } => {
+            let result = configure_server_log_sinks(sinks, paths);
+            let _ = ack.send(result);
+        }
+        ServerLogCommand::WriteLog(line) => {
+            if let Some(sink) = sinks.normal.as_mut() {
+                eprintln!("{line}");
+                let _ = sink.write_line(&line);
+            }
+        }
+        ServerLogCommand::WritePerformance(line) => {
+            if let Some(sink) = sinks.performance.as_mut() {
+                let _ = sink.write_line(&line);
+            }
+        }
+        ServerLogCommand::Flush(ack) => {
+            sinks.flush_all();
+            let _ = ack.send(());
+        }
+    }
+}
+
+fn configure_server_log_sinks(
+    sinks: &mut ServerLogSinks,
+    paths: Option<LogPaths>,
+) -> ServerLogConfigureResult {
+    sinks.flush_all();
+    *sinks = ServerLogSinks::default();
+
+    let Some(paths) = paths else {
+        return ServerLogConfigureResult::default();
+    };
+
+    sinks.normal = match RotatingLogSink::open(paths.server_log, None) {
+        Ok(sink) => Some(sink),
+        Err(error) => {
+            eprintln!("Failed to open server log file: {error}");
+            None
+        }
+    };
+    sinks.performance =
+        match RotatingLogSink::open(paths.performance_log, Some(SERVER_PERFORMANCE_LOG_HEADER)) {
+            Ok(sink) => Some(sink),
+            Err(error) => {
+                eprintln!("Failed to open server performance log file: {error}");
+                None
+            }
+        };
+
+    ServerLogConfigureResult {
+        normal_enabled: sinks.normal.is_some(),
+        performance_enabled: sinks.performance.is_some(),
+    }
+}
+
+fn send_server_log_command(command: ServerLogCommand) {
+    if let Err(error) = server_log_worker().sender.send(command) {
+        eprintln!("Failed to send server log command: {error}");
+    }
 }
 
 fn should_log(level: ServerLogLevel) -> bool {
-    level <= current_server_log_level()
+    if level == ServerLogLevel::Off {
+        return false;
+    }
+
+    SERVER_LOG_ENABLED.load(Ordering::Relaxed)
+}
+
+fn should_log_performance() -> bool {
+    SERVER_PERFORMANCE_LOG_ENABLED.load(Ordering::Relaxed)
 }
 
 macro_rules! log_event_lazy {
@@ -88,6 +332,21 @@ macro_rules! log_event_lazy {
         let level = $level;
         if should_log(level) {
             log_event(level, &format!($($arg)*));
+        }
+    }};
+}
+
+macro_rules! performance_event_lazy {
+    ($request_id:expr, $operation:expr, $stage:expr, $elapsed_ms:expr, $($arg:tt)*) => {{
+        if should_log_performance() {
+            log_performance_event(
+                $request_id,
+                "rust",
+                $operation,
+                $stage,
+                $elapsed_ms,
+                &format!($($arg)*),
+            );
         }
     }};
 }
@@ -127,6 +386,13 @@ unsafe extern "C" {
     fn FreeCString(ptr: *mut c_char);
     fn FreeCandidateList(ptr: *mut *mut FFICandidate, length: c_int);
     fn LoadConfig();
+    fn SetRequestId(request_id: u64);
+    fn SetServerLogCallbacks(
+        log_enabled: extern "C" fn() -> bool,
+        performance_log_enabled: extern "C" fn() -> bool,
+        write_log: extern "C" fn(*const c_char, *const c_char),
+        write_performance_log: extern "C" fn(u64, *const c_char, *const c_char, u64, *const c_char),
+    );
 }
 
 struct OwnedFfiString {
@@ -202,7 +468,36 @@ impl Drop for OwnedFfiCandidates {
 }
 
 fn next_request_id() -> u64 {
-    REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    SERVER_GENERATED_REQUEST_ID_PREFIX | REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
+
+fn request_id_or_next(request_id: u64) -> u64 {
+    if request_id == 0 {
+        next_request_id()
+    } else {
+        request_id
+    }
+}
+
+fn set_request_id(request_id: u64) {
+    unsafe {
+        SetRequestId(request_id);
+    }
+}
+
+fn register_server_log_callbacks() {
+    unsafe {
+        SetServerLogCallbacks(
+            AzookeyServerLogEnabled,
+            AzookeyServerPerformanceLogEnabled,
+            AzookeyServerLogFromSwift,
+            AzookeyServerPerformanceLogFromSwift,
+        );
+    }
+}
+
+fn elapsed_ms(start: Instant) -> u128 {
+    start.elapsed().as_millis()
 }
 
 fn now_timestamp_millis() -> u128 {
@@ -212,66 +507,179 @@ fn now_timestamp_millis() -> u128 {
         .unwrap_or_default()
 }
 
-fn resolve_server_log_path() -> PathBuf {
+fn resolve_log_path(file_name: &str) -> PathBuf {
     if let Ok(appdata) = std::env::var("APPDATA") {
         PathBuf::from(appdata)
             .join("Azookey")
             .join("logs")
-            .join(SERVER_LOG_FILE_NAME)
+            .join(file_name)
     } else {
         std::env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("."))
             .join("logs")
-            .join(SERVER_LOG_FILE_NAME)
+            .join(file_name)
     }
 }
 
-fn init_server_log_file() -> PathBuf {
-    let log_path = resolve_server_log_path();
-    let mut file = None;
+fn configure_server_logging(enabled: bool) -> Option<LogPaths> {
+    let paths = enabled.then(|| LogPaths {
+        server_log: resolve_log_path(SERVER_LOG_FILE_NAME),
+        performance_log: resolve_log_path(SERVER_PERFORMANCE_LOG_FILE_NAME),
+    });
+    let (ack_tx, ack_rx) = mpsc::channel();
+    send_server_log_command(ServerLogCommand::Configure {
+        paths: paths.clone(),
+        ack: ack_tx,
+    });
 
-    if let Some(parent) = log_path.parent() {
-        if let Err(error) = fs::create_dir_all(parent) {
-            eprintln!("Failed to create log directory: {error}");
-        } else {
-            match OpenOptions::new().create(true).append(true).open(&log_path) {
-                Ok(opened) => file = Some(opened),
-                Err(error) => eprintln!("Failed to open server log file: {error}"),
-            }
+    match ack_rx.recv_timeout(LOG_FLUSH_ACK_TIMEOUT) {
+        Ok(result) => {
+            SERVER_LOG_ENABLED.store(result.normal_enabled, Ordering::Relaxed);
+            SERVER_PERFORMANCE_LOG_ENABLED.store(result.performance_enabled, Ordering::Relaxed);
+        }
+        Err(error) => {
+            SERVER_LOG_ENABLED.store(false, Ordering::Relaxed);
+            SERVER_PERFORMANCE_LOG_ENABLED.store(false, Ordering::Relaxed);
+            eprintln!("Timed out configuring server logging: {error}");
         }
     }
 
-    let slot = SERVER_LOG_FILE.get_or_init(|| Mutex::new(None));
-    if let Ok(mut guard) = slot.lock() {
-        *guard = file;
-    }
+    paths
+}
 
-    log_path
+fn reload_server_logging_from_settings() -> Option<LogPaths> {
+    let enabled = AppConfig::read()
+        .map(|config| config.debug.server_log_enabled)
+        .unwrap_or(false);
+    configure_server_logging(enabled)
+}
+
+fn flush_server_logs() {
+    let (ack_tx, ack_rx) = mpsc::channel();
+    send_server_log_command(ServerLogCommand::Flush(ack_tx));
+    if let Err(error) = ack_rx.recv_timeout(LOG_FLUSH_ACK_TIMEOUT) {
+        eprintln!("Timed out flushing server logs: {error}");
+    }
 }
 
 fn log_event(level: ServerLogLevel, message: &str) {
+    log_event_with_component(None, level, message);
+}
+
+fn log_event_with_component(component: Option<&str>, level: ServerLogLevel, message: &str) {
     if !should_log(level) {
         return;
     }
 
-    let line = format!(
-        "[{}] [{}] {}",
-        now_timestamp_millis(),
-        level.as_str(),
-        message
-    );
-    eprintln!("{line}");
+    let level_label = if let Some(component) = component {
+        format!("{component}/{}", level.as_str())
+    } else {
+        level.as_str().to_owned()
+    };
+    let line = format!("[{}] [{}] {}", now_timestamp_millis(), level_label, message);
 
-    if let Some(slot) = SERVER_LOG_FILE.get() {
-        if let Ok(mut guard) = slot.lock() {
-            if let Some(file) = guard.as_mut() {
-                let _ = writeln!(file, "{line}");
-                let _ = file.flush();
-            }
-        }
+    send_server_log_command(ServerLogCommand::WriteLog(line));
+}
+
+fn sanitize_performance_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '\t' | '\r' | '\n' => ' ',
+            _ => ch,
+        })
+        .collect()
+}
+
+fn log_performance_event(
+    request_id: u64,
+    component: &str,
+    operation: &str,
+    stage: &str,
+    elapsed_ms: u128,
+    details: &str,
+) {
+    if !should_log_performance() {
+        return;
     }
+
+    let line = format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        now_timestamp_millis(),
+        request_id,
+        sanitize_performance_field(component),
+        sanitize_performance_field(operation),
+        sanitize_performance_field(stage),
+        elapsed_ms,
+        sanitize_performance_field(details),
+    );
+
+    send_server_log_command(ServerLogCommand::WritePerformance(line));
+}
+
+fn optional_cstr_lossy(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn server_log_level_from_str(level: &str) -> ServerLogLevel {
+    match level.to_ascii_uppercase().as_str() {
+        "ERROR" => ServerLogLevel::Error,
+        "WARN" | "WARNING" => ServerLogLevel::Warn,
+        "INFO" => ServerLogLevel::Info,
+        "DEBUG" => ServerLogLevel::Debug,
+        _ => ServerLogLevel::Info,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn AzookeyServerLogEnabled() -> bool {
+    SERVER_LOG_ENABLED.load(Ordering::Relaxed)
+}
+
+#[no_mangle]
+pub extern "C" fn AzookeyServerPerformanceLogEnabled() -> bool {
+    should_log_performance()
+}
+
+#[no_mangle]
+pub extern "C" fn AzookeyServerLogFromSwift(level: *const c_char, message: *const c_char) {
+    if !AzookeyServerLogEnabled() {
+        return;
+    }
+
+    let level = server_log_level_from_str(&optional_cstr_lossy(level));
+    let message = optional_cstr_lossy(message);
+    log_event_with_component(Some("SWIFT"), level, &message);
+}
+
+#[no_mangle]
+pub extern "C" fn AzookeyServerPerformanceLogFromSwift(
+    request_id: u64,
+    operation: *const c_char,
+    stage: *const c_char,
+    elapsed_ms: u64,
+    details: *const c_char,
+) {
+    if !should_log_performance() {
+        return;
+    }
+
+    log_performance_event(
+        request_id,
+        "swift",
+        &optional_cstr_lossy(operation),
+        &optional_cstr_lossy(stage),
+        elapsed_ms as u128,
+        &optional_cstr_lossy(details),
+    );
 }
 
 fn install_panic_hook() {
@@ -302,6 +710,7 @@ fn install_panic_hook() {
             ServerLogLevel::Error,
             &format!("payload={payload}; location={location}; backtrace={backtrace}"),
         );
+        flush_server_logs();
 
         default_hook(panic_info);
     }));
@@ -535,45 +944,53 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<AppendTextRequest>,
     ) -> Result<Response<AppendTextResponse>, Status> {
-        let request_id = next_request_id();
-        let handler_start = now_timestamp_millis();
         let request = request.into_inner();
+        let request_id = request_id_or_next(request.request_id);
+        set_request_id(request_id);
+        let handler_start = Instant::now();
+        let input_style = request.input_style;
         let input = request.text_to_append;
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[append_text:{request_id}] start input_len={} input_style={}",
-            input.chars().count(),
-            request.input_style
-        );
-        let t0 = now_timestamp_millis();
-        let composing_text = if request.input_style == INPUT_STYLE_DIRECT {
+        let input_len = input.chars().count();
+        let append_start = Instant::now();
+        let composing_text = if input_style == INPUT_STYLE_DIRECT {
             add_text_direct(&input).map_err(|error| status_from_error("append_text", error))?
         } else {
             add_text(&input).map_err(|error| status_from_error("append_text", error))?
         };
-        let t1 = now_timestamp_millis();
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[append_text:{request_id}] add_text elapsed_ms={}",
-            t1.saturating_sub(t0)
+        performance_event_lazy!(
+            request_id,
+            "append_text",
+            "swift_append_text",
+            elapsed_ms(append_start),
+            "input_len={input_len};input_style={input_style}"
         );
+        let get_composed_start = Instant::now();
         let composed_text =
             get_composed_text(false).map_err(|error| status_from_error("append_text", error))?;
-        let t2 = now_timestamp_millis();
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[append_text:{request_id}] get_composed_text elapsed_ms={}",
-            t2.saturating_sub(t1)
+        performance_event_lazy!(
+            request_id,
+            "append_text",
+            "swift_get_composed_text",
+            elapsed_ms(get_composed_start),
+            "suggestions={};hiragana_len={}",
+            composed_text.suggestions.len(),
+            composed_text
+                .hiragana
+                .as_ref()
+                .unwrap_or(&composing_text.text)
+                .chars()
+                .count()
         );
         update_active_composition_state(&composing_text.text);
-
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[append_text:{request_id}] success cursor={} hiragana_len={} suggestions={} total_elapsed_ms={}",
+        performance_event_lazy!(
+            request_id,
+            "append_text",
+            "total",
+            elapsed_ms(handler_start),
+            "status=success;cursor={};hiragana_len={};suggestions={}",
             composing_text.cursor,
             composing_text.text.chars().count(),
-            composed_text.suggestions.len(),
-            t2.saturating_sub(handler_start)
+            composed_text.suggestions.len()
         );
 
         Ok(Response::new(AppendTextResponse {
@@ -586,38 +1003,44 @@ impl AzookeyService for MyAzookeyService {
 
     async fn remove_text(
         &self,
-        _: Request<RemoveTextRequest>,
+        request: Request<RemoveTextRequest>,
     ) -> Result<Response<RemoveTextResponse>, Status> {
-        let request_id = next_request_id();
-        let handler_start = now_timestamp_millis();
-        log_event_lazy!(ServerLogLevel::Info, "[remove_text:{request_id}] start");
+        let request_id = request_id_or_next(request.into_inner().request_id);
+        set_request_id(request_id);
+        let handler_start = Instant::now();
 
-        let t0 = now_timestamp_millis();
+        let remove_start = Instant::now();
         let composing_text =
             remove_text().map_err(|error| status_from_error("remove_text", error))?;
-        let t1 = now_timestamp_millis();
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[remove_text:{request_id}] remove_text elapsed_ms={}",
-            t1.saturating_sub(t0)
+        performance_event_lazy!(
+            request_id,
+            "remove_text",
+            "swift_remove_text",
+            elapsed_ms(remove_start),
+            "hiragana_len={}",
+            composing_text.text.chars().count()
         );
+        let get_composed_start = Instant::now();
         let composed_text =
             get_composed_text(false).map_err(|error| status_from_error("remove_text", error))?;
-        let t2 = now_timestamp_millis();
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[remove_text:{request_id}] get_composed_text elapsed_ms={}",
-            t2.saturating_sub(t1)
+        performance_event_lazy!(
+            request_id,
+            "remove_text",
+            "swift_get_composed_text",
+            elapsed_ms(get_composed_start),
+            "suggestions={}",
+            composed_text.suggestions.len()
         );
         update_active_composition_state(&composing_text.text);
-
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[remove_text:{request_id}] success cursor={} hiragana_len={} suggestions={} total_elapsed_ms={}",
+        performance_event_lazy!(
+            request_id,
+            "remove_text",
+            "total",
+            elapsed_ms(handler_start),
+            "status=success;cursor={};hiragana_len={};suggestions={}",
             composing_text.cursor,
             composing_text.text.chars().count(),
-            composed_text.suggestions.len(),
-            t2.saturating_sub(handler_start)
+            composed_text.suggestions.len()
         );
 
         Ok(Response::new(RemoveTextResponse {
@@ -632,42 +1055,46 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<MoveCursorRequest>,
     ) -> Result<Response<MoveCursorResponse>, Status> {
-        let request_id = next_request_id();
-        let handler_start = now_timestamp_millis();
-        let raw_offset = request.into_inner().offset;
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[move_cursor:{request_id}] start offset={raw_offset}"
-        );
+        let request = request.into_inner();
+        let request_id = request_id_or_next(request.request_id);
+        set_request_id(request_id);
+        let handler_start = Instant::now();
+        let raw_offset = request.offset;
 
         let offset = i8_offset_from_i32("move_cursor", raw_offset)?;
         let use_cursor_prefix = offset == 0;
-        let t0 = now_timestamp_millis();
+        let move_start = Instant::now();
         let composing_text =
             move_cursor(offset).map_err(|error| status_from_error("move_cursor", error))?;
-        let t1 = now_timestamp_millis();
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[move_cursor:{request_id}] move_cursor elapsed_ms={}",
-            t1.saturating_sub(t0)
+        performance_event_lazy!(
+            request_id,
+            "move_cursor",
+            "swift_move_cursor",
+            elapsed_ms(move_start),
+            "offset={raw_offset};hiragana_len={}",
+            composing_text.text.chars().count()
         );
+        let get_composed_start = Instant::now();
         let composed_text = get_composed_text(use_cursor_prefix)
             .map_err(|error| status_from_error("move_cursor", error))?;
-        let t2 = now_timestamp_millis();
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[move_cursor:{request_id}] get_composed_text elapsed_ms={}",
-            t2.saturating_sub(t1)
+        performance_event_lazy!(
+            request_id,
+            "move_cursor",
+            "swift_get_composed_text",
+            elapsed_ms(get_composed_start),
+            "use_cursor_prefix={use_cursor_prefix};suggestions={}",
+            composed_text.suggestions.len()
         );
         update_active_composition_state(&composing_text.text);
-
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[move_cursor:{request_id}] success cursor={} hiragana_len={} suggestions={} use_cursor_prefix={use_cursor_prefix} total_elapsed_ms={}",
+        performance_event_lazy!(
+            request_id,
+            "move_cursor",
+            "total",
+            elapsed_ms(handler_start),
+            "status=success;cursor={};hiragana_len={};suggestions={};use_cursor_prefix={use_cursor_prefix}",
             composing_text.cursor,
             composing_text.text.chars().count(),
-            composed_text.suggestions.len(),
-            t2.saturating_sub(handler_start)
+            composed_text.suggestions.len()
         );
 
         Ok(Response::new(MoveCursorResponse {
@@ -680,19 +1107,26 @@ impl AzookeyService for MyAzookeyService {
 
     async fn clear_text(
         &self,
-        _: Request<ClearTextRequest>,
+        request: Request<ClearTextRequest>,
     ) -> Result<Response<ClearTextResponse>, Status> {
-        let request_id = next_request_id();
-        let handler_start = now_timestamp_millis();
-        log_event_lazy!(ServerLogLevel::Info, "[clear_text:{request_id}] start");
-        let t0 = now_timestamp_millis();
+        let request_id = request_id_or_next(request.into_inner().request_id);
+        set_request_id(request_id);
+        let handler_start = Instant::now();
+        let clear_start = Instant::now();
         clear_text();
-        let t1 = now_timestamp_millis();
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[clear_text:{request_id}] success clear_text_elapsed_ms={} total_elapsed_ms={}",
-            t1.saturating_sub(t0),
-            t1.saturating_sub(handler_start)
+        performance_event_lazy!(
+            request_id,
+            "clear_text",
+            "swift_clear_text",
+            elapsed_ms(clear_start),
+            "status=success"
+        );
+        performance_event_lazy!(
+            request_id,
+            "clear_text",
+            "total",
+            elapsed_ms(handler_start),
+            "status=success"
         );
         HAS_ACTIVE_COMPOSITION.store(false, Ordering::Relaxed);
         Ok(Response::new(ClearTextResponse {}))
@@ -702,40 +1136,44 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<ShrinkTextRequest>,
     ) -> Result<Response<ShrinkTextResponse>, Status> {
-        let request_id = next_request_id();
-        let handler_start = now_timestamp_millis();
-        let raw_offset = request.into_inner().offset;
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[shrink_text:{request_id}] start offset={raw_offset}"
-        );
+        let request = request.into_inner();
+        let request_id = request_id_or_next(request.request_id);
+        set_request_id(request_id);
+        let handler_start = Instant::now();
+        let raw_offset = request.offset;
 
         let offset = i8_offset_from_i32("shrink_text", raw_offset)?;
-        let t0 = now_timestamp_millis();
+        let shrink_start = Instant::now();
         let composing_text =
             shrink_text(offset).map_err(|error| status_from_error("shrink_text", error))?;
-        let t1 = now_timestamp_millis();
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[shrink_text:{request_id}] shrink_text elapsed_ms={}",
-            t1.saturating_sub(t0)
+        performance_event_lazy!(
+            request_id,
+            "shrink_text",
+            "swift_shrink_text",
+            elapsed_ms(shrink_start),
+            "offset={raw_offset};hiragana_len={}",
+            composing_text.text.chars().count()
         );
+        let get_composed_start = Instant::now();
         let composed_text =
             get_composed_text(false).map_err(|error| status_from_error("shrink_text", error))?;
-        let t2 = now_timestamp_millis();
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[shrink_text:{request_id}] get_composed_text elapsed_ms={}",
-            t2.saturating_sub(t1)
+        performance_event_lazy!(
+            request_id,
+            "shrink_text",
+            "swift_get_composed_text",
+            elapsed_ms(get_composed_start),
+            "suggestions={}",
+            composed_text.suggestions.len()
         );
         update_active_composition_state(&composing_text.text);
-
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[shrink_text:{request_id}] success hiragana_len={} suggestions={} total_elapsed_ms={}",
+        performance_event_lazy!(
+            request_id,
+            "shrink_text",
+            "total",
+            elapsed_ms(handler_start),
+            "status=success;hiragana_len={};suggestions={}",
             composing_text.text.chars().count(),
-            composed_text.suggestions.len(),
-            t2.saturating_sub(handler_start)
+            composed_text.suggestions.len()
         );
 
         Ok(Response::new(ShrinkTextResponse {
@@ -750,72 +1188,101 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<shared::proto::SetContextRequest>,
     ) -> Result<Response<shared::proto::SetContextResponse>, Status> {
-        let request_id = next_request_id();
-        let handler_start = now_timestamp_millis();
-        let context = request.into_inner().context;
+        let request = request.into_inner();
+        let request_id = request_id_or_next(request.request_id);
+        set_request_id(request_id);
+        let handler_start = Instant::now();
+        let context = request.context;
         let trimmed_context = context
             .split('\r')
             .filter(|s| !s.is_empty())
             .last()
             .unwrap_or_default();
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[set_context:{request_id}] start original_len={} trimmed_len={}",
-            context.chars().count(),
-            trimmed_context.chars().count()
-        );
+        let original_len = context.chars().count();
+        let trimmed_len = trimmed_context.chars().count();
 
         let context = cstring_from_input("SetContext.context", trimmed_context)
             .map_err(|error| status_from_error("set_context", error))?;
 
-        let t0 = now_timestamp_millis();
+        let set_context_start = Instant::now();
         unsafe { SetContext(context.as_ptr()) };
-        let t1 = now_timestamp_millis();
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[set_context:{request_id}] success set_context_elapsed_ms={} total_elapsed_ms={}",
-            t1.saturating_sub(t0),
-            t1.saturating_sub(handler_start)
+        performance_event_lazy!(
+            request_id,
+            "set_context",
+            "swift_set_context",
+            elapsed_ms(set_context_start),
+            "original_len={original_len};trimmed_len={trimmed_len}"
+        );
+        performance_event_lazy!(
+            request_id,
+            "set_context",
+            "total",
+            elapsed_ms(handler_start),
+            "status=success"
         );
         Ok(Response::new(shared::proto::SetContextResponse {}))
     }
 
     async fn update_config(
         &self,
-        _: Request<shared::proto::UpdateConfigRequest>,
+        request: Request<shared::proto::UpdateConfigRequest>,
     ) -> Result<Response<shared::proto::UpdateConfigResponse>, Status> {
-        let request_id = next_request_id();
-        let handler_start = now_timestamp_millis();
-        log_event_lazy!(ServerLogLevel::Info, "[update_config:{request_id}] start");
-        let t0 = now_timestamp_millis();
+        let request_id = request_id_or_next(request.into_inner().request_id);
+        let _log_paths = reload_server_logging_from_settings();
+        set_request_id(request_id);
+        let handler_start = Instant::now();
+        let load_config_start = Instant::now();
         unsafe { LoadConfig() };
-        let t1 = now_timestamp_millis();
         let has_active_composition = query_active_composition_state();
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[update_config:{request_id}] load_config_elapsed_ms={}",
-            t1.saturating_sub(t0)
+        performance_event_lazy!(
+            request_id,
+            "update_config",
+            "swift_load_config",
+            elapsed_ms(load_config_start),
+            "active_composition={has_active_composition}"
         );
         HAS_ACTIVE_COMPOSITION.store(has_active_composition, Ordering::Relaxed);
-        log_event_lazy!(
-            ServerLogLevel::Info,
-            "[update_config:{request_id}] success active_composition={} total_elapsed_ms={}",
-            has_active_composition,
-            t1.saturating_sub(handler_start)
+        performance_event_lazy!(
+            request_id,
+            "update_config",
+            "total",
+            elapsed_ms(handler_start),
+            "status=success;active_composition={has_active_composition}"
         );
         Ok(Response::new(shared::proto::UpdateConfigResponse {}))
+    }
+
+    async fn log_performance(
+        &self,
+        request: Request<PerformanceLogRequest>,
+    ) -> Result<Response<PerformanceLogResponse>, Status> {
+        let request = request.into_inner();
+        log_performance_event(
+            request.request_id,
+            &request.component,
+            &request.operation,
+            &request.stage,
+            u128::from(request.elapsed_ms),
+            &request.details,
+        );
+        Ok(Response::new(PerformanceLogResponse {}))
     }
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let log_path = init_server_log_file();
     install_panic_hook();
-    log_event_lazy!(
-        ServerLogLevel::Info,
-        "AzookeyServer started (log_path={})",
-        log_path.display()
-    );
+    if let Some(log_paths) = reload_server_logging_from_settings() {
+        log_event(
+            ServerLogLevel::Info,
+            &format!(
+                "AzookeyServer started (log_path={} performance_log_path={})",
+                log_paths.server_log.display(),
+                log_paths.performance_log.display()
+            ),
+        );
+    }
+    register_server_log_callbacks();
 
     // プロセス優先度を HIGH_PRIORITY_CLASS に引き上げ（放置後のOSスケジューリング遅延を抑制）
     unsafe {
@@ -852,6 +1319,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             log_event_lazy!(ServerLogLevel::Debug, "[warmup] start");
+            set_request_id(0);
             warmup();
             log_event_lazy!(ServerLogLevel::Debug, "[warmup] done");
         }
