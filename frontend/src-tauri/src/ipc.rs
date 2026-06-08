@@ -100,7 +100,7 @@ fn should_retry_pipe_connect_error(
 // implement methods to interact with kkc server
 impl IPCService {
     pub fn update_config(&mut self) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::UpdateConfigRequest {});
+        let request = tonic::Request::new(shared::proto::UpdateConfigRequest { request_id: 0 });
         self.runtime
             .clone()
             .block_on(self.azookey_client.update_config(request))?;

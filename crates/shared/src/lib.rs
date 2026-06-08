@@ -436,7 +436,8 @@ pub fn zenzai_cpu_backend_supported() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, ConfigError, GeneralConfig, NumpadInputMode, CONFIG_VERSION, SETTINGS_FILENAME,
+        AppConfig, ConfigError, DebugConfig, GeneralConfig, NumpadInputMode, CONFIG_VERSION,
+        SETTINGS_FILENAME,
     };
     use std::{
         env,
@@ -518,6 +519,14 @@ mod tests {
     }
 
     #[test]
+    fn debug_server_log_defaults_to_off() {
+        assert!(!DebugConfig::default().server_log_enabled);
+
+        let deserialized: DebugConfig = serde_json::from_str("{}").unwrap();
+        assert!(!deserialized.server_log_enabled);
+    }
+
+    #[test]
     fn new_creates_default_settings_when_file_is_missing() {
         let temp = tempfile::tempdir().unwrap();
         let _appdata = AppDataGuard::set(temp.path());
@@ -582,6 +591,74 @@ mod tests {
 
         assert_eq!(migrated.version, CONFIG_VERSION);
         assert_eq!(migrated.general.numpad_input, NumpadInputMode::DirectInput);
+    }
+
+    #[test]
+    fn new_with_recovery_repairs_mojibake_default_romaji_table() {
+        let temp = tempfile::tempdir().unwrap();
+        let _appdata = AppDataGuard::set(temp.path());
+        let config_root = temp.path().join("Azookey");
+        fs::create_dir_all(&config_root).unwrap();
+        let config_path = config_root.join(SETTINGS_FILENAME);
+        let mut config = AppConfig::default();
+        for row in &mut config.romaji_table.rows {
+            row.output = "繝ｼ".to_string();
+        }
+        fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let result = AppConfig::new_with_recovery().unwrap();
+
+        assert_eq!(
+            result
+                .config
+                .romaji_table
+                .rows
+                .iter()
+                .find(|row| row.input == "-")
+                .unwrap()
+                .output,
+            "ー"
+        );
+        assert_eq!(
+            result
+                .config
+                .romaji_table
+                .rows
+                .iter()
+                .find(|row| row.input == "a")
+                .unwrap()
+                .output,
+            "あ"
+        );
+
+        let saved: AppConfig = serde_json::from_str(&fs::read_to_string(config_path).unwrap())
+            .expect("rewritten settings should be valid JSON");
+        assert_eq!(
+            saved
+                .romaji_table
+                .rows
+                .iter()
+                .find(|row| row.input == "a")
+                .unwrap()
+                .output,
+            "あ"
+        );
+    }
+
+    #[test]
+    fn read_keeps_custom_romaji_table_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let _appdata = AppDataGuard::set(temp.path());
+        let config_root = temp.path().join("Azookey");
+        fs::create_dir_all(&config_root).unwrap();
+        let config_path = config_root.join(SETTINGS_FILENAME);
+        let mut config = AppConfig::default();
+        config.romaji_table.rows[0].output = "custom".to_string();
+        fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let loaded = AppConfig::read().unwrap();
+
+        assert_eq!(loaded.romaji_table.rows[0].output, "custom");
     }
 
     #[test]
@@ -676,6 +753,12 @@ pub struct ShortcutConfig {
     pub alt_backquote_toggle: bool,
 }
 
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct DebugConfig {
+    #[serde(default)]
+    pub server_log_enabled: bool,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CharacterWidthConfig {
     #[serde(default = "default_symbol_fullwidth_map")]
@@ -749,6 +832,8 @@ impl Default for ShortcutConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AppConfig {
     pub version: String,
+    #[serde(default)]
+    pub debug: DebugConfig,
     pub zenzai: ZenzaiConfig,
     #[serde(default)]
     pub shortcuts: ShortcutConfig,
@@ -766,6 +851,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         AppConfig {
             version: CONFIG_VERSION.to_string(),
+            debug: DebugConfig::default(),
             zenzai: ZenzaiConfig {
                 enable: false,
                 profile: "".to_string(),
@@ -904,7 +990,52 @@ fn parse_config(config_path: &Path, config_str: &str) -> Result<AppConfig, Confi
         config.version = CONFIG_VERSION.to_string();
     }
 
+    repair_mojibake_default_romaji_table(&mut config);
+
     Ok(config)
+}
+
+fn repair_mojibake_default_romaji_table(config: &mut AppConfig) {
+    if romaji_table_looks_like_mojibake_default(&config.romaji_table.rows) {
+        config.romaji_table.rows = default_romaji_rows();
+    }
+}
+
+fn romaji_table_looks_like_mojibake_default(rows: &[RomajiRule]) -> bool {
+    let default_rows = default_romaji_rows();
+    if rows.len() != default_rows.len() {
+        return false;
+    }
+
+    let matching_keys = rows
+        .iter()
+        .zip(default_rows.iter())
+        .filter(|(row, default_row)| {
+            row.input == default_row.input && row.next_input == default_row.next_input
+        })
+        .count();
+    if matching_keys < default_rows.len().saturating_mul(9) / 10 {
+        return false;
+    }
+
+    let differing_outputs = rows
+        .iter()
+        .zip(default_rows.iter())
+        .filter(|(row, default_row)| row.output != default_row.output)
+        .count();
+    let mojibake_outputs = rows
+        .iter()
+        .filter(|row| contains_common_utf8_mojibake_marker(&row.output))
+        .count();
+
+    differing_outputs > default_rows.len() / 2 && mojibake_outputs > 10
+}
+
+fn contains_common_utf8_mojibake_marker(value: &str) -> bool {
+    const MARKERS: [&str; 12] = [
+        "繝", "縺", "繧", "窶", "竊", "縲", "荳", "譁", "ã", "Ã", "Â", "â",
+    ];
+    MARKERS.iter().any(|marker| value.contains(marker))
 }
 
 fn ensure_config_dir(config_root: &Path) -> Result<(), ConfigError> {

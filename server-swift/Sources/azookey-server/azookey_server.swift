@@ -35,99 +35,152 @@ let minInputCountForZenzaiCandidates = 4
 let minHiraganaCountForZenzaiCandidates = 2
 // Request exact-clause supplements only when boundary-matched candidates are sparse.
 let cursorPrefixExactClauseSupplementCandidateThreshold = 5
-let serverLogFileName = "server.log"
 
-private enum ServerLogLevel: Int {
-    case off = 0
-    case error = 1
-    case warn = 2
-    case info = 3
-    case debug = 4
+@MainActor var currentRequestId: UInt64 = 0
 
-    init(label: String) {
-        switch label.lowercased() {
-        case "off":
-            self = .off
-        case "error", "panic":
-            self = .error
-        case "warn", "warning":
-            self = .warn
-        case "debug":
-            self = .debug
-        default:
-            self = .info
+public typealias ServerLogEnabledCallback = @convention(c) () -> Bool
+public typealias ServerLogWriteCallback = @convention(c) (
+    UnsafePointer<CChar>?,
+    UnsafePointer<CChar>?
+) -> Void
+public typealias ServerPerformanceLogWriteCallback = @convention(c) (
+    UInt64,
+    UnsafePointer<CChar>?,
+    UnsafePointer<CChar>?,
+    UInt64,
+    UnsafePointer<CChar>?
+) -> Void
+
+private final class ServerLogCallbacks: @unchecked Sendable {
+    private let lock = NSLock()
+    private var logEnabled: ServerLogEnabledCallback?
+    private var performanceLogEnabled: ServerLogEnabledCallback?
+    private var writeLog: ServerLogWriteCallback?
+    private var writePerformanceLog: ServerPerformanceLogWriteCallback?
+
+    func configure(
+        logEnabled: ServerLogEnabledCallback?,
+        performanceLogEnabled: ServerLogEnabledCallback?,
+        writeLog: ServerLogWriteCallback?,
+        writePerformanceLog: ServerPerformanceLogWriteCallback?
+    ) {
+        lock.lock()
+        self.logEnabled = logEnabled
+        self.performanceLogEnabled = performanceLogEnabled
+        self.writeLog = writeLog
+        self.writePerformanceLog = writePerformanceLog
+        lock.unlock()
+    }
+
+    func isLogEnabled() -> Bool {
+        lock.lock()
+        let callback = logEnabled
+        lock.unlock()
+        return callback?() ?? false
+    }
+
+    func isPerformanceLogEnabled() -> Bool {
+        lock.lock()
+        let callback = performanceLogEnabled
+        lock.unlock()
+        return callback?() ?? false
+    }
+
+    func log(level: String, message: String) {
+        lock.lock()
+        let callback = writeLog
+        lock.unlock()
+
+        guard let callback else {
+            return
+        }
+
+        level.withCString { levelPointer in
+            message.withCString { messagePointer in
+                callback(levelPointer, messagePointer)
+            }
         }
     }
 
-    static func fromEnvironment() -> Self {
-        guard let rawValue = ProcessInfo.processInfo.environment["AZOOKEY_SERVER_LOG_LEVEL"] else {
-            return .warn
+    func performanceLog(
+        requestId: UInt64,
+        operation: String,
+        stage: String,
+        elapsedMs: UInt64,
+        details: String
+    ) {
+        lock.lock()
+        let callback = writePerformanceLog
+        lock.unlock()
+
+        guard let callback else {
+            return
         }
-        return .init(label: rawValue)
+
+        operation.withCString { operationPointer in
+            stage.withCString { stagePointer in
+                details.withCString { detailsPointer in
+                    callback(requestId, operationPointer, stagePointer, elapsedMs, detailsPointer)
+                }
+            }
+        }
     }
 }
 
-private let serverLogThreshold = ServerLogLevel.fromEnvironment()
+private let serverLogCallbacks = ServerLogCallbacks()
 
-private func serverLogPath() -> URL {
-    if let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] {
-        return URL(filePath: appDataPath)
-            .appendingPathComponent("Azookey")
-            .appendingPathComponent("logs")
-            .appendingPathComponent(serverLogFileName)
-    }
-
-    return (executableDirectoryURL() ?? URL(filePath: FileManager.default.currentDirectoryPath))
-        .appendingPathComponent("logs")
-        .appendingPathComponent(serverLogFileName)
-}
-
-private func serverLogTimestampMillis() -> UInt64 {
-    UInt64(Date().timeIntervalSince1970 * 1000)
+@_silgen_name("SetServerLogCallbacks")
+public func set_server_log_callbacks(
+    _ logEnabled: ServerLogEnabledCallback?,
+    _ performanceLogEnabled: ServerLogEnabledCallback?,
+    _ writeLog: ServerLogWriteCallback?,
+    _ writePerformanceLog: ServerPerformanceLogWriteCallback?
+) {
+    serverLogCallbacks.configure(
+        logEnabled: logEnabled,
+        performanceLogEnabled: performanceLogEnabled,
+        writeLog: writeLog,
+        writePerformanceLog: writePerformanceLog
+    )
 }
 
 private func serverLog(_ level: String = "INFO", _ message: @autoclosure () -> String) {
-    let resolvedLevel = ServerLogLevel(label: level)
-    guard resolvedLevel.rawValue <= serverLogThreshold.rawValue else {
+    guard serverLogCallbacks.isLogEnabled() else {
         return
     }
 
-    let resolvedMessage = message()
-    let line = "[\(serverLogTimestampMillis())] [SWIFT/\(level)] \(resolvedMessage)"
-    fputs("\(line)\n", stderr)
+    serverLogCallbacks.log(level: level, message: message())
+}
 
-    let logPath = serverLogPath()
-    let logDirectory = logPath.deletingLastPathComponent()
-
-    do {
-        try FileManager.default.createDirectory(
-            at: logDirectory,
-            withIntermediateDirectories: true
-        )
-    } catch {
-        fputs("Failed to create log directory: \(error)\n", stderr)
+@MainActor private func performanceLog(
+    operation: String,
+    stage: String,
+    elapsedMs: Int,
+    details: @autoclosure () -> String = ""
+) {
+    guard serverLogCallbacks.isPerformanceLogEnabled() else {
         return
     }
 
-    if !FileManager.default.fileExists(atPath: logPath.path) {
-        FileManager.default.createFile(atPath: logPath.path, contents: nil)
-    }
+    serverLogCallbacks.performanceLog(
+        requestId: currentRequestId,
+        operation: operation,
+        stage: stage,
+        elapsedMs: UInt64(max(0, elapsedMs)),
+        details: details()
+    )
+}
 
-    guard let handle = FileHandle(forWritingAtPath: logPath.path) else {
-        fputs("Failed to open log file at \(logPath.path)\n", stderr)
-        return
+private func settingsPath() -> URL? {
+    guard let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] else {
+        return nil
     }
+    return URL(filePath: appDataPath).appendingPathComponent("Azookey/settings.json")
+}
 
-    defer {
-        handle.closeFile()
-    }
-
-    guard let data = "\(line)\n".data(using: .utf8) else {
-        return
-    }
-
-    handle.seekToEndOfFile()
-    handle.write(data)
+private func readAppSettings(at path: URL) throws -> AppSettings {
+    let data = try Data(contentsOf: path)
+    return try JSONDecoder().decode(AppSettings.self, from: data)
 }
 
 @MainActor private func rebuildConverter() {
@@ -925,6 +978,18 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 
 @_silgen_name("LoadConfig")
 @MainActor public func load_config() {
+    let loadedSettingsPath = settingsPath()
+    var loadedSettings: AppSettings?
+    var settingsLoadError: Error?
+    if let loadedSettingsPath {
+        do {
+            let settings = try readAppSettings(at: loadedSettingsPath)
+            loadedSettings = settings
+        } catch {
+            settingsLoadError = error
+        }
+    }
+
     serverLog("INFO", "LoadConfig: start")
     let previousZenzaiEnabled = (config["enable"] as? Bool) ?? false
     let previousProfile = (config["profile"] as? String) ?? ""
@@ -945,70 +1010,66 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     config["backend"] = "cpu"
     setRoman2KanaInputStyle()
 
-    if let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] {
-        let settingsPath = URL(filePath: appDataPath).appendingPathComponent("Azookey/settings.json")
-        serverLog("INFO", "LoadConfig: reading settingsPath=\(settingsPath.path)")
-        
-        do {
-            let data = try Data(contentsOf: settingsPath)
-            let settings = try JSONDecoder().decode(AppSettings.self, from: data)
-
-            if let zenzai = settings.zenzai {
-                if let enableValue = zenzai.enable {
-                    config["enable"] = enableValue
-                }
-
-                if let profileValue = zenzai.profile {
-                    config["profile"] = profileValue
-                }
-
-                if let backendValue = zenzai.backend {
-                    config["backend"] = backendValue
-                }
-            }
-
-            applyRomajiInputStyle(rows: settings.romaji_table?.rows)
-
-            let sourceEntries = settings.user_dictionary?.entries ?? []
-            var seen: Set<String> = []
-            var priorityRank = 0
-            for entry in sourceEntries {
-                if dynamicUserDictionary.count >= maxUserDictionaryEntryCount {
-                    break
-                }
-
-                let reading = entry.reading.trimmingCharacters(in: .whitespacesAndNewlines)
-                let word = entry.word.trimmingCharacters(in: .whitespacesAndNewlines)
-                if reading.isEmpty || word.isEmpty {
-                    continue
-                }
-
-                let normalizedReading = normalizeReading(reading)
-                let key = normalizedReading + "\u{0}" + word
-                if seen.contains(key) {
-                    continue
-                }
-                seen.insert(key)
-
-                let priorityAdjustedValue = PValue(-5 - Float(priorityRank) * 0.01)
-                dynamicUserDictionary.append(
-                    DicdataElement(
-                        word: word,
-                        ruby: normalizedReading,
-                        cid: CIDData.固有名詞.cid,
-                        mid: MIDData.一般.mid,
-                        value: priorityAdjustedValue
-                    )
-                )
-                priorityRank += 1
-            }
-
-            if sourceEntries.count > maxUserDictionaryEntryCount {
-                serverLog("WARN", "User dictionary entries are truncated to \(maxUserDictionaryEntryCount).")
-            }
-        } catch {
-            serverLog("ERROR", "Failed to read settings: \(error)")
+    if let settings = loadedSettings {
+        if let loadedSettingsPath {
+            serverLog("INFO", "LoadConfig: reading settingsPath=\(loadedSettingsPath.path)")
         }
+
+        if let zenzai = settings.zenzai {
+            if let enableValue = zenzai.enable {
+                config["enable"] = enableValue
+            }
+
+            if let profileValue = zenzai.profile {
+                config["profile"] = profileValue
+            }
+
+            if let backendValue = zenzai.backend {
+                config["backend"] = backendValue
+            }
+        }
+
+        applyRomajiInputStyle(rows: settings.romaji_table?.rows)
+
+        let sourceEntries = settings.user_dictionary?.entries ?? []
+        var seen: Set<String> = []
+        var priorityRank = 0
+        for entry in sourceEntries {
+            if dynamicUserDictionary.count >= maxUserDictionaryEntryCount {
+                break
+            }
+
+            let reading = entry.reading.trimmingCharacters(in: .whitespacesAndNewlines)
+            let word = entry.word.trimmingCharacters(in: .whitespacesAndNewlines)
+            if reading.isEmpty || word.isEmpty {
+                continue
+            }
+
+            let normalizedReading = normalizeReading(reading)
+            let key = normalizedReading + "\u{0}" + word
+            if seen.contains(key) {
+                continue
+            }
+            seen.insert(key)
+
+            let priorityAdjustedValue = PValue(-5 - Float(priorityRank) * 0.01)
+            dynamicUserDictionary.append(
+                DicdataElement(
+                    word: word,
+                    ruby: normalizedReading,
+                    cid: CIDData.固有名詞.cid,
+                    mid: MIDData.一般.mid,
+                    value: priorityAdjustedValue
+                )
+            )
+            priorityRank += 1
+        }
+
+        if sourceEntries.count > maxUserDictionaryEntryCount {
+            serverLog("WARN", "User dictionary entries are truncated to \(maxUserDictionaryEntryCount).")
+        }
+    } else if let settingsLoadError {
+        serverLog("ERROR", "Failed to read settings: \(settingsLoadError)")
     } else {
         serverLog("WARN", "LoadConfig: APPDATA is not set. Using defaults.")
     }
@@ -1075,6 +1136,11 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     )
 }
 
+@_silgen_name("SetRequestId")
+@MainActor public func set_request_id(_ requestID: UInt64) {
+    currentRequestId = requestID
+}
+
 @_silgen_name("Warmup")
 @MainActor public func warmup() {
     let contextString = (config["context"] as? String) ?? ""
@@ -1088,9 +1154,17 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
         "DEBUG",
         "Warmup: start hiraganaLength=\(warmupComposingText.convertTarget.count) inputCount=\(warmupComposingText.input.count) contextLength=\(contextString.count) useZenzai=\(useZenzai)"
     )
+    let requestStart = ProcessInfo.processInfo.systemUptime
     _ = converter.requestCandidates(
         warmupComposingText,
         options: getOptions(context: contextString, zenzaiEnabled: useZenzai)
+    )
+    let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
+    performanceLog(
+        operation: "warmup",
+        stage: "request_candidates",
+        elapsedMs: requestMs,
+        details: "use_zenzai=\(useZenzai);hiragana_len=\(warmupComposingText.convertTarget.count);input_count=\(warmupComposingText.input.count)"
     )
     serverLog("DEBUG", "Warmup: completed")
 }
@@ -1266,7 +1340,13 @@ public func free_candidate_list(
     let requestStart = ProcessInfo.processInfo.systemUptime
     let converted = converter.requestCandidates(previewComposingText, options: options)
     let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
-    serverLog("INFO", "GetComposedText: requestCandidates returned candidateCount=\(converted.mainResults.count) elapsed_ms=\(requestMs)")
+    performanceLog(
+        operation: "get_composed_text",
+        stage: "request_candidates",
+        elapsedMs: requestMs,
+        details: "candidate_count=\(converted.mainResults.count);use_zenzai=\(useZenzai);synthetic_end_of_text=\(previewState.syntheticEndOfText);hiragana_len=\(originalHiragana.count);preview_hiragana_len=\(previewHiragana.count)"
+    )
+    serverLog("INFO", "GetComposedText: requestCandidates returned candidateCount=\(converted.mainResults.count)")
     var result: [FFICandidate] = []
 
     for i in 0..<converted.mainResults.count {
@@ -1374,7 +1454,13 @@ public func free_candidate_list(
             resolutionCache: &cursorPrefixResolutionCache
         )
     let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
-    serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates returned candidateCount=\(cursorPrefixResults.count) firstClauseCandidateCount=\(converted.firstClauseResults.count) mainCandidateCount=\(converted.mainResults.count) exactClauseCandidateCount=\(exactClauseResults.count) elapsed_ms=\(requestMs)")
+    performanceLog(
+        operation: "get_composed_text_for_cursor_prefix",
+        stage: "request_candidates",
+        elapsedMs: requestMs,
+        details: "candidate_count=\(cursorPrefixResults.count);first_clause_candidate_count=\(converted.firstClauseResults.count);main_candidate_count=\(converted.mainResults.count);exact_clause_candidate_count=\(exactClauseResults.count);use_zenzai=\(useZenzai);synthetic_end_of_text=\(previewState.syntheticEndOfText);prefix_len=\(prefixHiragana.count);preview_prefix_len=\(previewPrefixHiragana.count);suffix_len=\(suffixAfterCursor.count)"
+    )
+    serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates returned candidateCount=\(cursorPrefixResults.count) firstClauseCandidateCount=\(converted.firstClauseResults.count) mainCandidateCount=\(converted.mainResults.count) exactClauseCandidateCount=\(exactClauseResults.count)")
     var result: [FFICandidate] = []
 
     for i in 0..<cursorPrefixResults.count {
