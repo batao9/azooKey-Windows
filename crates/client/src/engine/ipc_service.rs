@@ -8,6 +8,7 @@ use shared::{
     AppConfig,
 };
 use std::{
+    cell::Cell,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
@@ -25,6 +26,10 @@ const CLIENT_LOG_CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 static CLIENT_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static CLIENT_LOG_CONFIG_CACHE: OnceLock<Mutex<ClientLogConfigCache>> = OnceLock::new();
+
+thread_local! {
+    static CLIENT_INPUT_TRACE_REQUEST_ID: Cell<Option<u64>> = const { Cell::new(None) };
+}
 
 #[derive(Debug, Default)]
 struct ClientLogConfigCache {
@@ -56,11 +61,21 @@ fn next_request_id() -> u64 {
     (u64::from(std::process::id()) << 32) | (counter & 0xffff_ffff)
 }
 
+fn current_or_next_request_id() -> u64 {
+    CLIENT_INPUT_TRACE_REQUEST_ID
+        .with(|current| current.get())
+        .unwrap_or_else(next_request_id)
+}
+
+pub(crate) fn current_input_trace_request_id() -> Option<u64> {
+    CLIENT_INPUT_TRACE_REQUEST_ID.with(|current| current.get())
+}
+
 fn client_log_config_cache() -> &'static Mutex<ClientLogConfigCache> {
     CLIENT_LOG_CONFIG_CACHE.get_or_init(|| Mutex::new(ClientLogConfigCache::default()))
 }
 
-fn client_performance_log_enabled() -> bool {
+pub(crate) fn client_performance_log_enabled() -> bool {
     let Ok(mut cache) = client_log_config_cache().lock() else {
         return false;
     };
@@ -81,6 +96,38 @@ fn client_performance_log_enabled() -> bool {
 
 fn duration_millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn client_performance_start() -> Option<Instant> {
+    client_performance_log_enabled().then(Instant::now)
+}
+
+#[derive(Debug)]
+pub(crate) struct ClientInputTraceGuard {
+    request_id: u64,
+    previous_request_id: Option<u64>,
+}
+
+impl ClientInputTraceGuard {
+    pub(crate) fn begin() -> Self {
+        let request_id = next_request_id();
+        let previous_request_id =
+            CLIENT_INPUT_TRACE_REQUEST_ID.with(|current| current.replace(Some(request_id)));
+        Self {
+            request_id,
+            previous_request_id,
+        }
+    }
+
+    pub(crate) fn request_id(&self) -> u64 {
+        self.request_id
+    }
+}
+
+impl Drop for ClientInputTraceGuard {
+    fn drop(&mut self) {
+        CLIENT_INPUT_TRACE_REQUEST_ID.with(|current| current.set(self.previous_request_id));
+    }
 }
 
 impl IPCService {
@@ -187,18 +234,14 @@ impl IPCService {
         Ok(())
     }
 
-    fn log_client_performance(
-        &mut self,
+    fn enqueue_client_performance(
+        &self,
         request_id: u64,
         operation: &str,
         stage: &str,
         elapsed: Duration,
         details: String,
     ) {
-        if !client_performance_log_enabled() {
-            return;
-        }
-
         let request = PerformanceLogRequest {
             request_id,
             component: "ime".to_string(),
@@ -210,6 +253,40 @@ impl IPCService {
 
         if let Err(error) = self.performance_log_tx.send(request) {
             tracing::debug!("failed to enqueue client performance log: {error:?}");
+        }
+    }
+
+    pub(crate) fn log_client_performance(
+        &self,
+        request_id: u64,
+        operation: &str,
+        stage: &str,
+        elapsed: Duration,
+        details: String,
+    ) {
+        if !client_performance_log_enabled() {
+            return;
+        }
+
+        self.enqueue_client_performance(request_id, operation, stage, elapsed, details);
+    }
+
+    fn log_client_performance_from_start(
+        &self,
+        start: Option<Instant>,
+        request_id: u64,
+        operation: &str,
+        stage: &str,
+        details: impl FnOnce() -> String,
+    ) {
+        if let Some(start) = start {
+            self.enqueue_client_performance(
+                request_id,
+                operation,
+                stage,
+                start.elapsed(),
+                details(),
+            );
         }
     }
 
@@ -269,9 +346,9 @@ impl IPCService {
         input_style: i32,
         previous_candidates: Option<&Candidates>,
     ) -> anyhow::Result<Candidates> {
-        let request_id = next_request_id();
-        let operation_start = Instant::now();
-        let input_len = text.chars().count();
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
+        let input_len = performance_start.map(|_| text.chars().count());
         let send = |this: &mut Self| -> anyhow::Result<
             tonic::Response<shared::proto::AppendTextResponse>,
         > {
@@ -306,14 +383,17 @@ impl IPCService {
                         tracing::error!(
                             "append_text IPC reconnect failed (style={input_style}): {reconnect_error:?}"
                         );
-                        self.log_client_performance(
+                        self.log_client_performance_from_start(
+                            performance_start,
                             request_id,
                             "append_text",
                             "rpc_total",
-                            operation_start.elapsed(),
-                            format!(
-                                "status=error;phase=reconnect;input_len={input_len};input_style={input_style}"
-                            ),
+                            || {
+                                let input_len = input_len.unwrap_or_default();
+                                format!(
+                                    "status=error;phase=reconnect;input_len={input_len};input_style={input_style}"
+                                )
+                            },
                         );
                         return Err(reconnect_error);
                     }
@@ -330,14 +410,17 @@ impl IPCService {
                             let candidates = Self::candidates_from_composing_text(
                                 retry_response.into_inner().composing_text,
                             )?;
-                            self.log_client_performance(
+                            self.log_client_performance_from_start(
+                                performance_start,
                                 request_id,
                                 "append_text",
                                 "rpc_total",
-                                operation_start.elapsed(),
-                                format!(
-                                    "status=success;retry=true;input_len={input_len};input_style={input_style}"
-                                ),
+                                || {
+                                    let input_len = input_len.unwrap_or_default();
+                                    format!(
+                                        "status=success;retry=true;input_len={input_len};input_style={input_style}"
+                                    )
+                                },
                             );
                             return Ok(candidates);
                         }
@@ -345,14 +428,17 @@ impl IPCService {
                         tracing::info!(
                             "append_text recovered changed composition after reconnect (style={input_style}), reusing server state"
                         );
-                        self.log_client_performance(
+                        self.log_client_performance_from_start(
+                            performance_start,
                             request_id,
                             "append_text",
                             "rpc_total",
-                            operation_start.elapsed(),
-                            format!(
-                                "status=recovered_changed;input_len={input_len};input_style={input_style}"
-                            ),
+                            || {
+                                let input_len = input_len.unwrap_or_default();
+                                format!(
+                                    "status=recovered_changed;input_len={input_len};input_style={input_style}"
+                                )
+                            },
                         );
                         return Ok(candidates);
                     }
@@ -360,14 +446,17 @@ impl IPCService {
                         tracing::error!(
                             "append_text refresh failed after reconnect (style={input_style}): {refresh_error:?}"
                         );
-                        self.log_client_performance(
+                        self.log_client_performance_from_start(
+                            performance_start,
                             request_id,
                             "append_text",
                             "rpc_total",
-                            operation_start.elapsed(),
-                            format!(
-                                "status=error;phase=refresh;input_len={input_len};input_style={input_style}"
-                            ),
+                            || {
+                                let input_len = input_len.unwrap_or_default();
+                                format!(
+                                    "status=error;phase=refresh;input_len={input_len};input_style={input_style}"
+                                )
+                            },
                         );
                         return Err(refresh_error);
                     }
@@ -376,20 +465,23 @@ impl IPCService {
         };
         let candidates =
             Self::candidates_from_composing_text(response.into_inner().composing_text)?;
-        self.log_client_performance(
+        self.log_client_performance_from_start(
+            performance_start,
             request_id,
             "append_text",
             "rpc_total",
-            operation_start.elapsed(),
-            format!("status=success;input_len={input_len};input_style={input_style}"),
+            || {
+                let input_len = input_len.unwrap_or_default();
+                format!("status=success;input_len={input_len};input_style={input_style}")
+            },
         );
         Ok(candidates)
     }
 
     #[tracing::instrument]
     pub fn remove_text(&mut self) -> anyhow::Result<Candidates> {
-        let request_id = next_request_id();
-        let operation_start = Instant::now();
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
         let request = tonic::Request::new(shared::proto::RemoveTextRequest { request_id });
         let response = self
             .runtime
@@ -397,31 +489,31 @@ impl IPCService {
             .block_on(self.azookey_client.remove_text(request))?;
         let candidates =
             Self::candidates_from_composing_text(response.into_inner().composing_text)?;
-        self.log_client_performance(
+        self.log_client_performance_from_start(
+            performance_start,
             request_id,
             "remove_text",
             "rpc_total",
-            operation_start.elapsed(),
-            "status=success".to_string(),
+            || "status=success".to_string(),
         );
         Ok(candidates)
     }
 
     #[tracing::instrument]
     pub fn clear_text(&mut self) -> anyhow::Result<()> {
-        let request_id = next_request_id();
-        let operation_start = Instant::now();
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
         let request = tonic::Request::new(shared::proto::ClearTextRequest { request_id });
         let _response = self
             .runtime
             .clone()
             .block_on(self.azookey_client.clear_text(request))?;
-        self.log_client_performance(
+        self.log_client_performance_from_start(
+            performance_start,
             request_id,
             "clear_text",
             "rpc_total",
-            operation_start.elapsed(),
-            "status=success".to_string(),
+            || "status=success".to_string(),
         );
 
         Ok(())
@@ -429,8 +521,8 @@ impl IPCService {
 
     #[tracing::instrument]
     pub fn shrink_text(&mut self, offset: i32) -> anyhow::Result<Candidates> {
-        let request_id = next_request_id();
-        let operation_start = Instant::now();
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
         let request = tonic::Request::new(shared::proto::ShrinkTextRequest { offset, request_id });
         let response = self
             .runtime
@@ -438,20 +530,20 @@ impl IPCService {
             .block_on(self.azookey_client.shrink_text(request))?;
         let candidates =
             Self::candidates_from_composing_text(response.into_inner().composing_text)?;
-        self.log_client_performance(
+        self.log_client_performance_from_start(
+            performance_start,
             request_id,
             "shrink_text",
             "rpc_total",
-            operation_start.elapsed(),
-            format!("status=success;offset={offset}"),
+            || format!("status=success;offset={offset}"),
         );
         Ok(candidates)
     }
 
     #[tracing::instrument]
     pub fn move_cursor(&mut self, offset: i32) -> anyhow::Result<Candidates> {
-        let request_id = next_request_id();
-        let operation_start = Instant::now();
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
         let request = tonic::Request::new(shared::proto::MoveCursorRequest { offset, request_id });
         let response = self
             .runtime
@@ -459,20 +551,20 @@ impl IPCService {
             .block_on(self.azookey_client.move_cursor(request))?;
         let candidates =
             Self::candidates_from_composing_text(response.into_inner().composing_text)?;
-        self.log_client_performance(
+        self.log_client_performance_from_start(
+            performance_start,
             request_id,
             "move_cursor",
             "rpc_total",
-            operation_start.elapsed(),
-            format!("status=success;offset={offset}"),
+            || format!("status=success;offset={offset}"),
         );
         Ok(candidates)
     }
 
     pub fn set_context(&mut self, context: String) -> anyhow::Result<()> {
-        let request_id = next_request_id();
-        let operation_start = Instant::now();
-        let context_len = context.chars().count();
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
+        let context_len = performance_start.map(|_| context.chars().count());
         let request = tonic::Request::new(shared::proto::SetContextRequest {
             context,
             request_id,
@@ -481,12 +573,15 @@ impl IPCService {
             .runtime
             .clone()
             .block_on(self.azookey_client.set_context(request))?;
-        self.log_client_performance(
+        self.log_client_performance_from_start(
+            performance_start,
             request_id,
             "set_context",
             "rpc_total",
-            operation_start.elapsed(),
-            format!("status=success;context_len={context_len}"),
+            || {
+                let context_len = context_len.unwrap_or_default();
+                format!("status=success;context_len={context_len}")
+            },
         );
 
         Ok(())
@@ -497,22 +592,52 @@ impl IPCService {
 impl IPCService {
     #[tracing::instrument]
     pub fn show_window(&mut self) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::EmptyResponse {});
-        self.runtime
-            .clone()
-            .block_on(self.window_client.show_window(request))?;
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
+        let result: anyhow::Result<()> = (|| {
+            let request = tonic::Request::new(shared::proto::EmptyResponse {});
+            self.runtime
+                .clone()
+                .block_on(self.window_client.show_window(request))?;
 
-        Ok(())
+            Ok(())
+        })();
+        self.log_client_performance_from_start(
+            performance_start,
+            request_id,
+            "ui_show_window",
+            "rpc_total",
+            || match &result {
+                Ok(()) => "status=success".to_string(),
+                Err(error) => format!("status=error;error={error:?}"),
+            },
+        );
+        result
     }
 
     #[tracing::instrument]
     pub fn hide_window(&mut self) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::EmptyResponse {});
-        self.runtime
-            .clone()
-            .block_on(self.window_client.hide_window(request))?;
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
+        let result: anyhow::Result<()> = (|| {
+            let request = tonic::Request::new(shared::proto::EmptyResponse {});
+            self.runtime
+                .clone()
+                .block_on(self.window_client.hide_window(request))?;
 
-        Ok(())
+            Ok(())
+        })();
+        self.log_client_performance_from_start(
+            performance_start,
+            request_id,
+            "ui_hide_window",
+            "rpc_total",
+            || match &result {
+                Ok(()) => "status=success".to_string(),
+                Err(error) => format!("status=error;error={error:?}"),
+            },
+        );
+        result
     }
 
     #[tracing::instrument]
@@ -523,51 +648,121 @@ impl IPCService {
         bottom: i32,
         right: i32,
     ) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::SetPositionRequest {
-            position: Some(shared::proto::WindowPosition {
-                top,
-                left,
-                bottom,
-                right,
-            }),
-        });
-        self.runtime
-            .clone()
-            .block_on(self.window_client.set_window_position(request))?;
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
+        let result: anyhow::Result<()> = (|| {
+            let request = tonic::Request::new(shared::proto::SetPositionRequest {
+                position: Some(shared::proto::WindowPosition {
+                    top,
+                    left,
+                    bottom,
+                    right,
+                }),
+            });
+            self.runtime
+                .clone()
+                .block_on(self.window_client.set_window_position(request))?;
 
-        Ok(())
+            Ok(())
+        })();
+        self.log_client_performance_from_start(
+            performance_start,
+            request_id,
+            "ui_set_window_position",
+            "rpc_total",
+            || match &result {
+                Ok(()) => {
+                    format!("status=success;top={top};left={left};bottom={bottom};right={right}")
+                }
+                Err(error) => format!(
+                    "status=error;top={top};left={left};bottom={bottom};right={right};error={error:?}"
+                ),
+            },
+        );
+        result
     }
 
     #[tracing::instrument]
     pub fn set_candidates(&mut self, candidates: Vec<String>) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::SetCandidateRequest { candidates });
-        self.runtime
-            .clone()
-            .block_on(self.window_client.set_candidate(request))?;
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
+        let candidate_count = performance_start.map(|_| candidates.len());
+        let result: anyhow::Result<()> = (|| {
+            let request = tonic::Request::new(shared::proto::SetCandidateRequest { candidates });
+            self.runtime
+                .clone()
+                .block_on(self.window_client.set_candidate(request))?;
 
-        Ok(())
+            Ok(())
+        })();
+        self.log_client_performance_from_start(
+            performance_start,
+            request_id,
+            "ui_set_candidates",
+            "rpc_total",
+            || {
+                let candidate_count = candidate_count.unwrap_or_default();
+                match &result {
+                    Ok(()) => format!("status=success;candidate_count={candidate_count}"),
+                    Err(error) => {
+                        format!("status=error;candidate_count={candidate_count};error={error:?}")
+                    }
+                }
+            },
+        );
+        result
     }
 
     #[tracing::instrument]
     pub fn set_selection(&mut self, index: i32) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::SetSelectionRequest { index });
-        self.runtime
-            .clone()
-            .block_on(self.window_client.set_selection(request))?;
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
+        let result: anyhow::Result<()> = (|| {
+            let request = tonic::Request::new(shared::proto::SetSelectionRequest { index });
+            self.runtime
+                .clone()
+                .block_on(self.window_client.set_selection(request))?;
 
-        Ok(())
+            Ok(())
+        })();
+        self.log_client_performance_from_start(
+            performance_start,
+            request_id,
+            "ui_set_selection",
+            "rpc_total",
+            || match &result {
+                Ok(()) => format!("status=success;index={index}"),
+                Err(error) => format!("status=error;index={index};error={error:?}"),
+            },
+        );
+        result
     }
 
     #[tracing::instrument]
     pub fn set_input_mode(&mut self, mode: &str) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::SetInputModeRequest {
-            mode: mode.to_string(),
-        });
-        self.runtime
-            .clone()
-            .block_on(self.window_client.set_input_mode(request))?;
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
+        let result: anyhow::Result<()> = (|| {
+            let request = tonic::Request::new(shared::proto::SetInputModeRequest {
+                mode: mode.to_string(),
+            });
+            self.runtime
+                .clone()
+                .block_on(self.window_client.set_input_mode(request))?;
 
-        Ok(())
+            Ok(())
+        })();
+        self.log_client_performance_from_start(
+            performance_start,
+            request_id,
+            "ui_set_input_mode",
+            "rpc_total",
+            || match &result {
+                Ok(()) => format!("status=success;mode={mode}"),
+                Err(error) => format!("status=error;mode={mode};error={error:?}"),
+            },
+        );
+        result
     }
 
     #[tracing::instrument(skip(candidates))]
@@ -579,18 +774,46 @@ impl IPCService {
         selected_index: Option<i32>,
         input_mode: Option<&str>,
     ) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::UpdateCandidateWindowRequest {
-            visible,
-            position,
-            candidates: candidates.map(|candidates| shared::proto::CandidateList { candidates }),
-            selected_index,
-            input_mode: input_mode.map(ToString::to_string),
-        });
-        self.runtime
-            .clone()
-            .block_on(self.window_client.update_candidate_window(request))?;
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
+        let position_present = performance_start.map(|_| position.is_some());
+        let candidate_count = performance_start.map(|_| candidates.as_ref().map(Vec::len));
+        let input_mode_present = performance_start.map(|_| input_mode.is_some());
+        let result: anyhow::Result<()> = (|| {
+            let request = tonic::Request::new(shared::proto::UpdateCandidateWindowRequest {
+                visible,
+                position,
+                candidates: candidates
+                    .map(|candidates| shared::proto::CandidateList { candidates }),
+                selected_index,
+                input_mode: input_mode.map(ToString::to_string),
+            });
+            self.runtime
+                .clone()
+                .block_on(self.window_client.update_candidate_window(request))?;
 
-        Ok(())
+            Ok(())
+        })();
+        self.log_client_performance_from_start(
+            performance_start,
+            request_id,
+            "ui_update_candidate_window",
+            "rpc_total",
+            || {
+                let position_present = position_present.unwrap_or_default();
+                let candidate_count = candidate_count.unwrap_or_default();
+                let input_mode_present = input_mode_present.unwrap_or_default();
+                match &result {
+                    Ok(()) => format!(
+                        "status=success;visible={visible:?};position_present={position_present};candidate_count={candidate_count:?};selected_index={selected_index:?};input_mode_present={input_mode_present}"
+                    ),
+                    Err(error) => format!(
+                        "status=error;visible={visible:?};position_present={position_present};candidate_count={candidate_count:?};selected_index={selected_index:?};input_mode_present={input_mode_present};error={error:?}"
+                    ),
+                }
+            },
+        );
+        result
     }
 }
 

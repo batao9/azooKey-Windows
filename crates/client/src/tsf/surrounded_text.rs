@@ -1,7 +1,7 @@
 // reference to the original code:
 // https://github.com/google/mozc/blob/master/src/win32/tip/tip_surrounding_text.cc
 
-use std::{mem::ManuallyDrop, rc::Rc};
+use std::{mem::ManuallyDrop, rc::Rc, time::Instant};
 
 use anyhow::Result;
 use windows::{
@@ -13,11 +13,28 @@ use windows::{
     },
 };
 
-use crate::engine::state::IMEState;
+use crate::engine::{ipc_service::current_input_trace_request_id, state::IMEState};
 
 use super::{edit_session::edit_session, factory::TextServiceFactory};
 
 impl TextServiceFactory {
+    fn log_update_context_performance(
+        request_id: u64,
+        stage: &str,
+        start: Instant,
+        details: impl Into<String>,
+    ) {
+        if let Ok(Some(ipc_service)) = IMEState::ipc_service() {
+            ipc_service.log_client_performance(
+                request_id,
+                "update_context",
+                stage,
+                start.elapsed(),
+                details.into(),
+            );
+        }
+    }
+
     fn to_parent_document_if_exists(
         &self,
         document_manager: Option<ITfDocumentMgr>,
@@ -106,12 +123,15 @@ impl TextServiceFactory {
     }
 
     pub fn update_context(&self, preview: &str) -> Result<()> {
+        let trace_request_id = current_input_trace_request_id();
+        let total_start = trace_request_id.map(|_| Instant::now());
         let result: Result<()> = (|| unsafe {
             let text_service = self.borrow()?;
 
             let context = text_service.context::<ITfContext>()?;
             let parent_context = self.to_parent_context_if_exists(Some(context))?;
 
+            let edit_session_start = trace_request_id.map(|_| Instant::now());
             let preceding_text = edit_session::<String>(
                 text_service.tid,
                 parent_context.clone(),
@@ -175,6 +195,20 @@ impl TextServiceFactory {
                     }
                 }),
             )?;
+            if let (Some(request_id), Some(edit_session_start)) =
+                (trace_request_id, edit_session_start)
+            {
+                Self::log_update_context_performance(
+                    request_id,
+                    "edit_session",
+                    edit_session_start,
+                    format!(
+                        "status=success;preview_len={};preceding_text_present={}",
+                        preview.chars().count(),
+                        preceding_text.is_some()
+                    ),
+                );
+            }
 
             let Some(preceding_text) = preceding_text else {
                 return Ok(());
@@ -188,6 +222,17 @@ impl TextServiceFactory {
 
             Ok(())
         })();
+
+        if let (Some(request_id), Some(total_start)) = (trace_request_id, total_start) {
+            let details = match &result {
+                Ok(()) => format!("status=success;preview_len={}", preview.chars().count()),
+                Err(error) => format!(
+                    "status=error;preview_len={};error={error:?}",
+                    preview.chars().count()
+                ),
+            };
+            Self::log_update_context_performance(request_id, "total", total_start, details);
+        }
 
         if let Err(error) = result {
             tracing::warn!("Failed to update surrounded text context: {error:?}");
