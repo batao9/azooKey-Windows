@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
 
 use crate::{
     engine::user_action::UserAction,
@@ -11,7 +14,10 @@ use super::{
     client_action::{ClientAction, SetSelectionType, SetTextType},
     full_width::{convert_kana_symbol, to_fullwidth, to_halfwidth},
     input_mode::InputMode,
-    ipc_service::{Candidates, IPCService},
+    ipc_service::{
+        client_performance_log_enabled, current_input_trace_request_id, Candidates,
+        ClientInputTraceGuard, IPCService,
+    },
     state::{keyboard_disabled_from_context, IMEState},
     text_util::{to_half_katakana, to_katakana},
     user_action::{Function, Navigation},
@@ -37,8 +43,10 @@ pub(super) use clause_state::{
     ClauseCommand, ClauseState, ClauseTransitionInput, MoveClauseProgressMarker,
 };
 
+#[cfg(test)]
 pub(crate) struct CompositionReducer;
 
+#[cfg(test)]
 impl CompositionReducer {
     pub(crate) fn plan_actions_for_user_action(
         composition: &Composition,
@@ -284,6 +292,28 @@ impl TextServiceFactory {
         })
     }
 
+    fn log_client_performance(
+        request_id: u64,
+        operation: &str,
+        stage: &str,
+        elapsed: Duration,
+        details: impl Into<String>,
+    ) {
+        if !client_performance_log_enabled() {
+            return;
+        }
+
+        if let Ok(Some(ipc_service)) = IMEState::ipc_service() {
+            ipc_service.log_client_performance(
+                request_id,
+                operation,
+                stage,
+                elapsed,
+                details.into(),
+            );
+        }
+    }
+
     #[inline]
     fn is_ctrl_pressed() -> bool {
         VK_CONTROL.is_pressed() || VK_LCONTROL.is_pressed() || VK_RCONTROL.is_pressed()
@@ -499,15 +529,6 @@ impl TextServiceFactory {
         }
     }
 
-    fn has_romaji_table_context(
-        raw_input_before: &str,
-        symbol: char,
-        romaji_rows: &[RomajiRule],
-    ) -> bool {
-        let romaji_lookup = RomajiLookup::from_rows(romaji_rows);
-        Self::has_romaji_table_context_with_lookup(raw_input_before, symbol, &romaji_lookup)
-    }
-
     #[inline]
     fn has_romaji_table_context_with_lookup(
         raw_input_before: &str,
@@ -518,6 +539,7 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    #[cfg(test)]
     fn should_apply_symbol_fallback(
         raw_input_before: &str,
         input: &str,
@@ -540,20 +562,6 @@ impl TextServiceFactory {
         !symbols.iter().any(|symbol| {
             Self::has_romaji_table_context_with_lookup(raw_input_before, *symbol, romaji_lookup)
         })
-    }
-
-    #[inline]
-    fn has_multi_character_romaji_context(
-        raw_input_before: &str,
-        symbol: char,
-        romaji_rows: &[RomajiRule],
-    ) -> bool {
-        let romaji_lookup = RomajiLookup::from_rows(romaji_rows);
-        Self::has_multi_character_romaji_context_with_lookup(
-            raw_input_before,
-            symbol,
-            &romaji_lookup,
-        )
     }
 
     #[inline]
@@ -580,6 +588,7 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    #[cfg(test)]
     fn single_symbol_romaji_output(input: &str, romaji_rows: &[RomajiRule]) -> Option<String> {
         let romaji_lookup = RomajiLookup::from_rows(romaji_rows);
         Self::single_symbol_romaji_output_with_lookup(input, &romaji_lookup)
@@ -595,6 +604,7 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    #[cfg(test)]
     fn resolve_symbol_input_text(
         raw_input_before: &str,
         input: &str,
@@ -1450,19 +1460,61 @@ impl TextServiceFactory {
         visible: Option<bool>,
         update_pos: bool,
     ) -> Result<()> {
-        let position = if update_pos {
-            self.candidate_window_position()?
-        } else {
-            None
-        };
-        ipc_service.update_candidate_window(
-            visible,
-            position,
-            Some(candidates.texts.clone()),
-            Some(selection_index),
-            None,
-        )?;
-        Ok(())
+        let trace_request_id = current_input_trace_request_id();
+        let total_start = trace_request_id.map(|_| Instant::now());
+        let result: Result<()> = (|| {
+            let position = if update_pos {
+                let position_start = trace_request_id.map(|_| Instant::now());
+                let position = self.candidate_window_position()?;
+                if let (Some(request_id), Some(position_start)) = (trace_request_id, position_start)
+                {
+                    Self::log_client_performance(
+                        request_id,
+                        "sync_candidate_window_update",
+                        "candidate_window_position",
+                        position_start.elapsed(),
+                        format!(
+                            "status=success;position_present={};candidate_count={}",
+                            position.is_some(),
+                            candidates.texts.len()
+                        ),
+                    );
+                }
+                position
+            } else {
+                None
+            };
+            ipc_service.update_candidate_window(
+                visible,
+                position,
+                Some(candidates.texts.clone()),
+                Some(selection_index),
+                None,
+            )?;
+            Ok(())
+        })();
+
+        if let (Some(request_id), Some(total_start)) = (trace_request_id, total_start) {
+            let details = match &result {
+                Ok(()) => format!(
+                    "status=success;update_pos={update_pos};visible={visible:?};candidate_count={};selection_index={selection_index}",
+                    candidates.texts.len()
+                ),
+                Err(error) => format!(
+                    "status=error;update_pos={update_pos};visible={visible:?};candidate_count={};selection_index={selection_index};error={error:?}",
+                    candidates.texts.len()
+                ),
+            };
+            Self::log_client_performance(
+                request_id,
+                "sync_candidate_window_update",
+                "total",
+                total_start.elapsed(),
+                details,
+            );
+        }
+
+        result
     }
 
     #[inline]
@@ -2593,6 +2645,7 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    #[cfg(test)]
     fn plan_actions_for_user_action(
         composition: &Composition,
         action: &UserAction,
@@ -3005,139 +3058,213 @@ impl TextServiceFactory {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<Option<(Vec<ClientAction>, CompositionState)>> {
-        let Some(context) = context else {
-            self.set_keyboard_disabled_state(true)?;
-            return Ok(None);
-        };
-        let keyboard_disabled = keyboard_disabled_from_context(context);
-        self.set_keyboard_disabled_state(keyboard_disabled)?;
-        if keyboard_disabled {
-            self.cancel_composition_for_disabled_context();
-            return Ok(None);
-        }
+        let standalone_trace = (current_input_trace_request_id().is_none()
+            && client_performance_log_enabled())
+        .then(ClientInputTraceGuard::begin);
+        let trace_request_id = current_input_trace_request_id().or_else(|| {
+            standalone_trace
+                .as_ref()
+                .map(ClientInputTraceGuard::request_id)
+        });
+        let total_start = trace_request_id.map(|_| Instant::now());
+        let result: Result<Option<(Vec<ClientAction>, CompositionState)>> = (|| {
+            let Some(context) = context else {
+                self.set_keyboard_disabled_state(true)?;
+                return Ok(None);
+            };
+            let keyboard_disabled = keyboard_disabled_from_context(context);
+            self.set_keyboard_disabled_state(keyboard_disabled)?;
+            if keyboard_disabled {
+                self.cancel_composition_for_disabled_context();
+                return Ok(None);
+            }
 
-        let is_ctrl_pressed = Self::is_ctrl_pressed();
-        let is_alt_pressed = Self::is_alt_pressed();
-        let is_shift_pressed = Self::is_shift_pressed();
-        let is_ctrl_space = is_ctrl_pressed && wparam.0 == 0x20;
-        let is_ctrl_enter = is_ctrl_pressed && wparam.0 == 0x0D;
-        let is_ctrl_down = is_ctrl_pressed && wparam.0 == 0x28;
-        let ctrl_conversion_function =
-            Self::ctrl_conversion_shortcut_function(wparam.0, is_ctrl_pressed, is_alt_pressed);
-        let is_shift_left = is_shift_pressed && wparam.0 == 0x25;
-        let is_shift_right = is_shift_pressed && wparam.0 == 0x27;
-        let is_shift_key = Self::is_shift_key(wparam);
-        let is_alt_backquote = Self::is_alt_backquote(wparam, lparam);
-        let app_config = Self::load_app_config_or_default();
+            let is_ctrl_pressed = Self::is_ctrl_pressed();
+            let is_alt_pressed = Self::is_alt_pressed();
+            let is_shift_pressed = Self::is_shift_pressed();
+            let is_ctrl_space = is_ctrl_pressed && wparam.0 == 0x20;
+            let is_ctrl_enter = is_ctrl_pressed && wparam.0 == 0x0D;
+            let is_ctrl_down = is_ctrl_pressed && wparam.0 == 0x28;
+            let ctrl_conversion_function =
+                Self::ctrl_conversion_shortcut_function(wparam.0, is_ctrl_pressed, is_alt_pressed);
+            let is_shift_left = is_shift_pressed && wparam.0 == 0x25;
+            let is_shift_right = is_shift_pressed && wparam.0 == 0x27;
+            let is_shift_key = Self::is_shift_key(wparam);
+            let is_alt_backquote = Self::is_alt_backquote(wparam, lparam);
+            let app_config_start = trace_request_id.map(|_| Instant::now());
+            let app_config = Self::load_app_config_or_default();
+            if let (Some(request_id), Some(app_config_start)) = (trace_request_id, app_config_start)
+            {
+                Self::log_client_performance(
+                    request_id,
+                    "process_key",
+                    "app_config_read",
+                    app_config_start.elapsed(),
+                    format!(
+                        "romaji_rows={};wparam={}",
+                        app_config.romaji_table.rows.len(),
+                        wparam.0
+                    ),
+                );
+            }
 
-        // check shortcut keys
-        if is_ctrl_pressed
-            && !is_ctrl_space
-            && !is_alt_backquote
-            && !is_ctrl_enter
-            && !is_ctrl_down
-            && ctrl_conversion_function.is_none()
-        {
-            self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(wparam))?;
-            return Ok(None);
-        }
-
-        if is_ctrl_space || is_alt_backquote {
-            let shortcuts = &app_config.shortcuts;
-
-            if is_ctrl_space && !shortcuts.ctrl_space_toggle {
+            // check shortcut keys
+            if is_ctrl_pressed
+                && !is_ctrl_space
+                && !is_alt_backquote
+                && !is_ctrl_enter
+                && !is_ctrl_down
+                && ctrl_conversion_function.is_none()
+            {
                 self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(wparam))?;
                 return Ok(None);
             }
 
-            if is_alt_backquote && !shortcuts.alt_backquote_toggle {
-                self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(wparam))?;
-                return Ok(None);
+            if is_ctrl_space || is_alt_backquote {
+                let shortcuts = &app_config.shortcuts;
+
+                if is_ctrl_space && !shortcuts.ctrl_space_toggle {
+                    self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(
+                        wparam,
+                    ))?;
+                    return Ok(None);
+                }
+
+                if is_alt_backquote && !shortcuts.alt_backquote_toggle {
+                    self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(
+                        wparam,
+                    ))?;
+                    return Ok(None);
+                }
             }
-        }
 
-        #[allow(clippy::let_and_return)]
-        let (composition, mode) = {
-            let text_service = self.borrow()?;
-            let composition = text_service.borrow_composition()?.clone();
-            let mode = IMEState::input_mode()?;
-            (composition, mode)
-        };
-        let start_temporary_latin = !composition.temporary_latin
-            && mode == InputMode::Kana
-            && Self::is_shift_alphabet_shortcut(wparam, is_shift_pressed);
+            #[allow(clippy::let_and_return)]
+            let (composition, mode) = {
+                let text_service = self.borrow()?;
+                let composition = text_service.borrow_composition()?.clone();
+                let mode = IMEState::input_mode()?;
+                (composition, mode)
+            };
+            let start_temporary_latin = !composition.temporary_latin
+                && mode == InputMode::Kana
+                && Self::is_shift_alphabet_shortcut(wparam, is_shift_pressed);
 
-        if composition.temporary_latin && is_shift_key && !is_shift_left && !is_shift_right {
-            return Ok(Some((
-                vec![ClientAction::SetTemporaryLatinShiftPending(true)],
-                composition.state.clone(),
-            )));
-        }
+            if composition.temporary_latin && is_shift_key && !is_shift_left && !is_shift_right {
+                return Ok(Some((
+                    vec![ClientAction::SetTemporaryLatinShiftPending(true)],
+                    composition.state.clone(),
+                )));
+            }
 
-        let should_clear_shift_pending = composition.temporary_latin_shift_pending && !is_shift_key;
+            let should_clear_shift_pending =
+                composition.temporary_latin_shift_pending && !is_shift_key;
 
-        let action = if is_alt_backquote {
-            UserAction::ToggleInputMode
-        } else if is_ctrl_enter {
-            UserAction::CommitFirstClause
-        } else if is_ctrl_down {
-            UserAction::CommitAndNextClause
-        } else if let Some(function) = ctrl_conversion_function {
-            UserAction::Function(function)
-        } else if is_shift_left {
-            UserAction::AdjustClauseBoundary(-1)
-        } else if is_shift_right {
-            UserAction::AdjustClauseBoundary(1)
-        } else {
-            UserAction::try_from(wparam.0)?
-        };
+            let action = if is_alt_backquote {
+                UserAction::ToggleInputMode
+            } else if is_ctrl_enter {
+                UserAction::CommitFirstClause
+            } else if is_ctrl_down {
+                UserAction::CommitAndNextClause
+            } else if let Some(function) = ctrl_conversion_function {
+                UserAction::Function(function)
+            } else if is_shift_left {
+                UserAction::AdjustClauseBoundary(-1)
+            } else if is_shift_right {
+                UserAction::AdjustClauseBoundary(1)
+            } else {
+                UserAction::try_from(wparam.0)?
+            };
 
-        let Some((transition, mut actions)) = CompositionReducer::plan_actions_for_user_action(
-            &composition,
-            &action,
-            &mode,
-            is_shift_pressed,
-            &app_config,
-            start_temporary_latin,
-        ) else {
-            self.clear_temporary_latin_shift_pending_if_needed(should_clear_shift_pending)?;
-            return Ok(None);
-        };
+            let romaji_lookup_start = trace_request_id.map(|_| Instant::now());
+            let romaji_lookup = RomajiLookup::from_rows(&app_config.romaji_table.rows);
+            if let (Some(request_id), Some(romaji_lookup_start)) =
+                (trace_request_id, romaji_lookup_start)
+            {
+                Self::log_client_performance(
+                    request_id,
+                    "process_key",
+                    "romaji_lookup_build",
+                    romaji_lookup_start.elapsed(),
+                    format!(
+                        "rows={};max_input_len={};max_multi_char_input_len={}",
+                        app_config.romaji_table.rows.len(),
+                        romaji_lookup.max_input_len,
+                        romaji_lookup.max_multi_char_input_len
+                    ),
+                );
+            }
 
-        if composition.temporary_latin {
-            let should_reset_on_confirm = matches!(
-                action,
-                UserAction::Enter | UserAction::CommitAndNextClause | UserAction::CommitFirstClause
-            );
-            let should_reset_on_end = transition == CompositionState::None
-                || actions.iter().any(|current_action| {
+            let Some((transition, mut actions)) = Self::plan_actions_for_user_action_with_lookup(
+                &composition,
+                &action,
+                &mode,
+                is_shift_pressed,
+                &app_config,
+                &romaji_lookup,
+                start_temporary_latin,
+            ) else {
+                self.clear_temporary_latin_shift_pending_if_needed(should_clear_shift_pending)?;
+                return Ok(None);
+            };
+
+            if composition.temporary_latin {
+                let should_reset_on_confirm = matches!(
+                    action,
+                    UserAction::Enter
+                        | UserAction::CommitAndNextClause
+                        | UserAction::CommitFirstClause
+                );
+                let should_reset_on_end = transition == CompositionState::None
+                    || actions.iter().any(|current_action| {
+                        matches!(
+                            current_action,
+                            ClientAction::EndComposition | ClientAction::SetIMEMode(_)
+                        )
+                    });
+
+                if (should_reset_on_confirm || should_reset_on_end)
+                    && !actions.iter().any(|current_action| {
+                        matches!(current_action, ClientAction::SetTemporaryLatin(false))
+                    })
+                {
+                    actions.insert(0, ClientAction::SetTemporaryLatin(false));
+                }
+            }
+
+            if should_clear_shift_pending
+                && !actions.iter().any(|current_action| {
                     matches!(
                         current_action,
-                        ClientAction::EndComposition | ClientAction::SetIMEMode(_)
+                        ClientAction::SetTemporaryLatinShiftPending(_)
                     )
-                });
-
-            if (should_reset_on_confirm || should_reset_on_end)
-                && !actions.iter().any(|current_action| {
-                    matches!(current_action, ClientAction::SetTemporaryLatin(false))
                 })
             {
-                actions.insert(0, ClientAction::SetTemporaryLatin(false));
+                actions.insert(0, ClientAction::SetTemporaryLatinShiftPending(false));
             }
+
+            Ok(Some((actions, transition)))
+        })();
+
+        if let (Some(request_id), Some(total_start)) = (trace_request_id, total_start) {
+            let details = match &result {
+                Ok(Some((actions, transition))) => format!(
+                    "status=success;handled=true;actions={};transition={transition:?};wparam={}",
+                    actions.len(),
+                    wparam.0
+                ),
+                Ok(None) => format!("status=success;handled=false;wparam={}", wparam.0),
+                Err(error) => format!("status=error;wparam={};error={error:?}", wparam.0),
+            };
+            Self::log_client_performance(
+                request_id,
+                "process_key",
+                "total",
+                total_start.elapsed(),
+                details,
+            );
         }
 
-        if should_clear_shift_pending
-            && !actions.iter().any(|current_action| {
-                matches!(
-                    current_action,
-                    ClientAction::SetTemporaryLatinShiftPending(_)
-                )
-            })
-        {
-            actions.insert(0, ClientAction::SetTemporaryLatinShiftPending(false));
-        }
-
-        Ok(Some((actions, transition)))
+        result
     }
 
     #[tracing::instrument]
@@ -3186,6 +3313,8 @@ impl TextServiceFactory {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<bool> {
+        let input_trace = client_performance_log_enabled().then(ClientInputTraceGuard::begin);
+        let total_start = input_trace.as_ref().map(|_| Instant::now());
         let result: Result<bool> = (|| {
             if let Some(context) = context {
                 self.borrow_mut()?.context = Some(context.clone());
@@ -3201,6 +3330,27 @@ impl TextServiceFactory {
                 Ok(false)
             }
         })();
+
+        if let (Some(input_trace), Some(total_start)) = (input_trace.as_ref(), total_start) {
+            let request_id = input_trace.request_id();
+            let details = match &result {
+                Ok(handled) => format!(
+                    "status=success;handled={handled};wparam={};lparam={}",
+                    wparam.0, lparam.0
+                ),
+                Err(error) => format!(
+                    "status=error;wparam={};lparam={};error={error:?}",
+                    wparam.0, lparam.0
+                ),
+            };
+            Self::log_client_performance(
+                request_id,
+                "handle_key",
+                "total",
+                total_start.elapsed(),
+                details,
+            );
+        }
 
         match result {
             Ok(handled) => Ok(handled),
@@ -3219,6 +3369,8 @@ impl TextServiceFactory {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<bool> {
+        let input_trace = client_performance_log_enabled().then(ClientInputTraceGuard::begin);
+        let total_start = input_trace.as_ref().map(|_| Instant::now());
         let result: Result<bool> = (|| {
             if let Some(context) = context {
                 self.borrow_mut()?.context = Some(context.clone());
@@ -3234,6 +3386,27 @@ impl TextServiceFactory {
 
             Ok(false)
         })();
+
+        if let (Some(input_trace), Some(total_start)) = (input_trace.as_ref(), total_start) {
+            let request_id = input_trace.request_id();
+            let details = match &result {
+                Ok(handled) => format!(
+                    "status=success;handled={handled};wparam={};lparam={}",
+                    wparam.0, lparam.0
+                ),
+                Err(error) => format!(
+                    "status=error;wparam={};lparam={};error={error:?}",
+                    wparam.0, lparam.0
+                ),
+            };
+            Self::log_client_performance(
+                request_id,
+                "handle_key_up",
+                "total",
+                total_start.elapsed(),
+                details,
+            );
+        }
 
         match result {
             Ok(handled) => Ok(handled),
@@ -3275,241 +3448,119 @@ impl TextServiceFactory {
         actions: &[ClientAction],
         transition: CompositionState,
     ) -> Result<()> {
-        #[allow(clippy::let_and_return)]
-        let (composition, mode) = {
-            let text_service = self.borrow()?;
-            let composition = text_service.borrow_composition()?.clone();
-            let mode = IMEState::input_mode()?;
-            (composition, mode)
-        };
-        let app_config = Self::load_app_config_or_default();
-        let romaji_lookup = RomajiLookup::from_rows(&app_config.romaji_table.rows);
+        let trace_request_id = current_input_trace_request_id();
+        let total_start = trace_request_id.map(|_| Instant::now());
+        let requested_transition = transition.clone();
+        let result: Result<()> = (|| {
+            #[allow(clippy::let_and_return)]
+            let (composition, mode) = {
+                let text_service = self.borrow()?;
+                let composition = text_service.borrow_composition()?.clone();
+                let mode = IMEState::input_mode()?;
+                (composition, mode)
+            };
+            let app_config_start = trace_request_id.map(|_| Instant::now());
+            let app_config = Self::load_app_config_or_default();
+            if let (Some(request_id), Some(app_config_start)) = (trace_request_id, app_config_start)
+            {
+                Self::log_client_performance(
+                    request_id,
+                    "handle_action",
+                    "app_config_read",
+                    app_config_start.elapsed(),
+                    format!(
+                        "actions={};romaji_rows={}",
+                        actions.len(),
+                        app_config.romaji_table.rows.len()
+                    ),
+                );
+            }
+            let romaji_lookup_start = trace_request_id.map(|_| Instant::now());
+            let romaji_lookup = RomajiLookup::from_rows(&app_config.romaji_table.rows);
+            if let (Some(request_id), Some(romaji_lookup_start)) =
+                (trace_request_id, romaji_lookup_start)
+            {
+                Self::log_client_performance(
+                    request_id,
+                    "handle_action",
+                    "romaji_lookup_build",
+                    romaji_lookup_start.elapsed(),
+                    format!(
+                        "rows={};max_input_len={};max_multi_char_input_len={}",
+                        app_config.romaji_table.rows.len(),
+                        romaji_lookup.max_input_len,
+                        romaji_lookup.max_multi_char_input_len
+                    ),
+                );
+            }
 
-        let mut preview = composition.preview.clone();
-        let mut suffix = composition.suffix.clone();
-        let mut raw_input = composition.raw_input.clone();
-        let mut raw_hiragana = composition.raw_hiragana.clone();
-        let mut fixed_prefix = composition.fixed_prefix.clone();
-        let mut corresponding_count = composition.corresponding_count.clone();
-        let mut candidates = composition.candidates.clone();
-        let mut clause_snapshots = composition.clause_snapshots.clone();
-        let mut future_clause_snapshots = composition.future_clause_snapshots.clone();
-        let mut current_clause_is_split_derived = composition.current_clause_is_split_derived;
-        let mut current_clause_is_direct_split_remainder =
-            composition.current_clause_is_direct_split_remainder;
-        let mut current_clause_has_split_left_neighbor =
-            composition.current_clause_has_split_left_neighbor;
-        let mut current_clause_split_group_id = composition.current_clause_split_group_id;
-        let mut next_split_group_id = composition.next_split_group_id;
-        let mut selection_index = composition.selection_index;
-        let mut temporary_latin = composition.temporary_latin;
-        let mut temporary_latin_shift_pending = composition.temporary_latin_shift_pending;
-        let mut ipc_service = IMEState::ipc_service()?.context("ipc_service is None")?;
-        let mut transition = transition;
-        let mut deferred_clause_navigation_ready_ui_sync = None;
+            let mut preview = composition.preview.clone();
+            let mut suffix = composition.suffix.clone();
+            let mut raw_input = composition.raw_input.clone();
+            let mut raw_hiragana = composition.raw_hiragana.clone();
+            let mut fixed_prefix = composition.fixed_prefix.clone();
+            let mut corresponding_count = composition.corresponding_count.clone();
+            let mut candidates = composition.candidates.clone();
+            let mut clause_snapshots = composition.clause_snapshots.clone();
+            let mut future_clause_snapshots = composition.future_clause_snapshots.clone();
+            let mut current_clause_is_split_derived = composition.current_clause_is_split_derived;
+            let mut current_clause_is_direct_split_remainder =
+                composition.current_clause_is_direct_split_remainder;
+            let mut current_clause_has_split_left_neighbor =
+                composition.current_clause_has_split_left_neighbor;
+            let mut current_clause_split_group_id = composition.current_clause_split_group_id;
+            let mut next_split_group_id = composition.next_split_group_id;
+            let mut selection_index = composition.selection_index;
+            let mut temporary_latin = composition.temporary_latin;
+            let mut temporary_latin_shift_pending = composition.temporary_latin_shift_pending;
+            let mut ipc_service = IMEState::ipc_service()?.context("ipc_service is None")?;
+            let mut transition = transition;
+            let mut deferred_clause_navigation_ready_ui_sync = None;
 
-        self.update_context(&preview)?;
+            self.update_context(&preview)?;
 
-        for (action_index, action) in actions.iter().enumerate() {
-            match action {
-                ClientAction::StartComposition => {
-                    self.start_composition()?;
-                    if app_config.general.show_candidate_window_after_space {
-                        ipc_service.update_candidate_window(Some(false), None, None, None, None)?;
+            for (action_index, action) in actions.iter().enumerate() {
+                match action {
+                    ClientAction::StartComposition => {
+                        self.start_composition()?;
+                        if app_config.general.show_candidate_window_after_space {
+                            ipc_service.update_candidate_window(
+                                Some(false),
+                                None,
+                                None,
+                                None,
+                                None,
+                            )?;
+                        }
                     }
-                }
-                ClientAction::ShowCandidateWindow => {
-                    let position = self.candidate_window_position()?;
-                    ipc_service.update_candidate_window(Some(true), position, None, None, None)?;
-                }
-                ClientAction::EndComposition => {
-                    self.end_composition()?;
-                    selection_index = 0;
-                    corresponding_count = 0;
-                    temporary_latin = false;
-                    temporary_latin_shift_pending = false;
-                    preview.clear();
-                    suffix.clear();
-                    raw_input.clear();
-                    raw_hiragana.clear();
-                    fixed_prefix.clear();
-                    clause_snapshots.clear();
-                    future_clause_snapshots.clear();
-                    current_clause_is_split_derived = false;
-                    current_clause_is_direct_split_remainder = false;
-                    current_clause_has_split_left_neighbor = false;
-                    current_clause_split_group_id = None;
-                    next_split_group_id = 0;
-                    ipc_service.update_candidate_window(
-                        Some(false),
-                        None,
-                        Some(vec![]),
-                        Some(0),
-                        None,
-                    )?;
-                    ipc_service.clear_text()?;
-                }
-                ClientAction::AppendText(text) => {
-                    Self::clear_clause_caches(
-                        &mut clause_snapshots,
-                        &mut future_clause_snapshots,
-                        &mut ipc_service,
-                    )?;
-                    let resolved_symbol_text = match mode {
-                        InputMode::Kana => Self::resolve_symbol_input_text_with_lookup(
-                            &raw_input,
-                            text,
-                            &app_config,
-                            &romaji_lookup,
-                        ),
-                        InputMode::Latin => None,
-                    };
-                    let text = match mode {
-                        InputMode::Kana => resolved_symbol_text.unwrap_or_else(|| text.to_string()),
-                        InputMode::Latin => text.to_string(),
-                    };
-
-                    current_clause_is_split_derived = false;
-                    current_clause_is_direct_split_remainder = false;
-                    current_clause_has_split_left_neighbor = false;
-                    current_clause_split_group_id = None;
-                    candidates = ipc_service.append_text_with_context(text.clone(), &candidates)?;
-                    raw_input.push_str(&text);
-                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
-                        selection_index = selected.index;
-                        corresponding_count = selected.corresponding_count;
-                        preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
-                        suffix = selected.sub_text.clone();
-                        raw_hiragana = selected.hiragana;
-
-                        self.set_text(&preview, &suffix)?;
-                        self.sync_candidate_window_after_text_update(
-                            &mut ipc_service,
-                            &candidates,
-                            selection_index,
-                            &app_config,
-                            &transition,
-                        )?;
-                    }
-                }
-                ClientAction::AppendTextRaw(text) => {
-                    Self::clear_clause_caches(
-                        &mut clause_snapshots,
-                        &mut future_clause_snapshots,
-                        &mut ipc_service,
-                    )?;
-                    current_clause_is_split_derived = false;
-                    current_clause_is_direct_split_remainder = false;
-                    current_clause_has_split_left_neighbor = false;
-                    current_clause_split_group_id = None;
-                    candidates = ipc_service.append_text_with_context(text.clone(), &candidates)?;
-                    raw_input.push_str(text);
-                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
-                        selection_index = selected.index;
-                        corresponding_count = selected.corresponding_count;
-                        preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
-                        suffix = selected.sub_text.clone();
-                        raw_hiragana = selected.hiragana;
-
-                        self.set_text(&preview, &suffix)?;
-                        self.sync_candidate_window_after_text_update(
-                            &mut ipc_service,
-                            &candidates,
-                            selection_index,
-                            &app_config,
-                            &transition,
-                        )?;
-                    }
-                }
-                ClientAction::AppendTextDirect(text) => {
-                    Self::clear_clause_caches(
-                        &mut clause_snapshots,
-                        &mut future_clause_snapshots,
-                        &mut ipc_service,
-                    )?;
-                    current_clause_is_split_derived = false;
-                    current_clause_is_direct_split_remainder = false;
-                    current_clause_has_split_left_neighbor = false;
-                    current_clause_split_group_id = None;
-                    candidates =
-                        ipc_service.append_text_direct_with_context(text.clone(), &candidates)?;
-                    raw_input.push_str(text);
-                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
-                        selection_index = selected.index;
-                        corresponding_count = selected.corresponding_count;
-                        preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
-                        suffix = selected.sub_text.clone();
-                        raw_hiragana = selected.hiragana;
-
-                        self.set_text(&preview, &suffix)?;
-                        self.sync_candidate_window_after_text_update(
-                            &mut ipc_service,
-                            &candidates,
-                            selection_index,
-                            &app_config,
-                            &transition,
-                        )?;
-                    }
-                }
-                ClientAction::CommitTextDirect(text) => {
-                    self.start_composition()?;
-                    self.set_text(text, "")?;
-                    self.end_composition()?;
-                }
-                ClientAction::RemoveText => {
-                    Self::clear_clause_caches(
-                        &mut clause_snapshots,
-                        &mut future_clause_snapshots,
-                        &mut ipc_service,
-                    )?;
-                    current_clause_is_split_derived = false;
-                    current_clause_is_direct_split_remainder = false;
-                    current_clause_has_split_left_neighbor = false;
-                    current_clause_split_group_id = None;
-                    raw_input.pop();
-                    candidates = ipc_service.remove_text()?;
-                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
-                        selection_index = selected.index;
-                        corresponding_count = selected.corresponding_count;
-
-                        preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
-                        suffix = selected.sub_text.clone();
-                        raw_hiragana = selected.hiragana;
-
-                        self.set_text(&preview, &suffix)?;
-                        self.sync_candidate_window_update(
-                            &mut ipc_service,
-                            &candidates,
-                            selection_index,
+                    ClientAction::ShowCandidateWindow => {
+                        let position = self.candidate_window_position()?;
+                        ipc_service.update_candidate_window(
+                            Some(true),
+                            position,
                             None,
-                            false,
+                            None,
+                            None,
                         )?;
-                    } else {
-                        // Server side text is fully removed. Close TSF composition too
-                        // so preedit text does not linger in an inconsistent state.
-                        let committed_prefix = fixed_prefix.clone();
-
-                        transition = CompositionState::None;
+                    }
+                    ClientAction::EndComposition => {
+                        self.end_composition()?;
                         selection_index = 0;
                         corresponding_count = 0;
                         temporary_latin = false;
                         temporary_latin_shift_pending = false;
+                        preview.clear();
                         suffix.clear();
                         raw_input.clear();
                         raw_hiragana.clear();
+                        fixed_prefix.clear();
                         clause_snapshots.clear();
                         future_clause_snapshots.clear();
                         current_clause_is_split_derived = false;
                         current_clause_is_direct_split_remainder = false;
                         current_clause_has_split_left_neighbor = false;
                         current_clause_split_group_id = None;
-
-                        if committed_prefix.is_empty() {
-                            self.set_text("", "")?;
-                        } else {
-                            self.set_text(&committed_prefix, "")?;
-                        }
-                        self.end_composition()?;
+                        next_split_group_id = 0;
                         ipc_service.update_candidate_window(
                             Some(false),
                             None,
@@ -3518,82 +3569,294 @@ impl TextServiceFactory {
                             None,
                         )?;
                         ipc_service.clear_text()?;
-
-                        preview.clear();
-                        fixed_prefix.clear();
                     }
-                }
-                ClientAction::MoveCursor(offset) => {
-                    candidates = ipc_service.move_cursor(*offset)?;
-                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
-                        selection_index = selected.index;
-                        corresponding_count = selected.corresponding_count;
-                        preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
-                        suffix = selected.sub_text.clone();
-                        raw_hiragana = selected.hiragana;
-
-                        self.set_text(&preview, &suffix)?;
-                        self.sync_candidate_window_update(
-                            &mut ipc_service,
-                            &candidates,
-                            selection_index,
-                            None,
-                            true,
-                        )?;
-                    }
-                }
-                ClientAction::EnsureClauseNavigationReady => {
-                    Self::log_clause_action_state(
-                        "before",
-                        action,
-                        &preview,
-                        &suffix,
-                        &raw_input,
-                        &raw_hiragana,
-                        &fixed_prefix,
-                        corresponding_count,
-                        selection_index,
-                        &candidates,
-                        &clause_snapshots,
-                        &future_clause_snapshots,
-                    );
-                    let effect = {
-                        let mut state = ClauseState::from_composition_parts(
-                            &mut preview,
-                            &mut suffix,
-                            &mut raw_input,
-                            &mut raw_hiragana,
-                            &mut fixed_prefix,
-                            &mut corresponding_count,
-                            &mut selection_index,
-                            &mut candidates,
+                    ClientAction::AppendText(text) => {
+                        Self::clear_clause_caches(
                             &mut clause_snapshots,
                             &mut future_clause_snapshots,
-                            &mut current_clause_is_split_derived,
-                            &mut current_clause_is_direct_split_remainder,
-                            &mut current_clause_has_split_left_neighbor,
-                            &mut current_clause_split_group_id,
-                            &mut next_split_group_id,
-                        );
-                        let transition = ClauseState::transition_with_backend(
-                            &mut state,
-                            ClauseCommand::StartClauseNavigation,
-                            ClauseTransitionInput::default(),
                             &mut ipc_service,
                         )?;
-                        let effect = transition.effect;
-                        ClauseState::write_back(state);
-                        effect
-                    };
+                        let resolved_symbol_text = match mode {
+                            InputMode::Kana => Self::resolve_symbol_input_text_with_lookup(
+                                &raw_input,
+                                text,
+                                &app_config,
+                                &romaji_lookup,
+                            ),
+                            InputMode::Latin => None,
+                        };
+                        let text = match mode {
+                            InputMode::Kana => {
+                                resolved_symbol_text.unwrap_or_else(|| text.to_string())
+                            }
+                            InputMode::Latin => text.to_string(),
+                        };
 
-                    if effect.applied {
-                        let defer_ui_sync =
-                            Self::should_defer_clause_navigation_ready_sync(actions, action_index);
-                        let ready_ui_sync = Self::clause_navigation_ready_ui_sync(effect);
-                        if defer_ui_sync {
-                            deferred_clause_navigation_ready_ui_sync = ready_ui_sync;
+                        current_clause_is_split_derived = false;
+                        current_clause_is_direct_split_remainder = false;
+                        current_clause_has_split_left_neighbor = false;
+                        current_clause_split_group_id = None;
+                        candidates =
+                            ipc_service.append_text_with_context(text.clone(), &candidates)?;
+                        raw_input.push_str(&text);
+                        if let Some(selected) = Self::select_candidate(&candidates, selection_index)
+                        {
+                            selection_index = selected.index;
+                            corresponding_count = selected.corresponding_count;
+                            preview =
+                                Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
+                            suffix = selected.sub_text.clone();
+                            raw_hiragana = selected.hiragana;
+
+                            self.set_text(&preview, &suffix)?;
+                            self.sync_candidate_window_after_text_update(
+                                &mut ipc_service,
+                                &candidates,
+                                selection_index,
+                                &app_config,
+                                &transition,
+                            )?;
+                        }
+                    }
+                    ClientAction::AppendTextRaw(text) => {
+                        Self::clear_clause_caches(
+                            &mut clause_snapshots,
+                            &mut future_clause_snapshots,
+                            &mut ipc_service,
+                        )?;
+                        current_clause_is_split_derived = false;
+                        current_clause_is_direct_split_remainder = false;
+                        current_clause_has_split_left_neighbor = false;
+                        current_clause_split_group_id = None;
+                        candidates =
+                            ipc_service.append_text_with_context(text.clone(), &candidates)?;
+                        raw_input.push_str(text);
+                        if let Some(selected) = Self::select_candidate(&candidates, selection_index)
+                        {
+                            selection_index = selected.index;
+                            corresponding_count = selected.corresponding_count;
+                            preview =
+                                Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
+                            suffix = selected.sub_text.clone();
+                            raw_hiragana = selected.hiragana;
+
+                            self.set_text(&preview, &suffix)?;
+                            self.sync_candidate_window_after_text_update(
+                                &mut ipc_service,
+                                &candidates,
+                                selection_index,
+                                &app_config,
+                                &transition,
+                            )?;
+                        }
+                    }
+                    ClientAction::AppendTextDirect(text) => {
+                        Self::clear_clause_caches(
+                            &mut clause_snapshots,
+                            &mut future_clause_snapshots,
+                            &mut ipc_service,
+                        )?;
+                        current_clause_is_split_derived = false;
+                        current_clause_is_direct_split_remainder = false;
+                        current_clause_has_split_left_neighbor = false;
+                        current_clause_split_group_id = None;
+                        candidates = ipc_service
+                            .append_text_direct_with_context(text.clone(), &candidates)?;
+                        raw_input.push_str(text);
+                        if let Some(selected) = Self::select_candidate(&candidates, selection_index)
+                        {
+                            selection_index = selected.index;
+                            corresponding_count = selected.corresponding_count;
+                            preview =
+                                Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
+                            suffix = selected.sub_text.clone();
+                            raw_hiragana = selected.hiragana;
+
+                            self.set_text(&preview, &suffix)?;
+                            self.sync_candidate_window_after_text_update(
+                                &mut ipc_service,
+                                &candidates,
+                                selection_index,
+                                &app_config,
+                                &transition,
+                            )?;
+                        }
+                    }
+                    ClientAction::CommitTextDirect(text) => {
+                        self.start_composition()?;
+                        self.set_text(text, "")?;
+                        self.end_composition()?;
+                    }
+                    ClientAction::RemoveText => {
+                        Self::clear_clause_caches(
+                            &mut clause_snapshots,
+                            &mut future_clause_snapshots,
+                            &mut ipc_service,
+                        )?;
+                        current_clause_is_split_derived = false;
+                        current_clause_is_direct_split_remainder = false;
+                        current_clause_has_split_left_neighbor = false;
+                        current_clause_split_group_id = None;
+                        raw_input.pop();
+                        candidates = ipc_service.remove_text()?;
+                        if let Some(selected) = Self::select_candidate(&candidates, selection_index)
+                        {
+                            selection_index = selected.index;
+                            corresponding_count = selected.corresponding_count;
+
+                            preview =
+                                Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
+                            suffix = selected.sub_text.clone();
+                            raw_hiragana = selected.hiragana;
+
+                            self.set_text(&preview, &suffix)?;
+                            self.sync_candidate_window_update(
+                                &mut ipc_service,
+                                &candidates,
+                                selection_index,
+                                None,
+                                false,
+                            )?;
+                        } else {
+                            // Server side text is fully removed. Close TSF composition too
+                            // so preedit text does not linger in an inconsistent state.
+                            let committed_prefix = fixed_prefix.clone();
+
+                            transition = CompositionState::None;
+                            selection_index = 0;
+                            corresponding_count = 0;
+                            temporary_latin = false;
+                            temporary_latin_shift_pending = false;
+                            suffix.clear();
+                            raw_input.clear();
+                            raw_hiragana.clear();
+                            clause_snapshots.clear();
+                            future_clause_snapshots.clear();
+                            current_clause_is_split_derived = false;
+                            current_clause_is_direct_split_remainder = false;
+                            current_clause_has_split_left_neighbor = false;
+                            current_clause_split_group_id = None;
+
+                            if committed_prefix.is_empty() {
+                                self.set_text("", "")?;
+                            } else {
+                                self.set_text(&committed_prefix, "")?;
+                            }
+                            self.end_composition()?;
+                            ipc_service.update_candidate_window(
+                                Some(false),
+                                None,
+                                Some(vec![]),
+                                Some(0),
+                                None,
+                            )?;
+                            ipc_service.clear_text()?;
+
+                            preview.clear();
+                            fixed_prefix.clear();
+                        }
+                    }
+                    ClientAction::MoveCursor(offset) => {
+                        candidates = ipc_service.move_cursor(*offset)?;
+                        if let Some(selected) = Self::select_candidate(&candidates, selection_index)
+                        {
+                            selection_index = selected.index;
+                            corresponding_count = selected.corresponding_count;
+                            preview =
+                                Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
+                            suffix = selected.sub_text.clone();
+                            raw_hiragana = selected.hiragana;
+
+                            self.set_text(&preview, &suffix)?;
+                            self.sync_candidate_window_update(
+                                &mut ipc_service,
+                                &candidates,
+                                selection_index,
+                                None,
+                                true,
+                            )?;
+                        }
+                    }
+                    ClientAction::EnsureClauseNavigationReady => {
+                        Self::log_clause_action_state(
+                            "before",
+                            action,
+                            &preview,
+                            &suffix,
+                            &raw_input,
+                            &raw_hiragana,
+                            &fixed_prefix,
+                            corresponding_count,
+                            selection_index,
+                            &candidates,
+                            &clause_snapshots,
+                            &future_clause_snapshots,
+                        );
+                        let effect = {
+                            let mut state = ClauseState::from_composition_parts(
+                                &mut preview,
+                                &mut suffix,
+                                &mut raw_input,
+                                &mut raw_hiragana,
+                                &mut fixed_prefix,
+                                &mut corresponding_count,
+                                &mut selection_index,
+                                &mut candidates,
+                                &mut clause_snapshots,
+                                &mut future_clause_snapshots,
+                                &mut current_clause_is_split_derived,
+                                &mut current_clause_is_direct_split_remainder,
+                                &mut current_clause_has_split_left_neighbor,
+                                &mut current_clause_split_group_id,
+                                &mut next_split_group_id,
+                            );
+                            let transition = ClauseState::transition_with_backend(
+                                &mut state,
+                                ClauseCommand::StartClauseNavigation,
+                                ClauseTransitionInput::default(),
+                                &mut ipc_service,
+                            )?;
+                            let effect = transition.effect;
+                            ClauseState::write_back(state);
+                            effect
+                        };
+
+                        if effect.applied {
+                            let defer_ui_sync = Self::should_defer_clause_navigation_ready_sync(
+                                actions,
+                                action_index,
+                            );
+                            let ready_ui_sync = Self::clause_navigation_ready_ui_sync(effect);
+                            if defer_ui_sync {
+                                deferred_clause_navigation_ready_ui_sync = ready_ui_sync;
+                                Self::log_clause_action_state(
+                                    "defer",
+                                    action,
+                                    &preview,
+                                    &suffix,
+                                    &raw_input,
+                                    &raw_hiragana,
+                                    &fixed_prefix,
+                                    corresponding_count,
+                                    selection_index,
+                                    &candidates,
+                                    &clause_snapshots,
+                                    &future_clause_snapshots,
+                                );
+                                continue;
+                            }
+
+                            self.sync_clause_action_ui(
+                                &preview,
+                                &suffix,
+                                &candidates,
+                                selection_index,
+                                &mut ipc_service,
+                                ready_ui_sync.and_then(|sync| sync.visible),
+                                effect.update_pos,
+                            )?;
                             Self::log_clause_action_state(
-                                "defer",
+                                "after",
                                 action,
                                 &preview,
                                 &suffix,
@@ -3606,569 +3869,583 @@ impl TextServiceFactory {
                                 &clause_snapshots,
                                 &future_clause_snapshots,
                             );
-                            continue;
+                        } else {
+                            Self::log_clause_action_state(
+                                "skip",
+                                action,
+                                &preview,
+                                &suffix,
+                                &raw_input,
+                                &raw_hiragana,
+                                &fixed_prefix,
+                                corresponding_count,
+                                selection_index,
+                                &candidates,
+                                &clause_snapshots,
+                                &future_clause_snapshots,
+                            );
+                        }
+                    }
+                    ClientAction::MoveClause(direction) => {
+                        Self::log_clause_action_state(
+                            "before",
+                            action,
+                            &preview,
+                            &suffix,
+                            &raw_input,
+                            &raw_hiragana,
+                            &fixed_prefix,
+                            corresponding_count,
+                            selection_index,
+                            &candidates,
+                            &clause_snapshots,
+                            &future_clause_snapshots,
+                        );
+                        let effect = {
+                            let mut state = ClauseState::from_composition_parts(
+                                &mut preview,
+                                &mut suffix,
+                                &mut raw_input,
+                                &mut raw_hiragana,
+                                &mut fixed_prefix,
+                                &mut corresponding_count,
+                                &mut selection_index,
+                                &mut candidates,
+                                &mut clause_snapshots,
+                                &mut future_clause_snapshots,
+                                &mut current_clause_is_split_derived,
+                                &mut current_clause_is_direct_split_remainder,
+                                &mut current_clause_has_split_left_neighbor,
+                                &mut current_clause_split_group_id,
+                                &mut next_split_group_id,
+                            );
+                            let transition = ClauseState::transition_with_backend(
+                                &mut state,
+                                ClauseCommand::MoveBy(*direction),
+                                ClauseTransitionInput::default(),
+                                &mut ipc_service,
+                            )?;
+                            let effect = transition.effect;
+                            ClauseState::write_back(state);
+                            effect
+                        };
+
+                        let deferred_ready_ui_sync =
+                            Self::deferred_clause_navigation_ready_ui_sync_after_move(
+                                deferred_clause_navigation_ready_ui_sync.take(),
+                                effect,
+                            );
+                        if effect.applied {
+                            self.sync_clause_action_ui(
+                                &preview,
+                                &suffix,
+                                &candidates,
+                                selection_index,
+                                &mut ipc_service,
+                                deferred_ready_ui_sync.and_then(|sync| sync.visible),
+                                effect.update_pos,
+                            )?;
+                            Self::log_clause_action_state(
+                                "after",
+                                action,
+                                &preview,
+                                &suffix,
+                                &raw_input,
+                                &raw_hiragana,
+                                &fixed_prefix,
+                                corresponding_count,
+                                selection_index,
+                                &candidates,
+                                &clause_snapshots,
+                                &future_clause_snapshots,
+                            );
+                        } else if let Some(sync) = deferred_ready_ui_sync {
+                            self.sync_clause_action_ui(
+                                &preview,
+                                &suffix,
+                                &candidates,
+                                selection_index,
+                                &mut ipc_service,
+                                sync.visible,
+                                sync.update_pos,
+                            )?;
+                            Self::log_clause_action_state(
+                                "after-deferred",
+                                action,
+                                &preview,
+                                &suffix,
+                                &raw_input,
+                                &raw_hiragana,
+                                &fixed_prefix,
+                                corresponding_count,
+                                selection_index,
+                                &candidates,
+                                &clause_snapshots,
+                                &future_clause_snapshots,
+                            );
+                        } else {
+                            Self::log_clause_action_state(
+                                "skip",
+                                action,
+                                &preview,
+                                &suffix,
+                                &raw_input,
+                                &raw_hiragana,
+                                &fixed_prefix,
+                                corresponding_count,
+                                selection_index,
+                                &candidates,
+                                &clause_snapshots,
+                                &future_clause_snapshots,
+                            );
+                        }
+                    }
+                    ClientAction::AdjustBoundary(direction) => {
+                        Self::log_clause_action_state(
+                            "before",
+                            action,
+                            &preview,
+                            &suffix,
+                            &raw_input,
+                            &raw_hiragana,
+                            &fixed_prefix,
+                            corresponding_count,
+                            selection_index,
+                            &candidates,
+                            &clause_snapshots,
+                            &future_clause_snapshots,
+                        );
+                        let effect = {
+                            let mut state = ClauseState::from_composition_parts(
+                                &mut preview,
+                                &mut suffix,
+                                &mut raw_input,
+                                &mut raw_hiragana,
+                                &mut fixed_prefix,
+                                &mut corresponding_count,
+                                &mut selection_index,
+                                &mut candidates,
+                                &mut clause_snapshots,
+                                &mut future_clause_snapshots,
+                                &mut current_clause_is_split_derived,
+                                &mut current_clause_is_direct_split_remainder,
+                                &mut current_clause_has_split_left_neighbor,
+                                &mut current_clause_split_group_id,
+                                &mut next_split_group_id,
+                            );
+                            let transition = ClauseState::transition_with_backend(
+                                &mut state,
+                                ClauseCommand::AdjustBoundary(*direction),
+                                ClauseTransitionInput::default(),
+                                &mut ipc_service,
+                            )?;
+                            let effect = transition.effect;
+                            ClauseState::write_back(state);
+                            effect
+                        };
+
+                        if effect.applied {
+                            self.sync_clause_action_ui(
+                                &preview,
+                                &suffix,
+                                &candidates,
+                                selection_index,
+                                &mut ipc_service,
+                                None,
+                                effect.update_pos,
+                            )?;
+                            Self::log_clause_action_state(
+                                "after",
+                                action,
+                                &preview,
+                                &suffix,
+                                &raw_input,
+                                &raw_hiragana,
+                                &fixed_prefix,
+                                corresponding_count,
+                                selection_index,
+                                &candidates,
+                                &clause_snapshots,
+                                &future_clause_snapshots,
+                            );
+                        } else {
+                            Self::log_clause_action_state(
+                                "skip",
+                                action,
+                                &preview,
+                                &suffix,
+                                &raw_input,
+                                &raw_hiragana,
+                                &fixed_prefix,
+                                corresponding_count,
+                                selection_index,
+                                &candidates,
+                                &clause_snapshots,
+                                &future_clause_snapshots,
+                            );
+                        }
+                    }
+                    ClientAction::SetIMEMode(mode) => {
+                        self.start_composition()?;
+                        let position = self.candidate_window_position()?;
+                        self.end_composition()?;
+
+                        IMEState::set_input_mode(mode.clone())?;
+
+                        // update the language bar
+                        self.update_lang_bar()?;
+
+                        let mode = match mode {
+                            InputMode::Latin => "A",
+                            InputMode::Kana => "あ",
+                        };
+
+                        ipc_service.update_candidate_window(
+                            None,
+                            position,
+                            None,
+                            None,
+                            Some(mode),
+                        )?;
+
+                        selection_index = 0;
+                        corresponding_count = 0;
+                        temporary_latin = false;
+                        temporary_latin_shift_pending = false;
+                        preview.clear();
+                        suffix.clear();
+                        raw_input.clear();
+                        raw_hiragana.clear();
+                        fixed_prefix.clear();
+                        clause_snapshots.clear();
+                        future_clause_snapshots.clear();
+                        current_clause_is_split_derived = false;
+                        current_clause_is_direct_split_remainder = false;
+                        current_clause_has_split_left_neighbor = false;
+                        current_clause_split_group_id = None;
+                        next_split_group_id = 0;
+                        ipc_service.clear_text()?;
+                    }
+                    ClientAction::SetSelection(selection) => {
+                        Self::log_clause_action_state(
+                            "before",
+                            action,
+                            &preview,
+                            &suffix,
+                            &raw_input,
+                            &raw_hiragana,
+                            &fixed_prefix,
+                            corresponding_count,
+                            selection_index,
+                            &candidates,
+                            &clause_snapshots,
+                            &future_clause_snapshots,
+                        );
+                        let effect = {
+                            let mut state = ClauseState::from_composition_parts(
+                                &mut preview,
+                                &mut suffix,
+                                &mut raw_input,
+                                &mut raw_hiragana,
+                                &mut fixed_prefix,
+                                &mut corresponding_count,
+                                &mut selection_index,
+                                &mut candidates,
+                                &mut clause_snapshots,
+                                &mut future_clause_snapshots,
+                                &mut current_clause_is_split_derived,
+                                &mut current_clause_is_direct_split_remainder,
+                                &mut current_clause_has_split_left_neighbor,
+                                &mut current_clause_split_group_id,
+                                &mut next_split_group_id,
+                            );
+                            let transition = ClauseState::transition_without_backend(
+                                &mut state,
+                                ClauseCommand::SetSelection(selection),
+                            );
+                            let effect = transition.effect;
+                            ClauseState::write_back(state);
+                            effect
+                        };
+
+                        if effect.applied {
+                            self.sync_clause_action_ui(
+                                &preview,
+                                &suffix,
+                                &candidates,
+                                selection_index,
+                                &mut ipc_service,
+                                None,
+                                effect.update_pos,
+                            )?;
+                            Self::log_clause_action_state(
+                                "after",
+                                action,
+                                &preview,
+                                &suffix,
+                                &raw_input,
+                                &raw_hiragana,
+                                &fixed_prefix,
+                                corresponding_count,
+                                selection_index,
+                                &candidates,
+                                &clause_snapshots,
+                                &future_clause_snapshots,
+                            );
+                        } else {
+                            Self::log_clause_action_state(
+                                "skip",
+                                action,
+                                &preview,
+                                &suffix,
+                                &raw_input,
+                                &raw_hiragana,
+                                &fixed_prefix,
+                                corresponding_count,
+                                selection_index,
+                                &candidates,
+                                &clause_snapshots,
+                                &future_clause_snapshots,
+                            );
+                        }
+                    }
+                    ClientAction::ShrinkText(text) => {
+                        fixed_prefix.clear();
+                        Self::clear_clause_caches(
+                            &mut clause_snapshots,
+                            &mut future_clause_snapshots,
+                            &mut ipc_service,
+                        )?;
+                        current_clause_is_split_derived = false;
+                        current_clause_is_direct_split_remainder = false;
+                        current_clause_has_split_left_neighbor = false;
+                        current_clause_split_group_id = None;
+                        let shrunk_raw_input =
+                            Self::current_raw_input_suffix(&raw_input, corresponding_count);
+                        let resolved_symbol_text = match mode {
+                            InputMode::Kana => Self::resolve_symbol_input_text_with_lookup(
+                                &shrunk_raw_input,
+                                text,
+                                &app_config,
+                                &romaji_lookup,
+                            ),
+                            InputMode::Latin => None,
+                        };
+                        let mut updated_raw_input = shrunk_raw_input.clone();
+                        updated_raw_input.push_str(text);
+
+                        let shrunk_candidates = ipc_service.shrink_text(corresponding_count)?;
+                        let text = match mode {
+                            InputMode::Kana => {
+                                resolved_symbol_text.unwrap_or_else(|| text.to_string())
+                            }
+                            InputMode::Latin => text.to_string(),
+                        };
+                        candidates =
+                            ipc_service.append_text_with_context(text, &shrunk_candidates)?;
+                        raw_input = updated_raw_input;
+                        selection_index = 0;
+
+                        if let Some(selected) = Self::select_candidate(&candidates, selection_index)
+                        {
+                            self.shift_start(&preview, &selected.text)?;
+
+                            selection_index = selected.index;
+                            corresponding_count = selected.corresponding_count;
+                            preview = selected.text.clone();
+                            suffix = selected.sub_text.clone();
+                            raw_hiragana = selected.hiragana;
+
+                            self.sync_candidate_window_update(
+                                &mut ipc_service,
+                                &candidates,
+                                selection_index,
+                                None,
+                                true,
+                            )?;
                         }
 
-                        self.sync_clause_action_ui(
-                            &preview,
-                            &suffix,
-                            &candidates,
-                            selection_index,
-                            &mut ipc_service,
-                            ready_ui_sync.and_then(|sync| sync.visible),
-                            effect.update_pos,
-                        )?;
-                        Self::log_clause_action_state(
-                            "after",
-                            action,
-                            &preview,
-                            &suffix,
-                            &raw_input,
-                            &raw_hiragana,
-                            &fixed_prefix,
-                            corresponding_count,
-                            selection_index,
-                            &candidates,
-                            &clause_snapshots,
-                            &future_clause_snapshots,
-                        );
-                    } else {
-                        Self::log_clause_action_state(
-                            "skip",
-                            action,
-                            &preview,
-                            &suffix,
-                            &raw_input,
-                            &raw_hiragana,
-                            &fixed_prefix,
-                            corresponding_count,
-                            selection_index,
-                            &candidates,
-                            &clause_snapshots,
-                            &future_clause_snapshots,
-                        );
+                        transition = CompositionState::Composing;
                     }
-                }
-                ClientAction::MoveClause(direction) => {
-                    Self::log_clause_action_state(
-                        "before",
-                        action,
-                        &preview,
-                        &suffix,
-                        &raw_input,
-                        &raw_hiragana,
-                        &fixed_prefix,
-                        corresponding_count,
-                        selection_index,
-                        &candidates,
-                        &clause_snapshots,
-                        &future_clause_snapshots,
-                    );
-                    let effect = {
-                        let mut state = ClauseState::from_composition_parts(
-                            &mut preview,
-                            &mut suffix,
-                            &mut raw_input,
-                            &mut raw_hiragana,
-                            &mut fixed_prefix,
-                            &mut corresponding_count,
-                            &mut selection_index,
-                            &mut candidates,
+                    ClientAction::ShrinkTextRaw(text) => {
+                        fixed_prefix.clear();
+                        Self::clear_clause_caches(
                             &mut clause_snapshots,
                             &mut future_clause_snapshots,
-                            &mut current_clause_is_split_derived,
-                            &mut current_clause_is_direct_split_remainder,
-                            &mut current_clause_has_split_left_neighbor,
-                            &mut current_clause_split_group_id,
-                            &mut next_split_group_id,
-                        );
-                        let transition = ClauseState::transition_with_backend(
-                            &mut state,
-                            ClauseCommand::MoveBy(*direction),
-                            ClauseTransitionInput::default(),
                             &mut ipc_service,
                         )?;
-                        let effect = transition.effect;
-                        ClauseState::write_back(state);
-                        effect
-                    };
+                        current_clause_is_split_derived = false;
+                        current_clause_is_direct_split_remainder = false;
+                        current_clause_has_split_left_neighbor = false;
+                        current_clause_split_group_id = None;
+                        let mut updated_raw_input =
+                            Self::current_raw_input_suffix(&raw_input, corresponding_count);
+                        updated_raw_input.push_str(text);
 
-                    let deferred_ready_ui_sync =
-                        Self::deferred_clause_navigation_ready_ui_sync_after_move(
-                            deferred_clause_navigation_ready_ui_sync.take(),
-                            effect,
-                        );
-                    if effect.applied {
-                        self.sync_clause_action_ui(
-                            &preview,
-                            &suffix,
-                            &candidates,
-                            selection_index,
-                            &mut ipc_service,
-                            deferred_ready_ui_sync.and_then(|sync| sync.visible),
-                            effect.update_pos,
-                        )?;
-                        Self::log_clause_action_state(
-                            "after",
-                            action,
-                            &preview,
-                            &suffix,
-                            &raw_input,
-                            &raw_hiragana,
-                            &fixed_prefix,
-                            corresponding_count,
-                            selection_index,
-                            &candidates,
-                            &clause_snapshots,
-                            &future_clause_snapshots,
-                        );
-                    } else if let Some(sync) = deferred_ready_ui_sync {
-                        self.sync_clause_action_ui(
-                            &preview,
-                            &suffix,
-                            &candidates,
-                            selection_index,
-                            &mut ipc_service,
-                            sync.visible,
-                            sync.update_pos,
-                        )?;
-                        Self::log_clause_action_state(
-                            "after-deferred",
-                            action,
-                            &preview,
-                            &suffix,
-                            &raw_input,
-                            &raw_hiragana,
-                            &fixed_prefix,
-                            corresponding_count,
-                            selection_index,
-                            &candidates,
-                            &clause_snapshots,
-                            &future_clause_snapshots,
-                        );
-                    } else {
-                        Self::log_clause_action_state(
-                            "skip",
-                            action,
-                            &preview,
-                            &suffix,
-                            &raw_input,
-                            &raw_hiragana,
-                            &fixed_prefix,
-                            corresponding_count,
-                            selection_index,
-                            &candidates,
-                            &clause_snapshots,
-                            &future_clause_snapshots,
-                        );
+                        let shrunk_candidates = ipc_service.shrink_text(corresponding_count)?;
+                        candidates = ipc_service
+                            .append_text_with_context(text.clone(), &shrunk_candidates)?;
+                        raw_input = updated_raw_input;
+                        selection_index = 0;
+
+                        if let Some(selected) = Self::select_candidate(&candidates, selection_index)
+                        {
+                            self.shift_start(&preview, &selected.text)?;
+
+                            selection_index = selected.index;
+                            corresponding_count = selected.corresponding_count;
+                            preview = selected.text.clone();
+                            suffix = selected.sub_text.clone();
+                            raw_hiragana = selected.hiragana;
+
+                            self.sync_candidate_window_update(
+                                &mut ipc_service,
+                                &candidates,
+                                selection_index,
+                                None,
+                                true,
+                            )?;
+                        }
+
+                        transition = CompositionState::Composing;
                     }
-                }
-                ClientAction::AdjustBoundary(direction) => {
-                    Self::log_clause_action_state(
-                        "before",
-                        action,
-                        &preview,
-                        &suffix,
-                        &raw_input,
-                        &raw_hiragana,
-                        &fixed_prefix,
-                        corresponding_count,
-                        selection_index,
-                        &candidates,
-                        &clause_snapshots,
-                        &future_clause_snapshots,
-                    );
-                    let effect = {
-                        let mut state = ClauseState::from_composition_parts(
-                            &mut preview,
-                            &mut suffix,
-                            &mut raw_input,
-                            &mut raw_hiragana,
-                            &mut fixed_prefix,
-                            &mut corresponding_count,
-                            &mut selection_index,
-                            &mut candidates,
+                    ClientAction::ShrinkTextDirect(text) => {
+                        fixed_prefix.clear();
+                        Self::clear_clause_caches(
                             &mut clause_snapshots,
                             &mut future_clause_snapshots,
-                            &mut current_clause_is_split_derived,
-                            &mut current_clause_is_direct_split_remainder,
-                            &mut current_clause_has_split_left_neighbor,
-                            &mut current_clause_split_group_id,
-                            &mut next_split_group_id,
-                        );
-                        let transition = ClauseState::transition_with_backend(
-                            &mut state,
-                            ClauseCommand::AdjustBoundary(*direction),
-                            ClauseTransitionInput::default(),
                             &mut ipc_service,
                         )?;
-                        let effect = transition.effect;
-                        ClauseState::write_back(state);
-                        effect
-                    };
+                        current_clause_is_split_derived = false;
+                        current_clause_is_direct_split_remainder = false;
+                        current_clause_has_split_left_neighbor = false;
+                        current_clause_split_group_id = None;
+                        let mut updated_raw_input =
+                            Self::current_raw_input_suffix(&raw_input, corresponding_count);
+                        updated_raw_input.push_str(text);
 
-                    if effect.applied {
-                        self.sync_clause_action_ui(
-                            &preview,
-                            &suffix,
-                            &candidates,
-                            selection_index,
-                            &mut ipc_service,
-                            None,
-                            effect.update_pos,
-                        )?;
-                        Self::log_clause_action_state(
-                            "after",
-                            action,
-                            &preview,
-                            &suffix,
-                            &raw_input,
-                            &raw_hiragana,
-                            &fixed_prefix,
-                            corresponding_count,
-                            selection_index,
-                            &candidates,
-                            &clause_snapshots,
-                            &future_clause_snapshots,
-                        );
-                    } else {
-                        Self::log_clause_action_state(
-                            "skip",
-                            action,
-                            &preview,
-                            &suffix,
-                            &raw_input,
-                            &raw_hiragana,
-                            &fixed_prefix,
-                            corresponding_count,
-                            selection_index,
-                            &candidates,
-                            &clause_snapshots,
-                            &future_clause_snapshots,
-                        );
+                        let shrunk_candidates = ipc_service.shrink_text(corresponding_count)?;
+                        candidates = ipc_service
+                            .append_text_direct_with_context(text.clone(), &shrunk_candidates)?;
+                        raw_input = updated_raw_input;
+                        selection_index = 0;
+
+                        if let Some(selected) = Self::select_candidate(&candidates, selection_index)
+                        {
+                            self.shift_start(&preview, &selected.text)?;
+
+                            selection_index = selected.index;
+                            corresponding_count = selected.corresponding_count;
+                            preview = selected.text.clone();
+                            suffix = selected.sub_text.clone();
+                            raw_hiragana = selected.hiragana;
+
+                            self.sync_candidate_window_update(
+                                &mut ipc_service,
+                                &candidates,
+                                selection_index,
+                                None,
+                                true,
+                            )?;
+                        }
+
+                        transition = CompositionState::Composing;
                     }
-                }
-                ClientAction::SetIMEMode(mode) => {
-                    self.start_composition()?;
-                    let position = self.candidate_window_position()?;
-                    self.end_composition()?;
+                    ClientAction::SetTemporaryLatin(is_temporary_latin) => {
+                        temporary_latin = *is_temporary_latin;
+                        if !temporary_latin {
+                            temporary_latin_shift_pending = false;
+                        }
+                    }
+                    ClientAction::SetTemporaryLatinShiftPending(is_shift_pending) => {
+                        temporary_latin_shift_pending = *is_shift_pending;
+                    }
+                    ClientAction::SetTextWithType(set_type) => {
+                        let clause_raw_input = Self::current_clause_raw_input_preview(
+                            &raw_input,
+                            corresponding_count,
+                            &future_clause_snapshots,
+                        );
+                        let clause_raw_hiragana = Self::current_clause_raw_hiragana_preview(
+                            &raw_hiragana,
+                            corresponding_count,
+                            &future_clause_snapshots,
+                        );
+                        let converted_clause = Self::converted_clause_preview_text(
+                            set_type,
+                            &clause_raw_input,
+                            &clause_raw_hiragana,
+                        );
 
-                    IMEState::set_input_mode(mode.clone())?;
-
-                    // update the language bar
-                    self.update_lang_bar()?;
-
-                    let mode = match mode {
-                        InputMode::Latin => "A",
-                        InputMode::Kana => "あ",
-                    };
-
-                    ipc_service.update_candidate_window(None, position, None, None, Some(mode))?;
-
-                    selection_index = 0;
-                    corresponding_count = 0;
-                    temporary_latin = false;
-                    temporary_latin_shift_pending = false;
-                    preview.clear();
-                    suffix.clear();
-                    raw_input.clear();
-                    raw_hiragana.clear();
-                    fixed_prefix.clear();
-                    clause_snapshots.clear();
-                    future_clause_snapshots.clear();
-                    current_clause_is_split_derived = false;
-                    current_clause_is_direct_split_remainder = false;
-                    current_clause_has_split_left_neighbor = false;
-                    current_clause_split_group_id = None;
-                    next_split_group_id = 0;
-                    ipc_service.clear_text()?;
-                }
-                ClientAction::SetSelection(selection) => {
-                    Self::log_clause_action_state(
-                        "before",
-                        action,
-                        &preview,
-                        &suffix,
-                        &raw_input,
-                        &raw_hiragana,
-                        &fixed_prefix,
-                        corresponding_count,
-                        selection_index,
-                        &candidates,
-                        &clause_snapshots,
-                        &future_clause_snapshots,
-                    );
-                    let effect = {
-                        let mut state = ClauseState::from_composition_parts(
-                            &mut preview,
-                            &mut suffix,
-                            &mut raw_input,
-                            &mut raw_hiragana,
-                            &mut fixed_prefix,
-                            &mut corresponding_count,
-                            &mut selection_index,
-                            &mut candidates,
+                        preview = Self::merge_preview_with_prefix(&fixed_prefix, &converted_clause);
+                        Self::sync_clause_snapshot_suffixes(
                             &mut clause_snapshots,
-                            &mut future_clause_snapshots,
-                            &mut current_clause_is_split_derived,
-                            &mut current_clause_is_direct_split_remainder,
-                            &mut current_clause_has_split_left_neighbor,
-                            &mut current_clause_split_group_id,
-                            &mut next_split_group_id,
-                        );
-                        let transition = ClauseState::transition_without_backend(
-                            &mut state,
-                            ClauseCommand::SetSelection(selection),
-                        );
-                        let effect = transition.effect;
-                        ClauseState::write_back(state);
-                        effect
-                    };
-
-                    if effect.applied {
-                        self.sync_clause_action_ui(
                             &preview,
                             &suffix,
-                            &candidates,
-                            selection_index,
-                            &mut ipc_service,
-                            None,
-                            effect.update_pos,
-                        )?;
-                        Self::log_clause_action_state(
-                            "after",
-                            action,
-                            &preview,
-                            &suffix,
-                            &raw_input,
-                            &raw_hiragana,
-                            &fixed_prefix,
-                            corresponding_count,
-                            selection_index,
-                            &candidates,
-                            &clause_snapshots,
-                            &future_clause_snapshots,
                         );
-                    } else {
-                        Self::log_clause_action_state(
-                            "skip",
-                            action,
-                            &preview,
-                            &suffix,
-                            &raw_input,
-                            &raw_hiragana,
-                            &fixed_prefix,
-                            corresponding_count,
-                            selection_index,
-                            &candidates,
-                            &clause_snapshots,
-                            &future_clause_snapshots,
-                        );
+                        self.set_text(&preview, &suffix)?;
                     }
-                }
-                ClientAction::ShrinkText(text) => {
-                    fixed_prefix.clear();
-                    Self::clear_clause_caches(
-                        &mut clause_snapshots,
-                        &mut future_clause_snapshots,
-                        &mut ipc_service,
-                    )?;
-                    current_clause_is_split_derived = false;
-                    current_clause_is_direct_split_remainder = false;
-                    current_clause_has_split_left_neighbor = false;
-                    current_clause_split_group_id = None;
-                    let shrunk_raw_input =
-                        Self::current_raw_input_suffix(&raw_input, corresponding_count);
-                    let resolved_symbol_text = match mode {
-                        InputMode::Kana => Self::resolve_symbol_input_text_with_lookup(
-                            &shrunk_raw_input,
-                            text,
-                            &app_config,
-                            &romaji_lookup,
-                        ),
-                        InputMode::Latin => None,
-                    };
-                    let mut updated_raw_input = shrunk_raw_input.clone();
-                    updated_raw_input.push_str(text);
-
-                    let shrunk_candidates = ipc_service.shrink_text(corresponding_count)?;
-                    let text = match mode {
-                        InputMode::Kana => resolved_symbol_text.unwrap_or_else(|| text.to_string()),
-                        InputMode::Latin => text.to_string(),
-                    };
-                    candidates = ipc_service.append_text_with_context(text, &shrunk_candidates)?;
-                    raw_input = updated_raw_input;
-                    selection_index = 0;
-
-                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
-                        self.shift_start(&preview, &selected.text)?;
-
-                        selection_index = selected.index;
-                        corresponding_count = selected.corresponding_count;
-                        preview = selected.text.clone();
-                        suffix = selected.sub_text.clone();
-                        raw_hiragana = selected.hiragana;
-
-                        self.sync_candidate_window_update(
-                            &mut ipc_service,
-                            &candidates,
-                            selection_index,
-                            None,
-                            true,
-                        )?;
-                    }
-
-                    transition = CompositionState::Composing;
-                }
-                ClientAction::ShrinkTextRaw(text) => {
-                    fixed_prefix.clear();
-                    Self::clear_clause_caches(
-                        &mut clause_snapshots,
-                        &mut future_clause_snapshots,
-                        &mut ipc_service,
-                    )?;
-                    current_clause_is_split_derived = false;
-                    current_clause_is_direct_split_remainder = false;
-                    current_clause_has_split_left_neighbor = false;
-                    current_clause_split_group_id = None;
-                    let mut updated_raw_input =
-                        Self::current_raw_input_suffix(&raw_input, corresponding_count);
-                    updated_raw_input.push_str(text);
-
-                    let shrunk_candidates = ipc_service.shrink_text(corresponding_count)?;
-                    candidates =
-                        ipc_service.append_text_with_context(text.clone(), &shrunk_candidates)?;
-                    raw_input = updated_raw_input;
-                    selection_index = 0;
-
-                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
-                        self.shift_start(&preview, &selected.text)?;
-
-                        selection_index = selected.index;
-                        corresponding_count = selected.corresponding_count;
-                        preview = selected.text.clone();
-                        suffix = selected.sub_text.clone();
-                        raw_hiragana = selected.hiragana;
-
-                        self.sync_candidate_window_update(
-                            &mut ipc_service,
-                            &candidates,
-                            selection_index,
-                            None,
-                            true,
-                        )?;
-                    }
-
-                    transition = CompositionState::Composing;
-                }
-                ClientAction::ShrinkTextDirect(text) => {
-                    fixed_prefix.clear();
-                    Self::clear_clause_caches(
-                        &mut clause_snapshots,
-                        &mut future_clause_snapshots,
-                        &mut ipc_service,
-                    )?;
-                    current_clause_is_split_derived = false;
-                    current_clause_is_direct_split_remainder = false;
-                    current_clause_has_split_left_neighbor = false;
-                    current_clause_split_group_id = None;
-                    let mut updated_raw_input =
-                        Self::current_raw_input_suffix(&raw_input, corresponding_count);
-                    updated_raw_input.push_str(text);
-
-                    let shrunk_candidates = ipc_service.shrink_text(corresponding_count)?;
-                    candidates = ipc_service
-                        .append_text_direct_with_context(text.clone(), &shrunk_candidates)?;
-                    raw_input = updated_raw_input;
-                    selection_index = 0;
-
-                    if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
-                        self.shift_start(&preview, &selected.text)?;
-
-                        selection_index = selected.index;
-                        corresponding_count = selected.corresponding_count;
-                        preview = selected.text.clone();
-                        suffix = selected.sub_text.clone();
-                        raw_hiragana = selected.hiragana;
-
-                        self.sync_candidate_window_update(
-                            &mut ipc_service,
-                            &candidates,
-                            selection_index,
-                            None,
-                            true,
-                        )?;
-                    }
-
-                    transition = CompositionState::Composing;
-                }
-                ClientAction::SetTemporaryLatin(is_temporary_latin) => {
-                    temporary_latin = *is_temporary_latin;
-                    if !temporary_latin {
-                        temporary_latin_shift_pending = false;
-                    }
-                }
-                ClientAction::SetTemporaryLatinShiftPending(is_shift_pending) => {
-                    temporary_latin_shift_pending = *is_shift_pending;
-                }
-                ClientAction::SetTextWithType(set_type) => {
-                    let clause_raw_input = Self::current_clause_raw_input_preview(
-                        &raw_input,
-                        corresponding_count,
-                        &future_clause_snapshots,
-                    );
-                    let clause_raw_hiragana = Self::current_clause_raw_hiragana_preview(
-                        &raw_hiragana,
-                        corresponding_count,
-                        &future_clause_snapshots,
-                    );
-                    let converted_clause = Self::converted_clause_preview_text(
-                        set_type,
-                        &clause_raw_input,
-                        &clause_raw_hiragana,
-                    );
-
-                    preview = Self::merge_preview_with_prefix(&fixed_prefix, &converted_clause);
-                    Self::sync_clause_snapshot_suffixes(&mut clause_snapshots, &preview, &suffix);
-                    self.set_text(&preview, &suffix)?;
                 }
             }
-        }
 
-        let text_service = self.borrow()?;
-        let mut composition = text_service.borrow_mut_composition()?;
+            let text_service = self.borrow()?;
+            let mut composition = text_service.borrow_mut_composition()?;
 
-        composition.preview = preview.clone();
-        composition.state = transition;
-        composition.selection_index = selection_index;
-        composition.raw_input = raw_input.clone();
-        composition.raw_hiragana = raw_hiragana.clone();
-        composition.fixed_prefix = fixed_prefix.clone();
-        composition.candidates = candidates;
-        composition.clause_snapshots = clause_snapshots;
-        composition.future_clause_snapshots = future_clause_snapshots;
-        composition.current_clause_is_split_derived = current_clause_is_split_derived;
-        composition.current_clause_is_direct_split_remainder =
-            current_clause_is_direct_split_remainder;
-        composition.current_clause_has_split_left_neighbor = current_clause_has_split_left_neighbor;
-        composition.current_clause_split_group_id = current_clause_split_group_id;
-        composition.next_split_group_id = next_split_group_id;
-        composition.suffix = suffix.clone();
-        composition.corresponding_count = corresponding_count;
-        composition.temporary_latin = temporary_latin;
-        composition.temporary_latin_shift_pending = temporary_latin_shift_pending;
+            composition.preview = preview.clone();
+            composition.state = transition;
+            composition.selection_index = selection_index;
+            composition.raw_input = raw_input.clone();
+            composition.raw_hiragana = raw_hiragana.clone();
+            composition.fixed_prefix = fixed_prefix.clone();
+            composition.candidates = candidates;
+            composition.clause_snapshots = clause_snapshots;
+            composition.future_clause_snapshots = future_clause_snapshots;
+            composition.current_clause_is_split_derived = current_clause_is_split_derived;
+            composition.current_clause_is_direct_split_remainder =
+                current_clause_is_direct_split_remainder;
+            composition.current_clause_has_split_left_neighbor =
+                current_clause_has_split_left_neighbor;
+            composition.current_clause_split_group_id = current_clause_split_group_id;
+            composition.next_split_group_id = next_split_group_id;
+            composition.suffix = suffix.clone();
+            composition.corresponding_count = corresponding_count;
+            composition.temporary_latin = temporary_latin;
+            composition.temporary_latin_shift_pending = temporary_latin_shift_pending;
 
-        drop(composition);
-        drop(text_service);
+            drop(composition);
+            drop(text_service);
 
-        if let Err(error) = IMEState::set_ipc_service(ipc_service) {
-            tracing::warn!(
-                ?error,
-                "Failed to persist updated IPC service into IMEState"
+            if let Err(error) = IMEState::set_ipc_service(ipc_service) {
+                tracing::warn!(
+                    ?error,
+                    "Failed to persist updated IPC service into IMEState"
+                );
+            }
+
+            Ok(())
+        })();
+
+        if let (Some(request_id), Some(total_start)) = (trace_request_id, total_start) {
+            let details = match &result {
+                Ok(()) => format!(
+                    "status=success;actions={};requested_transition={requested_transition:?}",
+                    actions.len()
+                ),
+                Err(error) => format!(
+                    "status=error;actions={};requested_transition={requested_transition:?};error={error:?}",
+                    actions.len()
+                ),
+            };
+            Self::log_client_performance(
+                request_id,
+                "handle_action",
+                "total",
+                total_start.elapsed(),
+                details,
             );
         }
 
-        Ok(())
+        result
     }
 }
 

@@ -1408,8 +1408,16 @@ public func free_candidate_list(
     )
     let options = getOptions(context: contextString, zenzaiEnabled: useZenzai)
     serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates begin useZenzai=\(useZenzai) syntheticEndOfText=\(previewState.syntheticEndOfText)")
+    let totalStart = ProcessInfo.processInfo.systemUptime
     let requestStart = ProcessInfo.processInfo.systemUptime
     let converted = converter.requestCandidates(previewPrefixComposingText, options: options)
+    let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
+    performanceLog(
+        operation: "get_composed_text_for_cursor_prefix",
+        stage: "request_candidates",
+        elapsedMs: requestMs,
+        details: "first_clause_candidate_count=\(converted.firstClauseResults.count);main_candidate_count=\(converted.mainResults.count);use_zenzai=\(useZenzai);synthetic_end_of_text=\(previewState.syntheticEndOfText);prefix_len=\(prefixHiragana.count);preview_prefix_len=\(previewPrefixHiragana.count);suffix_len=\(suffixAfterCursor.count)"
+    )
     var cursorPrefixResolutionCache: [String: CandidateDisplayResolution] = [:]
     let firstClauseCorrespondingCount = cursorPrefixFirstClauseCorrespondingCount(
         firstClauseResults: converted.firstClauseResults,
@@ -1436,10 +1444,19 @@ public func free_candidate_list(
         let exactClausePreviewState = makeCandidatePreviewComposingText(
             from: exactClauseComposingText
         )
-        exactClauseResults = converter.requestCandidates(
+        let exactClauseRequestStart = ProcessInfo.processInfo.systemUptime
+        let exactClauseConverted = converter.requestCandidates(
             exactClausePreviewState.composingText,
             options: options
-        ).mainResults
+        )
+        exactClauseResults = exactClauseConverted.mainResults
+        let exactClauseRequestMs = Int((ProcessInfo.processInfo.systemUptime - exactClauseRequestStart) * 1000)
+        performanceLog(
+            operation: "get_composed_text_for_cursor_prefix",
+            stage: "request_candidates_exact_clause",
+            elapsedMs: exactClauseRequestMs,
+            details: "candidate_count=\(exactClauseResults.count);use_zenzai=\(useZenzai);synthetic_end_of_text=\(exactClausePreviewState.syntheticEndOfText);prefix_len=\(prefixHiragana.count);corresponding_count=\(firstClauseCorrespondingCount)"
+        )
     }
     let cursorPrefixResults = exactClauseResults.isEmpty
         ? preliminaryCursorPrefixResults
@@ -1453,11 +1470,11 @@ public func free_candidate_list(
             previewHiragana: previewPrefixHiragana,
             resolutionCache: &cursorPrefixResolutionCache
         )
-    let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
+    let totalMs = Int((ProcessInfo.processInfo.systemUptime - totalStart) * 1000)
     performanceLog(
         operation: "get_composed_text_for_cursor_prefix",
-        stage: "request_candidates",
-        elapsedMs: requestMs,
+        stage: "total_before_ffi_candidates",
+        elapsedMs: totalMs,
         details: "candidate_count=\(cursorPrefixResults.count);first_clause_candidate_count=\(converted.firstClauseResults.count);main_candidate_count=\(converted.mainResults.count);exact_clause_candidate_count=\(exactClauseResults.count);use_zenzai=\(useZenzai);synthetic_end_of_text=\(previewState.syntheticEndOfText);prefix_len=\(prefixHiragana.count);preview_prefix_len=\(previewPrefixHiragana.count);suffix_len=\(suffixAfterCursor.count)"
     )
     serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates returned candidateCount=\(cursorPrefixResults.count) firstClauseCandidateCount=\(converted.firstClauseResults.count) mainCandidateCount=\(converted.mainResults.count) exactClauseCandidateCount=\(exactClauseResults.count)")

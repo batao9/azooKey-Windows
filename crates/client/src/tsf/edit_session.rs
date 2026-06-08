@@ -16,7 +16,11 @@ use std::{cell::Cell, mem::ManuallyDrop, rc::Rc, time::Instant};
 
 use anyhow::Result;
 
-use crate::{engine::state::IMEState, extension::StringExt as _, globals::GUID_DISPLAY_ATTRIBUTE};
+use crate::{
+    engine::{ipc_service::current_input_trace_request_id, state::IMEState},
+    extension::StringExt as _,
+    globals::GUID_DISPLAY_ATTRIBUTE,
+};
 use shared::proto::WindowPosition;
 
 use super::factory::TextServiceFactory;
@@ -62,6 +66,23 @@ impl<'a, T> ITfEditSession_Impl for EditSession_Impl<'a, T> {
 }
 
 impl TextServiceFactory {
+    fn log_candidate_window_position_performance(
+        request_id: u64,
+        stage: &str,
+        start: Instant,
+        details: impl Into<String>,
+    ) {
+        if let Ok(Some(ipc_service)) = IMEState::ipc_service() {
+            ipc_service.log_client_performance(
+                request_id,
+                "candidate_window_position",
+                stage,
+                start.elapsed(),
+                details.into(),
+            );
+        }
+    }
+
     fn close_composition(&self, discard_text: bool) -> Result<()> {
         let text_service = self.borrow()?;
 
@@ -285,6 +306,8 @@ impl TextServiceFactory {
 
     #[tracing::instrument]
     pub fn candidate_window_position(&self) -> Result<Option<WindowPosition>> {
+        let trace_request_id = current_input_trace_request_id();
+        let total_start = trace_request_id.map(|_| Instant::now());
         {
             let mut text_service = match self.borrow_mut() {
                 Ok(text_service) => text_service,
@@ -292,6 +315,14 @@ impl TextServiceFactory {
                     tracing::warn!(
                         "Skip candidate_window_position due to borrow conflict: {error:?}"
                     );
+                    if let (Some(request_id), Some(total_start)) = (trace_request_id, total_start) {
+                        Self::log_candidate_window_position_performance(
+                            request_id,
+                            "total",
+                            total_start,
+                            format!("status=skipped;reason=borrow_conflict;error={error:?}"),
+                        );
+                    }
                     return Ok(None);
                 }
             };
@@ -301,6 +332,14 @@ impl TextServiceFactory {
                 .try_begin_update(Instant::now())
             {
                 tracing::debug!("Skip re-entrant candidate_window_position call");
+                if let (Some(request_id), Some(total_start)) = (trace_request_id, total_start) {
+                    Self::log_candidate_window_position_performance(
+                        request_id,
+                        "total",
+                        total_start,
+                        "status=skipped;reason=reentrant".to_string(),
+                    );
+                }
                 return Ok(None);
             }
         }
@@ -353,6 +392,19 @@ impl TextServiceFactory {
             Err(error) => {
                 tracing::warn!("Failed to reset update_pos guard: {error:?}");
             }
+        }
+
+        if let (Some(request_id), Some(total_start)) = (trace_request_id, total_start) {
+            let details = match &result {
+                Ok(position) => format!("status=success;position_present={}", position.is_some()),
+                Err(error) => format!("status=error;error={error:?}"),
+            };
+            Self::log_candidate_window_position_performance(
+                request_id,
+                "total",
+                total_start,
+                details,
+            );
         }
 
         match result {
