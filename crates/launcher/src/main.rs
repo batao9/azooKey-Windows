@@ -229,6 +229,10 @@ fn crash_trace_is_in_progress(trace: &str) -> bool {
     trace.contains("\"state\":\"begin\"") || trace.contains("\"state\": \"begin\"")
 }
 
+fn crash_trace_is_completed(trace: &str) -> bool {
+    trace.contains("\"state\":\"completed\"") || trace.contains("\"state\": \"completed\"")
+}
+
 fn preserve_launcher_crash_trace_if_incomplete(config: &AppConfig) {
     if !config.debug.server_crash_trace_enabled {
         return;
@@ -276,6 +280,14 @@ fn write_launcher_crash_trace(
     let Some(path) = resolve_log_path(LAUNCHER_CRASH_TRACE_FILE_NAME) else {
         return;
     };
+    if stage == "spawned"
+        && state == "begin"
+        && fs::read_to_string(&path)
+            .map(|trace| crash_trace_is_completed(&trace))
+            .unwrap_or(false)
+    {
+        return;
+    }
     if let Some(parent) = path.parent() {
         if let Err(error) = fs::create_dir_all(parent) {
             eprintln!("[launcher] failed to create crash trace directory: {error}");
