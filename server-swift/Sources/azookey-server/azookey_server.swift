@@ -1569,6 +1569,12 @@ public func free_candidate_list(
         details: "candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
     )
     serverLog("DEBUG", "GetComposedText: requestCandidates returned candidateCount=\(converted.mainResults.count) \(diagnosticDetails)")
+    crashTrace(
+        operation: "GetComposedText",
+        stage: "postprocessCandidates",
+        state: "begin",
+        details: "candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
+    )
     var result: [FFICandidate] = []
 
     for i in 0..<converted.mainResults.count {
@@ -1600,6 +1606,13 @@ public func free_candidate_list(
     }
 
     lengthPtr.pointee = result.count
+    crashTrace(
+        operation: "GetComposedText",
+        stage: "postprocessCandidates",
+        state: "completed",
+        details: "candidate_count=\(result.count);main_candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
+    )
+    serverLog("DEBUG", "GetComposedText: postprocessCandidates completed candidateCount=\(result.count) mainCandidateCount=\(converted.mainResults.count) \(diagnosticDetails)")
     serverLog("DEBUG", "GetComposedText: completed candidateCount=\(result.count) \(diagnosticDetails)")
 
     return to_list_pointer(result)
