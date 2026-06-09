@@ -520,10 +520,15 @@ mod tests {
 
     #[test]
     fn debug_server_log_defaults_to_off() {
-        assert!(!DebugConfig::default().server_log_enabled);
+        let default_config = DebugConfig::default();
+        assert!(!default_config.server_log_enabled);
+        assert_eq!(default_config.server_log_level, "warn");
+        assert!(default_config.server_crash_trace_enabled);
 
         let deserialized: DebugConfig = serde_json::from_str("{}").unwrap();
         assert!(!deserialized.server_log_enabled);
+        assert_eq!(deserialized.server_log_level, "warn");
+        assert!(deserialized.server_crash_trace_enabled);
     }
 
     #[test]
@@ -753,10 +758,24 @@ pub struct ShortcutConfig {
     pub alt_backquote_toggle: bool,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DebugConfig {
     #[serde(default)]
     pub server_log_enabled: bool,
+    #[serde(default = "default_server_log_level")]
+    pub server_log_level: String,
+    #[serde(default = "default_server_crash_trace_enabled")]
+    pub server_crash_trace_enabled: bool,
+}
+
+impl Default for DebugConfig {
+    fn default() -> Self {
+        Self {
+            server_log_enabled: false,
+            server_log_level: default_server_log_level(),
+            server_crash_trace_enabled: default_server_crash_trace_enabled(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -813,6 +832,14 @@ impl Default for NumpadInputMode {
 }
 
 fn default_shortcut_enabled() -> bool {
+    true
+}
+
+fn default_server_log_level() -> String {
+    "warn".to_string()
+}
+
+fn default_server_crash_trace_enabled() -> bool {
     true
 }
 

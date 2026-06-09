@@ -39,6 +39,9 @@ let cursorPrefixExactClauseSupplementCandidateThreshold = 5
 @MainActor var currentRequestId: UInt64 = 0
 
 public typealias ServerLogEnabledCallback = @convention(c) () -> Bool
+public typealias ServerLogLevelEnabledCallback = @convention(c) (
+    UnsafePointer<CChar>?
+) -> Bool
 public typealias ServerLogWriteCallback = @convention(c) (
     UnsafePointer<CChar>?,
     UnsafePointer<CChar>?
@@ -50,33 +53,58 @@ public typealias ServerPerformanceLogWriteCallback = @convention(c) (
     UInt64,
     UnsafePointer<CChar>?
 ) -> Void
+public typealias ServerLogFlushCallback = @convention(c) () -> Void
+public typealias ServerCrashTraceWriteCallback = @convention(c) (
+    UnsafePointer<CChar>?,
+    UnsafePointer<CChar>?,
+    UnsafePointer<CChar>?,
+    UnsafePointer<CChar>?
+) -> Void
 
 private final class ServerLogCallbacks: @unchecked Sendable {
     private let lock = NSLock()
     private var logEnabled: ServerLogEnabledCallback?
+    private var logLevelEnabled: ServerLogLevelEnabledCallback?
     private var performanceLogEnabled: ServerLogEnabledCallback?
     private var writeLog: ServerLogWriteCallback?
     private var writePerformanceLog: ServerPerformanceLogWriteCallback?
+    private var flushLog: ServerLogFlushCallback?
+    private var crashTraceEnabled: ServerLogEnabledCallback?
+    private var writeCrashTrace: ServerCrashTraceWriteCallback?
 
     func configure(
         logEnabled: ServerLogEnabledCallback?,
+        logLevelEnabled: ServerLogLevelEnabledCallback?,
         performanceLogEnabled: ServerLogEnabledCallback?,
         writeLog: ServerLogWriteCallback?,
-        writePerformanceLog: ServerPerformanceLogWriteCallback?
+        writePerformanceLog: ServerPerformanceLogWriteCallback?,
+        flushLog: ServerLogFlushCallback?,
+        crashTraceEnabled: ServerLogEnabledCallback?,
+        writeCrashTrace: ServerCrashTraceWriteCallback?
     ) {
         lock.lock()
         self.logEnabled = logEnabled
+        self.logLevelEnabled = logLevelEnabled
         self.performanceLogEnabled = performanceLogEnabled
         self.writeLog = writeLog
         self.writePerformanceLog = writePerformanceLog
+        self.flushLog = flushLog
+        self.crashTraceEnabled = crashTraceEnabled
+        self.writeCrashTrace = writeCrashTrace
         lock.unlock()
     }
 
-    func isLogEnabled() -> Bool {
+    func isLogEnabled(level: String) -> Bool {
         lock.lock()
-        let callback = logEnabled
+        let fallbackCallback = logEnabled
+        let levelCallback = logLevelEnabled
         lock.unlock()
-        return callback?() ?? false
+        if let levelCallback {
+            return level.withCString { levelPointer in
+                levelCallback(levelPointer)
+            }
+        }
+        return fallbackCallback?() ?? false
     }
 
     func isPerformanceLogEnabled() -> Bool {
@@ -125,6 +153,41 @@ private final class ServerLogCallbacks: @unchecked Sendable {
             }
         }
     }
+
+    func flush() {
+        lock.lock()
+        let callback = flushLog
+        lock.unlock()
+
+        callback?()
+    }
+
+    func isCrashTraceEnabled() -> Bool {
+        lock.lock()
+        let callback = crashTraceEnabled
+        lock.unlock()
+        return callback?() ?? false
+    }
+
+    func crashTrace(operation: String, stage: String, state: String, details: String) {
+        lock.lock()
+        let callback = writeCrashTrace
+        lock.unlock()
+
+        guard let callback else {
+            return
+        }
+
+        operation.withCString { operationPointer in
+            stage.withCString { stagePointer in
+                state.withCString { statePointer in
+                    details.withCString { detailsPointer in
+                        callback(operationPointer, stagePointer, statePointer, detailsPointer)
+                    }
+                }
+            }
+        }
+    }
 }
 
 private let serverLogCallbacks = ServerLogCallbacks()
@@ -132,24 +195,57 @@ private let serverLogCallbacks = ServerLogCallbacks()
 @_silgen_name("SetServerLogCallbacks")
 public func set_server_log_callbacks(
     _ logEnabled: ServerLogEnabledCallback?,
+    _ logLevelEnabled: ServerLogLevelEnabledCallback?,
     _ performanceLogEnabled: ServerLogEnabledCallback?,
     _ writeLog: ServerLogWriteCallback?,
-    _ writePerformanceLog: ServerPerformanceLogWriteCallback?
+    _ writePerformanceLog: ServerPerformanceLogWriteCallback?,
+    _ flushLog: ServerLogFlushCallback?,
+    _ crashTraceEnabled: ServerLogEnabledCallback?,
+    _ writeCrashTrace: ServerCrashTraceWriteCallback?
 ) {
     serverLogCallbacks.configure(
         logEnabled: logEnabled,
+        logLevelEnabled: logLevelEnabled,
         performanceLogEnabled: performanceLogEnabled,
         writeLog: writeLog,
-        writePerformanceLog: writePerformanceLog
+        writePerformanceLog: writePerformanceLog,
+        flushLog: flushLog,
+        crashTraceEnabled: crashTraceEnabled,
+        writeCrashTrace: writeCrashTrace
     )
 }
 
-private func serverLog(_ level: String = "INFO", _ message: @autoclosure () -> String) {
-    guard serverLogCallbacks.isLogEnabled() else {
+@MainActor private func serverLog(
+    _ level: String = "INFO",
+    _ message: @autoclosure () -> String,
+    flush: Bool = false
+) {
+    guard serverLogCallbacks.isLogEnabled(level: level) else {
         return
     }
 
-    serverLogCallbacks.log(level: level, message: message())
+    serverLogCallbacks.log(level: level, message: "request_id=\(currentRequestId) \(message())")
+    if flush {
+        serverLogCallbacks.flush()
+    }
+}
+
+@MainActor private func crashTrace(
+    operation: String,
+    stage: String,
+    state: String,
+    details: @autoclosure () -> String = ""
+) {
+    guard serverLogCallbacks.isCrashTraceEnabled() else {
+        return
+    }
+
+    serverLogCallbacks.crashTrace(
+        operation: operation,
+        stage: stage,
+        state: state,
+        details: "request_id=\(currentRequestId);\(details())"
+    )
 }
 
 @MainActor private func performanceLog(
@@ -939,6 +1035,79 @@ private func preferCursorPrefixBoundary(
     )
 }
 
+private struct ZenzaiDiagnosticSnapshot {
+    let configuredEnabled: Bool
+    let backend: String
+    let normalizedBackend: String
+    let profileLength: Int
+    let cpuBackendSupported: Bool
+    let runtimeEnabled: Bool
+}
+
+@MainActor private func zenzaiDiagnosticSnapshot() -> ZenzaiDiagnosticSnapshot {
+    let configuredEnabled = (config["enable"] as? Bool) ?? false
+    let backend = (config["backend"] as? String) ?? "cpu"
+    let profile = (config["profile"] as? String) ?? ""
+    let cpuBackendSupported = cpuZenzaiBackendSupportedFromEnvironment()
+    return ZenzaiDiagnosticSnapshot(
+        configuredEnabled: configuredEnabled,
+        backend: backend,
+        normalizedBackend: normalizedZenzaiBackend(backend),
+        profileLength: profile.count,
+        cpuBackendSupported: cpuBackendSupported,
+        runtimeEnabled: effectiveZenzaiRuntimeEnabled(
+            isConfigured: configuredEnabled,
+            backend: backend,
+            cpuBackendSupported: cpuBackendSupported
+        )
+    )
+}
+
+private func sanitizeDiagnosticField(_ value: String, maxLength: Int = 80) -> String {
+    let text = String(value.map { character -> Character in
+        switch character {
+        case "\t", "\r", "\n", ";":
+            return " "
+        default:
+            return character
+        }
+    })
+    if text.count <= maxLength {
+        return text
+    }
+    return String(text.prefix(maxLength))
+}
+
+@MainActor private func zenzaiDiagnosticDetails(
+    snapshot: ZenzaiDiagnosticSnapshot,
+    contextLength: Int,
+    inputCount: Int,
+    hiraganaLength: Int,
+    previewHiraganaLength: Int? = nil,
+    useZenzai: Bool,
+    syntheticEndOfText: Bool? = nil
+) -> String {
+    var fields = [
+        "configured_zenzai=\(snapshot.configuredEnabled)",
+        "runtime_zenzai=\(snapshot.runtimeEnabled)",
+        "use_zenzai=\(useZenzai)",
+        "backend=\(sanitizeDiagnosticField(snapshot.normalizedBackend))",
+        "backend_raw=\(sanitizeDiagnosticField(snapshot.backend))",
+        "cpu_backend_supported=\(snapshot.cpuBackendSupported)",
+        "profile_len=\(snapshot.profileLength)",
+        "context_len=\(contextLength)",
+        "input_count=\(inputCount)",
+        "hiragana_len=\(hiraganaLength)",
+    ]
+    if let previewHiraganaLength {
+        fields.append("preview_hiragana_len=\(previewHiraganaLength)")
+    }
+    if let syntheticEndOfText {
+        fields.append("synthetic_end_of_text=\(syntheticEndOfText)")
+    }
+    return fields.joined(separator: ";")
+}
+
 @MainActor private func makeWarmupComposingText() -> ComposingText {
     var warmupComposingText = ComposingText()
     warmupComposingText.insertAtCursorPosition("a", inputStyle: currentInputStyle)
@@ -1124,15 +1293,33 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
         inputCount: composingText.input.count,
         hiraganaCount: composingText.convertTarget.count
     )
-    converter.requestCandidates(
-        composingText,
-        options: getOptions(zenzaiEnabled: useZenzaiForWarmup)
+    let diagnosticSnapshot = zenzaiDiagnosticSnapshot()
+    let diagnosticDetails = zenzaiDiagnosticDetails(
+        snapshot: diagnosticSnapshot,
+        contextLength: 0,
+        inputCount: composingText.input.count,
+        hiraganaLength: composingText.convertTarget.count,
+        useZenzai: useZenzaiForWarmup
     )
+    let options = getOptions(zenzaiEnabled: useZenzaiForWarmup)
+    crashTrace(operation: "Initialize", stage: "requestCandidates", state: "begin", details: diagnosticDetails)
+    serverLog("DEBUG", "Initialize: requestCandidates begin \(diagnosticDetails)", flush: true)
+    let converted = converter.requestCandidates(
+        composingText,
+        options: options
+    )
+    crashTrace(
+        operation: "Initialize",
+        stage: "requestCandidates",
+        state: "completed",
+        details: "candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
+    )
+    serverLog("DEBUG", "Initialize: requestCandidates returned candidateCount=\(converted.mainResults.count) \(diagnosticDetails)")
     composingText = ComposingText()
     composingTextSnapshots.removeAll()
     serverLog(
         "INFO",
-        "Initialize: completed inputStyle=\(String(describing: currentInputStyle)) warmupUseZenzai=\(useZenzaiForWarmup)"
+        "Initialize: completed inputStyle=\(String(describing: currentInputStyle)) warmupUseZenzai=\(useZenzaiForWarmup) \(diagnosticDetails)"
     )
 }
 
@@ -1145,28 +1332,46 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 @MainActor public func warmup() {
     let contextString = (config["context"] as? String) ?? ""
     let warmupComposingText = makeWarmupComposingText()
+    let diagnosticSnapshot = zenzaiDiagnosticSnapshot()
     let useZenzai = effectiveZenzaiEnabledForCandidates(
-        isConfigured: currentRuntimeZenzaiEnabled(),
+        isConfigured: diagnosticSnapshot.runtimeEnabled,
         inputCount: warmupComposingText.input.count,
         hiraganaCount: warmupComposingText.convertTarget.count
     )
+    let diagnosticDetails = zenzaiDiagnosticDetails(
+        snapshot: diagnosticSnapshot,
+        contextLength: contextString.count,
+        inputCount: warmupComposingText.input.count,
+        hiraganaLength: warmupComposingText.convertTarget.count,
+        useZenzai: useZenzai
+    )
     serverLog(
         "DEBUG",
-        "Warmup: start hiraganaLength=\(warmupComposingText.convertTarget.count) inputCount=\(warmupComposingText.input.count) contextLength=\(contextString.count) useZenzai=\(useZenzai)"
+        "Warmup: start \(diagnosticDetails)"
     )
+    let options = getOptions(context: contextString, zenzaiEnabled: useZenzai)
+    crashTrace(operation: "Warmup", stage: "requestCandidates", state: "begin", details: diagnosticDetails)
+    serverLog("DEBUG", "Warmup: requestCandidates begin \(diagnosticDetails)", flush: true)
     let requestStart = ProcessInfo.processInfo.systemUptime
-    _ = converter.requestCandidates(
+    let converted = converter.requestCandidates(
         warmupComposingText,
-        options: getOptions(context: contextString, zenzaiEnabled: useZenzai)
+        options: options
     )
     let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
     performanceLog(
         operation: "warmup",
         stage: "request_candidates",
         elapsedMs: requestMs,
-        details: "use_zenzai=\(useZenzai);hiragana_len=\(warmupComposingText.convertTarget.count);input_count=\(warmupComposingText.input.count)"
+        details: "candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
     )
-    serverLog("DEBUG", "Warmup: completed")
+    crashTrace(
+        operation: "Warmup",
+        stage: "requestCandidates",
+        state: "completed",
+        details: "candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
+    )
+    serverLog("DEBUG", "Warmup: requestCandidates returned candidateCount=\(converted.mainResults.count) \(diagnosticDetails)")
+    serverLog("DEBUG", "Warmup: completed \(diagnosticDetails)")
 }
 
 @_silgen_name("HasActiveComposition")
@@ -1180,12 +1385,12 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     cursorPtr: UnsafeMutablePointer<Int>
 ) -> UnsafeMutablePointer<CChar> {
     let inputString = String(cString: input)
-    serverLog("INFO", "AppendText: start inputLength=\(inputString.count) inputStyle=\(String(describing: currentInputStyle))")
+    serverLog("DEBUG", "AppendText: start inputLength=\(inputString.count) inputStyle=\(String(describing: currentInputStyle))")
     composingText.insertAtCursorPosition(inputString, inputStyle: currentInputStyle)
 
     cursorPtr.pointee = composingText.convertTargetCursorPosition
     serverLog(
-        "INFO",
+        "DEBUG",
         "AppendText: completed cursor=\(cursorPtr.pointee) hiraganaLength=\(composingText.convertTarget.count) inputCount=\(composingText.input.count)"
     )
     return _strdup(composingText.convertTarget)!
@@ -1197,12 +1402,12 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     cursorPtr: UnsafeMutablePointer<Int>
 ) -> UnsafeMutablePointer<CChar> {
     let inputString = String(cString: input)
-    serverLog("INFO", "AppendTextDirect: start inputLength=\(inputString.count)")
+    serverLog("DEBUG", "AppendTextDirect: start inputLength=\(inputString.count)")
     composingText.insertAtCursorPosition(inputString, inputStyle: .direct)
 
     cursorPtr.pointee = composingText.convertTargetCursorPosition
     serverLog(
-        "INFO",
+        "DEBUG",
         "AppendTextDirect: completed cursor=\(cursorPtr.pointee) hiraganaLength=\(composingText.convertTarget.count)"
     )
     return _strdup(composingText.convertTarget)!
@@ -1212,12 +1417,12 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 @MainActor public func remove_text(
     cursorPtr: UnsafeMutablePointer<Int>
 ) -> UnsafeMutablePointer<CChar> {
-    serverLog("INFO", "RemoveText: start")
+    serverLog("DEBUG", "RemoveText: start")
     composingText.deleteBackwardFromCursorPosition(count: 1)
 
     cursorPtr.pointee = composingText.convertTargetCursorPosition
     serverLog(
-        "INFO",
+        "DEBUG",
         "RemoveText: completed cursor=\(cursorPtr.pointee) hiraganaLength=\(composingText.convertTarget.count) inputCount=\(composingText.input.count)"
     )
     return _strdup(composingText.convertTarget)!
@@ -1228,18 +1433,18 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     offset: Int32,
     cursorPtr: UnsafeMutablePointer<Int>
 ) -> UnsafeMutablePointer<CChar> {
-    serverLog("INFO", "MoveCursor: start offset=\(offset)")
+    serverLog("DEBUG", "MoveCursor: start offset=\(offset)")
     if offset == 125 {
         composingTextSnapshots.removeAll()
         cursorPtr.pointee = composingText.convertTargetCursorPosition
-        serverLog("INFO", "MoveCursor: clear snapshots")
+        serverLog("DEBUG", "MoveCursor: clear snapshots")
         return _strdup(composingText.convertTarget)!
     }
 
     if offset == 126 {
         composingTextSnapshots.append(composingText)
         cursorPtr.pointee = composingText.convertTargetCursorPosition
-        serverLog("INFO", "MoveCursor: push snapshot count=\(composingTextSnapshots.count)")
+        serverLog("DEBUG", "MoveCursor: push snapshot count=\(composingTextSnapshots.count)")
         return _strdup(composingText.convertTarget)!
     }
 
@@ -1248,7 +1453,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
             composingText = restored
         }
         cursorPtr.pointee = composingText.convertTargetCursorPosition
-        serverLog("INFO", "MoveCursor: pop snapshot remaining=\(composingTextSnapshots.count)")
+        serverLog("DEBUG", "MoveCursor: pop snapshot remaining=\(composingTextSnapshots.count)")
         return _strdup(composingText.convertTarget)!
     }
 
@@ -1256,16 +1461,16 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     serverLog("DEBUG", "MoveCursor: offset=\(offset) cursor=\(cursor)")
 
     cursorPtr.pointee = cursor
-    serverLog("INFO", "MoveCursor: completed cursor=\(cursor)")
+    serverLog("DEBUG", "MoveCursor: completed cursor=\(cursor)")
     return _strdup(composingText.convertTarget)!
 }
 
 @_silgen_name("ClearText")
 @MainActor public func clear_text() {
-    serverLog("INFO", "ClearText: start")
+    serverLog("DEBUG", "ClearText: start")
     composingText = ComposingText()
     composingTextSnapshots.removeAll()
-    serverLog("INFO", "ClearText: completed")
+    serverLog("DEBUG", "ClearText: completed")
 }
 
 func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
@@ -1322,21 +1527,32 @@ public func free_candidate_list(
 @MainActor public func get_composed_text(lengthPtr: UnsafeMutablePointer<Int>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
     let originalHiragana = composingText.convertTarget
     let contextString = (config["context"] as? String) ?? ""
-    let runtimeZenzaiEnabled = currentRuntimeZenzaiEnabled()
+    let diagnosticSnapshot = zenzaiDiagnosticSnapshot()
+    let runtimeZenzaiEnabled = diagnosticSnapshot.runtimeEnabled
     let previewState = makeCandidatePreviewComposingText(from: composingText)
     let previewComposingText = previewState.composingText
     let previewHiragana = previewComposingText.convertTarget
-    serverLog(
-        "INFO",
-        "GetComposedText: start hiraganaLength=\(originalHiragana.count) previewHiraganaLength=\(previewHiragana.count) inputCount=\(composingText.input.count) contextLength=\(contextString.count) runtimeZenzaiEnabled=\(runtimeZenzaiEnabled) syntheticEndOfText=\(previewState.syntheticEndOfText)"
-    )
     let useZenzai = effectiveZenzaiEnabledForCandidates(
         isConfigured: runtimeZenzaiEnabled,
         inputCount: composingText.input.count,
         hiraganaCount: originalHiragana.count
     )
+    let diagnosticDetails = zenzaiDiagnosticDetails(
+        snapshot: diagnosticSnapshot,
+        contextLength: contextString.count,
+        inputCount: composingText.input.count,
+        hiraganaLength: originalHiragana.count,
+        previewHiraganaLength: previewHiragana.count,
+        useZenzai: useZenzai,
+        syntheticEndOfText: previewState.syntheticEndOfText
+    )
+    serverLog(
+        "DEBUG",
+        "GetComposedText: start \(diagnosticDetails)"
+    )
     let options = getOptions(context: contextString, zenzaiEnabled: useZenzai)
-    serverLog("INFO", "GetComposedText: requestCandidates begin useZenzai=\(useZenzai) syntheticEndOfText=\(previewState.syntheticEndOfText)")
+    crashTrace(operation: "GetComposedText", stage: "requestCandidates", state: "begin", details: diagnosticDetails)
+    serverLog("DEBUG", "GetComposedText: requestCandidates begin \(diagnosticDetails)", flush: true)
     let requestStart = ProcessInfo.processInfo.systemUptime
     let converted = converter.requestCandidates(previewComposingText, options: options)
     let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
@@ -1344,9 +1560,15 @@ public func free_candidate_list(
         operation: "get_composed_text",
         stage: "request_candidates",
         elapsedMs: requestMs,
-        details: "candidate_count=\(converted.mainResults.count);use_zenzai=\(useZenzai);synthetic_end_of_text=\(previewState.syntheticEndOfText);hiragana_len=\(originalHiragana.count);preview_hiragana_len=\(previewHiragana.count)"
+        details: "candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
     )
-    serverLog("INFO", "GetComposedText: requestCandidates returned candidateCount=\(converted.mainResults.count)")
+    crashTrace(
+        operation: "GetComposedText",
+        stage: "requestCandidates",
+        state: "completed",
+        details: "candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
+    )
+    serverLog("DEBUG", "GetComposedText: requestCandidates returned candidateCount=\(converted.mainResults.count) \(diagnosticDetails)")
     var result: [FFICandidate] = []
 
     for i in 0..<converted.mainResults.count {
@@ -1378,7 +1600,7 @@ public func free_candidate_list(
     }
 
     lengthPtr.pointee = result.count
-    serverLog("INFO", "GetComposedText: completed candidateCount=\(result.count) useZenzai=\(useZenzai)")
+    serverLog("DEBUG", "GetComposedText: completed candidateCount=\(result.count) \(diagnosticDetails)")
 
     return to_list_pointer(result)
 }
@@ -1396,18 +1618,34 @@ public func free_candidate_list(
     let prefixHiragana = prefixComposingText.convertTarget
     let previewPrefixHiragana = previewPrefixComposingText.convertTarget
     let contextString = (config["context"] as? String) ?? ""
-    let runtimeZenzaiEnabled = currentRuntimeZenzaiEnabled()
-    serverLog(
-        "INFO",
-        "GetComposedTextForCursorPrefix: start prefixLength=\(prefixHiragana.count) previewPrefixLength=\(previewPrefixHiragana.count) suffixLength=\(suffixAfterCursor.count) inputCount=\(prefixComposingText.input.count) contextLength=\(contextString.count) runtimeZenzaiEnabled=\(runtimeZenzaiEnabled) syntheticEndOfText=\(previewState.syntheticEndOfText)"
-    )
+    let diagnosticSnapshot = zenzaiDiagnosticSnapshot()
+    let runtimeZenzaiEnabled = diagnosticSnapshot.runtimeEnabled
     let useZenzai = effectiveZenzaiEnabledForCandidates(
         isConfigured: runtimeZenzaiEnabled,
         inputCount: prefixComposingText.input.count,
         hiraganaCount: prefixHiragana.count
     )
+    let diagnosticDetails = zenzaiDiagnosticDetails(
+        snapshot: diagnosticSnapshot,
+        contextLength: contextString.count,
+        inputCount: prefixComposingText.input.count,
+        hiraganaLength: prefixHiragana.count,
+        previewHiraganaLength: previewPrefixHiragana.count,
+        useZenzai: useZenzai,
+        syntheticEndOfText: previewState.syntheticEndOfText
+    )
+    serverLog(
+        "DEBUG",
+        "GetComposedTextForCursorPrefix: start suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
+    )
     let options = getOptions(context: contextString, zenzaiEnabled: useZenzai)
-    serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates begin useZenzai=\(useZenzai) syntheticEndOfText=\(previewState.syntheticEndOfText)")
+    crashTrace(
+        operation: "GetComposedTextForCursorPrefix",
+        stage: "requestCandidates",
+        state: "begin",
+        details: "suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
+    )
+    serverLog("DEBUG", "GetComposedTextForCursorPrefix: requestCandidates begin suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)", flush: true)
     let totalStart = ProcessInfo.processInfo.systemUptime
     let requestStart = ProcessInfo.processInfo.systemUptime
     let converted = converter.requestCandidates(previewPrefixComposingText, options: options)
@@ -1416,7 +1654,20 @@ public func free_candidate_list(
         operation: "get_composed_text_for_cursor_prefix",
         stage: "request_candidates",
         elapsedMs: requestMs,
-        details: "first_clause_candidate_count=\(converted.firstClauseResults.count);main_candidate_count=\(converted.mainResults.count);use_zenzai=\(useZenzai);synthetic_end_of_text=\(previewState.syntheticEndOfText);prefix_len=\(prefixHiragana.count);preview_prefix_len=\(previewPrefixHiragana.count);suffix_len=\(suffixAfterCursor.count)"
+        details: "first_clause_candidate_count=\(converted.firstClauseResults.count);main_candidate_count=\(converted.mainResults.count);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
+    )
+    crashTrace(
+        operation: "GetComposedTextForCursorPrefix",
+        stage: "requestCandidates",
+        state: "completed",
+        details: "first_clause_candidate_count=\(converted.firstClauseResults.count);main_candidate_count=\(converted.mainResults.count);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
+    )
+    serverLog("DEBUG", "GetComposedTextForCursorPrefix: requestCandidates returned firstClauseCandidateCount=\(converted.firstClauseResults.count) mainCandidateCount=\(converted.mainResults.count) suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)")
+    crashTrace(
+        operation: "GetComposedTextForCursorPrefix",
+        stage: "postprocessCandidates",
+        state: "begin",
+        details: "phase=first_clause;first_clause_candidate_count=\(converted.firstClauseResults.count);main_candidate_count=\(converted.mainResults.count);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
     )
     var cursorPrefixResolutionCache: [String: CandidateDisplayResolution] = [:]
     let firstClauseCorrespondingCount = cursorPrefixFirstClauseCorrespondingCount(
@@ -1444,6 +1695,26 @@ public func free_candidate_list(
         let exactClausePreviewState = makeCandidatePreviewComposingText(
             from: exactClauseComposingText
         )
+        let exactClauseDiagnosticDetails = zenzaiDiagnosticDetails(
+            snapshot: diagnosticSnapshot,
+            contextLength: contextString.count,
+            inputCount: exactClauseComposingText.input.count,
+            hiraganaLength: exactClauseComposingText.convertTarget.count,
+            previewHiraganaLength: exactClausePreviewState.composingText.convertTarget.count,
+            useZenzai: useZenzai,
+            syntheticEndOfText: exactClausePreviewState.syntheticEndOfText
+        )
+        crashTrace(
+            operation: "GetComposedTextForCursorPrefix",
+            stage: "requestCandidatesExactClause",
+            state: "begin",
+            details: "corresponding_count=\(firstClauseCorrespondingCount);\(exactClauseDiagnosticDetails)"
+        )
+        serverLog(
+            "DEBUG",
+            "GetComposedTextForCursorPrefix: requestCandidates exactClause begin correspondingCount=\(firstClauseCorrespondingCount) \(exactClauseDiagnosticDetails)",
+            flush: true
+        )
         let exactClauseRequestStart = ProcessInfo.processInfo.systemUptime
         let exactClauseConverted = converter.requestCandidates(
             exactClausePreviewState.composingText,
@@ -1455,9 +1726,25 @@ public func free_candidate_list(
             operation: "get_composed_text_for_cursor_prefix",
             stage: "request_candidates_exact_clause",
             elapsedMs: exactClauseRequestMs,
-            details: "candidate_count=\(exactClauseResults.count);use_zenzai=\(useZenzai);synthetic_end_of_text=\(exactClausePreviewState.syntheticEndOfText);prefix_len=\(prefixHiragana.count);corresponding_count=\(firstClauseCorrespondingCount)"
+            details: "candidate_count=\(exactClauseResults.count);corresponding_count=\(firstClauseCorrespondingCount);\(exactClauseDiagnosticDetails)"
+        )
+        crashTrace(
+            operation: "GetComposedTextForCursorPrefix",
+            stage: "requestCandidatesExactClause",
+            state: "completed",
+            details: "candidate_count=\(exactClauseResults.count);corresponding_count=\(firstClauseCorrespondingCount);\(exactClauseDiagnosticDetails)"
+        )
+        serverLog(
+            "DEBUG",
+            "GetComposedTextForCursorPrefix: requestCandidates exactClause returned candidateCount=\(exactClauseResults.count) correspondingCount=\(firstClauseCorrespondingCount) \(exactClauseDiagnosticDetails)"
         )
     }
+    crashTrace(
+        operation: "GetComposedTextForCursorPrefix",
+        stage: "postprocessCandidates",
+        state: "begin",
+        details: "phase=merge;preliminary_candidate_count=\(preliminaryCursorPrefixResults.count);exact_clause_candidate_count=\(exactClauseResults.count);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
+    )
     let cursorPrefixResults = exactClauseResults.isEmpty
         ? preliminaryCursorPrefixResults
         : cursorPrefixCandidateDisplayResults(
@@ -1475,9 +1762,8 @@ public func free_candidate_list(
         operation: "get_composed_text_for_cursor_prefix",
         stage: "total_before_ffi_candidates",
         elapsedMs: totalMs,
-        details: "candidate_count=\(cursorPrefixResults.count);first_clause_candidate_count=\(converted.firstClauseResults.count);main_candidate_count=\(converted.mainResults.count);exact_clause_candidate_count=\(exactClauseResults.count);use_zenzai=\(useZenzai);synthetic_end_of_text=\(previewState.syntheticEndOfText);prefix_len=\(prefixHiragana.count);preview_prefix_len=\(previewPrefixHiragana.count);suffix_len=\(suffixAfterCursor.count)"
+        details: "candidate_count=\(cursorPrefixResults.count);first_clause_candidate_count=\(converted.firstClauseResults.count);main_candidate_count=\(converted.mainResults.count);exact_clause_candidate_count=\(exactClauseResults.count);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
     )
-    serverLog("INFO", "GetComposedTextForCursorPrefix: requestCandidates returned candidateCount=\(cursorPrefixResults.count) firstClauseCandidateCount=\(converted.firstClauseResults.count) mainCandidateCount=\(converted.mainResults.count) exactClauseCandidateCount=\(exactClauseResults.count)")
     var result: [FFICandidate] = []
 
     for i in 0..<cursorPrefixResults.count {
@@ -1511,7 +1797,14 @@ public func free_candidate_list(
     }
 
     lengthPtr.pointee = result.count
-    serverLog("INFO", "GetComposedTextForCursorPrefix: completed candidateCount=\(result.count) useZenzai=\(useZenzai)")
+    crashTrace(
+        operation: "GetComposedTextForCursorPrefix",
+        stage: "postprocessCandidates",
+        state: "completed",
+        details: "candidate_count=\(result.count);first_clause_candidate_count=\(converted.firstClauseResults.count);main_candidate_count=\(converted.mainResults.count);exact_clause_candidate_count=\(exactClauseResults.count);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
+    )
+    serverLog("DEBUG", "GetComposedTextForCursorPrefix: postprocessCandidates completed candidateCount=\(result.count) firstClauseCandidateCount=\(converted.firstClauseResults.count) mainCandidateCount=\(converted.mainResults.count) exactClauseCandidateCount=\(exactClauseResults.count) suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)")
+    serverLog("DEBUG", "GetComposedTextForCursorPrefix: completed candidateCount=\(result.count) suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)")
 
     return to_list_pointer(result)
 }
@@ -1520,12 +1813,12 @@ public func free_candidate_list(
 @MainActor public func shrink_text(
     offset: Int32
 ) -> UnsafeMutablePointer<CChar>  {
-    serverLog("INFO", "ShrinkText: start offset=\(offset)")
+    serverLog("DEBUG", "ShrinkText: start offset=\(offset)")
     var afterComposingText = composingText
     afterComposingText.prefixComplete(composingCount: .inputCount(Int(offset)))
     composingText = afterComposingText
 
-    serverLog("INFO", "ShrinkText: completed hiraganaLength=\(composingText.convertTarget.count) inputCount=\(composingText.input.count)")
+    serverLog("DEBUG", "ShrinkText: completed hiraganaLength=\(composingText.convertTarget.count) inputCount=\(composingText.input.count)")
     return _strdup(composingText.convertTarget)!
 }
 
@@ -1535,5 +1828,5 @@ public func free_candidate_list(
 ) {
     let contextString = String(cString: context)
     config["context"] = contextString
-    serverLog("INFO", "SetContext: contextLength=\(contextString.count)")
+    serverLog("DEBUG", "SetContext: contextLength=\(contextString.count)")
 }

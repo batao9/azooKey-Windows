@@ -1,7 +1,8 @@
 use shared::{zenzai_cpu_backend_supported, AppConfig};
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::io::{BufRead, BufReader};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::ptr::addr_of_mut;
@@ -36,6 +37,8 @@ const SERVER_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LAUNCHER_PIPE_PATH: &str = r"\\.\pipe\azookey_launcher";
 const LAUNCHER_RESTART_COMMAND: &str = "restart-server";
 const LAUNCHER_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const LAUNCHER_CRASH_TRACE_FILE_NAME: &str = "launcher-crash-trace.json";
+const LAUNCHER_PREVIOUS_CRASH_TRACE_FILE_NAME: &str = "launcher-crash-trace.previous.json";
 
 fn main() -> anyhow::Result<()> {
     let cpu_backend_supported = zenzai_cpu_backend_supported();
@@ -135,7 +138,42 @@ fn start_server_process(install_dir: &Path, cpu_backend_supported: bool) -> anyh
         if cpu_backend_supported { "1" } else { "0" },
     );
 
-    spawn_process(command, "azookey-server.exe", "[server]")
+    let startup_details = format!(
+        "backend={};backend_dir={};zenzai_enable={};cpu_backend_supported={}",
+        config.zenzai.backend,
+        backend_dir(&config),
+        config.zenzai.enable,
+        cpu_backend_supported
+    );
+    write_launcher_crash_trace(
+        &config,
+        "server_startup",
+        "spawning",
+        "begin",
+        &startup_details,
+    );
+    match spawn_process(command, "azookey-server.exe", "[server]") {
+        Ok(child) => {
+            write_launcher_crash_trace(
+                &config,
+                "server_startup",
+                "spawned",
+                "begin",
+                &format!("child_pid={};{startup_details}", child.id()),
+            );
+            Ok(child)
+        }
+        Err(error) => {
+            write_launcher_crash_trace(
+                &config,
+                "server_startup",
+                "spawn",
+                "error",
+                &format!("{startup_details};error={error:?}"),
+            );
+            Err(error)
+        }
+    }
 }
 
 fn start_ui_process(install_dir: &Path) -> anyhow::Result<Child> {
@@ -160,6 +198,125 @@ fn process_command(install_dir: &Path, exe: &str) -> Command {
     };
     command.current_dir(install_dir);
     command
+}
+
+fn resolve_log_path(file_name: &str) -> Option<std::path::PathBuf> {
+    env::var("APPDATA").ok().map(|appdata| {
+        std::path::PathBuf::from(appdata)
+            .join("Azookey")
+            .join("logs")
+            .join(file_name)
+    })
+}
+
+fn json_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => escaped.push(' '),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn crash_trace_is_in_progress(trace: &str) -> bool {
+    trace.contains("\"state\":\"begin\"") || trace.contains("\"state\": \"begin\"")
+}
+
+fn preserve_launcher_crash_trace_if_incomplete(config: &AppConfig) {
+    if !config.debug.server_crash_trace_enabled {
+        return;
+    }
+
+    let Some(source_path) = resolve_log_path(LAUNCHER_CRASH_TRACE_FILE_NAME) else {
+        return;
+    };
+    let Ok(trace) = fs::read_to_string(source_path) else {
+        return;
+    };
+    if !crash_trace_is_in_progress(&trace) {
+        return;
+    }
+
+    let Some(previous_path) = resolve_log_path(LAUNCHER_PREVIOUS_CRASH_TRACE_FILE_NAME) else {
+        return;
+    };
+    if let Some(parent) = previous_path.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            eprintln!("[launcher] failed to create previous crash trace directory: {error}");
+            return;
+        }
+    }
+    if let Err(error) = fs::write(previous_path, trace.as_bytes()) {
+        eprintln!("[launcher] failed to preserve previous crash trace: {error}");
+    }
+}
+
+fn write_launcher_crash_trace(
+    config: &AppConfig,
+    operation: &str,
+    stage: &str,
+    state: &str,
+    details: &str,
+) {
+    if !config.debug.server_crash_trace_enabled {
+        return;
+    }
+
+    if stage == "spawning" && state == "begin" {
+        preserve_launcher_crash_trace_if_incomplete(config);
+    }
+
+    let Some(path) = resolve_log_path(LAUNCHER_CRASH_TRACE_FILE_NAME) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            eprintln!("[launcher] failed to create crash trace directory: {error}");
+            return;
+        }
+    }
+
+    let trace = format!(
+        concat!(
+            "{{\n",
+            "  \"timestamp_ms\": {},\n",
+            "  \"process_id\": {},\n",
+            "  \"component\": \"launcher\",\n",
+            "  \"operation\": \"{}\",\n",
+            "  \"stage\": \"{}\",\n",
+            "  \"state\": \"{}\",\n",
+            "  \"details\": \"{}\"\n",
+            "}}\n"
+        ),
+        now_timestamp_millis(),
+        std::process::id(),
+        json_escape(operation),
+        json_escape(stage),
+        json_escape(state),
+        json_escape(details),
+    );
+
+    match File::create(path).and_then(|mut file| {
+        file.write_all(trace.as_bytes())?;
+        file.flush()
+    }) {
+        Ok(()) => {}
+        Err(error) => eprintln!("[launcher] failed to write crash trace: {error}"),
+    }
+}
+
+fn now_timestamp_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
 }
 
 fn spawn_process(mut command: Command, exe: &str, prefix: &str) -> anyhow::Result<Child> {

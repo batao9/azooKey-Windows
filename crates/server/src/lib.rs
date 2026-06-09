@@ -68,6 +68,16 @@ impl AsyncWrite for TonicNamedPipeServer {
 
 impl TonicNamedPipeServer {
     pub fn new(path: &str) -> impl Stream<Item = io::Result<TonicNamedPipeServer>> {
+        Self::new_with_first_pipe_callback(path, || {})
+    }
+
+    pub fn new_with_first_pipe_callback<F>(
+        path: &str,
+        on_first_pipe_created: F,
+    ) -> impl Stream<Item = io::Result<TonicNamedPipeServer>>
+    where
+        F: FnOnce() + Send + 'static,
+    {
         // set security attributes to allow ipc from sandboxed processes
         // see https://nathancorvussolis.blogspot.com/2018/05/windows-ime-security.html
 
@@ -91,12 +101,16 @@ impl TonicNamedPipeServer {
             });
 
             stream! {
+                let mut on_first_pipe_created = Some(on_first_pipe_created);
                 let mut server = ServerOptions::new()
                     .first_pipe_instance(true)
                     .create_with_security_attributes_raw(
                         &name,
                         addr_of_mut!(security_attributes) as *mut c_void
                     )?;
+                if let Some(on_first_pipe_created) = on_first_pipe_created.take() {
+                    on_first_pipe_created();
+                }
 
                 loop {
                     server.connect().await?;
