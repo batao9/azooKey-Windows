@@ -169,31 +169,6 @@ UNINSTALL_AFTER_INSTALL=1 scripts/vm_stage_for_manual_test.sh <installer-path|la
 
 検証用 VM はクリーンなスナップショットから起動し、インストールログを `.local/logs/` に回収します。`UNINSTALL_AFTER_INSTALL=1` を指定した場合はアンインストールログも回収します。手動確認を続ける場合は `SHUTDOWN_AFTER_INSTALL=0` を指定して、インストール後も VM を起動したままにできます。
 
-#### azookey-server.exe の crash 調査
-
-設定画面の Debug では server log の有効化、ログレベル、クラッシュトレースを設定できます。通常運用では crash trace は既定で有効、server log level は `warn` です。この状態では 1 キーごとの `AppendText` / `GetComposedText` や `server-performance.tsv` は記録せず、候補生成の直前状態だけを `%APPDATA%\Azookey\logs\server-crash-trace.json` に小さく上書きします。再起動時に前回の trace が `state: "begin"` のまま残っていた場合は、上書き前に `server-crash-trace.previous.json` へ退避します。
-
-詳細な調査が必要な場合は server log を有効にし、log level を `debug` にすると、`%APPDATA%\Azookey\logs\server.log` と `server-performance.tsv` に request id、候補生成処理、Zenzai backend などが記録されます。`azookey-server.exe` が強制終了した場合は、最後に記録された `requestCandidates begin` / `returned`、または `server-crash-trace.json` / `server-crash-trace.previous.json` の `state: "begin"` と Windows Event Viewer の faulting module を照合します。
-
-`server-crash-trace.json` は native crash でも直前処理を残すため、`requestCandidates` の直前に同期書き込みします。SSD への書き込みを抑えるため、通常の per-key 詳細ログではなく 1 つの小さな JSON ファイルの上書きに限定しています。ただし、process が crash trace 書き込みに入る前、たとえば DLL load 中や Rust `main()` より前に停止した場合は、`launcher-crash-trace.json` / `launcher-crash-trace.previous.json` に残る startup trace までが手がかりになります。
-
-Event Viewer は GUI から「Windows ログ > Application」を開くか、PowerShell で次のように確認します。
-
-```powershell
-$start = (Get-Date).AddHours(-1)
-Get-WinEvent -FilterHashtable @{ LogName = "Application"; ProviderName = "Application Error"; StartTime = $start } |
-  Where-Object { $_.Message -like "*azookey-server.exe*" } |
-  Select-Object -First 5 TimeCreated, Id, ProviderName, Message |
-  Format-List
-
-Get-WinEvent -FilterHashtable @{ LogName = "Application"; ProviderName = "Windows Error Reporting"; StartTime = $start } |
-  Where-Object { $_.Message -like "*azookey-server.exe*" } |
-  Select-Object -First 5 TimeCreated, Id, ProviderName, Message |
-  Format-List
-```
-
-`Faulting module name` が `llama.dll` などの Zenzai backend 由来か、Swift/Rust server 側かを確認し、同じ入力を Zenzai off / CPU / Vulkan / CUDA で比較します。
-
 # 関連
 
 - [azooKey/azooKey](https://github.com/azooKey/azooKey): iOS / iPadOS向けの日本語キーボードアプリ
