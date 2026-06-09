@@ -689,17 +689,32 @@ fn log_previous_crash_trace(label: &str, trace: &str) {
     );
 }
 
-fn log_previous_crash_trace_if_incomplete(file_name: &str, label: &str) {
+fn log_and_consume_previous_crash_trace_if_incomplete(file_name: &str, label: &str) {
     if !crash_trace_enabled() {
         return;
     }
 
     let path = resolve_log_path(file_name);
-    let Ok(trace) = fs::read_to_string(path) else {
+    let Ok(trace) = fs::read_to_string(&path) else {
         return;
     };
     if crash_trace_is_in_progress(&trace) {
+        let should_consume = should_log(ServerLogLevel::Warn);
         log_previous_crash_trace(label, &trace);
+        if should_consume {
+            flush_server_logs();
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    log_event(
+                        ServerLogLevel::Warn,
+                        &format!("failed to clear consumed {label}: {error}"),
+                    );
+                    flush_server_logs();
+                }
+            }
+        }
     }
 }
 
@@ -1505,7 +1520,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ) {
         log_previous_crash_trace("previous server crash trace", &trace);
     }
-    log_previous_crash_trace_if_incomplete(
+    log_and_consume_previous_crash_trace_if_incomplete(
         LAUNCHER_PREVIOUS_CRASH_TRACE_FILE_NAME,
         "previous launcher startup crash trace",
     );
