@@ -86,7 +86,10 @@ pub(crate) fn client_performance_log_enabled() -> bool {
         .unwrap_or(true);
     if should_refresh {
         cache.enabled = AppConfig::read()
-            .map(|config| config.debug.server_log_enabled)
+            .map(|config| {
+                config.debug.server_log_enabled
+                    && config.debug.server_log_level.eq_ignore_ascii_case("debug")
+            })
             .unwrap_or(false);
         cache.last_checked = Some(Instant::now());
     }

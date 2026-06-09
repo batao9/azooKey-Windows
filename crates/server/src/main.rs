@@ -18,7 +18,7 @@ use std::{
     io::{BufWriter, Write},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         mpsc, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -28,6 +28,10 @@ const USE_ZENZAI: bool = true;
 const INPUT_STYLE_DIRECT: i32 = 1;
 const SERVER_LOG_FILE_NAME: &str = "server.log";
 const SERVER_PERFORMANCE_LOG_FILE_NAME: &str = "server-performance.tsv";
+const SERVER_CRASH_TRACE_FILE_NAME: &str = "server-crash-trace.json";
+const SERVER_PREVIOUS_CRASH_TRACE_FILE_NAME: &str = "server-crash-trace.previous.json";
+const LAUNCHER_CRASH_TRACE_FILE_NAME: &str = "launcher-crash-trace.json";
+const LAUNCHER_PREVIOUS_CRASH_TRACE_FILE_NAME: &str = "launcher-crash-trace.previous.json";
 const SERVER_PERFORMANCE_LOG_HEADER: &str =
     "timestamp_ms\trequest_id\tcomponent\toperation\tstage\telapsed_ms\tdetails";
 const LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -38,6 +42,8 @@ const WARMUP_INTERVAL_SECS: u64 = 30;
 static SERVER_LOG_WORKER: OnceLock<ServerLogWorker> = OnceLock::new();
 static SERVER_LOG_ENABLED: AtomicBool = AtomicBool::new(false);
 static SERVER_PERFORMANCE_LOG_ENABLED: AtomicBool = AtomicBool::new(false);
+static SERVER_LOG_LEVEL: AtomicU8 = AtomicU8::new(ServerLogLevel::Warn as u8);
+static SERVER_CRASH_TRACE_ENABLED: AtomicBool = AtomicBool::new(true);
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const SERVER_GENERATED_REQUEST_ID_PREFIX: u64 = 1 << 63;
 static HAS_ACTIVE_COMPOSITION: AtomicBool = AtomicBool::new(false);
@@ -59,6 +65,16 @@ impl ServerLogLevel {
             Self::Warn => "WARN",
             Self::Info => "INFO",
             Self::Debug => "DEBUG",
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Error,
+            2 => Self::Warn,
+            3 => Self::Info,
+            4 => Self::Debug,
+            _ => Self::Off,
         }
     }
 }
@@ -321,10 +337,13 @@ fn should_log(level: ServerLogLevel) -> bool {
     }
 
     SERVER_LOG_ENABLED.load(Ordering::Relaxed)
+        && level <= ServerLogLevel::from_u8(SERVER_LOG_LEVEL.load(Ordering::Relaxed))
 }
 
 fn should_log_performance() -> bool {
     SERVER_PERFORMANCE_LOG_ENABLED.load(Ordering::Relaxed)
+        && ServerLogLevel::from_u8(SERVER_LOG_LEVEL.load(Ordering::Relaxed))
+            >= ServerLogLevel::Debug
 }
 
 macro_rules! log_event_lazy {
@@ -389,9 +408,18 @@ unsafe extern "C" {
     fn SetRequestId(request_id: u64);
     fn SetServerLogCallbacks(
         log_enabled: extern "C" fn() -> bool,
+        log_level_enabled: extern "C" fn(*const c_char) -> bool,
         performance_log_enabled: extern "C" fn() -> bool,
         write_log: extern "C" fn(*const c_char, *const c_char),
         write_performance_log: extern "C" fn(u64, *const c_char, *const c_char, u64, *const c_char),
+        flush_log: extern "C" fn(),
+        crash_trace_enabled: extern "C" fn() -> bool,
+        write_crash_trace: extern "C" fn(
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+        ),
     );
 }
 
@@ -489,9 +517,13 @@ fn register_server_log_callbacks() {
     unsafe {
         SetServerLogCallbacks(
             AzookeyServerLogEnabled,
+            AzookeyServerLogLevelEnabled,
             AzookeyServerPerformanceLogEnabled,
             AzookeyServerLogFromSwift,
             AzookeyServerPerformanceLogFromSwift,
+            AzookeyServerLogFlushFromSwift,
+            AzookeyServerCrashTraceEnabled,
+            AzookeyServerCrashTraceFromSwift,
         );
     }
 }
@@ -523,8 +555,12 @@ fn resolve_log_path(file_name: &str) -> PathBuf {
     }
 }
 
-fn configure_server_logging(enabled: bool) -> Option<LogPaths> {
-    let paths = enabled.then(|| LogPaths {
+fn configure_server_logging(config: &AppConfig) -> Option<LogPaths> {
+    let level = server_log_level_from_str(&config.debug.server_log_level);
+    SERVER_LOG_LEVEL.store(level as u8, Ordering::Relaxed);
+    SERVER_CRASH_TRACE_ENABLED.store(config.debug.server_crash_trace_enabled, Ordering::Relaxed);
+
+    let paths = config.debug.server_log_enabled.then(|| LogPaths {
         server_log: resolve_log_path(SERVER_LOG_FILE_NAME),
         performance_log: resolve_log_path(SERVER_PERFORMANCE_LOG_FILE_NAME),
     });
@@ -550,10 +586,8 @@ fn configure_server_logging(enabled: bool) -> Option<LogPaths> {
 }
 
 fn reload_server_logging_from_settings() -> Option<LogPaths> {
-    let enabled = AppConfig::read()
-        .map(|config| config.debug.server_log_enabled)
-        .unwrap_or(false);
-    configure_server_logging(enabled)
+    let config = AppConfig::read().unwrap_or_default();
+    configure_server_logging(&config)
 }
 
 fn flush_server_logs() {
@@ -581,6 +615,174 @@ fn log_event_with_component(component: Option<&str>, level: ServerLogLevel, mess
     let line = format!("[{}] [{}] {}", now_timestamp_millis(), level_label, message);
 
     send_server_log_command(ServerLogCommand::WriteLog(line));
+}
+
+fn crash_trace_enabled() -> bool {
+    SERVER_CRASH_TRACE_ENABLED.load(Ordering::Relaxed)
+}
+
+fn json_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => escaped.push(' '),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn compact_trace_for_log(trace: &str) -> String {
+    let compact = trace.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX_TRACE_LOG_CHARS: usize = 512;
+    if compact.chars().count() <= MAX_TRACE_LOG_CHARS {
+        return compact;
+    }
+    compact.chars().take(MAX_TRACE_LOG_CHARS).collect()
+}
+
+fn crash_trace_is_in_progress(trace: &str) -> bool {
+    trace.contains("\"state\":\"begin\"") || trace.contains("\"state\": \"begin\"")
+}
+
+fn preserve_crash_trace_if_incomplete(
+    source_file_name: &str,
+    previous_file_name: &str,
+) -> Option<String> {
+    if !crash_trace_enabled() {
+        return None;
+    }
+
+    let source_path = resolve_log_path(source_file_name);
+    let Ok(trace) = fs::read_to_string(&source_path) else {
+        return None;
+    };
+    if !crash_trace_is_in_progress(&trace) {
+        return None;
+    }
+
+    let previous_path = resolve_log_path(previous_file_name);
+    if let Some(parent) = previous_path.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            eprintln!("Failed to create previous crash trace directory: {error}");
+            return Some(trace);
+        }
+    }
+    if let Err(error) = fs::write(&previous_path, trace.as_bytes()) {
+        eprintln!("Failed to preserve previous crash trace: {error}");
+    }
+    Some(trace)
+}
+
+fn log_previous_crash_trace(label: &str, trace: &str) {
+    log_event(
+        ServerLogLevel::Warn,
+        &format!(
+            "{label} was still in progress: {}",
+            compact_trace_for_log(trace)
+        ),
+    );
+}
+
+fn log_and_consume_previous_crash_trace_if_incomplete(file_name: &str, label: &str) {
+    if !crash_trace_enabled() {
+        return;
+    }
+
+    let path = resolve_log_path(file_name);
+    let Ok(trace) = fs::read_to_string(&path) else {
+        return;
+    };
+    if crash_trace_is_in_progress(&trace) {
+        let should_consume = should_log(ServerLogLevel::Warn);
+        log_previous_crash_trace(label, &trace);
+        if should_consume {
+            flush_server_logs();
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    log_event(
+                        ServerLogLevel::Warn,
+                        &format!("failed to clear consumed {label}: {error}"),
+                    );
+                    flush_server_logs();
+                }
+            }
+        }
+    }
+}
+
+fn write_crash_trace_file(
+    file_name: &str,
+    component: &str,
+    operation: &str,
+    stage: &str,
+    state: &str,
+    details: &str,
+) {
+    if !crash_trace_enabled() {
+        return;
+    }
+
+    let path = resolve_log_path(file_name);
+    if let Some(parent) = path.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            eprintln!("Failed to create crash trace directory: {error}");
+            return;
+        }
+    }
+
+    let trace = format!(
+        concat!(
+            "{{\n",
+            "  \"timestamp_ms\": {},\n",
+            "  \"process_id\": {},\n",
+            "  \"component\": \"{}\",\n",
+            "  \"operation\": \"{}\",\n",
+            "  \"stage\": \"{}\",\n",
+            "  \"state\": \"{}\",\n",
+            "  \"details\": \"{}\"\n",
+            "}}\n"
+        ),
+        now_timestamp_millis(),
+        std::process::id(),
+        json_escape(component),
+        json_escape(operation),
+        json_escape(stage),
+        json_escape(state),
+        json_escape(details),
+    );
+
+    match File::create(path).and_then(|mut file| {
+        file.write_all(trace.as_bytes())?;
+        file.flush()
+    }) {
+        Ok(()) => {}
+        Err(error) => eprintln!("Failed to write crash trace: {error}"),
+    }
+}
+
+fn write_server_crash_trace(
+    component: &str,
+    operation: &str,
+    stage: &str,
+    state: &str,
+    details: &str,
+) {
+    write_crash_trace_file(
+        SERVER_CRASH_TRACE_FILE_NAME,
+        component,
+        operation,
+        stage,
+        state,
+        details,
+    );
 }
 
 fn sanitize_performance_field(value: &str) -> String {
@@ -631,11 +833,12 @@ fn optional_cstr_lossy(ptr: *const c_char) -> String {
 
 fn server_log_level_from_str(level: &str) -> ServerLogLevel {
     match level.to_ascii_uppercase().as_str() {
+        "OFF" => ServerLogLevel::Off,
         "ERROR" => ServerLogLevel::Error,
         "WARN" | "WARNING" => ServerLogLevel::Warn,
         "INFO" => ServerLogLevel::Info,
         "DEBUG" => ServerLogLevel::Debug,
-        _ => ServerLogLevel::Info,
+        _ => ServerLogLevel::Warn,
     }
 }
 
@@ -645,17 +848,22 @@ pub extern "C" fn AzookeyServerLogEnabled() -> bool {
 }
 
 #[no_mangle]
+pub extern "C" fn AzookeyServerLogLevelEnabled(level: *const c_char) -> bool {
+    should_log(server_log_level_from_str(&optional_cstr_lossy(level)))
+}
+
+#[no_mangle]
 pub extern "C" fn AzookeyServerPerformanceLogEnabled() -> bool {
     should_log_performance()
 }
 
 #[no_mangle]
 pub extern "C" fn AzookeyServerLogFromSwift(level: *const c_char, message: *const c_char) {
-    if !AzookeyServerLogEnabled() {
+    let level = server_log_level_from_str(&optional_cstr_lossy(level));
+    if !should_log(level) {
         return;
     }
 
-    let level = server_log_level_from_str(&optional_cstr_lossy(level));
     let message = optional_cstr_lossy(message);
     log_event_with_component(Some("SWIFT"), level, &message);
 }
@@ -678,6 +886,32 @@ pub extern "C" fn AzookeyServerPerformanceLogFromSwift(
         &optional_cstr_lossy(operation),
         &optional_cstr_lossy(stage),
         elapsed_ms as u128,
+        &optional_cstr_lossy(details),
+    );
+}
+
+#[no_mangle]
+pub extern "C" fn AzookeyServerLogFlushFromSwift() {
+    flush_server_logs();
+}
+
+#[no_mangle]
+pub extern "C" fn AzookeyServerCrashTraceEnabled() -> bool {
+    crash_trace_enabled()
+}
+
+#[no_mangle]
+pub extern "C" fn AzookeyServerCrashTraceFromSwift(
+    operation: *const c_char,
+    stage: *const c_char,
+    state: *const c_char,
+    details: *const c_char,
+) {
+    write_server_crash_trace(
+        "swift",
+        &optional_cstr_lossy(operation),
+        &optional_cstr_lossy(stage),
+        &optional_cstr_lossy(state),
         &optional_cstr_lossy(details),
     );
 }
@@ -706,6 +940,13 @@ fn install_panic_hook() {
             .unwrap_or_else(|| "<unknown>".to_owned());
 
         let backtrace = Backtrace::force_capture();
+        write_server_crash_trace(
+            "rust",
+            "panic",
+            "panic_hook",
+            "error",
+            &format!("payload={payload};location={location}"),
+        );
         log_event(
             ServerLogLevel::Error,
             &format!("payload={payload}; location={location}; backtrace={backtrace}"),
@@ -1272,7 +1513,19 @@ impl AzookeyService for MyAzookeyService {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     install_panic_hook();
-    if let Some(log_paths) = reload_server_logging_from_settings() {
+    let log_paths = reload_server_logging_from_settings();
+    if let Some(trace) = preserve_crash_trace_if_incomplete(
+        SERVER_CRASH_TRACE_FILE_NAME,
+        SERVER_PREVIOUS_CRASH_TRACE_FILE_NAME,
+    ) {
+        log_previous_crash_trace("previous server crash trace", &trace);
+    }
+    log_and_consume_previous_crash_trace_if_incomplete(
+        LAUNCHER_PREVIOUS_CRASH_TRACE_FILE_NAME,
+        "previous launcher startup crash trace",
+    );
+    write_server_crash_trace("rust", "server_startup", "main", "begin", "");
+    if let Some(log_paths) = log_paths {
         log_event(
             ServerLogLevel::Info,
             &format!(
@@ -1318,23 +1571,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
-            log_event_lazy!(ServerLogLevel::Debug, "[warmup] start");
-            set_request_id(0);
+            let request_id = next_request_id();
+            log_event_lazy!(
+                ServerLogLevel::Debug,
+                "request_id={request_id} [warmup] start"
+            );
+            set_request_id(request_id);
             warmup();
-            log_event_lazy!(ServerLogLevel::Debug, "[warmup] done");
+            log_event_lazy!(
+                ServerLogLevel::Debug,
+                "request_id={request_id} [warmup] done"
+            );
         }
     });
 
-    log_event_lazy!(ServerLogLevel::Info, "AzookeyServer listening");
     let reflection_service = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(shared::proto::FILE_DESCRIPTOR_SET)
         .build_v1()
         .map_err(std::io::Error::other)?;
 
+    let incoming = TonicNamedPipeServer::new_with_first_pipe_callback("azookey_server", || {
+        log_event_lazy!(ServerLogLevel::Info, "AzookeyServer listening");
+        write_server_crash_trace(
+            "rust",
+            "server_startup",
+            "listening",
+            "completed",
+            "pipe=azookey_server",
+        );
+        write_crash_trace_file(
+            LAUNCHER_CRASH_TRACE_FILE_NAME,
+            "rust",
+            "server_startup",
+            "server_listening",
+            "completed",
+            &format!("server_pid={};pipe=azookey_server", std::process::id()),
+        );
+    });
+
     Server::builder()
         .add_service(AzookeyServiceServer::new(service))
         .add_service(reflection_service)
-        .serve_with_incoming(TonicNamedPipeServer::new("azookey_server"))
+        .serve_with_incoming(incoming)
         .await
         .map_err(|error| {
             log_event(
