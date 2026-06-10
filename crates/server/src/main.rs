@@ -20,7 +20,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
-        mpsc, Arc, OnceLock,
+        mpsc, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -40,7 +40,6 @@ const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 const LOG_FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const WARMUP_INTERVAL_SECS: u64 = 30;
 const WARMUP_RECENT_INPUT_SKIP_MS: u64 = 2_000;
-const WARMUP_LONG_RUNNING_WARNING_MS: u64 = 5_000;
 
 static SERVER_LOG_WORKER: OnceLock<ServerLogWorker> = OnceLock::new();
 static SERVER_LOG_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -404,7 +403,7 @@ unsafe extern "C" {
     fn MoveCursor(offset: c_int, cursorPtr: *mut c_int) -> *mut c_char;
     fn ShrinkText(offset: c_int) -> *mut c_char;
     fn ClearText();
-    fn Warmup();
+    fn Warmup() -> bool;
     fn HasActiveComposition() -> bool;
     fn GetComposedText(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
     fn GetComposedTextForCursorPrefix(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
@@ -641,33 +640,6 @@ fn warmup_skip_reason() -> Option<WarmupSkipReason> {
     }
 
     None
-}
-
-fn start_warmup_watchdog(request_id: u64) -> Arc<AtomicBool> {
-    let completed = Arc::new(AtomicBool::new(false));
-    let watchdog_completed = Arc::clone(&completed);
-    let _ = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(WARMUP_LONG_RUNNING_WARNING_MS));
-        if watchdog_completed.load(Ordering::Acquire) {
-            return;
-        }
-
-        log_event(
-            ServerLogLevel::Warn,
-            &format!(
-                "request_id={request_id} [warmup] still running after {WARMUP_LONG_RUNNING_WARNING_MS}ms"
-            ),
-        );
-        log_performance_event(
-            request_id,
-            "rust",
-            "warmup",
-            "long_running",
-            u128::from(WARMUP_LONG_RUNNING_WARNING_MS),
-            &format!("threshold_ms={WARMUP_LONG_RUNNING_WARNING_MS}"),
-        );
-    });
-    completed
 }
 
 fn now_timestamp_millis() -> u128 {
@@ -1204,10 +1176,8 @@ fn clear_text() {
     }
 }
 
-fn warmup() {
-    unsafe {
-        Warmup();
-    }
+fn warmup() -> bool {
+    unsafe { Warmup() }
 }
 
 fn query_active_composition_state() -> bool {
@@ -1771,25 +1741,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             log_event_lazy!(
                 ServerLogLevel::Debug,
-                "request_id={request_id} [warmup] start interval_secs={WARMUP_INTERVAL_SECS};recent_input_skip_ms={WARMUP_RECENT_INPUT_SKIP_MS}"
+                "request_id={request_id} [warmup] schedule_start interval_secs={WARMUP_INTERVAL_SECS};recent_input_skip_ms={WARMUP_RECENT_INPUT_SKIP_MS}"
             );
             set_request_id(request_id);
-            let warmup_start = Instant::now();
-            let watchdog_completed = start_warmup_watchdog(request_id);
-            warmup();
-            watchdog_completed.store(true, Ordering::Release);
-            let warmup_elapsed_ms = elapsed_ms(warmup_start);
-            performance_event_lazy!(
-                request_id,
-                "warmup",
-                "total",
-                warmup_elapsed_ms,
-                "status=success"
-            );
-            log_event_lazy!(
-                ServerLogLevel::Debug,
-                "request_id={request_id} [warmup] done elapsed_ms={warmup_elapsed_ms}"
-            );
+            let schedule_start = Instant::now();
+            let scheduled = warmup();
+            let schedule_elapsed_ms = elapsed_ms(schedule_start);
+            if scheduled {
+                performance_event_lazy!(
+                    request_id,
+                    "warmup",
+                    "schedule",
+                    schedule_elapsed_ms,
+                    "status=scheduled"
+                );
+                log_event_lazy!(
+                    ServerLogLevel::Debug,
+                    "request_id={request_id} [warmup] scheduled elapsed_ms={schedule_elapsed_ms}"
+                );
+            } else {
+                performance_event_lazy!(
+                    request_id,
+                    "warmup",
+                    "skip",
+                    schedule_elapsed_ms,
+                    "reason=warmup_in_progress"
+                );
+                log_event_lazy!(
+                    ServerLogLevel::Debug,
+                    "request_id={request_id} [warmup] skipped reason=warmup_in_progress elapsed_ms={schedule_elapsed_ms}"
+                );
+            }
         }
     });
 

@@ -217,7 +217,8 @@ public func set_server_log_callbacks(
     )
 }
 
-@MainActor private func serverLog(
+private func serverLog(
+    requestId: UInt64,
     _ level: String = "INFO",
     _ message: @autoclosure () -> String,
     flush: Bool = false
@@ -226,13 +227,22 @@ public func set_server_log_callbacks(
         return
     }
 
-    serverLogCallbacks.log(level: level, message: "request_id=\(currentRequestId) \(message())")
+    serverLogCallbacks.log(level: level, message: "request_id=\(requestId) \(message())")
     if flush {
         serverLogCallbacks.flush()
     }
 }
 
-@MainActor private func crashTrace(
+@MainActor private func serverLog(
+    _ level: String = "INFO",
+    _ message: @autoclosure () -> String,
+    flush: Bool = false
+) {
+    serverLog(requestId: currentRequestId, level, message(), flush: flush)
+}
+
+private func crashTrace(
+    requestId: UInt64,
     operation: String,
     stage: String,
     state: String,
@@ -246,7 +256,22 @@ public func set_server_log_callbacks(
         operation: operation,
         stage: stage,
         state: state,
-        details: "request_id=\(currentRequestId);\(details())"
+        details: "request_id=\(requestId);\(details())"
+    )
+}
+
+@MainActor private func crashTrace(
+    operation: String,
+    stage: String,
+    state: String,
+    details: @autoclosure () -> String = ""
+) {
+    crashTrace(
+        requestId: currentRequestId,
+        operation: operation,
+        stage: stage,
+        state: state,
+        details: details()
     )
 }
 
@@ -264,7 +289,8 @@ public func set_server_log_callbacks(
     crashTrace(operation: operation, stage: stage, state: state, details: details())
 }
 
-@MainActor private func performanceLog(
+private func performanceLog(
+    requestId: UInt64,
     operation: String,
     stage: String,
     elapsedMs: Int,
@@ -275,10 +301,25 @@ public func set_server_log_callbacks(
     }
 
     serverLogCallbacks.performanceLog(
-        requestId: currentRequestId,
+        requestId: requestId,
         operation: operation,
         stage: stage,
         elapsedMs: UInt64(max(0, elapsedMs)),
+        details: details()
+    )
+}
+
+@MainActor private func performanceLog(
+    operation: String,
+    stage: String,
+    elapsedMs: Int,
+    details: @autoclosure () -> String = ""
+) {
+    performanceLog(
+        requestId: currentRequestId,
+        operation: operation,
+        stage: stage,
+        elapsedMs: elapsedMs,
         details: details()
     )
 }
@@ -320,11 +361,53 @@ func normalizedZenzaiBackend(_ backend: String?) -> String {
         .lowercased()
 }
 
+private func shouldOffloadZenzaiToGpu(zenzaiEnabled: Bool, backend: String?) -> Bool {
+    let normalizedBackend = normalizedZenzaiBackend(backend)
+    return zenzaiEnabled && !normalizedBackend.isEmpty && normalizedBackend != "cpu"
+}
+
 @MainActor private func configureEngineRuntime(zenzaiEnabled: Bool) {
-    let normalizedBackend = normalizedZenzaiBackend(config["backend"] as? String)
-    let shouldOffloadToGpu = zenzaiEnabled && !normalizedBackend.isEmpty && normalizedBackend != "cpu"
+    let shouldOffloadToGpu = shouldOffloadZenzaiToGpu(
+        zenzaiEnabled: zenzaiEnabled,
+        backend: config["backend"] as? String
+    )
     KanaKanjiConverterEngineRuntime.configure(
         gpuLayerCount: shouldOffloadToGpu ? Int32.max : 0
+    )
+}
+
+private func makeConvertRequestOptions(
+    context: String,
+    zenzaiEnabled: Bool,
+    runtimeDirectoryURL: URL,
+    emojiDictionaryURL: URL,
+    zenzaiWeightURL: URL,
+    profile: String
+) -> ConvertRequestOptions {
+    return ConvertRequestOptions(
+        requireJapanesePrediction: .disabled,
+        requireEnglishPrediction: .disabled,
+        keyboardLanguage: .ja_JP,
+        learningType: .nothing,
+        memoryDirectoryURL: runtimeDirectoryURL,
+        sharedContainerURL: runtimeDirectoryURL,
+        textReplacer: .init {
+            return emojiDictionaryURL
+        },
+        specialCandidateProviders: nil,
+        zenzaiMode: zenzaiEnabled ? .on(
+            weight: zenzaiWeightURL,
+            inferenceLimit: 1,
+            requestRichCandidates: false,
+            personalizationMode: nil,
+            versionDependentMode: .v3(
+                .init(
+                    profile: profile,
+                    leftSideContext: context
+                )
+            )
+        ) : .off,
+        metadata: .init(versionString: "Azookey for Windows")
     )
 }
 
@@ -1006,32 +1089,15 @@ private func preferCursorPrefixBoundary(
     zenzaiEnabled: Bool
 ) -> ConvertRequestOptions {
     configureEngineRuntime(zenzaiEnabled: zenzaiEnabled)
-    let profile = (config["profile"] as? String) ?? ""
-    return ConvertRequestOptions(
-        requireJapanesePrediction: .disabled,
-        requireEnglishPrediction: .disabled,
-        keyboardLanguage: .ja_JP,
-        learningType: .nothing,
-        memoryDirectoryURL: converterRuntimeDirectoryURL(),
-        sharedContainerURL: converterRuntimeDirectoryURL(),
-        textReplacer: .init {
-            return execURL.appendingPathComponent("EmojiDictionary").appendingPathComponent("emoji_all_E15.1.txt")
-        },
-        specialCandidateProviders: nil,
-        // zenzai
-        zenzaiMode: zenzaiEnabled ? .on(
-            weight: execURL.appendingPathComponent("zenz.gguf"),
-            inferenceLimit: 1,
-            requestRichCandidates: false,
-            personalizationMode: nil,
-            versionDependentMode: .v3(
-                .init(
-                    profile: profile,
-                    leftSideContext: context
-                )
-            )
-        ) : .off,
-        metadata: .init(versionString: "Azookey for Windows")
+    return makeConvertRequestOptions(
+        context: context,
+        zenzaiEnabled: zenzaiEnabled,
+        runtimeDirectoryURL: converterRuntimeDirectoryURL(),
+        emojiDictionaryURL: execURL
+            .appendingPathComponent("EmojiDictionary")
+            .appendingPathComponent("emoji_all_E15.1.txt"),
+        zenzaiWeightURL: execURL.appendingPathComponent("zenz.gguf"),
+        profile: (config["profile"] as? String) ?? ""
     )
 }
 
@@ -1136,6 +1202,207 @@ private func sanitizeDiagnosticField(_ value: String, maxLength: Int = 80) -> St
     }
 
     return makeWarmupComposingText(input: zenzaiWarmupRomanInput, inputStyle: .roman2kana)
+}
+
+private enum WarmupInputStyleSnapshot: Sendable {
+    case roman2kana
+    case direct
+
+    var inputStyle: InputStyle {
+        switch self {
+        case .roman2kana:
+            return .roman2kana
+        case .direct:
+            return .direct
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .roman2kana:
+            return "roman2kana"
+        case .direct:
+            return "direct"
+        }
+    }
+}
+
+private struct WarmupExecutionSnapshot: Sendable {
+    let requestId: UInt64
+    let dictionaryURL: URL
+    let preloadDictionary: Bool
+    let runtimeDirectoryURL: URL
+    let emojiDictionaryURL: URL
+    let zenzaiWeightURL: URL
+    let profile: String
+    let context: String
+    let input: String
+    let inputStyle: WarmupInputStyleSnapshot
+    let useZenzai: Bool
+    let diagnosticDetails: String
+}
+
+private struct WarmupConverterKey: Equatable {
+    let dictionaryURL: URL
+    let preloadDictionary: Bool
+}
+
+private final class BackgroundWarmupRunner: @unchecked Sendable {
+    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "azookey.server.warmup", qos: .utility)
+    private var isRunning = false
+    private var converterKey: WarmupConverterKey?
+    private var converter: KanaKanjiConverter?
+
+    func schedule(_ snapshot: WarmupExecutionSnapshot) -> Bool {
+        lock.lock()
+        guard !isRunning else {
+            lock.unlock()
+            return false
+        }
+        isRunning = true
+        lock.unlock()
+
+        queue.async { [self, snapshot] in
+            defer {
+                self.lock.lock()
+                self.isRunning = false
+                self.lock.unlock()
+            }
+            self.run(snapshot)
+        }
+        return true
+    }
+
+    private func run(_ snapshot: WarmupExecutionSnapshot) {
+        var warmupComposingText = ComposingText()
+        warmupComposingText.insertAtCursorPosition(
+            snapshot.input,
+            inputStyle: snapshot.inputStyle.inputStyle
+        )
+        let options = makeConvertRequestOptions(
+            context: snapshot.context,
+            zenzaiEnabled: snapshot.useZenzai,
+            runtimeDirectoryURL: snapshot.runtimeDirectoryURL,
+            emojiDictionaryURL: snapshot.emojiDictionaryURL,
+            zenzaiWeightURL: snapshot.zenzaiWeightURL,
+            profile: snapshot.profile
+        )
+
+        crashTrace(
+            requestId: snapshot.requestId,
+            operation: "Warmup",
+            stage: "requestCandidates",
+            state: "begin",
+            details: snapshot.diagnosticDetails
+        )
+        serverLog(
+            requestId: snapshot.requestId,
+            "DEBUG",
+            "Warmup: requestCandidates begin \(snapshot.diagnosticDetails)",
+            flush: true
+        )
+
+        let key = WarmupConverterKey(
+            dictionaryURL: snapshot.dictionaryURL,
+            preloadDictionary: snapshot.preloadDictionary
+        )
+        if converterKey != key || converter == nil {
+            converter = KanaKanjiConverter(
+                dictionaryURL: snapshot.dictionaryURL,
+                preloadDictionary: snapshot.preloadDictionary
+            )
+            converterKey = key
+        }
+
+        let requestStart = ProcessInfo.processInfo.systemUptime
+        let converted = converter!.requestCandidates(
+            warmupComposingText,
+            options: options
+        )
+        let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
+        if requestMs >= warmupRequestCandidatesWarningMs {
+            serverLog(
+                requestId: snapshot.requestId,
+                "WARN",
+                "Warmup: requestCandidates slow elapsed_ms=\(requestMs);threshold_ms=\(warmupRequestCandidatesWarningMs) \(snapshot.diagnosticDetails)",
+                flush: true
+            )
+        }
+        performanceLog(
+            requestId: snapshot.requestId,
+            operation: "warmup",
+            stage: "request_candidates",
+            elapsedMs: requestMs,
+            details: "candidate_count=\(converted.mainResults.count);\(snapshot.diagnosticDetails)"
+        )
+        crashTrace(
+            requestId: snapshot.requestId,
+            operation: "Warmup",
+            stage: "requestCandidates",
+            state: "completed",
+            details: "candidate_count=\(converted.mainResults.count);\(snapshot.diagnosticDetails)"
+        )
+        serverLog(
+            requestId: snapshot.requestId,
+            "DEBUG",
+            "Warmup: requestCandidates returned candidateCount=\(converted.mainResults.count) \(snapshot.diagnosticDetails)"
+        )
+        serverLog(
+            requestId: snapshot.requestId,
+            "DEBUG",
+            "Warmup: completed \(snapshot.diagnosticDetails)"
+        )
+    }
+}
+
+private let backgroundWarmupRunner = BackgroundWarmupRunner()
+
+@MainActor private func makeBackgroundWarmupSnapshot() -> WarmupExecutionSnapshot {
+    let contextString = (config["context"] as? String) ?? ""
+    let diagnosticSnapshot = zenzaiDiagnosticSnapshot()
+    let inputStyle: WarmupInputStyleSnapshot = if diagnosticSnapshot.runtimeEnabled {
+        .roman2kana
+    } else if currentInputStyle == .direct {
+        .direct
+    } else {
+        .roman2kana
+    }
+    let input = diagnosticSnapshot.runtimeEnabled ? zenzaiWarmupRomanInput : "a"
+    let warmupComposingText = makeWarmupComposingText(
+        input: input,
+        inputStyle: inputStyle.inputStyle
+    )
+    let useZenzai = effectiveZenzaiEnabledForCandidates(
+        isConfigured: diagnosticSnapshot.runtimeEnabled,
+        inputCount: warmupComposingText.input.count,
+        hiraganaCount: warmupComposingText.convertTarget.count
+    )
+    configureEngineRuntime(zenzaiEnabled: useZenzai)
+    let diagnosticDetails = zenzaiDiagnosticDetails(
+        snapshot: diagnosticSnapshot,
+        contextLength: contextString.count,
+        inputCount: warmupComposingText.input.count,
+        hiraganaLength: warmupComposingText.convertTarget.count,
+        useZenzai: useZenzai
+    ) + ";warmup_input_style=\(inputStyle.label);background=true"
+
+    return WarmupExecutionSnapshot(
+        requestId: currentRequestId,
+        dictionaryURL: converterDictionaryURL,
+        preloadDictionary: converterPreloadDictionary,
+        runtimeDirectoryURL: converterRuntimeDirectoryURL(),
+        emojiDictionaryURL: execURL
+            .appendingPathComponent("EmojiDictionary")
+            .appendingPathComponent("emoji_all_E15.1.txt"),
+        zenzaiWeightURL: execURL.appendingPathComponent("zenz.gguf"),
+        profile: (config["profile"] as? String) ?? "",
+        context: contextString,
+        input: input,
+        inputStyle: inputStyle,
+        useZenzai: useZenzai,
+        diagnosticDetails: diagnosticDetails
+    )
 }
 
 class SimpleComposingText {
@@ -1360,58 +1627,18 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 }
 
 @_silgen_name("Warmup")
-@MainActor public func warmup() {
-    let contextString = (config["context"] as? String) ?? ""
-    let diagnosticSnapshot = zenzaiDiagnosticSnapshot()
-    let warmupComposingText = makeWarmupComposingText(
-        zenzaiRuntimeEnabled: diagnosticSnapshot.runtimeEnabled
-    )
-    let useZenzai = effectiveZenzaiEnabledForCandidates(
-        isConfigured: diagnosticSnapshot.runtimeEnabled,
-        inputCount: warmupComposingText.input.count,
-        hiraganaCount: warmupComposingText.convertTarget.count
-    )
-    let diagnosticDetails = zenzaiDiagnosticDetails(
-        snapshot: diagnosticSnapshot,
-        contextLength: contextString.count,
-        inputCount: warmupComposingText.input.count,
-        hiraganaLength: warmupComposingText.convertTarget.count,
-        useZenzai: useZenzai
-    )
-    serverLog(
-        "DEBUG",
-        "Warmup: start \(diagnosticDetails)"
-    )
-    let options = getOptions(context: contextString, zenzaiEnabled: useZenzai)
-    crashTrace(operation: "Warmup", stage: "requestCandidates", state: "begin", details: diagnosticDetails)
-    serverLog("DEBUG", "Warmup: requestCandidates begin \(diagnosticDetails)", flush: true)
-    let requestStart = ProcessInfo.processInfo.systemUptime
-    let converted = converter.requestCandidates(
-        warmupComposingText,
-        options: options
-    )
-    let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
-    if requestMs >= warmupRequestCandidatesWarningMs {
+@MainActor public func warmup() -> Bool {
+    let snapshot = makeBackgroundWarmupSnapshot()
+    let scheduled = backgroundWarmupRunner.schedule(snapshot)
+    if scheduled {
+        serverLog("DEBUG", "Warmup: scheduled \(snapshot.diagnosticDetails)")
+    } else {
         serverLog(
-            "WARN",
-            "Warmup: requestCandidates slow elapsed_ms=\(requestMs);threshold_ms=\(warmupRequestCandidatesWarningMs) \(diagnosticDetails)",
-            flush: true
+            "DEBUG",
+            "Warmup: skipped reason=background_warmup_in_progress \(snapshot.diagnosticDetails)"
         )
     }
-    performanceLog(
-        operation: "warmup",
-        stage: "request_candidates",
-        elapsedMs: requestMs,
-        details: "candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
-    )
-    crashTrace(
-        operation: "Warmup",
-        stage: "requestCandidates",
-        state: "completed",
-        details: "candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
-    )
-    serverLog("DEBUG", "Warmup: requestCandidates returned candidateCount=\(converted.mainResults.count) \(diagnosticDetails)")
-    serverLog("DEBUG", "Warmup: completed \(diagnosticDetails)")
+    return scheduled
 }
 
 @_silgen_name("HasActiveComposition")
