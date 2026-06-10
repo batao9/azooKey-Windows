@@ -13,6 +13,7 @@ use shared::AppConfig;
 
 use std::{
     backtrace::Backtrace,
+    collections::HashSet,
     ffi::{c_char, c_int, CStr, CString},
     fs::{self, File, OpenOptions},
     io::{BufWriter, Write},
@@ -485,12 +486,34 @@ impl OwnedFfiCandidates {
     unsafe fn candidate_ptr(&self, index: usize) -> *mut FFICandidate {
         *self.ptr.add(index)
     }
+
+    fn free_with_performance(mut self, request_id: u64, operation: &str) {
+        let ptr = self.ptr;
+        let length = self.length;
+        self.ptr = std::ptr::null_mut();
+        self.length = 0;
+
+        let free_start = Instant::now();
+        unsafe {
+            FreeCandidateList(ptr, length);
+        }
+        performance_event_lazy!(
+            request_id,
+            operation,
+            "free_candidate_list",
+            elapsed_ms(free_start),
+            "candidate_count={}",
+            length.max(0)
+        );
+    }
 }
 
 impl Drop for OwnedFfiCandidates {
     fn drop(&mut self) {
-        unsafe {
-            FreeCandidateList(self.ptr, self.length);
+        if !self.ptr.is_null() {
+            unsafe {
+                FreeCandidateList(self.ptr, self.length);
+            }
         }
     }
 }
@@ -530,6 +553,16 @@ fn register_server_log_callbacks() {
 
 fn elapsed_ms(start: Instant) -> u128 {
     start.elapsed().as_millis()
+}
+
+fn performance_instant(enabled: bool) -> Option<Instant> {
+    enabled.then(Instant::now)
+}
+
+fn add_elapsed_ms(total: &mut u128, start: Option<Instant>) {
+    if let Some(start) = start {
+        *total += elapsed_ms(start);
+    }
 }
 
 fn now_timestamp_millis() -> u128 {
@@ -1084,8 +1117,14 @@ fn update_active_composition_state(text: &str) {
     HAS_ACTIVE_COMPOSITION.store(!text.is_empty(), Ordering::Relaxed);
 }
 
-fn get_composed_text(use_cursor_prefix: bool) -> Result<ComposedText, String> {
+fn get_composed_text(use_cursor_prefix: bool, request_id: u64) -> Result<ComposedText, String> {
     let mut length: c_int = 0;
+    let operation = if use_cursor_prefix {
+        "get_composed_text_for_cursor_prefix"
+    } else {
+        "get_composed_text"
+    };
+    let ffi_call_start = Instant::now();
     let result = unsafe {
         if use_cursor_prefix {
             GetComposedTextForCursorPrefix(&mut length)
@@ -1100,9 +1139,21 @@ fn get_composed_text(use_cursor_prefix: bool) -> Result<ComposedText, String> {
     };
     let candidates = unsafe { OwnedFfiCandidates::from_raw(call_name, result, length)? };
     let length = candidates.len();
+    performance_event_lazy!(
+        request_id,
+        operation,
+        "ffi_call",
+        elapsed_ms(ffi_call_start),
+        "candidate_count={length};use_cursor_prefix={use_cursor_prefix}"
+    );
 
     let mut suggestions = Vec::with_capacity(length);
     let mut hiragana = None;
+    let mut seen_texts = HashSet::with_capacity(length);
+    let performance_enabled = should_log_performance();
+    let mut cstr_decode_ms = 0;
+    let mut dedup_ms = 0;
+    let mut duplicate_count = 0usize;
     log_event_lazy!(
         ServerLogLevel::Debug,
         "[{call_name}] candidate_count={length}"
@@ -1130,19 +1181,34 @@ fn get_composed_text(use_cursor_prefix: bool) -> Result<ComposedText, String> {
         }
 
         if hiragana.is_none() && !candidate.hiragana.is_null() {
+            let decode_start = performance_instant(performance_enabled);
             hiragana = Some(
                 unsafe { CStr::from_ptr(candidate.hiragana) }
                     .to_string_lossy()
                     .into_owned(),
             );
+            add_elapsed_ms(&mut cstr_decode_ms, decode_start);
         }
 
+        let text_decode_start = performance_instant(performance_enabled);
         let text = unsafe { CStr::from_ptr(candidate.text) }
             .to_string_lossy()
             .into_owned();
+        add_elapsed_ms(&mut cstr_decode_ms, text_decode_start);
+
+        let dedup_start = performance_instant(performance_enabled);
+        if !seen_texts.insert(text.clone()) {
+            duplicate_count += 1;
+            add_elapsed_ms(&mut dedup_ms, dedup_start);
+            continue;
+        }
+        add_elapsed_ms(&mut dedup_ms, dedup_start);
+
+        let subtext_decode_start = performance_instant(performance_enabled);
         let subtext = unsafe { CStr::from_ptr(candidate.subtext) }
             .to_string_lossy()
             .into_owned();
+        add_elapsed_ms(&mut cstr_decode_ms, subtext_decode_start);
         let corresponding_count = candidate.corresponding_count;
 
         let suggestion = Suggestion {
@@ -1151,14 +1217,25 @@ fn get_composed_text(use_cursor_prefix: bool) -> Result<ComposedText, String> {
             corresponding_count,
         };
 
-        if suggestions
-            .iter()
-            .any(|s: &Suggestion| s.text == suggestion.text)
-        {
-            continue;
-        }
         suggestions.push(suggestion);
     }
+    performance_event_lazy!(
+        request_id,
+        operation,
+        "cstr_decode",
+        cstr_decode_ms,
+        "candidate_count={length};unique_candidate_count={};duplicate_count={duplicate_count}",
+        suggestions.len()
+    );
+    performance_event_lazy!(
+        request_id,
+        operation,
+        "dedup",
+        dedup_ms,
+        "candidate_count={length};unique_candidate_count={};duplicate_count={duplicate_count}",
+        suggestions.len()
+    );
+    candidates.free_with_performance(request_id, operation);
 
     Ok(ComposedText {
         hiragana,
@@ -1206,8 +1283,8 @@ impl AzookeyService for MyAzookeyService {
             "input_len={input_len};input_style={input_style}"
         );
         let get_composed_start = Instant::now();
-        let composed_text =
-            get_composed_text(false).map_err(|error| status_from_error("append_text", error))?;
+        let composed_text = get_composed_text(false, request_id)
+            .map_err(|error| status_from_error("append_text", error))?;
         performance_event_lazy!(
             request_id,
             "append_text",
@@ -1262,8 +1339,8 @@ impl AzookeyService for MyAzookeyService {
             composing_text.text.chars().count()
         );
         let get_composed_start = Instant::now();
-        let composed_text =
-            get_composed_text(false).map_err(|error| status_from_error("remove_text", error))?;
+        let composed_text = get_composed_text(false, request_id)
+            .map_err(|error| status_from_error("remove_text", error))?;
         performance_event_lazy!(
             request_id,
             "remove_text",
@@ -1316,7 +1393,7 @@ impl AzookeyService for MyAzookeyService {
             composing_text.text.chars().count()
         );
         let get_composed_start = Instant::now();
-        let composed_text = get_composed_text(use_cursor_prefix)
+        let composed_text = get_composed_text(use_cursor_prefix, request_id)
             .map_err(|error| status_from_error("move_cursor", error))?;
         performance_event_lazy!(
             request_id,
@@ -1396,8 +1473,8 @@ impl AzookeyService for MyAzookeyService {
             composing_text.text.chars().count()
         );
         let get_composed_start = Instant::now();
-        let composed_text =
-            get_composed_text(false).map_err(|error| status_from_error("shrink_text", error))?;
+        let composed_text = get_composed_text(false, request_id)
+            .map_err(|error| status_from_error("shrink_text", error))?;
         performance_event_lazy!(
             request_id,
             "shrink_text",

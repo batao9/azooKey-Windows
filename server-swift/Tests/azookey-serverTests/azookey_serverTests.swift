@@ -104,6 +104,72 @@ private func testCandidate(
     ]
 
     free_candidate_list(to_list_pointer(candidates), Int32(candidates.count))
+
+    let nilHiraganaText = try #require(_strdup("candidate"))
+    let nilHiraganaSubtext = try #require(_strdup("remaining"))
+    let nilHiraganaCandidates = [
+        FFICandidate(
+            text: nilHiraganaText,
+            subtext: nilHiraganaSubtext,
+            hiragana: nil,
+            correspondingCount: 1
+        )
+    ]
+
+    free_candidate_list(to_list_pointer(nilHiraganaCandidates), Int32(nilHiraganaCandidates.count))
+
+    let legacyText = try #require(_strdup("legacy"))
+    let legacySubtext = try #require(_strdup("remaining"))
+    let legacyHiragana = try #require(_strdup("かな"))
+    let legacyCandidate = UnsafeMutablePointer<FFICandidate>.allocate(capacity: 1)
+    legacyCandidate.initialize(
+        to: FFICandidate(
+            text: legacyText,
+            subtext: legacySubtext,
+            hiragana: legacyHiragana,
+            correspondingCount: 1
+        )
+    )
+    let legacyList = UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>.allocate(capacity: 1)
+    legacyList.initialize(to: legacyCandidate)
+    free_candidate_list(legacyList, 1)
+}
+
+@Test func constructCandidateStringAdvancesByRubyWithoutMutatingRemainder() async throws {
+    let candidate = Candidate(
+        text: "今日は",
+        value: -1,
+        composingCount: .inputCount(5),
+        lastMid: MIDData.一般.mid,
+        data: [
+            DicdataElement(
+                word: "今日",
+                ruby: "きょう",
+                cid: CIDData.一般名詞.cid,
+                mid: MIDData.一般.mid,
+                value: -1
+            ),
+            DicdataElement(
+                word: "は",
+                ruby: "は",
+                cid: CIDData.一般名詞.cid,
+                mid: MIDData.一般.mid,
+                value: -1
+            ),
+        ]
+    )
+
+    #expect(constructCandidateString(candidate: candidate, hiragana: "きょうは") == "今日は")
+}
+
+@Test func constructCandidateStringFallsBackToRemainingHiraganaWhenRubyOverruns() async throws {
+    let candidate = testCandidate(
+        word: "今日",
+        ruby: "きょう",
+        composingCount: .inputCount(2)
+    )
+
+    #expect(constructCandidateString(candidate: candidate, hiragana: "きょ") == "きょ")
 }
 
 @Test func supportsNextInputCarryForTsuRules() async throws {

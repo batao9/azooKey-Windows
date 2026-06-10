@@ -248,6 +248,20 @@ public func set_server_log_callbacks(
     )
 }
 
+@MainActor private func candidateCrashTrace(
+    useZenzai: Bool,
+    operation: String,
+    stage: String,
+    state: String,
+    details: @autoclosure () -> String = ""
+) {
+    guard useZenzai else {
+        return
+    }
+
+    crashTrace(operation: operation, stage: stage, state: state, details: details())
+}
+
 @MainActor private func performanceLog(
     operation: String,
     stage: String,
@@ -265,6 +279,14 @@ public func set_server_log_callbacks(
         elapsedMs: UInt64(max(0, elapsedMs)),
         details: details()
     )
+}
+
+private func performanceNow() -> TimeInterval {
+    ProcessInfo.processInfo.systemUptime
+}
+
+private func elapsedPerformanceMilliseconds(since start: TimeInterval) -> Int {
+    Int((performanceNow() - start) * 1000)
 }
 
 private func settingsPath() -> URL? {
@@ -780,22 +802,6 @@ private func preferCursorPrefixBoundary(
     return resolved
 }
 
-@MainActor private func debugLogResolvedCorrespondingCount(
-    scope: String,
-    candidateIndex: Int,
-    candidateTotal: Int,
-    candidateComposingCount: ComposingCount,
-    resolvedCorrespondingCount: Int,
-    inputCount: Int,
-    isZenzaiEnabled: Bool
-) {
-    let mode = isZenzaiEnabled ? "zenzai" : "standard"
-    serverLog(
-        "DEBUG",
-        "[\(scope)] mode=\(mode) candidate[\(candidateIndex + 1)/\(candidateTotal)] composingCount=\(candidateComposingCount) resolvedCorrespondingCount=\(resolvedCorrespondingCount) inputCount=\(inputCount)"
-    )
-}
-
 @MainActor func cursorPrefixCandidateResults(
     mainResults: [Candidate],
     firstClauseResults: [Candidate],
@@ -1130,18 +1136,23 @@ struct SComposingText {
 }
 
 func constructCandidateString(candidate: Candidate, hiragana: String) -> String {
-    var remainingHiragana = hiragana
     var result = ""
-    
+    result.reserveCapacity(hiragana.count)
+
+    var remainingStart = hiragana.startIndex
+    var remainingCount = hiragana.count
     for data in candidate.data {
-        if remainingHiragana.count < data.ruby.count {
-            result += remainingHiragana
+        let rubyCount = data.ruby.count
+        if remainingCount < rubyCount {
+            result += hiragana[remainingStart...]
             break
         }
-        remainingHiragana.removeFirst(data.ruby.count)
+
+        remainingStart = hiragana.index(remainingStart, offsetBy: rubyCount)
+        remainingCount -= rubyCount
         result += data.word
     }
-    
+
     return result
 }
 
@@ -1382,13 +1393,13 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 @_silgen_name("AppendText")
 @MainActor public func append_text(
     input: UnsafePointer<CChar>,
-    cursorPtr: UnsafeMutablePointer<Int>
+    cursorPtr: UnsafeMutablePointer<CInt>
 ) -> UnsafeMutablePointer<CChar> {
     let inputString = String(cString: input)
     serverLog("DEBUG", "AppendText: start inputLength=\(inputString.count) inputStyle=\(String(describing: currentInputStyle))")
     composingText.insertAtCursorPosition(inputString, inputStyle: currentInputStyle)
 
-    cursorPtr.pointee = composingText.convertTargetCursorPosition
+    cursorPtr.pointee = CInt(composingText.convertTargetCursorPosition)
     serverLog(
         "DEBUG",
         "AppendText: completed cursor=\(cursorPtr.pointee) hiraganaLength=\(composingText.convertTarget.count) inputCount=\(composingText.input.count)"
@@ -1399,13 +1410,13 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 @_silgen_name("AppendTextDirect")
 @MainActor public func append_text_direct(
     input: UnsafePointer<CChar>,
-    cursorPtr: UnsafeMutablePointer<Int>
+    cursorPtr: UnsafeMutablePointer<CInt>
 ) -> UnsafeMutablePointer<CChar> {
     let inputString = String(cString: input)
     serverLog("DEBUG", "AppendTextDirect: start inputLength=\(inputString.count)")
     composingText.insertAtCursorPosition(inputString, inputStyle: .direct)
 
-    cursorPtr.pointee = composingText.convertTargetCursorPosition
+    cursorPtr.pointee = CInt(composingText.convertTargetCursorPosition)
     serverLog(
         "DEBUG",
         "AppendTextDirect: completed cursor=\(cursorPtr.pointee) hiraganaLength=\(composingText.convertTarget.count)"
@@ -1415,12 +1426,12 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 
 @_silgen_name("RemoveText")
 @MainActor public func remove_text(
-    cursorPtr: UnsafeMutablePointer<Int>
+    cursorPtr: UnsafeMutablePointer<CInt>
 ) -> UnsafeMutablePointer<CChar> {
     serverLog("DEBUG", "RemoveText: start")
     composingText.deleteBackwardFromCursorPosition(count: 1)
 
-    cursorPtr.pointee = composingText.convertTargetCursorPosition
+    cursorPtr.pointee = CInt(composingText.convertTargetCursorPosition)
     serverLog(
         "DEBUG",
         "RemoveText: completed cursor=\(cursorPtr.pointee) hiraganaLength=\(composingText.convertTarget.count) inputCount=\(composingText.input.count)"
@@ -1431,19 +1442,19 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 @_silgen_name("MoveCursor")
 @MainActor public func move_cursor(
     offset: Int32,
-    cursorPtr: UnsafeMutablePointer<Int>
+    cursorPtr: UnsafeMutablePointer<CInt>
 ) -> UnsafeMutablePointer<CChar> {
     serverLog("DEBUG", "MoveCursor: start offset=\(offset)")
     if offset == 125 {
         composingTextSnapshots.removeAll()
-        cursorPtr.pointee = composingText.convertTargetCursorPosition
+        cursorPtr.pointee = CInt(composingText.convertTargetCursorPosition)
         serverLog("DEBUG", "MoveCursor: clear snapshots")
         return _strdup(composingText.convertTarget)!
     }
 
     if offset == 126 {
         composingTextSnapshots.append(composingText)
-        cursorPtr.pointee = composingText.convertTargetCursorPosition
+        cursorPtr.pointee = CInt(composingText.convertTargetCursorPosition)
         serverLog("DEBUG", "MoveCursor: push snapshot count=\(composingTextSnapshots.count)")
         return _strdup(composingText.convertTarget)!
     }
@@ -1452,7 +1463,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
         if let restored = composingTextSnapshots.popLast() {
             composingText = restored
         }
-        cursorPtr.pointee = composingText.convertTargetCursorPosition
+        cursorPtr.pointee = CInt(composingText.convertTargetCursorPosition)
         serverLog("DEBUG", "MoveCursor: pop snapshot remaining=\(composingTextSnapshots.count)")
         return _strdup(composingText.convertTarget)!
     }
@@ -1460,7 +1471,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     let cursor = composingText.moveCursorFromCursorPosition(count: Int(offset))
     serverLog("DEBUG", "MoveCursor: offset=\(offset) cursor=\(cursor)")
 
-    cursorPtr.pointee = cursor
+    cursorPtr.pointee = CInt(cursor)
     serverLog("DEBUG", "MoveCursor: completed cursor=\(cursor)")
     return _strdup(composingText.convertTarget)!
 }
@@ -1475,10 +1486,14 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 
 func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
     let pointer = UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>.allocate(capacity: list.count)
-    for (i, item) in list.enumerated() {
-        let candidatePtr = UnsafeMutablePointer<FFICandidate>.allocate(capacity: 1)
-        candidatePtr.initialize(to: item)
-        pointer.advanced(by: i).initialize(to: candidatePtr)
+    guard !list.isEmpty else {
+        return pointer
+    }
+
+    let candidateStorage = UnsafeMutablePointer<FFICandidate>.allocate(capacity: list.count)
+    candidateStorage.initialize(from: list, count: list.count)
+    for i in 0..<list.count {
+        pointer.advanced(by: i).initialize(to: candidateStorage.advanced(by: i))
     }
     return pointer
 }
@@ -1506,7 +1521,19 @@ public func free_candidate_list(
         return
     }
 
-    for index in 0..<Int(length) {
+    let count = Int(length)
+    guard count > 0 else {
+        ptr.deallocate()
+        return
+    }
+
+    let candidateStorage = ptr[0]
+    let isContiguousCandidateStorage = candidateStorage.map { storage in
+        (0..<count).allSatisfy { index in
+            ptr[index] == storage.advanced(by: index)
+        }
+    } ?? false
+    for index in 0..<count {
         guard let candidatePtr = ptr[index] else {
             continue
         }
@@ -1515,16 +1542,29 @@ public func free_candidate_list(
         free(candidate.text)
         free(candidate.subtext)
         free(candidate.hiragana)
-        candidatePtr.deinitialize(count: 1)
-        candidatePtr.deallocate()
     }
 
-    ptr.deinitialize(count: Int(length))
+    if isContiguousCandidateStorage, let candidateStorage {
+        candidateStorage.deinitialize(count: count)
+        candidateStorage.deallocate()
+    } else {
+        for index in 0..<count {
+            guard let candidatePtr = ptr[index] else {
+                continue
+            }
+            candidatePtr.deinitialize(count: 1)
+            candidatePtr.deallocate()
+        }
+    }
+
+    ptr.deinitialize(count: count)
     ptr.deallocate()
 }
 
 @_silgen_name("GetComposedText")
-@MainActor public func get_composed_text(lengthPtr: UnsafeMutablePointer<Int>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
+@MainActor public func get_composed_text(lengthPtr: UnsafeMutablePointer<CInt>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
+    let functionStart = performanceNow()
+    let performanceEnabled = serverLogCallbacks.isPerformanceLogEnabled()
     let originalHiragana = composingText.convertTarget
     let contextString = (config["context"] as? String) ?? ""
     let diagnosticSnapshot = zenzaiDiagnosticSnapshot()
@@ -1551,62 +1591,117 @@ public func free_candidate_list(
         "GetComposedText: start \(diagnosticDetails)"
     )
     let options = getOptions(context: contextString, zenzaiEnabled: useZenzai)
-    crashTrace(operation: "GetComposedText", stage: "requestCandidates", state: "begin", details: diagnosticDetails)
-    serverLog("DEBUG", "GetComposedText: requestCandidates begin \(diagnosticDetails)", flush: true)
-    let requestStart = ProcessInfo.processInfo.systemUptime
+    candidateCrashTrace(
+        useZenzai: useZenzai,
+        operation: "GetComposedText",
+        stage: "requestCandidates",
+        state: "begin",
+        details: diagnosticDetails
+    )
+    serverLog("DEBUG", "GetComposedText: requestCandidates begin \(diagnosticDetails)")
+    if performanceEnabled {
+        performanceLog(
+            operation: "get_composed_text",
+            stage: "prepare_request",
+            elapsedMs: elapsedPerformanceMilliseconds(since: functionStart),
+            details: diagnosticDetails
+        )
+    }
+    let requestStart = performanceNow()
     let converted = converter.requestCandidates(previewComposingText, options: options)
-    let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
+    let requestMs = elapsedPerformanceMilliseconds(since: requestStart)
     performanceLog(
         operation: "get_composed_text",
         stage: "request_candidates",
         elapsedMs: requestMs,
         details: "candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
     )
-    crashTrace(
+    candidateCrashTrace(
+        useZenzai: useZenzai,
         operation: "GetComposedText",
         stage: "requestCandidates",
         state: "completed",
         details: "candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
     )
     serverLog("DEBUG", "GetComposedText: requestCandidates returned candidateCount=\(converted.mainResults.count) \(diagnosticDetails)")
-    crashTrace(
+    candidateCrashTrace(
+        useZenzai: useZenzai,
         operation: "GetComposedText",
         stage: "postprocessCandidates",
         state: "begin",
         details: "candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
     )
+    let buildStart = performanceEnabled ? performanceNow() : 0
+    var constructCandidateStringMs = 0
+    var resolveCandidateCompositionMs = 0
+    var strdupCandidatesMs = 0
+    var resolutionCache: [String: CandidateDisplayResolution] = [:]
     var result: [FFICandidate] = []
+    result.reserveCapacity(converted.mainResults.count)
 
     for i in 0..<converted.mainResults.count {
         let candidate = converted.mainResults[i]
-        serverLog("DEBUG", "GetComposedText: candidate[\(i + 1)/\(converted.mainResults.count)] start")
 
-        let text = strdup(constructCandidateString(candidate: candidate, hiragana: previewHiragana))
-        serverLog("DEBUG", "GetComposedText: candidate[\(i + 1)] textReady")
-        let hiragana = strdup(previewHiragana)
+        let constructStart = performanceEnabled ? performanceNow() : 0
+        let candidateText = constructCandidateString(candidate: candidate, hiragana: previewHiragana)
+        if performanceEnabled {
+            constructCandidateStringMs += elapsedPerformanceMilliseconds(since: constructStart)
+        }
+
+        let resolveStart = performanceEnabled ? performanceNow() : 0
         let resolvedCandidate = resolveCandidateCompositionForDisplay(
             originalComposingText: composingText,
             previewComposingText: previewComposingText,
-            candidateComposingCount: candidate.composingCount
-        )
-        let correspondingCount = resolvedCandidate.correspondingCount
-        debugLogResolvedCorrespondingCount(
-            scope: "GetComposedText",
-            candidateIndex: i,
-            candidateTotal: converted.mainResults.count,
             candidateComposingCount: candidate.composingCount,
-            resolvedCorrespondingCount: correspondingCount,
-            inputCount: composingText.input.count,
-            isZenzaiEnabled: useZenzai
+            resolutionCache: &resolutionCache
         )
-        let subtext = strdup(resolvedCandidate.remainingConvertTarget)
-        serverLog("DEBUG", "GetComposedText: candidate[\(i + 1)] subtextReady")
+        if performanceEnabled {
+            resolveCandidateCompositionMs += elapsedPerformanceMilliseconds(since: resolveStart)
+        }
+        let correspondingCount = resolvedCandidate.correspondingCount
+
+        let strdupStart = performanceEnabled ? performanceNow() : 0
+        let text = _strdup(candidateText)
+        let subtext = _strdup(resolvedCandidate.remainingConvertTarget)
+        let hiragana = i == 0 ? _strdup(previewHiragana) : nil
+        if performanceEnabled {
+            strdupCandidatesMs += elapsedPerformanceMilliseconds(since: strdupStart)
+        }
 
         result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))
     }
 
-    lengthPtr.pointee = result.count
-    crashTrace(
+    lengthPtr.pointee = CInt(result.count)
+    let listPointer = to_list_pointer(result)
+    if performanceEnabled {
+        let stringAllocationCount = result.isEmpty ? 0 : result.count * 2 + 1
+        performanceLog(
+            operation: "get_composed_text",
+            stage: "construct_candidate_string",
+            elapsedMs: constructCandidateStringMs,
+            details: "candidate_count=\(result.count);main_candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
+        )
+        performanceLog(
+            operation: "get_composed_text",
+            stage: "resolve_candidate_composition",
+            elapsedMs: resolveCandidateCompositionMs,
+            details: "candidate_count=\(result.count);cache_entries=\(resolutionCache.count);\(diagnosticDetails)"
+        )
+        performanceLog(
+            operation: "get_composed_text",
+            stage: "strdup_candidates",
+            elapsedMs: strdupCandidatesMs,
+            details: "candidate_count=\(result.count);string_allocations=\(stringAllocationCount);\(diagnosticDetails)"
+        )
+        performanceLog(
+            operation: "get_composed_text",
+            stage: "build_ffi_candidates_total",
+            elapsedMs: elapsedPerformanceMilliseconds(since: buildStart),
+            details: "candidate_count=\(result.count);main_candidate_count=\(converted.mainResults.count);cache_entries=\(resolutionCache.count);string_allocations=\(stringAllocationCount);\(diagnosticDetails)"
+        )
+    }
+    candidateCrashTrace(
+        useZenzai: useZenzai,
         operation: "GetComposedText",
         stage: "postprocessCandidates",
         state: "completed",
@@ -1615,11 +1710,13 @@ public func free_candidate_list(
     serverLog("DEBUG", "GetComposedText: postprocessCandidates completed candidateCount=\(result.count) mainCandidateCount=\(converted.mainResults.count) \(diagnosticDetails)")
     serverLog("DEBUG", "GetComposedText: completed candidateCount=\(result.count) \(diagnosticDetails)")
 
-    return to_list_pointer(result)
+    return listPointer
 }
 
 @_silgen_name("GetComposedTextForCursorPrefix")
-@MainActor public func get_composed_text_for_cursor_prefix(lengthPtr: UnsafeMutablePointer<Int>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
+@MainActor public func get_composed_text_for_cursor_prefix(lengthPtr: UnsafeMutablePointer<CInt>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
+    let functionStart = performanceNow()
+    let performanceEnabled = serverLogCallbacks.isPerformanceLogEnabled()
     let hiragana = composingText.convertTarget
     let suffixAfterCursor = String(hiragana.dropFirst(composingText.convertTargetCursorPosition))
     let prefixComposingText = composingText.prefixToCursorPosition()
@@ -1652,31 +1749,42 @@ public func free_candidate_list(
         "GetComposedTextForCursorPrefix: start suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
     )
     let options = getOptions(context: contextString, zenzaiEnabled: useZenzai)
-    crashTrace(
+    candidateCrashTrace(
+        useZenzai: useZenzai,
         operation: "GetComposedTextForCursorPrefix",
         stage: "requestCandidates",
         state: "begin",
         details: "suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
     )
-    serverLog("DEBUG", "GetComposedTextForCursorPrefix: requestCandidates begin suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)", flush: true)
-    let totalStart = ProcessInfo.processInfo.systemUptime
-    let requestStart = ProcessInfo.processInfo.systemUptime
+    serverLog("DEBUG", "GetComposedTextForCursorPrefix: requestCandidates begin suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)")
+    if performanceEnabled {
+        performanceLog(
+            operation: "get_composed_text_for_cursor_prefix",
+            stage: "prepare_request",
+            elapsedMs: elapsedPerformanceMilliseconds(since: functionStart),
+            details: "suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
+        )
+    }
+    let totalStart = performanceNow()
+    let requestStart = performanceNow()
     let converted = converter.requestCandidates(previewPrefixComposingText, options: options)
-    let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
+    let requestMs = elapsedPerformanceMilliseconds(since: requestStart)
     performanceLog(
         operation: "get_composed_text_for_cursor_prefix",
         stage: "request_candidates",
         elapsedMs: requestMs,
         details: "first_clause_candidate_count=\(converted.firstClauseResults.count);main_candidate_count=\(converted.mainResults.count);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
     )
-    crashTrace(
+    candidateCrashTrace(
+        useZenzai: useZenzai,
         operation: "GetComposedTextForCursorPrefix",
         stage: "requestCandidates",
         state: "completed",
         details: "first_clause_candidate_count=\(converted.firstClauseResults.count);main_candidate_count=\(converted.mainResults.count);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
     )
     serverLog("DEBUG", "GetComposedTextForCursorPrefix: requestCandidates returned firstClauseCandidateCount=\(converted.firstClauseResults.count) mainCandidateCount=\(converted.mainResults.count) suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)")
-    crashTrace(
+    candidateCrashTrace(
+        useZenzai: useZenzai,
         operation: "GetComposedTextForCursorPrefix",
         stage: "postprocessCandidates",
         state: "begin",
@@ -1717,7 +1825,8 @@ public func free_candidate_list(
             useZenzai: useZenzai,
             syntheticEndOfText: exactClausePreviewState.syntheticEndOfText
         )
-        crashTrace(
+        candidateCrashTrace(
+            useZenzai: useZenzai,
             operation: "GetComposedTextForCursorPrefix",
             stage: "requestCandidatesExactClause",
             state: "begin",
@@ -1725,23 +1834,23 @@ public func free_candidate_list(
         )
         serverLog(
             "DEBUG",
-            "GetComposedTextForCursorPrefix: requestCandidates exactClause begin correspondingCount=\(firstClauseCorrespondingCount) \(exactClauseDiagnosticDetails)",
-            flush: true
+            "GetComposedTextForCursorPrefix: requestCandidates exactClause begin correspondingCount=\(firstClauseCorrespondingCount) \(exactClauseDiagnosticDetails)"
         )
-        let exactClauseRequestStart = ProcessInfo.processInfo.systemUptime
+        let exactClauseRequestStart = performanceNow()
         let exactClauseConverted = converter.requestCandidates(
             exactClausePreviewState.composingText,
             options: options
         )
         exactClauseResults = exactClauseConverted.mainResults
-        let exactClauseRequestMs = Int((ProcessInfo.processInfo.systemUptime - exactClauseRequestStart) * 1000)
+        let exactClauseRequestMs = elapsedPerformanceMilliseconds(since: exactClauseRequestStart)
         performanceLog(
             operation: "get_composed_text_for_cursor_prefix",
             stage: "request_candidates_exact_clause",
             elapsedMs: exactClauseRequestMs,
             details: "candidate_count=\(exactClauseResults.count);corresponding_count=\(firstClauseCorrespondingCount);\(exactClauseDiagnosticDetails)"
         )
-        crashTrace(
+        candidateCrashTrace(
+            useZenzai: useZenzai,
             operation: "GetComposedTextForCursorPrefix",
             stage: "requestCandidatesExactClause",
             state: "completed",
@@ -1752,7 +1861,8 @@ public func free_candidate_list(
             "GetComposedTextForCursorPrefix: requestCandidates exactClause returned candidateCount=\(exactClauseResults.count) correspondingCount=\(firstClauseCorrespondingCount) \(exactClauseDiagnosticDetails)"
         )
     }
-    crashTrace(
+    candidateCrashTrace(
+        useZenzai: useZenzai,
         operation: "GetComposedTextForCursorPrefix",
         stage: "postprocessCandidates",
         state: "begin",
@@ -1770,47 +1880,72 @@ public func free_candidate_list(
             previewHiragana: previewPrefixHiragana,
             resolutionCache: &cursorPrefixResolutionCache
         )
-    let totalMs = Int((ProcessInfo.processInfo.systemUptime - totalStart) * 1000)
+    let totalMs = elapsedPerformanceMilliseconds(since: totalStart)
     performanceLog(
         operation: "get_composed_text_for_cursor_prefix",
         stage: "total_before_ffi_candidates",
         elapsedMs: totalMs,
         details: "candidate_count=\(cursorPrefixResults.count);first_clause_candidate_count=\(converted.firstClauseResults.count);main_candidate_count=\(converted.mainResults.count);exact_clause_candidate_count=\(exactClauseResults.count);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
     )
+    let buildStart = performanceEnabled ? performanceNow() : 0
+    var resolveCandidateCompositionMs = 0
+    var strdupCandidatesMs = 0
     var result: [FFICandidate] = []
+    result.reserveCapacity(cursorPrefixResults.count)
+    let ffiHiragana = previewPrefixHiragana + suffixAfterCursor
 
     for i in 0..<cursorPrefixResults.count {
         let cursorPrefixResult = cursorPrefixResults[i]
         let candidate = cursorPrefixResult.candidate
-        serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)/\(cursorPrefixResults.count)] start")
 
-        let text = strdup(cursorPrefixResult.displayText)
-        serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)] textReady")
-        let hiragana = strdup(previewPrefixHiragana + suffixAfterCursor)
+        let resolveStart = performanceEnabled ? performanceNow() : 0
         let resolvedCandidate = resolveCandidateCompositionForDisplay(
             originalComposingText: prefixComposingText,
             previewComposingText: previewPrefixComposingText,
             candidateComposingCount: candidate.composingCount,
             resolutionCache: &cursorPrefixResolutionCache
         )
+        if performanceEnabled {
+            resolveCandidateCompositionMs += elapsedPerformanceMilliseconds(since: resolveStart)
+        }
         let correspondingCount = resolvedCandidate.correspondingCount
-        debugLogResolvedCorrespondingCount(
-            scope: "GetComposedTextForCursorPrefix",
-            candidateIndex: i,
-            candidateTotal: cursorPrefixResults.count,
-            candidateComposingCount: candidate.composingCount,
-            resolvedCorrespondingCount: correspondingCount,
-            inputCount: prefixComposingText.input.count,
-            isZenzaiEnabled: useZenzai
-        )
-        let subtext = strdup(resolvedCandidate.remainingConvertTarget + suffixAfterCursor)
-        serverLog("DEBUG", "GetComposedTextForCursorPrefix: candidate[\(i + 1)] subtextReady")
+
+        let strdupStart = performanceEnabled ? performanceNow() : 0
+        let text = _strdup(cursorPrefixResult.displayText)
+        let subtext = _strdup(resolvedCandidate.remainingConvertTarget + suffixAfterCursor)
+        let hiragana = i == 0 ? _strdup(ffiHiragana) : nil
+        if performanceEnabled {
+            strdupCandidatesMs += elapsedPerformanceMilliseconds(since: strdupStart)
+        }
 
         result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))
     }
 
-    lengthPtr.pointee = result.count
-    crashTrace(
+    lengthPtr.pointee = CInt(result.count)
+    let listPointer = to_list_pointer(result)
+    if performanceEnabled {
+        let stringAllocationCount = result.isEmpty ? 0 : result.count * 2 + 1
+        performanceLog(
+            operation: "get_composed_text_for_cursor_prefix",
+            stage: "resolve_candidate_composition",
+            elapsedMs: resolveCandidateCompositionMs,
+            details: "candidate_count=\(result.count);cache_entries=\(cursorPrefixResolutionCache.count);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
+        )
+        performanceLog(
+            operation: "get_composed_text_for_cursor_prefix",
+            stage: "strdup_candidates",
+            elapsedMs: strdupCandidatesMs,
+            details: "candidate_count=\(result.count);string_allocations=\(stringAllocationCount);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
+        )
+        performanceLog(
+            operation: "get_composed_text_for_cursor_prefix",
+            stage: "build_ffi_candidates_total",
+            elapsedMs: elapsedPerformanceMilliseconds(since: buildStart),
+            details: "candidate_count=\(result.count);first_clause_candidate_count=\(converted.firstClauseResults.count);main_candidate_count=\(converted.mainResults.count);exact_clause_candidate_count=\(exactClauseResults.count);cache_entries=\(cursorPrefixResolutionCache.count);string_allocations=\(stringAllocationCount);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
+        )
+    }
+    candidateCrashTrace(
+        useZenzai: useZenzai,
         operation: "GetComposedTextForCursorPrefix",
         stage: "postprocessCandidates",
         state: "completed",
@@ -1819,7 +1954,7 @@ public func free_candidate_list(
     serverLog("DEBUG", "GetComposedTextForCursorPrefix: postprocessCandidates completed candidateCount=\(result.count) firstClauseCandidateCount=\(converted.firstClauseResults.count) mainCandidateCount=\(converted.mainResults.count) exactClauseCandidateCount=\(exactClauseResults.count) suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)")
     serverLog("DEBUG", "GetComposedTextForCursorPrefix: completed candidateCount=\(result.count) suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)")
 
-    return to_list_pointer(result)
+    return listPointer
 }
 
 @_silgen_name("ShrinkText")
