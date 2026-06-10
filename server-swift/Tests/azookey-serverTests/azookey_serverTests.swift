@@ -290,6 +290,50 @@ private func testCandidate(
     #expect(useZenzai)
 }
 
+@Test func warmupUsesShortInputWhenZenzaiRuntimeIsDisabled() async throws {
+    let metrics = await MainActor.run {
+        let warmupComposingText = makeWarmupComposingText(
+            zenzaiRuntimeEnabled: false,
+            inputStyle: .roman2kana
+        )
+        return (
+            inputCount: warmupComposingText.input.count,
+            hiraganaCount: warmupComposingText.convertTarget.count,
+            convertTarget: warmupComposingText.convertTarget
+        )
+    }
+
+    #expect(metrics.inputCount == 1)
+    #expect(metrics.hiraganaCount == 1)
+    #expect(metrics.convertTarget == "あ")
+}
+
+@Test func warmupUsesZenzaiCandidatePathWhenRuntimeIsEnabled() async throws {
+    let metrics = await MainActor.run {
+        let warmupComposingText = makeWarmupComposingText(
+            zenzaiRuntimeEnabled: true,
+            inputStyle: .direct
+        )
+        return (
+            inputCount: warmupComposingText.input.count,
+            hiraganaCount: warmupComposingText.convertTarget.count,
+            convertTarget: warmupComposingText.convertTarget
+        )
+    }
+
+    #expect(metrics.inputCount == zenzaiWarmupRomanInput.count)
+    #expect(metrics.inputCount >= minInputCountForZenzaiCandidates)
+    #expect(metrics.hiraganaCount >= minHiraganaCountForZenzaiCandidates)
+    #expect(metrics.convertTarget == "にほんご")
+    #expect(
+        effectiveZenzaiEnabledForCandidates(
+            isConfigured: true,
+            inputCount: metrics.inputCount,
+            hiraganaCount: metrics.hiraganaCount
+        )
+    )
+}
+
 @Test func cpuBackendIsDisabledWhenAvxIsUnavailable() async throws {
     let enabled = effectiveZenzaiRuntimeEnabled(
         isConfigured: true,

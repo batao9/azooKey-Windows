@@ -20,7 +20,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
-        mpsc, OnceLock,
+        mpsc, Arc, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -39,6 +39,8 @@ const LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 const LOG_FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const WARMUP_INTERVAL_SECS: u64 = 30;
+const WARMUP_RECENT_INPUT_SKIP_MS: u64 = 2_000;
+const WARMUP_LONG_RUNNING_WARNING_MS: u64 = 5_000;
 
 static SERVER_LOG_WORKER: OnceLock<ServerLogWorker> = OnceLock::new();
 static SERVER_LOG_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -48,6 +50,9 @@ static SERVER_CRASH_TRACE_ENABLED: AtomicBool = AtomicBool::new(true);
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const SERVER_GENERATED_REQUEST_ID_PREFIX: u64 = 1 << 63;
 static HAS_ACTIVE_COMPOSITION: AtomicBool = AtomicBool::new(false);
+static SERVER_REQUESTS_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+static LAST_INPUT_REQUEST_FINISHED_MS: AtomicU64 = AtomicU64::new(0);
+static MONOTONIC_START: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum ServerLogLevel {
@@ -563,6 +568,106 @@ fn add_elapsed_ms(total: &mut u128, start: Option<Instant>) {
     if let Some(start) = start {
         *total += elapsed_ms(start);
     }
+}
+
+fn monotonic_millis() -> u64 {
+    let elapsed = MONOTONIC_START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis();
+    u64::try_from(elapsed).unwrap_or(u64::MAX)
+}
+
+fn record_input_request_finished() {
+    LAST_INPUT_REQUEST_FINISHED_MS.store(monotonic_millis().max(1), Ordering::Release);
+}
+
+struct ServerRequestGuard {
+    is_input_request: bool,
+}
+
+impl ServerRequestGuard {
+    fn begin(is_input_request: bool) -> Self {
+        SERVER_REQUESTS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+        Self { is_input_request }
+    }
+}
+
+impl Drop for ServerRequestGuard {
+    fn drop(&mut self) {
+        if self.is_input_request {
+            record_input_request_finished();
+        }
+        SERVER_REQUESTS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+enum WarmupSkipReason {
+    ActiveComposition,
+    RequestInFlight { in_flight: u64 },
+    RecentInput { elapsed_ms: u64 },
+}
+
+impl WarmupSkipReason {
+    fn details(&self) -> String {
+        match self {
+            Self::ActiveComposition => "reason=active_composition".to_owned(),
+            Self::RequestInFlight { in_flight } => {
+                format!("reason=request_in_flight;in_flight={in_flight}")
+            }
+            Self::RecentInput { elapsed_ms } => format!(
+                "reason=recent_input;elapsed_ms={elapsed_ms};skip_ms={WARMUP_RECENT_INPUT_SKIP_MS}"
+            ),
+        }
+    }
+}
+
+fn warmup_skip_reason() -> Option<WarmupSkipReason> {
+    if has_active_composition() {
+        return Some(WarmupSkipReason::ActiveComposition);
+    }
+
+    let in_flight = SERVER_REQUESTS_IN_FLIGHT.load(Ordering::Acquire);
+    if in_flight > 0 {
+        return Some(WarmupSkipReason::RequestInFlight { in_flight });
+    }
+
+    let last_input_finished_ms = LAST_INPUT_REQUEST_FINISHED_MS.load(Ordering::Acquire);
+    if last_input_finished_ms > 0 {
+        let elapsed_ms = monotonic_millis().saturating_sub(last_input_finished_ms);
+        if elapsed_ms < WARMUP_RECENT_INPUT_SKIP_MS {
+            return Some(WarmupSkipReason::RecentInput { elapsed_ms });
+        }
+    }
+
+    None
+}
+
+fn start_warmup_watchdog(request_id: u64) -> Arc<AtomicBool> {
+    let completed = Arc::new(AtomicBool::new(false));
+    let watchdog_completed = Arc::clone(&completed);
+    let _ = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(WARMUP_LONG_RUNNING_WARNING_MS));
+        if watchdog_completed.load(Ordering::Acquire) {
+            return;
+        }
+
+        log_event(
+            ServerLogLevel::Warn,
+            &format!(
+                "request_id={request_id} [warmup] still running after {WARMUP_LONG_RUNNING_WARNING_MS}ms"
+            ),
+        );
+        log_performance_event(
+            request_id,
+            "rust",
+            "warmup",
+            "long_running",
+            u128::from(WARMUP_LONG_RUNNING_WARNING_MS),
+            &format!("threshold_ms={WARMUP_LONG_RUNNING_WARNING_MS}"),
+        );
+    });
+    completed
 }
 
 fn now_timestamp_millis() -> u128 {
@@ -1263,6 +1368,7 @@ impl AzookeyService for MyAzookeyService {
         request: Request<AppendTextRequest>,
     ) -> Result<Response<AppendTextResponse>, Status> {
         let request = request.into_inner();
+        let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
         set_request_id(request_id);
         let handler_start = Instant::now();
@@ -1323,7 +1429,9 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<RemoveTextRequest>,
     ) -> Result<Response<RemoveTextResponse>, Status> {
-        let request_id = request_id_or_next(request.into_inner().request_id);
+        let request = request.into_inner();
+        let _request_guard = ServerRequestGuard::begin(true);
+        let request_id = request_id_or_next(request.request_id);
         set_request_id(request_id);
         let handler_start = Instant::now();
 
@@ -1374,6 +1482,7 @@ impl AzookeyService for MyAzookeyService {
         request: Request<MoveCursorRequest>,
     ) -> Result<Response<MoveCursorResponse>, Status> {
         let request = request.into_inner();
+        let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
         set_request_id(request_id);
         let handler_start = Instant::now();
@@ -1427,7 +1536,9 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<ClearTextRequest>,
     ) -> Result<Response<ClearTextResponse>, Status> {
-        let request_id = request_id_or_next(request.into_inner().request_id);
+        let request = request.into_inner();
+        let _request_guard = ServerRequestGuard::begin(true);
+        let request_id = request_id_or_next(request.request_id);
         set_request_id(request_id);
         let handler_start = Instant::now();
         let clear_start = Instant::now();
@@ -1455,6 +1566,7 @@ impl AzookeyService for MyAzookeyService {
         request: Request<ShrinkTextRequest>,
     ) -> Result<Response<ShrinkTextResponse>, Status> {
         let request = request.into_inner();
+        let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
         set_request_id(request_id);
         let handler_start = Instant::now();
@@ -1507,6 +1619,7 @@ impl AzookeyService for MyAzookeyService {
         request: Request<shared::proto::SetContextRequest>,
     ) -> Result<Response<shared::proto::SetContextResponse>, Status> {
         let request = request.into_inner();
+        let _request_guard = ServerRequestGuard::begin(false);
         let request_id = request_id_or_next(request.request_id);
         set_request_id(request_id);
         let handler_start = Instant::now();
@@ -1545,7 +1658,9 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<shared::proto::UpdateConfigRequest>,
     ) -> Result<Response<shared::proto::UpdateConfigResponse>, Status> {
-        let request_id = request_id_or_next(request.into_inner().request_id);
+        let request = request.into_inner();
+        let _request_guard = ServerRequestGuard::begin(false);
+        let request_id = request_id_or_next(request.request_id);
         let _log_paths = reload_server_logging_from_settings();
         set_request_id(request_id);
         let handler_start = Instant::now();
@@ -1574,6 +1689,7 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<PerformanceLogRequest>,
     ) -> Result<Response<PerformanceLogResponse>, Status> {
+        let _request_guard = ServerRequestGuard::begin(false);
         let request = request.into_inner();
         log_performance_event(
             request.request_id,
@@ -1640,24 +1756,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         loop {
             interval.tick().await;
-            if has_active_composition() {
+            tokio::task::yield_now().await;
+
+            let request_id = next_request_id();
+            if let Some(reason) = warmup_skip_reason() {
+                let details = reason.details();
                 log_event_lazy!(
                     ServerLogLevel::Debug,
-                    "[warmup] skipped because composition is active"
+                    "request_id={request_id} [warmup] skipped {details}"
                 );
+                performance_event_lazy!(request_id, "warmup", "skip", 0, "{details}");
                 continue;
             }
 
-            let request_id = next_request_id();
             log_event_lazy!(
                 ServerLogLevel::Debug,
-                "request_id={request_id} [warmup] start"
+                "request_id={request_id} [warmup] start interval_secs={WARMUP_INTERVAL_SECS};recent_input_skip_ms={WARMUP_RECENT_INPUT_SKIP_MS}"
             );
             set_request_id(request_id);
+            let warmup_start = Instant::now();
+            let watchdog_completed = start_warmup_watchdog(request_id);
             warmup();
+            watchdog_completed.store(true, Ordering::Release);
+            let warmup_elapsed_ms = elapsed_ms(warmup_start);
+            performance_event_lazy!(
+                request_id,
+                "warmup",
+                "total",
+                warmup_elapsed_ms,
+                "status=success"
+            );
             log_event_lazy!(
                 ServerLogLevel::Debug,
-                "request_id={request_id} [warmup] done"
+                "request_id={request_id} [warmup] done elapsed_ms={warmup_elapsed_ms}"
             );
         }
     });

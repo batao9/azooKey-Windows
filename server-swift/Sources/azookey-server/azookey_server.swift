@@ -33,6 +33,8 @@ private let fallbackDictionaryURL =
 let maxUserDictionaryEntryCount = 50
 let minInputCountForZenzaiCandidates = 4
 let minHiraganaCountForZenzaiCandidates = 2
+let zenzaiWarmupRomanInput = "nihongo"
+let warmupRequestCandidatesWarningMs = 5_000
 // Request exact-clause supplements only when boundary-matched candidates are sparse.
 let cursorPrefixExactClauseSupplementCandidateThreshold = 5
 
@@ -1114,10 +1116,26 @@ private func sanitizeDiagnosticField(_ value: String, maxLength: Int = 80) -> St
     return fields.joined(separator: ";")
 }
 
-@MainActor private func makeWarmupComposingText() -> ComposingText {
+@MainActor private func makeWarmupComposingText(
+    input: String,
+    inputStyle: InputStyle
+) -> ComposingText {
     var warmupComposingText = ComposingText()
-    warmupComposingText.insertAtCursorPosition("a", inputStyle: currentInputStyle)
+    warmupComposingText.insertAtCursorPosition(input, inputStyle: inputStyle)
     return warmupComposingText
+}
+
+@MainActor func makeWarmupComposingText(
+    zenzaiRuntimeEnabled: Bool? = nil,
+    inputStyle: InputStyle? = nil
+) -> ComposingText {
+    let selectedInputStyle = inputStyle ?? currentInputStyle
+    let useZenzaiWarmup = zenzaiRuntimeEnabled ?? currentRuntimeZenzaiEnabled()
+    guard useZenzaiWarmup else {
+        return makeWarmupComposingText(input: "a", inputStyle: selectedInputStyle)
+    }
+
+    return makeWarmupComposingText(input: zenzaiWarmupRomanInput, inputStyle: .roman2kana)
 }
 
 class SimpleComposingText {
@@ -1298,13 +1316,15 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 
     load_config()
 
-    composingText = makeWarmupComposingText()
+    let diagnosticSnapshot = zenzaiDiagnosticSnapshot()
+    composingText = makeWarmupComposingText(
+        zenzaiRuntimeEnabled: diagnosticSnapshot.runtimeEnabled
+    )
     let useZenzaiForWarmup = effectiveZenzaiEnabledForCandidates(
-        isConfigured: currentRuntimeZenzaiEnabled(),
+        isConfigured: diagnosticSnapshot.runtimeEnabled,
         inputCount: composingText.input.count,
         hiraganaCount: composingText.convertTarget.count
     )
-    let diagnosticSnapshot = zenzaiDiagnosticSnapshot()
     let diagnosticDetails = zenzaiDiagnosticDetails(
         snapshot: diagnosticSnapshot,
         contextLength: 0,
@@ -1342,8 +1362,10 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
 @_silgen_name("Warmup")
 @MainActor public func warmup() {
     let contextString = (config["context"] as? String) ?? ""
-    let warmupComposingText = makeWarmupComposingText()
     let diagnosticSnapshot = zenzaiDiagnosticSnapshot()
+    let warmupComposingText = makeWarmupComposingText(
+        zenzaiRuntimeEnabled: diagnosticSnapshot.runtimeEnabled
+    )
     let useZenzai = effectiveZenzaiEnabledForCandidates(
         isConfigured: diagnosticSnapshot.runtimeEnabled,
         inputCount: warmupComposingText.input.count,
@@ -1369,6 +1391,13 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
         options: options
     )
     let requestMs = Int((ProcessInfo.processInfo.systemUptime - requestStart) * 1000)
+    if requestMs >= warmupRequestCandidatesWarningMs {
+        serverLog(
+            "WARN",
+            "Warmup: requestCandidates slow elapsed_ms=\(requestMs);threshold_ms=\(warmupRequestCandidatesWarningMs) \(diagnosticDetails)",
+            flush: true
+        )
+    }
     performanceLog(
         operation: "warmup",
         stage: "request_candidates",
