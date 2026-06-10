@@ -104,6 +104,87 @@ private func testCandidate(
     ]
 
     free_candidate_list(to_list_pointer(candidates), Int32(candidates.count))
+
+    let nilHiraganaText = try #require(_strdup("candidate"))
+    let nilHiraganaSubtext = try #require(_strdup("remaining"))
+    let nilHiraganaCandidates = [
+        FFICandidate(
+            text: nilHiraganaText,
+            subtext: nilHiraganaSubtext,
+            hiragana: nil,
+            correspondingCount: 1
+        )
+    ]
+
+    free_candidate_list(to_list_pointer(nilHiraganaCandidates), Int32(nilHiraganaCandidates.count))
+
+    let firstLegacyText = try #require(_strdup("legacy"))
+    let firstLegacySubtext = try #require(_strdup("remaining"))
+    let firstLegacyHiragana = try #require(_strdup("かな"))
+    let firstLegacyCandidate = UnsafeMutablePointer<FFICandidate>.allocate(capacity: 1)
+    firstLegacyCandidate.initialize(
+        to: FFICandidate(
+            text: firstLegacyText,
+            subtext: firstLegacySubtext,
+            hiragana: firstLegacyHiragana,
+            correspondingCount: 1
+        )
+    )
+
+    let secondLegacyText = try #require(_strdup("legacy-second"))
+    let secondLegacySubtext = try #require(_strdup("remaining-second"))
+    let secondLegacyCandidate = UnsafeMutablePointer<FFICandidate>.allocate(capacity: 1)
+    secondLegacyCandidate.initialize(
+        to: FFICandidate(
+            text: secondLegacyText,
+            subtext: secondLegacySubtext,
+            hiragana: nil,
+            correspondingCount: 1
+        )
+    )
+
+    let legacyList = UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>.allocate(capacity: 3)
+    legacyList.advanced(by: 0).initialize(to: firstLegacyCandidate)
+    legacyList.advanced(by: 1).initialize(to: nil)
+    legacyList.advanced(by: 2).initialize(to: secondLegacyCandidate)
+    free_candidate_list(legacyList, 3)
+}
+
+@Test func constructCandidateStringAdvancesByRubyWithoutMutatingRemainder() async throws {
+    let candidate = Candidate(
+        text: "今日は",
+        value: -1,
+        composingCount: .inputCount(5),
+        lastMid: MIDData.一般.mid,
+        data: [
+            DicdataElement(
+                word: "今日",
+                ruby: "きょう",
+                cid: CIDData.一般名詞.cid,
+                mid: MIDData.一般.mid,
+                value: -1
+            ),
+            DicdataElement(
+                word: "は",
+                ruby: "は",
+                cid: CIDData.一般名詞.cid,
+                mid: MIDData.一般.mid,
+                value: -1
+            ),
+        ]
+    )
+
+    #expect(constructCandidateString(candidate: candidate, hiragana: "きょうは") == "今日は")
+}
+
+@Test func constructCandidateStringFallsBackToRemainingHiraganaWhenRubyOverruns() async throws {
+    let candidate = testCandidate(
+        word: "今日",
+        ruby: "きょう",
+        composingCount: .inputCount(2)
+    )
+
+    #expect(constructCandidateString(candidate: candidate, hiragana: "きょ") == "きょ")
 }
 
 @Test func supportsNextInputCarryForTsuRules() async throws {
