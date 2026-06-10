@@ -118,21 +118,36 @@ private func testCandidate(
 
     free_candidate_list(to_list_pointer(nilHiraganaCandidates), Int32(nilHiraganaCandidates.count))
 
-    let legacyText = try #require(_strdup("legacy"))
-    let legacySubtext = try #require(_strdup("remaining"))
-    let legacyHiragana = try #require(_strdup("かな"))
-    let legacyCandidate = UnsafeMutablePointer<FFICandidate>.allocate(capacity: 1)
-    legacyCandidate.initialize(
+    let firstLegacyText = try #require(_strdup("legacy"))
+    let firstLegacySubtext = try #require(_strdup("remaining"))
+    let firstLegacyHiragana = try #require(_strdup("かな"))
+    let firstLegacyCandidate = UnsafeMutablePointer<FFICandidate>.allocate(capacity: 1)
+    firstLegacyCandidate.initialize(
         to: FFICandidate(
-            text: legacyText,
-            subtext: legacySubtext,
-            hiragana: legacyHiragana,
+            text: firstLegacyText,
+            subtext: firstLegacySubtext,
+            hiragana: firstLegacyHiragana,
             correspondingCount: 1
         )
     )
-    let legacyList = UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>.allocate(capacity: 1)
-    legacyList.initialize(to: legacyCandidate)
-    free_candidate_list(legacyList, 1)
+
+    let secondLegacyText = try #require(_strdup("legacy-second"))
+    let secondLegacySubtext = try #require(_strdup("remaining-second"))
+    let secondLegacyCandidate = UnsafeMutablePointer<FFICandidate>.allocate(capacity: 1)
+    secondLegacyCandidate.initialize(
+        to: FFICandidate(
+            text: secondLegacyText,
+            subtext: secondLegacySubtext,
+            hiragana: nil,
+            correspondingCount: 1
+        )
+    )
+
+    let legacyList = UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>.allocate(capacity: 3)
+    legacyList.advanced(by: 0).initialize(to: firstLegacyCandidate)
+    legacyList.advanced(by: 1).initialize(to: nil)
+    legacyList.advanced(by: 2).initialize(to: secondLegacyCandidate)
+    free_candidate_list(legacyList, 3)
 }
 
 @Test func constructCandidateStringAdvancesByRubyWithoutMutatingRemainder() async throws {
