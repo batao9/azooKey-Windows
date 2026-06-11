@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use crate::{
     engine::user_action::UserAction,
@@ -18,13 +15,14 @@ use super::{
         client_performance_log_enabled, current_input_trace_request_id, Candidates,
         ClientInputTraceGuard, IPCService,
     },
-    state::{keyboard_disabled_from_context, IMEState},
+    romaji_lookup::RomajiLookup,
+    state::{keyboard_disabled_from_context, AppConfigSnapshot, IMEState},
     text_util::{to_half_katakana, to_katakana},
     user_action::{Function, Navigation},
 };
-use shared::{
-    zenzai_cpu_backend_supported, AppConfig, NumpadInputMode, RomajiRule, SpaceInputMode,
-};
+#[cfg(test)]
+use shared::RomajiRule;
+use shared::{zenzai_cpu_backend_supported, AppConfig, NumpadInputMode, SpaceInputMode};
 use windows::Win32::{
     Foundation::{LPARAM, WPARAM},
     UI::{
@@ -69,124 +67,6 @@ impl CompositionReducer {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct RomajiLookup {
-    max_input_len: usize,
-    max_multi_char_input_len: usize,
-    prefix_set: HashSet<String>,
-    multi_char_prefix_set: HashSet<String>,
-    single_symbol_outputs: HashMap<char, String>,
-    single_symbol_output_order: HashMap<char, usize>,
-}
-
-impl RomajiLookup {
-    fn from_rows(rows: &[RomajiRule]) -> Self {
-        let mut lookup = Self::default();
-
-        for (row_index, row) in rows.iter().enumerate() {
-            let input = row.input.trim();
-            if input.is_empty() {
-                continue;
-            }
-
-            let input_len = input.chars().count();
-            lookup.max_input_len = lookup.max_input_len.max(input_len);
-            Self::insert_prefixes(input, &mut lookup.prefix_set);
-
-            if input_len > 1 {
-                lookup.max_multi_char_input_len = lookup.max_multi_char_input_len.max(input_len);
-                Self::insert_prefixes(input, &mut lookup.multi_char_prefix_set);
-            } else if row.next_input.trim().is_empty() && !row.output.is_empty() {
-                if let Some(symbol) = Self::single_char(input) {
-                    lookup
-                        .single_symbol_outputs
-                        .entry(symbol)
-                        .or_insert_with(|| row.output.clone());
-                    lookup
-                        .single_symbol_output_order
-                        .entry(symbol)
-                        .or_insert(row_index);
-                }
-            }
-        }
-
-        lookup
-    }
-
-    fn insert_prefixes(input: &str, prefixes: &mut HashSet<String>) {
-        let mut end = 0;
-        for ch in input.chars() {
-            end += ch.len_utf8();
-            prefixes.insert(input[..end].to_string());
-        }
-    }
-
-    fn single_char(input: &str) -> Option<char> {
-        let mut chars = input.chars();
-        let ch = chars.next()?;
-        chars.next().is_none().then_some(ch)
-    }
-
-    fn has_romaji_table_context(&self, raw_input_before: &str, symbol: char) -> bool {
-        self.has_context(
-            raw_input_before,
-            symbol,
-            self.max_input_len,
-            &self.prefix_set,
-        )
-    }
-
-    fn has_multi_character_romaji_context(&self, raw_input_before: &str, symbol: char) -> bool {
-        self.has_context(
-            raw_input_before,
-            symbol,
-            self.max_multi_char_input_len,
-            &self.multi_char_prefix_set,
-        )
-    }
-
-    fn has_context(
-        &self,
-        raw_input_before: &str,
-        symbol: char,
-        max_input_len: usize,
-        prefixes: &HashSet<String>,
-    ) -> bool {
-        if max_input_len == 0 || prefixes.is_empty() {
-            return false;
-        }
-
-        let mut tail: Vec<char> = raw_input_before
-            .chars()
-            .rev()
-            .take(max_input_len.saturating_sub(1))
-            .collect();
-        tail.reverse();
-
-        let mut combined = String::with_capacity(raw_input_before.len() + symbol.len_utf8());
-        for ch in tail {
-            combined.push(ch);
-        }
-        combined.push(symbol);
-
-        combined
-            .char_indices()
-            .any(|(suffix_start, _)| prefixes.contains(&combined[suffix_start..]))
-    }
-
-    fn single_symbol_output(&self, symbols: &[char]) -> Option<String> {
-        symbols
-            .iter()
-            .filter_map(|symbol| {
-                let order = self.single_symbol_output_order.get(symbol)?;
-                let output = self.single_symbol_outputs.get(symbol)?;
-                Some((*order, output))
-            })
-            .min_by_key(|(order, _)| *order)
-            .map(|(_, output)| output.clone())
-    }
-}
-
 #[derive(Default, Clone, PartialEq, Debug)]
 pub enum CompositionState {
     #[default]
@@ -195,6 +75,8 @@ pub enum CompositionState {
     Previewing,
     Selecting,
 }
+
+pub(crate) type ProcessKeyResult = Option<(Vec<ClientAction>, CompositionState, AppConfigSnapshot)>;
 
 #[derive(Default, Clone, Debug)]
 pub struct Composition {
@@ -284,13 +166,6 @@ impl TextServiceFactory {
     const MOVE_CURSOR_PUSH_CLAUSE_SNAPSHOT: i32 = 126;
     const MOVE_CURSOR_POP_CLAUSE_SNAPSHOT: i32 = 127;
     const MOVE_CLAUSE_TO_LAST: i32 = i32::MAX;
-
-    fn load_app_config_or_default() -> AppConfig {
-        AppConfig::read().unwrap_or_else(|error| {
-            tracing::error!("Failed to load settings; using defaults: {error}");
-            AppConfig::default()
-        })
-    }
 
     fn log_client_performance(
         request_id: u64,
@@ -3108,7 +2983,7 @@ impl TextServiceFactory {
         context: Option<&ITfContext>,
         wparam: WPARAM,
         lparam: LPARAM,
-    ) -> Result<Option<(Vec<ClientAction>, CompositionState)>> {
+    ) -> Result<ProcessKeyResult> {
         let standalone_trace = (current_input_trace_request_id().is_none()
             && client_performance_log_enabled())
         .then(ClientInputTraceGuard::begin);
@@ -3118,7 +2993,7 @@ impl TextServiceFactory {
                 .map(ClientInputTraceGuard::request_id)
         });
         let total_start = trace_request_id.map(|_| Instant::now());
-        let result: Result<Option<(Vec<ClientAction>, CompositionState)>> = (|| {
+        let result: Result<ProcessKeyResult> = (|| {
             let Some(context) = context else {
                 self.set_keyboard_disabled_state(true)?;
                 return Ok(None);
@@ -3142,18 +3017,23 @@ impl TextServiceFactory {
             let is_shift_right = is_shift_pressed && wparam.0 == 0x27;
             let is_shift_key = Self::is_shift_key(wparam);
             let is_alt_backquote = Self::is_alt_backquote(wparam, lparam);
-            let app_config_start = trace_request_id.map(|_| Instant::now());
-            let app_config = Self::load_app_config_or_default();
-            if let (Some(request_id), Some(app_config_start)) = (trace_request_id, app_config_start)
+            let config_snapshot_start = trace_request_id.map(|_| Instant::now());
+            let config_snapshot = IMEState::app_config_snapshot()?;
+            let app_config = config_snapshot.app_config();
+            let romaji_lookup = config_snapshot.romaji_lookup();
+            if let (Some(request_id), Some(config_snapshot_start)) =
+                (trace_request_id, config_snapshot_start)
             {
                 Self::log_client_performance(
                     request_id,
                     "process_key",
-                    "app_config_read",
-                    app_config_start.elapsed(),
+                    "config_snapshot",
+                    config_snapshot_start.elapsed(),
                     format!(
-                        "romaji_rows={};wparam={}",
+                        "romaji_rows={};max_input_len={};max_multi_char_input_len={};wparam={}",
                         app_config.romaji_table.rows.len(),
+                        romaji_lookup.max_input_len,
+                        romaji_lookup.max_multi_char_input_len,
                         wparam.0
                     ),
                 );
@@ -3204,6 +3084,7 @@ impl TextServiceFactory {
                 return Ok(Some((
                     vec![ClientAction::SetTemporaryLatinShiftPending(true)],
                     composition.state.clone(),
+                    config_snapshot,
                 )));
             }
 
@@ -3226,32 +3107,13 @@ impl TextServiceFactory {
                 UserAction::try_from(wparam.0)?
             };
 
-            let romaji_lookup_start = trace_request_id.map(|_| Instant::now());
-            let romaji_lookup = RomajiLookup::from_rows(&app_config.romaji_table.rows);
-            if let (Some(request_id), Some(romaji_lookup_start)) =
-                (trace_request_id, romaji_lookup_start)
-            {
-                Self::log_client_performance(
-                    request_id,
-                    "process_key",
-                    "romaji_lookup_build",
-                    romaji_lookup_start.elapsed(),
-                    format!(
-                        "rows={};max_input_len={};max_multi_char_input_len={}",
-                        app_config.romaji_table.rows.len(),
-                        romaji_lookup.max_input_len,
-                        romaji_lookup.max_multi_char_input_len
-                    ),
-                );
-            }
-
             let Some((transition, mut actions)) = Self::plan_actions_for_user_action_with_lookup(
                 &composition,
                 &action,
                 &mode,
                 is_shift_pressed,
-                &app_config,
-                &romaji_lookup,
+                app_config,
+                romaji_lookup,
                 start_temporary_latin,
             ) else {
                 self.clear_temporary_latin_shift_pending_if_needed(should_clear_shift_pending)?;
@@ -3293,12 +3155,12 @@ impl TextServiceFactory {
                 actions.insert(0, ClientAction::SetTemporaryLatinShiftPending(false));
             }
 
-            Ok(Some((actions, transition)))
+            Ok(Some((actions, transition, config_snapshot)))
         })();
 
         if let (Some(request_id), Some(total_start)) = (trace_request_id, total_start) {
             let details = match &result {
-                Ok(Some((actions, transition))) => format!(
+                Ok(Some((actions, transition, _))) => format!(
                     "status=success;handled=true;actions={};transition={transition:?};wparam={}",
                     actions.len(),
                     wparam.0
@@ -3374,8 +3236,10 @@ impl TextServiceFactory {
                 return Ok(false);
             };
 
-            if let Some((actions, transition)) = self.process_key(context, wparam, lparam)? {
-                self.handle_action(&actions, transition)?;
+            if let Some((actions, transition, config_snapshot)) =
+                self.process_key(context, wparam, lparam)?
+            {
+                self.handle_action_with_config_snapshot(&actions, transition, config_snapshot)?;
                 Ok(true)
             } else {
                 Ok(false)
@@ -3500,6 +3364,38 @@ impl TextServiceFactory {
         transition: CompositionState,
     ) -> Result<()> {
         let trace_request_id = current_input_trace_request_id();
+        let config_snapshot_start = trace_request_id.map(|_| Instant::now());
+        let config_snapshot = IMEState::app_config_snapshot()?;
+        if let (Some(request_id), Some(config_snapshot_start)) =
+            (trace_request_id, config_snapshot_start)
+        {
+            let app_config = config_snapshot.app_config();
+            let romaji_lookup = config_snapshot.romaji_lookup();
+            Self::log_client_performance(
+                request_id,
+                "handle_action",
+                "config_snapshot",
+                config_snapshot_start.elapsed(),
+                format!(
+                    "actions={};romaji_rows={};max_input_len={};max_multi_char_input_len={}",
+                    actions.len(),
+                    app_config.romaji_table.rows.len(),
+                    romaji_lookup.max_input_len,
+                    romaji_lookup.max_multi_char_input_len
+                ),
+            );
+        }
+
+        self.handle_action_with_config_snapshot(actions, transition, config_snapshot)
+    }
+
+    fn handle_action_with_config_snapshot(
+        &self,
+        actions: &[ClientAction],
+        transition: CompositionState,
+        config_snapshot: AppConfigSnapshot,
+    ) -> Result<()> {
+        let trace_request_id = current_input_trace_request_id();
         let total_start = trace_request_id.map(|_| Instant::now());
         let requested_transition = transition.clone();
         let result: Result<()> = (|| {
@@ -3510,40 +3406,8 @@ impl TextServiceFactory {
                 let mode = IMEState::input_mode()?;
                 (composition, mode)
             };
-            let app_config_start = trace_request_id.map(|_| Instant::now());
-            let app_config = Self::load_app_config_or_default();
-            if let (Some(request_id), Some(app_config_start)) = (trace_request_id, app_config_start)
-            {
-                Self::log_client_performance(
-                    request_id,
-                    "handle_action",
-                    "app_config_read",
-                    app_config_start.elapsed(),
-                    format!(
-                        "actions={};romaji_rows={}",
-                        actions.len(),
-                        app_config.romaji_table.rows.len()
-                    ),
-                );
-            }
-            let romaji_lookup_start = trace_request_id.map(|_| Instant::now());
-            let romaji_lookup = RomajiLookup::from_rows(&app_config.romaji_table.rows);
-            if let (Some(request_id), Some(romaji_lookup_start)) =
-                (trace_request_id, romaji_lookup_start)
-            {
-                Self::log_client_performance(
-                    request_id,
-                    "handle_action",
-                    "romaji_lookup_build",
-                    romaji_lookup_start.elapsed(),
-                    format!(
-                        "rows={};max_input_len={};max_multi_char_input_len={}",
-                        app_config.romaji_table.rows.len(),
-                        romaji_lookup.max_input_len,
-                        romaji_lookup.max_multi_char_input_len
-                    ),
-                );
-            }
+            let app_config = config_snapshot.app_config();
+            let romaji_lookup = config_snapshot.romaji_lookup();
 
             let mut preview = composition.preview.clone();
             let mut suffix = composition.suffix.clone();
@@ -3699,8 +3563,8 @@ impl TextServiceFactory {
                             InputMode::Kana => Self::resolve_symbol_input_text_with_lookup(
                                 &raw_input,
                                 text,
-                                &app_config,
-                                &romaji_lookup,
+                                app_config,
+                                romaji_lookup,
                             ),
                             InputMode::Latin => None,
                         };
@@ -3754,7 +3618,7 @@ impl TextServiceFactory {
                                 &mut ipc_service,
                                 &candidates,
                                 selection_index,
-                                &app_config,
+                                app_config,
                                 &transition,
                             )?;
                         } else if candidates.is_empty_composition() {
@@ -3813,7 +3677,7 @@ impl TextServiceFactory {
                                 &mut ipc_service,
                                 &candidates,
                                 selection_index,
-                                &app_config,
+                                app_config,
                                 &transition,
                             )?;
                         } else if candidates.is_empty_composition() {
@@ -3872,7 +3736,7 @@ impl TextServiceFactory {
                                 &mut ipc_service,
                                 &candidates,
                                 selection_index,
-                                &app_config,
+                                app_config,
                                 &transition,
                             )?;
                         } else if candidates.is_empty_composition() {
@@ -4550,8 +4414,8 @@ impl TextServiceFactory {
                             InputMode::Kana => Self::resolve_symbol_input_text_with_lookup(
                                 &shrunk_raw_input,
                                 text,
-                                &app_config,
-                                &romaji_lookup,
+                                app_config,
+                                romaji_lookup,
                             ),
                             InputMode::Latin => None,
                         };

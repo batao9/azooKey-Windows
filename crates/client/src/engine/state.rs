@@ -1,17 +1,133 @@
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::{
+    fs, io,
+    path::PathBuf,
+    sync::{Arc, LazyLock, Mutex, MutexGuard},
+    time::SystemTime,
+};
 
+use shared::AppConfig;
 use windows::{
     core::Interface as _,
     Win32::UI::TextServices::{ITfCompartmentMgr, ITfContext, GUID_COMPARTMENT_KEYBOARD_DISABLED},
 };
 
-use super::{input_mode::InputMode, ipc_service::IPCService};
+use super::{input_mode::InputMode, ipc_service::IPCService, romaji_lookup::RomajiLookup};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AppConfigCacheKey {
+    File {
+        path: PathBuf,
+        len: u64,
+        modified: Option<SystemTime>,
+    },
+    Missing {
+        path: PathBuf,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+impl AppConfigCacheKey {
+    fn current() -> Result<Self, shared::ConfigError> {
+        Self::for_path(AppConfig::settings_path()?)
+    }
+
+    fn for_path(path: PathBuf) -> Result<Self, shared::ConfigError> {
+        match fs::metadata(&path) {
+            Ok(metadata) => Ok(Self::File {
+                path,
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::Missing { path }),
+            Err(source) => Err(shared::ConfigError::Read { path, source }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::AppConfigCacheKey;
+
+    fn unique_test_dir(test_name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after UNIX_EPOCH")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "azookey-windows-{test_name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn app_config_cache_key_uses_missing_variant_for_absent_settings_file() {
+        let root = unique_test_dir("missing-config");
+        fs::create_dir_all(&root).expect("temp config dir should be created");
+        let path = root.join("settings.json");
+
+        let cache_key = AppConfigCacheKey::for_path(path.clone()).unwrap();
+
+        assert_eq!(cache_key, AppConfigCacheKey::Missing { path });
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn app_config_cache_key_changes_when_settings_file_changes_size() {
+        let root = unique_test_dir("changed-config");
+        fs::create_dir_all(&root).expect("temp config dir should be created");
+        let path = root.join("settings.json");
+        fs::write(&path, "a").expect("initial settings should be written");
+        let initial = AppConfigCacheKey::for_path(path.clone()).unwrap();
+
+        fs::write(&path, "abcd").expect("updated settings should be written");
+        let updated = AppConfigCacheKey::for_path(path).unwrap();
+
+        assert_ne!(initial, updated);
+        assert!(matches!(updated, AppConfigCacheKey::File { len: 4, .. }));
+        fs::remove_dir_all(root).ok();
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AppConfigSnapshot {
+    app_config: Arc<AppConfig>,
+    romaji_lookup: Arc<RomajiLookup>,
+    cache_key: AppConfigCacheKey,
+}
+
+impl AppConfigSnapshot {
+    fn new(app_config: AppConfig, cache_key: AppConfigCacheKey) -> Self {
+        let romaji_lookup = RomajiLookup::from_rows(&app_config.romaji_table.rows);
+        Self {
+            app_config: Arc::new(app_config),
+            romaji_lookup: Arc::new(romaji_lookup),
+            cache_key,
+        }
+    }
+
+    pub(super) fn app_config(&self) -> &AppConfig {
+        self.app_config.as_ref()
+    }
+
+    pub(super) fn romaji_lookup(&self) -> &RomajiLookup {
+        self.romaji_lookup.as_ref()
+    }
+}
 
 #[derive(Debug)]
 pub struct IMEState {
     pub ipc_service: Option<IPCService>,
     pub input_mode: InputMode,
     pub keyboard_disabled: bool,
+    app_config_snapshot: Option<AppConfigSnapshot>,
 }
 
 pub static IME_STATE: LazyLock<Mutex<IMEState>> = LazyLock::new(|| {
@@ -20,6 +136,7 @@ pub static IME_STATE: LazyLock<Mutex<IMEState>> = LazyLock::new(|| {
         ipc_service: None,
         input_mode: InputMode::default(),
         keyboard_disabled: false,
+        app_config_snapshot: None,
     })
 });
 
@@ -66,6 +183,40 @@ impl IMEState {
         };
 
         Ok((changed, ipc_service))
+    }
+
+    pub(super) fn app_config_snapshot() -> anyhow::Result<AppConfigSnapshot> {
+        let (cache_key, inspect_error) = match AppConfigCacheKey::current() {
+            Ok(cache_key) => (cache_key, None),
+            Err(error) => {
+                let reason = error.to_string();
+                (
+                    AppConfigCacheKey::Unavailable {
+                        reason: reason.clone(),
+                    },
+                    Some(reason),
+                )
+            }
+        };
+
+        let mut state = Self::get()?;
+        if let Some(snapshot) = &state.app_config_snapshot {
+            if snapshot.cache_key == cache_key {
+                return Ok(snapshot.clone());
+            }
+        }
+        state.app_config_snapshot = None;
+
+        if let Some(error) = inspect_error {
+            tracing::error!("Failed to inspect settings; using cached/default config: {error}");
+        }
+        let app_config = AppConfig::read().unwrap_or_else(|error| {
+            tracing::error!("Failed to load settings; using defaults: {error}");
+            AppConfig::default()
+        });
+        let snapshot = AppConfigSnapshot::new(app_config, cache_key);
+        state.app_config_snapshot = Some(snapshot.clone());
+        Ok(snapshot)
     }
 }
 
