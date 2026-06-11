@@ -65,6 +65,42 @@ impl UpdatePosState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CandidateWindowPositionState {
+    last_attempt_at: Option<Instant>,
+}
+
+impl CandidateWindowPositionState {
+    const THROTTLE_INTERVAL: Duration = Duration::from_millis(50);
+
+    pub fn should_throttle(&self, now: Instant) -> bool {
+        self.last_attempt_at
+            .is_some_and(|last| now.duration_since(last) < Self::THROTTLE_INTERVAL)
+    }
+
+    pub fn mark_attempt(&mut self, now: Instant) {
+        self.last_attempt_at = Some(now);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SurroundingTextContextState {
+    connection_id: Option<u64>,
+    context: String,
+}
+
+impl SurroundingTextContextState {
+    pub fn should_send(&self, connection_id: u64, context: &str) -> bool {
+        self.connection_id != Some(connection_id) || self.context != context
+    }
+
+    pub fn remember(&mut self, connection_id: u64, context: &str) {
+        self.connection_id = Some(connection_id);
+        self.context.clear();
+        self.context.push_str(context);
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct TextService {
     pub tid: u32,
@@ -73,6 +109,8 @@ pub struct TextService {
     pub layout_sink_context: Option<ITfContext>,
     pub composition: RefCell<Composition>,
     pub update_pos_state: UpdatePosState,
+    pub candidate_window_position_state: CandidateWindowPositionState,
+    pub surrounding_text_context_state: SurroundingTextContextState,
     pub sink_cookies: HashMap<GUID, u32>,
     pub display_attribute_atom: HashMap<GUID, u32>,
     pub mode: InputMode,
@@ -103,5 +141,35 @@ impl TextService {
 
     pub fn borrow_mut_composition(&self) -> Result<RefMut<Composition>> {
         Ok(self.composition.try_borrow_mut()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CandidateWindowPositionState, SurroundingTextContextState};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn surrounding_text_context_state_resends_after_connection_change() {
+        let mut state = SurroundingTextContextState::default();
+
+        assert!(state.should_send(1, "context"));
+        state.remember(1, "context");
+
+        assert!(!state.should_send(1, "context"));
+        assert!(state.should_send(2, "context"));
+        assert!(state.should_send(1, "changed"));
+    }
+
+    #[test]
+    fn candidate_window_position_state_throttles_recent_attempts() {
+        let mut state = CandidateWindowPositionState::default();
+        let now = Instant::now();
+
+        assert!(!state.should_throttle(now));
+        state.mark_attempt(now);
+
+        assert!(state.should_throttle(now + Duration::from_millis(10)));
+        assert!(!state.should_throttle(now + Duration::from_millis(60)));
     }
 }

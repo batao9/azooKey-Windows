@@ -25,6 +25,7 @@ const INPUT_STYLE_DIRECT: i32 = 1;
 const CLIENT_LOG_CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 static CLIENT_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static IPC_CONNECTION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static CLIENT_LOG_CONFIG_CACHE: OnceLock<Mutex<ClientLogConfigCache>> = OnceLock::new();
 
 thread_local! {
@@ -40,6 +41,7 @@ struct ClientLogConfigCache {
 // connect to kkc server
 #[derive(Debug, Clone)]
 pub struct IPCService {
+    connection_id: u64,
     // kkc server client
     azookey_client: AzookeyServiceClient<tonic::transport::channel::Channel>,
     // candidate window server client
@@ -170,6 +172,7 @@ impl Drop for ClientInputTraceGuard {
 impl IPCService {
     pub fn new() -> Result<Self> {
         let runtime = Arc::new(tokio::runtime::Runtime::new()?);
+        let connection_id = IPC_CONNECTION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
 
         let server_channel = runtime.block_on(
             Endpoint::try_from("http://[::]:50051")?.connect_with_connector(service_fn(
@@ -225,6 +228,7 @@ impl IPCService {
         tracing::debug!("Connected to server: {:?}", azookey_client);
 
         Ok(Self {
+            connection_id,
             azookey_client,
             window_client,
             runtime,
@@ -266,6 +270,7 @@ impl IPCService {
 
     fn reconnect(&mut self) -> anyhow::Result<()> {
         let refreshed = Self::new()?;
+        self.connection_id = refreshed.connection_id;
         self.azookey_client = refreshed.azookey_client;
         self.window_client = refreshed.window_client;
         self.runtime = refreshed.runtime;
@@ -534,6 +539,10 @@ impl IPCService {
         let response = response.into_inner();
         self.observe_server_session("set_context", response.server_session_id);
         Ok(())
+    }
+
+    pub(crate) fn connection_id(&self) -> u64 {
+        self.connection_id
     }
 
     fn enqueue_client_performance(

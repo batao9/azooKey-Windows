@@ -1341,9 +1341,10 @@ impl TextServiceFactory {
         let trace_request_id = current_input_trace_request_id();
         let total_start = trace_request_id.map(|_| Instant::now());
         let result: Result<()> = (|| {
-            let position = if update_pos {
+            let should_update_pos = update_pos && visible != Some(false);
+            let position = if should_update_pos {
                 let position_start = trace_request_id.map(|_| Instant::now());
-                let position = self.candidate_window_position()?;
+                let position = self.candidate_window_position_for_update()?;
                 if let (Some(request_id), Some(position_start)) = (trace_request_id, position_start)
                 {
                     Self::log_client_performance(
@@ -1360,6 +1361,11 @@ impl TextServiceFactory {
                 }
                 position
             } else {
+                if update_pos {
+                    tracing::debug!(
+                        "Skip candidate_window_position while candidate window is hidden"
+                    );
+                }
                 None
             };
             ipc_service.update_candidate_window(
@@ -1411,7 +1417,29 @@ impl TextServiceFactory {
         } else {
             None
         };
-        self.sync_candidate_window_update(ipc_service, candidates, selection_index, visible, true)
+        let update_pos = visible == Some(true);
+        self.sync_candidate_window_update(
+            ipc_service,
+            candidates,
+            selection_index,
+            visible,
+            update_pos,
+        )
+    }
+
+    #[inline]
+    fn actions_need_context_update(actions: &[ClientAction]) -> bool {
+        actions.iter().any(|action| {
+            matches!(
+                action,
+                ClientAction::AppendText(_)
+                    | ClientAction::AppendTextRaw(_)
+                    | ClientAction::AppendTextDirect(_)
+                    | ClientAction::ShrinkText(_)
+                    | ClientAction::ShrinkTextRaw(_)
+                    | ClientAction::ShrinkTextDirect(_)
+            )
+        })
     }
 
     #[inline]
@@ -3428,7 +3456,7 @@ impl TextServiceFactory {
             let mut selection_index = composition.selection_index;
             let mut temporary_latin = composition.temporary_latin;
             let mut temporary_latin_shift_pending = composition.temporary_latin_shift_pending;
-            let mut ipc_service = IMEState::ipc_service()?.context("ipc_service is None")?;
+            let mut ipc_service;
             let mut transition = transition;
             let mut deferred_clause_navigation_ready_ui_sync = None;
 
@@ -3499,7 +3527,10 @@ impl TextServiceFactory {
                 }};
             }
 
-            self.update_context(&preview)?;
+            if Self::actions_need_context_update(actions) {
+                self.update_context(&preview)?;
+            }
+            ipc_service = IMEState::ipc_service()?.context("ipc_service is None")?;
 
             for (action_index, action) in actions.iter().enumerate() {
                 match action {
