@@ -1545,6 +1545,45 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn append_result_indicates_server_reset(
+        previous_raw_input: &str,
+        previous_candidates: &Candidates,
+        appended_text: &str,
+        appended_candidates: &Candidates,
+    ) -> bool {
+        if previous_raw_input.is_empty()
+            || previous_candidates.is_empty_composition()
+            || appended_candidates.is_empty_composition()
+        {
+            return false;
+        }
+
+        let appended_len = appended_text.chars().count() as i32;
+        appended_len > 0
+            && appended_candidates
+                .corresponding_count
+                .iter()
+                .copied()
+                .max()
+                .is_some_and(|count| count > 0 && count <= appended_len)
+    }
+
+    #[inline]
+    fn has_client_composition_state(
+        raw_input: &str,
+        preview: &str,
+        suffix: &str,
+        fixed_prefix: &str,
+        candidates: &Candidates,
+    ) -> bool {
+        !raw_input.is_empty()
+            || !preview.is_empty()
+            || !suffix.is_empty()
+            || !fixed_prefix.is_empty()
+            || !candidates.is_empty_composition()
+    }
+
+    #[inline]
     fn current_raw_input_suffix(raw_input: &str, corresponding_count: i32) -> String {
         let split_at = Self::byte_index_after_chars(raw_input, corresponding_count.max(0) as usize);
         let adjusted_split_at = Self::adjust_single_n_raw_input_boundary(raw_input, split_at);
@@ -2634,6 +2673,10 @@ impl TextServiceFactory {
         deferred_sync: Option<ClauseNavigationReadyUiSync>,
         move_effect: ClauseActionEffect,
     ) -> Option<ClauseNavigationReadyUiSync> {
+        if move_effect.server_reset {
+            return None;
+        }
+
         if move_effect.applied {
             deferred_sync.map(|sync| ClauseNavigationReadyUiSync {
                 update_pos: move_effect.update_pos,
@@ -3517,6 +3560,73 @@ impl TextServiceFactory {
             let mut transition = transition;
             let mut deferred_clause_navigation_ready_ui_sync = None;
 
+            macro_rules! reset_after_empty_server_composition {
+                ($reason:expr) => {{
+                    tracing::warn!(
+                        reason = $reason,
+                        "Reset stale client composition after server returned empty composition"
+                    );
+
+                    transition = CompositionState::None;
+                    selection_index = 0;
+                    corresponding_count = 0;
+                    temporary_latin = false;
+                    temporary_latin_shift_pending = false;
+                    preview.clear();
+                    suffix.clear();
+                    raw_input.clear();
+                    raw_hiragana.clear();
+                    fixed_prefix.clear();
+                    candidates = Candidates::default();
+                    clause_snapshots.clear();
+                    future_clause_snapshots.clear();
+                    current_clause_is_split_derived = false;
+                    current_clause_is_direct_split_remainder = false;
+                    current_clause_has_split_left_neighbor = false;
+                    current_clause_split_group_id = None;
+                    next_split_group_id = 0;
+
+                    self.discard_composition_text()?;
+                    ipc_service.update_candidate_window(
+                        Some(false),
+                        None,
+                        Some(vec![]),
+                        Some(0),
+                        None,
+                    )?;
+                    ipc_service.clear_text()?;
+                }};
+            }
+
+            macro_rules! reset_stale_composition_before_fresh_append {
+                ($reason:expr) => {{
+                    tracing::warn!(
+                        reason = $reason,
+                        "Reset stale client composition before applying fresh append"
+                    );
+
+                    transition = CompositionState::Composing;
+                    corresponding_count = 0;
+                    temporary_latin = false;
+                    temporary_latin_shift_pending = false;
+                    preview.clear();
+                    suffix.clear();
+                    raw_input.clear();
+                    raw_hiragana.clear();
+                    fixed_prefix.clear();
+                    clause_snapshots.clear();
+                    future_clause_snapshots.clear();
+                    current_clause_is_split_derived = false;
+                    current_clause_is_direct_split_remainder = false;
+                    current_clause_has_split_left_neighbor = false;
+                    current_clause_split_group_id = None;
+                    next_split_group_id = 0;
+
+                    self.discard_composition_text()?;
+                    self.start_composition()?;
+                }};
+            }
+
             self.update_context(&preview)?;
 
             for (action_index, action) in actions.iter().enumerate() {
@@ -3596,8 +3706,30 @@ impl TextServiceFactory {
                         current_clause_is_direct_split_remainder = false;
                         current_clause_has_split_left_neighbor = false;
                         current_clause_split_group_id = None;
-                        candidates =
+                        let appended_candidates =
                             ipc_service.append_text_with_context(text.clone(), &candidates)?;
+                        let session_changed = ipc_service.take_server_reset_recovered()
+                            && Self::has_client_composition_state(
+                                &raw_input,
+                                &preview,
+                                &suffix,
+                                &fixed_prefix,
+                                &candidates,
+                            );
+                        let server_reset_recovered = session_changed
+                            || Self::append_result_indicates_server_reset(
+                                &raw_input,
+                                &candidates,
+                                &text,
+                                &appended_candidates,
+                            );
+                        candidates = appended_candidates;
+                        if server_reset_recovered {
+                            reset_stale_composition_before_fresh_append!(
+                                "append_text recovered after server reset"
+                            );
+                            selection_index = 0;
+                        }
                         raw_input.push_str(&text);
                         if let Some(selected) = Self::select_candidate(&candidates, selection_index)
                         {
@@ -3616,6 +3748,10 @@ impl TextServiceFactory {
                                 &app_config,
                                 &transition,
                             )?;
+                        } else if candidates.is_empty_composition() {
+                            reset_after_empty_server_composition!(
+                                "append_text returned empty composition"
+                            );
                         }
                     }
                     ClientAction::AppendTextRaw(text) => {
@@ -3628,8 +3764,30 @@ impl TextServiceFactory {
                         current_clause_is_direct_split_remainder = false;
                         current_clause_has_split_left_neighbor = false;
                         current_clause_split_group_id = None;
-                        candidates =
+                        let appended_candidates =
                             ipc_service.append_text_with_context(text.clone(), &candidates)?;
+                        let session_changed = ipc_service.take_server_reset_recovered()
+                            && Self::has_client_composition_state(
+                                &raw_input,
+                                &preview,
+                                &suffix,
+                                &fixed_prefix,
+                                &candidates,
+                            );
+                        let server_reset_recovered = session_changed
+                            || Self::append_result_indicates_server_reset(
+                                &raw_input,
+                                &candidates,
+                                text,
+                                &appended_candidates,
+                            );
+                        candidates = appended_candidates;
+                        if server_reset_recovered {
+                            reset_stale_composition_before_fresh_append!(
+                                "append_text_raw recovered after server reset"
+                            );
+                            selection_index = 0;
+                        }
                         raw_input.push_str(text);
                         if let Some(selected) = Self::select_candidate(&candidates, selection_index)
                         {
@@ -3648,6 +3806,10 @@ impl TextServiceFactory {
                                 &app_config,
                                 &transition,
                             )?;
+                        } else if candidates.is_empty_composition() {
+                            reset_after_empty_server_composition!(
+                                "append_text_raw returned empty composition"
+                            );
                         }
                     }
                     ClientAction::AppendTextDirect(text) => {
@@ -3660,8 +3822,30 @@ impl TextServiceFactory {
                         current_clause_is_direct_split_remainder = false;
                         current_clause_has_split_left_neighbor = false;
                         current_clause_split_group_id = None;
-                        candidates = ipc_service
+                        let appended_candidates = ipc_service
                             .append_text_direct_with_context(text.clone(), &candidates)?;
+                        let session_changed = ipc_service.take_server_reset_recovered()
+                            && Self::has_client_composition_state(
+                                &raw_input,
+                                &preview,
+                                &suffix,
+                                &fixed_prefix,
+                                &candidates,
+                            );
+                        let server_reset_recovered = session_changed
+                            || Self::append_result_indicates_server_reset(
+                                &raw_input,
+                                &candidates,
+                                text,
+                                &appended_candidates,
+                            );
+                        candidates = appended_candidates;
+                        if server_reset_recovered {
+                            reset_stale_composition_before_fresh_append!(
+                                "append_text_direct recovered after server reset"
+                            );
+                            selection_index = 0;
+                        }
                         raw_input.push_str(text);
                         if let Some(selected) = Self::select_candidate(&candidates, selection_index)
                         {
@@ -3680,6 +3864,10 @@ impl TextServiceFactory {
                                 &app_config,
                                 &transition,
                             )?;
+                        } else if candidates.is_empty_composition() {
+                            reset_after_empty_server_composition!(
+                                "append_text_direct returned empty composition"
+                            );
                         }
                     }
                     ClientAction::CommitTextDirect(text) => {
@@ -3697,8 +3885,36 @@ impl TextServiceFactory {
                         current_clause_is_direct_split_remainder = false;
                         current_clause_has_split_left_neighbor = false;
                         current_clause_split_group_id = None;
+                        if ipc_service.take_server_reset_recovered()
+                            && Self::has_client_composition_state(
+                                &raw_input,
+                                &preview,
+                                &suffix,
+                                &fixed_prefix,
+                                &candidates,
+                            )
+                        {
+                            reset_after_empty_server_composition!(
+                                "server session changed before remove_text"
+                            );
+                            continue;
+                        }
                         raw_input.pop();
                         candidates = ipc_service.remove_text()?;
+                        if ipc_service.take_server_reset_recovered()
+                            && Self::has_client_composition_state(
+                                &raw_input,
+                                &preview,
+                                &suffix,
+                                &fixed_prefix,
+                                &candidates,
+                            )
+                        {
+                            reset_after_empty_server_composition!(
+                                "remove_text detected server session change"
+                            );
+                            continue;
+                        }
                         if let Some(selected) = Self::select_candidate(&candidates, selection_index)
                         {
                             selection_index = selected.index;
@@ -3757,7 +3973,35 @@ impl TextServiceFactory {
                         }
                     }
                     ClientAction::MoveCursor(offset) => {
+                        if ipc_service.take_server_reset_recovered()
+                            && Self::has_client_composition_state(
+                                &raw_input,
+                                &preview,
+                                &suffix,
+                                &fixed_prefix,
+                                &candidates,
+                            )
+                        {
+                            reset_after_empty_server_composition!(
+                                "server session changed before move_cursor"
+                            );
+                            continue;
+                        }
                         candidates = ipc_service.move_cursor(*offset)?;
+                        if ipc_service.take_server_reset_recovered()
+                            && Self::has_client_composition_state(
+                                &raw_input,
+                                &preview,
+                                &suffix,
+                                &fixed_prefix,
+                                &candidates,
+                            )
+                        {
+                            reset_after_empty_server_composition!(
+                                "move_cursor detected server session change"
+                            );
+                            continue;
+                        }
                         if let Some(selected) = Self::select_candidate(&candidates, selection_index)
                         {
                             selection_index = selected.index;
@@ -3775,9 +4019,27 @@ impl TextServiceFactory {
                                 None,
                                 true,
                             )?;
+                        } else if candidates.is_empty_composition() {
+                            reset_after_empty_server_composition!(
+                                "move_cursor returned empty composition"
+                            );
                         }
                     }
                     ClientAction::EnsureClauseNavigationReady => {
+                        if ipc_service.take_server_reset_recovered()
+                            && Self::has_client_composition_state(
+                                &raw_input,
+                                &preview,
+                                &suffix,
+                                &fixed_prefix,
+                                &candidates,
+                            )
+                        {
+                            reset_after_empty_server_composition!(
+                                "server session changed before clause_navigation_ready"
+                            );
+                            continue;
+                        }
                         Self::log_clause_action_state(
                             "before",
                             action,
@@ -3821,7 +4083,11 @@ impl TextServiceFactory {
                             effect
                         };
 
-                        if effect.applied {
+                        if effect.server_reset {
+                            reset_after_empty_server_composition!(
+                                "clause_navigation_ready returned empty composition"
+                            );
+                        } else if effect.applied {
                             let defer_ui_sync = Self::should_defer_clause_navigation_ready_sync(
                                 actions,
                                 action_index,
@@ -3887,6 +4153,20 @@ impl TextServiceFactory {
                         }
                     }
                     ClientAction::MoveClause(direction) => {
+                        if ipc_service.take_server_reset_recovered()
+                            && Self::has_client_composition_state(
+                                &raw_input,
+                                &preview,
+                                &suffix,
+                                &fixed_prefix,
+                                &candidates,
+                            )
+                        {
+                            reset_after_empty_server_composition!(
+                                "server session changed before move_clause"
+                            );
+                            continue;
+                        }
                         Self::log_clause_action_state(
                             "before",
                             action,
@@ -3935,7 +4215,11 @@ impl TextServiceFactory {
                                 deferred_clause_navigation_ready_ui_sync.take(),
                                 effect,
                             );
-                        if effect.applied {
+                        if effect.server_reset {
+                            reset_after_empty_server_composition!(
+                                "move_clause returned empty composition"
+                            );
+                        } else if effect.applied {
                             self.sync_clause_action_ui(
                                 &preview,
                                 &suffix,
@@ -4001,6 +4285,20 @@ impl TextServiceFactory {
                         }
                     }
                     ClientAction::AdjustBoundary(direction) => {
+                        if ipc_service.take_server_reset_recovered()
+                            && Self::has_client_composition_state(
+                                &raw_input,
+                                &preview,
+                                &suffix,
+                                &fixed_prefix,
+                                &candidates,
+                            )
+                        {
+                            reset_after_empty_server_composition!(
+                                "server session changed before adjust_boundary"
+                            );
+                            continue;
+                        }
                         Self::log_clause_action_state(
                             "before",
                             action,
@@ -4044,7 +4342,20 @@ impl TextServiceFactory {
                             effect
                         };
 
-                        if effect.applied {
+                        if effect.server_reset
+                            || (ipc_service.take_server_reset_recovered()
+                                && Self::has_client_composition_state(
+                                    &raw_input,
+                                    &preview,
+                                    &suffix,
+                                    &fixed_prefix,
+                                    &candidates,
+                                ))
+                        {
+                            reset_after_empty_server_composition!(
+                                "adjust_boundary detected server reset"
+                            );
+                        } else if effect.applied {
                             self.sync_clause_action_ui(
                                 &preview,
                                 &suffix,
@@ -4234,28 +4545,68 @@ impl TextServiceFactory {
                         let mut updated_raw_input = shrunk_raw_input.clone();
                         updated_raw_input.push_str(text);
 
-                        let shrunk_candidates = ipc_service.shrink_text(corresponding_count)?;
                         let text = match mode {
                             InputMode::Kana => {
                                 resolved_symbol_text.unwrap_or_else(|| text.to_string())
                             }
                             InputMode::Latin => text.to_string(),
                         };
-                        candidates =
-                            ipc_service.append_text_with_context(text, &shrunk_candidates)?;
+                        let session_changed_before_shrink = ipc_service
+                            .take_server_reset_recovered()
+                            && Self::has_client_composition_state(
+                                &raw_input,
+                                &preview,
+                                &suffix,
+                                &fixed_prefix,
+                                &candidates,
+                            );
+                        let shrunk_candidates = if session_changed_before_shrink {
+                            Candidates::default()
+                        } else {
+                            ipc_service.shrink_text(corresponding_count)?
+                        };
+                        let mut fresh_append_after_server_reset = session_changed_before_shrink
+                            || shrunk_candidates.is_empty_composition();
+                        if fresh_append_after_server_reset {
+                            let reset_reason = if session_changed_before_shrink {
+                                "server session changed before shrink_text"
+                            } else {
+                                "shrink_text returned empty composition before append"
+                            };
+                            reset_stale_composition_before_fresh_append!(reset_reason);
+                            updated_raw_input.clear();
+                            updated_raw_input.push_str(&text);
+                        }
+                        candidates = ipc_service
+                            .append_text_with_context(text.clone(), &shrunk_candidates)?;
+                        if ipc_service.take_server_reset_recovered() {
+                            if !fresh_append_after_server_reset {
+                                reset_stale_composition_before_fresh_append!(
+                                    "shrink_text append recovered after server reset"
+                                );
+                            }
+                            updated_raw_input.clear();
+                            updated_raw_input.push_str(&text);
+                            fresh_append_after_server_reset = true;
+                        }
                         raw_input = updated_raw_input;
                         selection_index = 0;
 
-                        if let Some(selected) = Self::select_candidate(&candidates, selection_index)
+                        let recovered = if let Some(selected) =
+                            Self::select_candidate(&candidates, selection_index)
                         {
-                            self.shift_start(&preview, &selected.text)?;
-
+                            let previous_preview = preview.clone();
                             selection_index = selected.index;
                             corresponding_count = selected.corresponding_count;
                             preview = selected.text.clone();
                             suffix = selected.sub_text.clone();
                             raw_hiragana = selected.hiragana;
 
+                            if fresh_append_after_server_reset {
+                                self.set_text(&preview, &suffix)?;
+                            } else {
+                                self.shift_start(&previous_preview, &selected.text)?;
+                            }
                             self.sync_candidate_window_update(
                                 &mut ipc_service,
                                 &candidates,
@@ -4263,9 +4614,19 @@ impl TextServiceFactory {
                                 None,
                                 true,
                             )?;
-                        }
+                            true
+                        } else if candidates.is_empty_composition() {
+                            reset_after_empty_server_composition!(
+                                "shrink_text returned empty composition"
+                            );
+                            false
+                        } else {
+                            true
+                        };
 
-                        transition = CompositionState::Composing;
+                        if recovered {
+                            transition = CompositionState::Composing;
+                        }
                     }
                     ClientAction::ShrinkTextRaw(text) => {
                         fixed_prefix.clear();
@@ -4282,22 +4643,62 @@ impl TextServiceFactory {
                             Self::current_raw_input_suffix(&raw_input, corresponding_count);
                         updated_raw_input.push_str(text);
 
-                        let shrunk_candidates = ipc_service.shrink_text(corresponding_count)?;
+                        let session_changed_before_shrink = ipc_service
+                            .take_server_reset_recovered()
+                            && Self::has_client_composition_state(
+                                &raw_input,
+                                &preview,
+                                &suffix,
+                                &fixed_prefix,
+                                &candidates,
+                            );
+                        let shrunk_candidates = if session_changed_before_shrink {
+                            Candidates::default()
+                        } else {
+                            ipc_service.shrink_text(corresponding_count)?
+                        };
+                        let mut fresh_append_after_server_reset = session_changed_before_shrink
+                            || shrunk_candidates.is_empty_composition();
+                        if fresh_append_after_server_reset {
+                            let reset_reason = if session_changed_before_shrink {
+                                "server session changed before shrink_text_raw"
+                            } else {
+                                "shrink_text_raw returned empty composition before append"
+                            };
+                            reset_stale_composition_before_fresh_append!(reset_reason);
+                            updated_raw_input.clear();
+                            updated_raw_input.push_str(text);
+                        }
                         candidates = ipc_service
                             .append_text_with_context(text.clone(), &shrunk_candidates)?;
+                        if ipc_service.take_server_reset_recovered() {
+                            if !fresh_append_after_server_reset {
+                                reset_stale_composition_before_fresh_append!(
+                                    "shrink_text_raw append recovered after server reset"
+                                );
+                            }
+                            updated_raw_input.clear();
+                            updated_raw_input.push_str(text);
+                            fresh_append_after_server_reset = true;
+                        }
                         raw_input = updated_raw_input;
                         selection_index = 0;
 
-                        if let Some(selected) = Self::select_candidate(&candidates, selection_index)
+                        let recovered = if let Some(selected) =
+                            Self::select_candidate(&candidates, selection_index)
                         {
-                            self.shift_start(&preview, &selected.text)?;
-
+                            let previous_preview = preview.clone();
                             selection_index = selected.index;
                             corresponding_count = selected.corresponding_count;
                             preview = selected.text.clone();
                             suffix = selected.sub_text.clone();
                             raw_hiragana = selected.hiragana;
 
+                            if fresh_append_after_server_reset {
+                                self.set_text(&preview, &suffix)?;
+                            } else {
+                                self.shift_start(&previous_preview, &selected.text)?;
+                            }
                             self.sync_candidate_window_update(
                                 &mut ipc_service,
                                 &candidates,
@@ -4305,9 +4706,19 @@ impl TextServiceFactory {
                                 None,
                                 true,
                             )?;
-                        }
+                            true
+                        } else if candidates.is_empty_composition() {
+                            reset_after_empty_server_composition!(
+                                "shrink_text_raw returned empty composition"
+                            );
+                            false
+                        } else {
+                            true
+                        };
 
-                        transition = CompositionState::Composing;
+                        if recovered {
+                            transition = CompositionState::Composing;
+                        }
                     }
                     ClientAction::ShrinkTextDirect(text) => {
                         fixed_prefix.clear();
@@ -4324,22 +4735,62 @@ impl TextServiceFactory {
                             Self::current_raw_input_suffix(&raw_input, corresponding_count);
                         updated_raw_input.push_str(text);
 
-                        let shrunk_candidates = ipc_service.shrink_text(corresponding_count)?;
+                        let session_changed_before_shrink = ipc_service
+                            .take_server_reset_recovered()
+                            && Self::has_client_composition_state(
+                                &raw_input,
+                                &preview,
+                                &suffix,
+                                &fixed_prefix,
+                                &candidates,
+                            );
+                        let shrunk_candidates = if session_changed_before_shrink {
+                            Candidates::default()
+                        } else {
+                            ipc_service.shrink_text(corresponding_count)?
+                        };
+                        let mut fresh_append_after_server_reset = session_changed_before_shrink
+                            || shrunk_candidates.is_empty_composition();
+                        if fresh_append_after_server_reset {
+                            let reset_reason = if session_changed_before_shrink {
+                                "server session changed before shrink_text_direct"
+                            } else {
+                                "shrink_text_direct returned empty composition before append"
+                            };
+                            reset_stale_composition_before_fresh_append!(reset_reason);
+                            updated_raw_input.clear();
+                            updated_raw_input.push_str(text);
+                        }
                         candidates = ipc_service
                             .append_text_direct_with_context(text.clone(), &shrunk_candidates)?;
+                        if ipc_service.take_server_reset_recovered() {
+                            if !fresh_append_after_server_reset {
+                                reset_stale_composition_before_fresh_append!(
+                                    "shrink_text_direct append recovered after server reset"
+                                );
+                            }
+                            updated_raw_input.clear();
+                            updated_raw_input.push_str(text);
+                            fresh_append_after_server_reset = true;
+                        }
                         raw_input = updated_raw_input;
                         selection_index = 0;
 
-                        if let Some(selected) = Self::select_candidate(&candidates, selection_index)
+                        let recovered = if let Some(selected) =
+                            Self::select_candidate(&candidates, selection_index)
                         {
-                            self.shift_start(&preview, &selected.text)?;
-
+                            let previous_preview = preview.clone();
                             selection_index = selected.index;
                             corresponding_count = selected.corresponding_count;
                             preview = selected.text.clone();
                             suffix = selected.sub_text.clone();
                             raw_hiragana = selected.hiragana;
 
+                            if fresh_append_after_server_reset {
+                                self.set_text(&preview, &suffix)?;
+                            } else {
+                                self.shift_start(&previous_preview, &selected.text)?;
+                            }
                             self.sync_candidate_window_update(
                                 &mut ipc_service,
                                 &candidates,
@@ -4347,9 +4798,19 @@ impl TextServiceFactory {
                                 None,
                                 true,
                             )?;
-                        }
+                            true
+                        } else if candidates.is_empty_composition() {
+                            reset_after_empty_server_composition!(
+                                "shrink_text_direct returned empty composition"
+                            );
+                            false
+                        } else {
+                            true
+                        };
 
-                        transition = CompositionState::Composing;
+                        if recovered {
+                            transition = CompositionState::Composing;
+                        }
                     }
                     ClientAction::SetTemporaryLatin(is_temporary_latin) => {
                         temporary_latin = *is_temporary_latin;

@@ -56,6 +56,7 @@ pub(crate) struct ClauseActionStateMut<'a> {
 pub(crate) struct ClauseActionEffect {
     pub(crate) applied: bool,
     pub(crate) update_pos: bool,
+    pub(crate) server_reset: bool,
 }
 
 impl ClauseActionEffect {
@@ -63,6 +64,7 @@ impl ClauseActionEffect {
         Self {
             applied: false,
             update_pos: false,
+            server_reset: false,
         }
     }
 
@@ -70,6 +72,15 @@ impl ClauseActionEffect {
         Self {
             applied: true,
             update_pos,
+            server_reset: false,
+        }
+    }
+
+    pub(crate) fn server_reset() -> Self {
+        Self {
+            applied: false,
+            update_pos: false,
+            server_reset: true,
         }
     }
 }
@@ -270,6 +281,9 @@ impl ClauseState {
             Some(candidates) => candidates,
             None => backend.move_cursor(0)?,
         };
+        if navigation_candidates.is_empty_composition() {
+            return Ok(ClauseActionEffect::server_reset());
+        }
         let Some(mut selected) =
             TextServiceFactory::select_navigation_candidate_for_current_preview(
                 &navigation_candidates,
@@ -369,6 +383,9 @@ impl ClauseState {
             loop {
                 let before = MoveClauseProgressMarker::from_state(state);
                 let effect = ClauseState::apply_move_clause(state, backend, 1)?;
+                if effect.server_reset {
+                    return Ok(effect);
+                }
                 if !effect.applied {
                     break;
                 }
@@ -416,6 +433,9 @@ impl ClauseState {
             state.clause_snapshots.push(snapshot);
 
             *state.candidates = backend.shrink_text(current_corresponding_count)?;
+            if state.candidates.is_empty_composition() {
+                return Ok(ClauseActionEffect::server_reset());
+            }
             *state.selection_index = 0;
             *state.raw_input = TextServiceFactory::current_raw_input_suffix(
                 state.raw_input,

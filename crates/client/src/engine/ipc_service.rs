@@ -46,6 +46,8 @@ pub struct IPCService {
     window_client: WindowServiceClient<tonic::transport::channel::Channel>,
     runtime: Arc<tokio::runtime::Runtime>,
     performance_log_tx: tokio::sync::mpsc::UnboundedSender<PerformanceLogRequest>,
+    server_session_id: Option<u64>,
+    server_reset_recovered: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -54,6 +56,15 @@ pub struct Candidates {
     pub sub_texts: Vec<String>,
     pub hiragana: String,
     pub corresponding_count: Vec<i32>,
+}
+
+impl Candidates {
+    pub(crate) fn is_empty_composition(&self) -> bool {
+        self.texts.is_empty()
+            && self.sub_texts.is_empty()
+            && self.hiragana.is_empty()
+            && self.corresponding_count.is_empty()
+    }
 }
 
 fn next_request_id() -> u64 {
@@ -195,6 +206,8 @@ impl IPCService {
             window_client,
             runtime,
             performance_log_tx,
+            server_session_id: None,
+            server_reset_recovered: false,
         })
     }
 }
@@ -234,6 +247,176 @@ impl IPCService {
         self.window_client = refreshed.window_client;
         self.runtime = refreshed.runtime;
         self.performance_log_tx = refreshed.performance_log_tx;
+        Ok(())
+    }
+
+    fn observe_server_session(&mut self, operation: &str, server_session_id: u64) {
+        if server_session_id == 0 {
+            return;
+        }
+
+        if Self::server_session_changed(self.server_session_id, server_session_id) {
+            if let Some(previous_session_id) = self.server_session_id {
+                self.server_reset_recovered = true;
+                tracing::warn!(
+                    operation = operation,
+                    previous_session_id = previous_session_id,
+                    server_session_id = server_session_id,
+                    "Detected azookey server session change"
+                );
+            }
+        }
+
+        self.server_session_id = Some(server_session_id);
+    }
+
+    #[inline]
+    fn server_session_changed(previous_session_id: Option<u64>, server_session_id: u64) -> bool {
+        server_session_id != 0
+            && previous_session_id.is_some_and(|previous| previous != server_session_id)
+    }
+
+    pub(crate) fn take_server_reset_recovered(&mut self) -> bool {
+        let recovered = self.server_reset_recovered;
+        self.server_reset_recovered = false;
+        recovered
+    }
+
+    fn run_rpc_with_reconnect<T>(
+        &mut self,
+        operation: &str,
+        mut send: impl FnMut(&mut Self) -> anyhow::Result<T>,
+    ) -> anyhow::Result<(T, bool)> {
+        match send(self) {
+            Ok(value) => Ok((value, false)),
+            Err(first_error) => {
+                if !Self::should_reconnect_rpc_error(&first_error) {
+                    tracing::warn!(
+                        "{operation} failed with non-reconnectable error: {first_error:?}"
+                    );
+                    return Err(first_error);
+                }
+
+                tracing::warn!(
+                    "{operation} first attempt failed, reconnecting IPC once: {first_error:?}"
+                );
+
+                match self.reconnect() {
+                    Ok(()) => {
+                        tracing::info!("{operation} IPC reconnect succeeded, retrying request");
+                    }
+                    Err(reconnect_error) => {
+                        tracing::error!("{operation} IPC reconnect failed: {reconnect_error:?}");
+                        return Err(reconnect_error);
+                    }
+                }
+
+                match send(self) {
+                    Ok(value) => Ok((value, true)),
+                    Err(retry_error) => {
+                        tracing::error!(
+                            "{operation} retry failed after IPC reconnect: {retry_error:?}"
+                        );
+                        Err(retry_error)
+                    }
+                }
+            }
+        }
+    }
+
+    fn should_reconnect_rpc_error(error: &anyhow::Error) -> bool {
+        let Some(status) = error.downcast_ref::<tonic::Status>() else {
+            return true;
+        };
+
+        matches!(
+            status.code(),
+            tonic::Code::Aborted
+                | tonic::Code::Cancelled
+                | tonic::Code::DataLoss
+                | tonic::Code::DeadlineExceeded
+                | tonic::Code::Internal
+                | tonic::Code::Unavailable
+                | tonic::Code::Unknown
+        )
+    }
+
+    fn send_append_text(
+        &mut self,
+        text: &str,
+        input_style: i32,
+        request_id: u64,
+    ) -> anyhow::Result<shared::proto::AppendTextResponse> {
+        let request = tonic::Request::new(shared::proto::AppendTextRequest {
+            text_to_append: text.to_string(),
+            input_style,
+            request_id,
+        });
+
+        let response = self
+            .runtime
+            .clone()
+            .block_on(self.azookey_client.append_text(request))?;
+        let response = response.into_inner();
+        self.observe_server_session("append_text", response.server_session_id);
+        Ok(response)
+    }
+
+    fn send_remove_text(&mut self, request_id: u64) -> anyhow::Result<Candidates> {
+        let request = tonic::Request::new(shared::proto::RemoveTextRequest { request_id });
+        let response = self
+            .runtime
+            .clone()
+            .block_on(self.azookey_client.remove_text(request))?;
+        let response = response.into_inner();
+        self.observe_server_session("remove_text", response.server_session_id);
+        Self::candidates_from_composing_text(response.composing_text)
+    }
+
+    fn send_clear_text(&mut self, request_id: u64) -> anyhow::Result<()> {
+        let request = tonic::Request::new(shared::proto::ClearTextRequest { request_id });
+        let response = self
+            .runtime
+            .clone()
+            .block_on(self.azookey_client.clear_text(request))?;
+        let response = response.into_inner();
+        self.observe_server_session("clear_text", response.server_session_id);
+        Ok(())
+    }
+
+    fn send_shrink_text(&mut self, offset: i32, request_id: u64) -> anyhow::Result<Candidates> {
+        let request = tonic::Request::new(shared::proto::ShrinkTextRequest { offset, request_id });
+        let response = self
+            .runtime
+            .clone()
+            .block_on(self.azookey_client.shrink_text(request))?;
+        let response = response.into_inner();
+        self.observe_server_session("shrink_text", response.server_session_id);
+        Self::candidates_from_composing_text(response.composing_text)
+    }
+
+    fn send_move_cursor(&mut self, offset: i32, request_id: u64) -> anyhow::Result<Candidates> {
+        let request = tonic::Request::new(shared::proto::MoveCursorRequest { offset, request_id });
+        let response = self
+            .runtime
+            .clone()
+            .block_on(self.azookey_client.move_cursor(request))?;
+        let response = response.into_inner();
+        self.observe_server_session("move_cursor", response.server_session_id);
+        Self::candidates_from_composing_text(response.composing_text)
+    }
+
+    fn send_set_context(&mut self, context: &str, request_id: u64) -> anyhow::Result<()> {
+        let request = tonic::Request::new(shared::proto::SetContextRequest {
+            context: context.to_string(),
+            request_id,
+        });
+        let response = self
+            .runtime
+            .clone()
+            .block_on(self.azookey_client.set_context(request))?;
+        let response = response.into_inner();
+        self.observe_server_session("set_context", response.server_session_id);
         Ok(())
     }
 
@@ -339,7 +522,17 @@ impl IPCService {
         previous_candidates: Option<&Candidates>,
         refreshed_candidates: &Candidates,
     ) -> bool {
-        previous_candidates.is_some_and(|previous| previous == refreshed_candidates)
+        previous_candidates.is_some_and(|previous| {
+            previous == refreshed_candidates || refreshed_candidates.is_empty_composition()
+        })
+    }
+
+    #[inline]
+    fn should_reset_client_composition_after_append_refresh(
+        previous_candidates: Option<&Candidates>,
+        refreshed_candidates: &Candidates,
+    ) -> bool {
+        previous_candidates.is_some() && refreshed_candidates.is_empty_composition()
     }
 
     #[tracing::instrument]
@@ -352,21 +545,7 @@ impl IPCService {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
         let input_len = performance_start.map(|_| text.chars().count());
-        let send = |this: &mut Self| -> anyhow::Result<
-            tonic::Response<shared::proto::AppendTextResponse>,
-        > {
-            let request = tonic::Request::new(shared::proto::AppendTextRequest {
-                text_to_append: text.clone(),
-                input_style,
-                request_id,
-            });
-
-            let response = this
-                .runtime
-                .clone()
-                .block_on(this.azookey_client.append_text(request))?;
-            Ok(response)
-        };
+        let send = |this: &mut Self| this.send_append_text(&text, input_style, request_id);
 
         let response = match send(self) {
             Ok(response) => response,
@@ -402,16 +581,25 @@ impl IPCService {
                     }
                 }
 
-                match self.move_cursor(0) {
+                match self.send_move_cursor(0, request_id) {
                     Ok(candidates) => {
                         if Self::should_retry_append_after_refresh(previous_candidates, &candidates)
                         {
+                            if Self::should_reset_client_composition_after_append_refresh(
+                                previous_candidates,
+                                &candidates,
+                            ) {
+                                self.server_reset_recovered = true;
+                                tracing::warn!(
+                                    "append_text recovered empty composition after reconnect (style={input_style}); client composition reset required"
+                                );
+                            }
                             tracing::warn!(
                                 "append_text recovered unchanged composition after reconnect (style={input_style}), retrying original input"
                             );
                             let retry_response = send(self)?;
                             let candidates = Self::candidates_from_composing_text(
-                                retry_response.into_inner().composing_text,
+                                retry_response.composing_text,
                             )?;
                             self.log_client_performance_from_start(
                                 performance_start,
@@ -466,8 +654,7 @@ impl IPCService {
                 }
             }
         };
-        let candidates =
-            Self::candidates_from_composing_text(response.into_inner().composing_text)?;
+        let candidates = Self::candidates_from_composing_text(response.composing_text)?;
         self.log_client_performance_from_start(
             performance_start,
             request_id,
@@ -485,20 +672,19 @@ impl IPCService {
     pub fn remove_text(&mut self) -> anyhow::Result<Candidates> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let request = tonic::Request::new(shared::proto::RemoveTextRequest { request_id });
-        let response = self
-            .runtime
-            .clone()
-            .block_on(self.azookey_client.remove_text(request))?;
-        let candidates =
-            Self::candidates_from_composing_text(response.into_inner().composing_text)?;
+        let result =
+            self.run_rpc_with_reconnect("remove_text", |this| this.send_remove_text(request_id));
         self.log_client_performance_from_start(
             performance_start,
             request_id,
             "remove_text",
             "rpc_total",
-            || "status=success".to_string(),
+            || match &result {
+                Ok((_, retried)) => format!("status=success;retry={retried}"),
+                Err(error) => format!("status=error;error={error:?}"),
+            },
         );
+        let (candidates, _) = result?;
         Ok(candidates)
     }
 
@@ -506,40 +692,39 @@ impl IPCService {
     pub fn clear_text(&mut self) -> anyhow::Result<()> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let request = tonic::Request::new(shared::proto::ClearTextRequest { request_id });
-        let _response = self
-            .runtime
-            .clone()
-            .block_on(self.azookey_client.clear_text(request))?;
+        let result =
+            self.run_rpc_with_reconnect("clear_text", |this| this.send_clear_text(request_id));
         self.log_client_performance_from_start(
             performance_start,
             request_id,
             "clear_text",
             "rpc_total",
-            || "status=success".to_string(),
+            || match &result {
+                Ok(((), retried)) => format!("status=success;retry={retried}"),
+                Err(error) => format!("status=error;error={error:?}"),
+            },
         );
-
-        Ok(())
+        result.map(|((), _)| ())
     }
 
     #[tracing::instrument]
     pub fn shrink_text(&mut self, offset: i32) -> anyhow::Result<Candidates> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let request = tonic::Request::new(shared::proto::ShrinkTextRequest { offset, request_id });
-        let response = self
-            .runtime
-            .clone()
-            .block_on(self.azookey_client.shrink_text(request))?;
-        let candidates =
-            Self::candidates_from_composing_text(response.into_inner().composing_text)?;
+        let result = self.run_rpc_with_reconnect("shrink_text", |this| {
+            this.send_shrink_text(offset, request_id)
+        });
         self.log_client_performance_from_start(
             performance_start,
             request_id,
             "shrink_text",
             "rpc_total",
-            || format!("status=success;offset={offset}"),
+            || match &result {
+                Ok((_, retried)) => format!("status=success;retry={retried};offset={offset}"),
+                Err(error) => format!("status=error;offset={offset};error={error:?}"),
+            },
         );
+        let (candidates, _) = result?;
         Ok(candidates)
     }
 
@@ -547,20 +732,20 @@ impl IPCService {
     pub fn move_cursor(&mut self, offset: i32) -> anyhow::Result<Candidates> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let request = tonic::Request::new(shared::proto::MoveCursorRequest { offset, request_id });
-        let response = self
-            .runtime
-            .clone()
-            .block_on(self.azookey_client.move_cursor(request))?;
-        let candidates =
-            Self::candidates_from_composing_text(response.into_inner().composing_text)?;
+        let result = self.run_rpc_with_reconnect("move_cursor", |this| {
+            this.send_move_cursor(offset, request_id)
+        });
         self.log_client_performance_from_start(
             performance_start,
             request_id,
             "move_cursor",
             "rpc_total",
-            || format!("status=success;offset={offset}"),
+            || match &result {
+                Ok((_, retried)) => format!("status=success;retry={retried};offset={offset}"),
+                Err(error) => format!("status=error;offset={offset};error={error:?}"),
+            },
         );
+        let (candidates, _) = result?;
         Ok(candidates)
     }
 
@@ -568,14 +753,9 @@ impl IPCService {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
         let context_len = performance_start.map(|_| context.chars().count());
-        let request = tonic::Request::new(shared::proto::SetContextRequest {
-            context,
-            request_id,
+        let result = self.run_rpc_with_reconnect("set_context", |this| {
+            this.send_set_context(&context, request_id)
         });
-        let _response = self
-            .runtime
-            .clone()
-            .block_on(self.azookey_client.set_context(request))?;
         self.log_client_performance_from_start(
             performance_start,
             request_id,
@@ -583,11 +763,18 @@ impl IPCService {
             "rpc_total",
             || {
                 let context_len = context_len.unwrap_or_default();
-                format!("status=success;context_len={context_len}")
+                match &result {
+                    Ok(((), retried)) => {
+                        format!("status=success;retry={retried};context_len={context_len}")
+                    }
+                    Err(error) => {
+                        format!("status=error;context_len={context_len};error={error:?}")
+                    }
+                }
             },
         );
 
-        Ok(())
+        result.map(|((), _)| ())
     }
 }
 
@@ -853,5 +1040,95 @@ mod tests {
             Some(&previous),
             &refreshed
         ));
+    }
+
+    #[test]
+    fn append_retry_is_enabled_when_server_state_was_reset() {
+        let previous = Candidates {
+            texts: vec!["感じ".to_string()],
+            sub_texts: vec![String::new()],
+            hiragana: "かんじ".to_string(),
+            corresponding_count: vec![5],
+        };
+
+        assert!(IPCService::should_retry_append_after_refresh(
+            Some(&previous),
+            &Candidates::default()
+        ));
+    }
+
+    #[test]
+    fn append_recovery_requires_client_reset_when_server_state_was_reset() {
+        let previous = Candidates {
+            texts: vec!["漢字".to_string()],
+            sub_texts: vec![String::new()],
+            hiragana: "かんじ".to_string(),
+            corresponding_count: vec![5],
+        };
+
+        assert!(
+            IPCService::should_reset_client_composition_after_append_refresh(
+                Some(&previous),
+                &Candidates::default()
+            )
+        );
+    }
+
+    #[test]
+    fn append_recovery_does_not_reset_client_when_server_state_is_unchanged() {
+        let previous = Candidates {
+            texts: vec!["か".to_string()],
+            sub_texts: vec![String::new()],
+            hiragana: "か".to_string(),
+            corresponding_count: vec![1],
+        };
+
+        assert!(
+            !IPCService::should_reset_client_composition_after_append_refresh(
+                Some(&previous),
+                &previous
+            )
+        );
+    }
+
+    #[test]
+    fn server_session_change_ignores_initial_observation() {
+        assert!(!IPCService::server_session_changed(None, 42));
+    }
+
+    #[test]
+    fn server_session_change_detects_known_session_change() {
+        assert!(IPCService::server_session_changed(Some(42), 43));
+    }
+
+    #[test]
+    fn server_session_change_ignores_zero_session_id() {
+        assert!(!IPCService::server_session_changed(Some(42), 0));
+    }
+
+    #[test]
+    fn server_session_change_ignores_same_session() {
+        assert!(!IPCService::server_session_changed(Some(42), 42));
+    }
+
+    #[test]
+    fn reconnect_retry_is_enabled_for_transport_like_status() {
+        let error = anyhow::Error::new(tonic::Status::unavailable("pipe closed"));
+
+        assert!(IPCService::should_reconnect_rpc_error(&error));
+    }
+
+    #[test]
+    fn reconnect_retry_is_disabled_for_invalid_request_status() {
+        let error = anyhow::Error::new(tonic::Status::invalid_argument("offset out of range"));
+
+        assert!(!IPCService::should_reconnect_rpc_error(&error));
+    }
+
+    #[test]
+    fn reconnect_retry_is_enabled_for_non_status_error() {
+        let error = anyhow::anyhow!("named pipe disconnected");
+
+        assert!(IPCService::should_reconnect_rpc_error(&error));
     }
 }
