@@ -49,12 +49,50 @@ impl AppConfigCacheKey {
 #[cfg(test)]
 mod tests {
     use std::{
+        env,
+        ffi::OsString,
         fs,
         path::PathBuf,
+        sync::{Mutex, MutexGuard, OnceLock},
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::AppConfigCacheKey;
+    use super::{AppConfigCacheKey, IMEState};
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    struct AppDataGuard {
+        _guard: MutexGuard<'static, ()>,
+        previous: Option<OsString>,
+    }
+
+    impl AppDataGuard {
+        fn set(path: &PathBuf) -> Self {
+            let guard = env_lock();
+            let previous = env::var_os("APPDATA");
+            unsafe {
+                env::set_var("APPDATA", path);
+            }
+            Self {
+                _guard: guard,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for AppDataGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => env::set_var("APPDATA", value),
+                    None => env::remove_var("APPDATA"),
+                }
+            }
+        }
+    }
 
     fn unique_test_dir(test_name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -92,6 +130,59 @@ mod tests {
 
         assert_ne!(initial, updated);
         assert!(matches!(updated, AppConfigCacheKey::File { len: 4, .. }));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn app_config_snapshot_does_not_cache_default_after_read_error() {
+        let root = unique_test_dir("config-read-error");
+        let config_root = root.join("Azookey");
+        fs::create_dir_all(&config_root).expect("temp config dir should be created");
+        fs::create_dir(config_root.join("settings.json"))
+            .expect("settings path directory should cause read_to_string to fail");
+        let _appdata = AppDataGuard::set(&root);
+
+        IMEState::get().unwrap().app_config_snapshot = None;
+
+        let snapshot = IMEState::app_config_snapshot().unwrap();
+        assert!(matches!(
+            &snapshot.cache_key,
+            AppConfigCacheKey::Unavailable { .. }
+        ));
+        assert!(IMEState::get().unwrap().app_config_snapshot.is_none());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn app_config_snapshot_keeps_previous_cache_after_read_error() {
+        let root = unique_test_dir("config-read-error-keeps-cache");
+        let config_root = root.join("Azookey");
+        fs::create_dir_all(&config_root).expect("temp config dir should be created");
+        let _appdata = AppDataGuard::set(&root);
+
+        IMEState::get().unwrap().app_config_snapshot = None;
+        let initial = IMEState::app_config_snapshot().unwrap();
+        assert!(matches!(
+            &initial.cache_key,
+            AppConfigCacheKey::Missing { .. }
+        ));
+
+        fs::create_dir(config_root.join("settings.json"))
+            .expect("settings path directory should cause read_to_string to fail");
+        let after_error = IMEState::app_config_snapshot().unwrap();
+        assert_eq!(&after_error.cache_key, &initial.cache_key);
+        assert_eq!(
+            &IMEState::get()
+                .unwrap()
+                .app_config_snapshot
+                .as_ref()
+                .unwrap()
+                .cache_key,
+            &initial.cache_key
+        );
+
+        IMEState::get().unwrap().app_config_snapshot = None;
         fs::remove_dir_all(root).ok();
     }
 }
@@ -205,18 +296,39 @@ impl IMEState {
                 return Ok(snapshot.clone());
             }
         }
-        state.app_config_snapshot = None;
-
         if let Some(error) = inspect_error {
             tracing::error!("Failed to inspect settings; using cached/default config: {error}");
         }
-        let app_config = AppConfig::read().unwrap_or_else(|error| {
-            tracing::error!("Failed to load settings; using defaults: {error}");
-            AppConfig::default()
-        });
-        let snapshot = AppConfigSnapshot::new(app_config, cache_key);
-        state.app_config_snapshot = Some(snapshot.clone());
-        Ok(snapshot)
+        match AppConfig::read() {
+            Ok(app_config) => {
+                let snapshot = AppConfigSnapshot::new(app_config, cache_key);
+                state.app_config_snapshot = Some(snapshot.clone());
+                Ok(snapshot)
+            }
+            Err(shared::ConfigError::Read { path, source }) => {
+                tracing::error!(
+                    "Failed to load settings; using cached/default config without updating cache: failed to read config {}: {}",
+                    path.display(),
+                    source
+                );
+                if let Some(snapshot) = &state.app_config_snapshot {
+                    return Ok(snapshot.clone());
+                }
+
+                Ok(AppConfigSnapshot::new(
+                    AppConfig::default(),
+                    AppConfigCacheKey::Unavailable {
+                        reason: format!("read failed: {}: {}", path.display(), source),
+                    },
+                ))
+            }
+            Err(error) => {
+                tracing::error!("Failed to load settings; using defaults: {error}");
+                let snapshot = AppConfigSnapshot::new(AppConfig::default(), cache_key);
+                state.app_config_snapshot = Some(snapshot.clone());
+                Ok(snapshot)
+            }
+        }
     }
 }
 
