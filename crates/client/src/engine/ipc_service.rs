@@ -67,6 +67,29 @@ impl Candidates {
     }
 }
 
+#[derive(Debug)]
+enum NonIdempotentEditAttempt<T> {
+    Completed(T),
+    ReconnectAndRefresh(anyhow::Error),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonIdempotentEditRecovery {
+    None,
+    RetriedAfterUnchangedRefresh,
+    RefreshedAfterReconnect,
+}
+
+impl NonIdempotentEditRecovery {
+    fn log_value(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::RetriedAfterUnchangedRefresh => "retry_after_unchanged_refresh",
+            Self::RefreshedAfterReconnect => "refresh_after_reconnect",
+        }
+    }
+}
+
 fn next_request_id() -> u64 {
     let counter = CLIENT_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     (u64::from(std::process::id()) << 32) | (counter & 0xffff_ffff)
@@ -318,6 +341,99 @@ impl IPCService {
                             "{operation} retry failed after IPC reconnect: {retry_error:?}"
                         );
                         Err(retry_error)
+                    }
+                }
+            }
+        }
+    }
+
+    fn classify_non_idempotent_edit_attempt<T>(
+        operation: &str,
+        first_result: anyhow::Result<T>,
+    ) -> anyhow::Result<NonIdempotentEditAttempt<T>> {
+        match first_result {
+            Ok(value) => Ok(NonIdempotentEditAttempt::Completed(value)),
+            Err(first_error) => {
+                if !Self::should_reconnect_rpc_error(&first_error) {
+                    tracing::warn!(
+                        "{operation} failed with non-reconnectable error: {first_error:?}"
+                    );
+                    return Err(first_error);
+                }
+
+                tracing::warn!(
+                    "{operation} first attempt failed, reconnecting IPC once without replaying edit RPC: {first_error:?}"
+                );
+                Ok(NonIdempotentEditAttempt::ReconnectAndRefresh(first_error))
+            }
+        }
+    }
+
+    #[inline]
+    fn should_retry_non_idempotent_edit_after_refresh(
+        previous_candidates: Option<&Candidates>,
+        refreshed_candidates: &Candidates,
+    ) -> bool {
+        previous_candidates.is_some_and(|previous| {
+            previous == refreshed_candidates && !refreshed_candidates.is_empty_composition()
+        })
+    }
+
+    fn run_non_idempotent_edit_with_reconnect(
+        &mut self,
+        operation: &str,
+        request_id: u64,
+        previous_candidates: Option<&Candidates>,
+        mut send: impl FnMut(&mut Self) -> anyhow::Result<Candidates>,
+    ) -> anyhow::Result<(Candidates, NonIdempotentEditRecovery)> {
+        match Self::classify_non_idempotent_edit_attempt(operation, send(self))? {
+            NonIdempotentEditAttempt::Completed(candidates) => {
+                Ok((candidates, NonIdempotentEditRecovery::None))
+            }
+            NonIdempotentEditAttempt::ReconnectAndRefresh(first_error) => {
+                match self.reconnect() {
+                    Ok(()) => {
+                        tracing::info!(
+                            "{operation} IPC reconnect succeeded, refreshing server composition without replaying edit RPC"
+                        );
+                    }
+                    Err(reconnect_error) => {
+                        tracing::error!(
+                            "{operation} IPC reconnect failed after first error {first_error:?}: {reconnect_error:?}"
+                        );
+                        return Err(reconnect_error);
+                    }
+                }
+
+                // remove_text, shrink_text, and non-zero move_cursor may have already
+                // changed server state before the transport broke. Refresh first, and
+                // only replay the edit if the server state is still the previous one.
+                match self.send_move_cursor(0, request_id) {
+                    Ok(refreshed_candidates) => {
+                        if Self::should_retry_non_idempotent_edit_after_refresh(
+                            previous_candidates,
+                            &refreshed_candidates,
+                        ) {
+                            tracing::warn!(
+                                "{operation} refreshed unchanged composition after reconnect, retrying edit RPC once"
+                            );
+                            let candidates = send(self)?;
+                            return Ok((
+                                candidates,
+                                NonIdempotentEditRecovery::RetriedAfterUnchangedRefresh,
+                            ));
+                        }
+
+                        Ok((
+                            refreshed_candidates,
+                            NonIdempotentEditRecovery::RefreshedAfterReconnect,
+                        ))
+                    }
+                    Err(refresh_error) => {
+                        tracing::error!(
+                            "{operation} refresh failed after IPC reconnect: {refresh_error:?}"
+                        );
+                        Err(refresh_error)
                     }
                 }
             }
@@ -670,17 +786,36 @@ impl IPCService {
 
     #[tracing::instrument]
     pub fn remove_text(&mut self) -> anyhow::Result<Candidates> {
+        self.remove_text_inner(None)
+    }
+
+    #[tracing::instrument(skip(self, previous_candidates))]
+    pub fn remove_text_with_context(
+        &mut self,
+        previous_candidates: &Candidates,
+    ) -> anyhow::Result<Candidates> {
+        self.remove_text_inner(Some(previous_candidates))
+    }
+
+    fn remove_text_inner(
+        &mut self,
+        previous_candidates: Option<&Candidates>,
+    ) -> anyhow::Result<Candidates> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let result =
-            self.run_rpc_with_reconnect("remove_text", |this| this.send_remove_text(request_id));
+        let result = self.run_non_idempotent_edit_with_reconnect(
+            "remove_text",
+            request_id,
+            previous_candidates,
+            |this| this.send_remove_text(request_id),
+        );
         self.log_client_performance_from_start(
             performance_start,
             request_id,
             "remove_text",
             "rpc_total",
             || match &result {
-                Ok((_, retried)) => format!("status=success;retry={retried}"),
+                Ok((_, recovery)) => format!("status=success;recovery={}", recovery.log_value()),
                 Err(error) => format!("status=error;error={error:?}"),
             },
         );
@@ -709,18 +844,41 @@ impl IPCService {
 
     #[tracing::instrument]
     pub fn shrink_text(&mut self, offset: i32) -> anyhow::Result<Candidates> {
+        self.shrink_text_inner(offset, None)
+    }
+
+    #[tracing::instrument(skip(self, previous_candidates))]
+    pub fn shrink_text_with_context(
+        &mut self,
+        offset: i32,
+        previous_candidates: &Candidates,
+    ) -> anyhow::Result<Candidates> {
+        self.shrink_text_inner(offset, Some(previous_candidates))
+    }
+
+    fn shrink_text_inner(
+        &mut self,
+        offset: i32,
+        previous_candidates: Option<&Candidates>,
+    ) -> anyhow::Result<Candidates> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let result = self.run_rpc_with_reconnect("shrink_text", |this| {
-            this.send_shrink_text(offset, request_id)
-        });
+        let result = self.run_non_idempotent_edit_with_reconnect(
+            "shrink_text",
+            request_id,
+            previous_candidates,
+            |this| this.send_shrink_text(offset, request_id),
+        );
         self.log_client_performance_from_start(
             performance_start,
             request_id,
             "shrink_text",
             "rpc_total",
             || match &result {
-                Ok((_, retried)) => format!("status=success;retry={retried};offset={offset}"),
+                Ok((_, recovery)) => format!(
+                    "status=success;recovery={};offset={offset}",
+                    recovery.log_value()
+                ),
                 Err(error) => format!("status=error;offset={offset};error={error:?}"),
             },
         );
@@ -730,18 +888,41 @@ impl IPCService {
 
     #[tracing::instrument]
     pub fn move_cursor(&mut self, offset: i32) -> anyhow::Result<Candidates> {
+        self.move_cursor_inner(offset, None)
+    }
+
+    #[tracing::instrument(skip(self, previous_candidates))]
+    pub fn move_cursor_with_context(
+        &mut self,
+        offset: i32,
+        previous_candidates: &Candidates,
+    ) -> anyhow::Result<Candidates> {
+        self.move_cursor_inner(offset, Some(previous_candidates))
+    }
+
+    fn move_cursor_inner(
+        &mut self,
+        offset: i32,
+        previous_candidates: Option<&Candidates>,
+    ) -> anyhow::Result<Candidates> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let result = self.run_rpc_with_reconnect("move_cursor", |this| {
-            this.send_move_cursor(offset, request_id)
-        });
+        let result = self.run_non_idempotent_edit_with_reconnect(
+            "move_cursor",
+            request_id,
+            previous_candidates,
+            |this| this.send_move_cursor(offset, request_id),
+        );
         self.log_client_performance_from_start(
             performance_start,
             request_id,
             "move_cursor",
             "rpc_total",
             || match &result {
-                Ok((_, retried)) => format!("status=success;retry={retried};offset={offset}"),
+                Ok((_, recovery)) => format!(
+                    "status=success;recovery={};offset={offset}",
+                    recovery.log_value()
+                ),
                 Err(error) => format!("status=error;offset={offset};error={error:?}"),
             },
         );
@@ -1009,7 +1190,7 @@ impl IPCService {
 
 #[cfg(test)]
 mod tests {
-    use super::{Candidates, IPCService};
+    use super::{Candidates, IPCService, NonIdempotentEditAttempt};
 
     #[test]
     fn append_retry_is_enabled_when_server_state_is_unchanged() {
@@ -1092,6 +1273,57 @@ mod tests {
     }
 
     #[test]
+    fn non_idempotent_edit_retry_is_enabled_when_refreshed_state_is_unchanged() {
+        let previous = Candidates {
+            texts: vec!["か".to_string()],
+            sub_texts: vec![String::new()],
+            hiragana: "か".to_string(),
+            corresponding_count: vec![1],
+        };
+
+        assert!(IPCService::should_retry_non_idempotent_edit_after_refresh(
+            Some(&previous),
+            &previous
+        ));
+    }
+
+    #[test]
+    fn non_idempotent_edit_retry_is_disabled_when_refreshed_state_changed() {
+        let previous = Candidates {
+            texts: vec!["か".to_string()],
+            sub_texts: vec![String::new()],
+            hiragana: "か".to_string(),
+            corresponding_count: vec![1],
+        };
+        let refreshed = Candidates {
+            texts: vec!["".to_string()],
+            sub_texts: vec![String::new()],
+            hiragana: String::new(),
+            corresponding_count: vec![0],
+        };
+
+        assert!(!IPCService::should_retry_non_idempotent_edit_after_refresh(
+            Some(&previous),
+            &refreshed
+        ));
+    }
+
+    #[test]
+    fn non_idempotent_edit_retry_is_disabled_for_empty_refreshed_state() {
+        let previous = Candidates {
+            texts: vec!["か".to_string()],
+            sub_texts: vec![String::new()],
+            hiragana: "か".to_string(),
+            corresponding_count: vec![1],
+        };
+
+        assert!(!IPCService::should_retry_non_idempotent_edit_after_refresh(
+            Some(&previous),
+            &Candidates::default()
+        ));
+    }
+
+    #[test]
     fn server_session_change_ignores_initial_observation() {
         assert!(!IPCService::server_session_changed(None, 42));
     }
@@ -1130,5 +1362,54 @@ mod tests {
         let error = anyhow::anyhow!("named pipe disconnected");
 
         assert!(IPCService::should_reconnect_rpc_error(&error));
+    }
+
+    #[test]
+    fn non_idempotent_edit_attempt_completes_without_recovery_on_success() {
+        let candidates = Candidates {
+            texts: vec!["か".to_string()],
+            sub_texts: vec![String::new()],
+            hiragana: "か".to_string(),
+            corresponding_count: vec![1],
+        };
+
+        let attempt =
+            IPCService::classify_non_idempotent_edit_attempt("remove_text", Ok(candidates.clone()))
+                .expect("successful edit should not require recovery");
+
+        match attempt {
+            NonIdempotentEditAttempt::Completed(value) => assert_eq!(value, candidates),
+            NonIdempotentEditAttempt::ReconnectAndRefresh(_) => {
+                panic!("successful edit must not be classified as reconnect recovery")
+            }
+        }
+    }
+
+    #[test]
+    fn non_idempotent_edit_attempt_refreshes_after_reconnectable_error() {
+        let error = anyhow::Error::new(tonic::Status::unavailable("pipe closed"));
+
+        let attempt = IPCService::classify_non_idempotent_edit_attempt::<Candidates>(
+            "remove_text",
+            Err(error),
+        )
+        .expect("reconnectable edit error should recover by refreshing");
+
+        assert!(matches!(
+            attempt,
+            NonIdempotentEditAttempt::ReconnectAndRefresh(_)
+        ));
+    }
+
+    #[test]
+    fn non_idempotent_edit_attempt_returns_non_reconnectable_error() {
+        let error = anyhow::Error::new(tonic::Status::invalid_argument("offset out of range"));
+
+        let attempt = IPCService::classify_non_idempotent_edit_attempt::<Candidates>(
+            "move_cursor",
+            Err(error),
+        );
+
+        assert!(attempt.is_err());
     }
 }

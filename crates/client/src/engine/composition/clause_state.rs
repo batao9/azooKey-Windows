@@ -22,6 +22,22 @@ pub(crate) struct CandidateSelection {
 pub(crate) trait ClauseActionBackend {
     fn move_cursor(&mut self, offset: i32) -> Result<Candidates>;
     fn shrink_text(&mut self, offset: i32) -> Result<Candidates>;
+
+    fn move_cursor_with_context(
+        &mut self,
+        offset: i32,
+        _previous_candidates: &Candidates,
+    ) -> Result<Candidates> {
+        self.move_cursor(offset)
+    }
+
+    fn shrink_text_with_context(
+        &mut self,
+        offset: i32,
+        _previous_candidates: &Candidates,
+    ) -> Result<Candidates> {
+        self.shrink_text(offset)
+    }
 }
 
 impl ClauseActionBackend for IPCService {
@@ -31,6 +47,22 @@ impl ClauseActionBackend for IPCService {
 
     fn shrink_text(&mut self, offset: i32) -> Result<Candidates> {
         IPCService::shrink_text(self, offset)
+    }
+
+    fn move_cursor_with_context(
+        &mut self,
+        offset: i32,
+        previous_candidates: &Candidates,
+    ) -> Result<Candidates> {
+        IPCService::move_cursor_with_context(self, offset, previous_candidates)
+    }
+
+    fn shrink_text_with_context(
+        &mut self,
+        offset: i32,
+        previous_candidates: &Candidates,
+    ) -> Result<Candidates> {
+        IPCService::shrink_text_with_context(self, offset, previous_candidates)
     }
 }
 
@@ -428,11 +460,16 @@ impl ClauseState {
             let current_clause_preview =
                 TextServiceFactory::current_clause_preview(state.preview, state.fixed_prefix);
             let current_corresponding_count = *state.corresponding_count;
+            let previous_candidates = state.candidates.clone();
 
-            let _ = backend.move_cursor(TextServiceFactory::MOVE_CURSOR_PUSH_CLAUSE_SNAPSHOT)?;
+            let _ = backend.move_cursor_with_context(
+                TextServiceFactory::MOVE_CURSOR_PUSH_CLAUSE_SNAPSHOT,
+                &previous_candidates,
+            )?;
             state.clause_snapshots.push(snapshot);
 
-            *state.candidates = backend.shrink_text(current_corresponding_count)?;
+            *state.candidates = backend
+                .shrink_text_with_context(current_corresponding_count, &previous_candidates)?;
             if state.candidates.is_empty_composition() {
                 return Ok(ClauseActionEffect::server_reset());
             }
@@ -507,8 +544,11 @@ impl ClauseState {
                 let Some(selected) =
                     TextServiceFactory::select_candidate(state.candidates, *state.selection_index)
                 else {
-                    let _ =
-                        backend.move_cursor(TextServiceFactory::MOVE_CURSOR_POP_CLAUSE_SNAPSHOT)?;
+                    let previous_candidates = state.candidates.clone();
+                    let _ = backend.move_cursor_with_context(
+                        TextServiceFactory::MOVE_CURSOR_POP_CLAUSE_SNAPSHOT,
+                        &previous_candidates,
+                    )?;
                     if let Some(restored) = state.clause_snapshots.pop() {
                         *state.preview = restored.preview;
                         *state.suffix = restored.suffix;
@@ -568,7 +608,11 @@ impl ClauseState {
                     *state.current_clause_split_group_id,
                     state.candidates,
                 );
-                let _ = backend.move_cursor(TextServiceFactory::MOVE_CURSOR_POP_CLAUSE_SNAPSHOT)?;
+                let previous_candidates = state.candidates.clone();
+                let _ = backend.move_cursor_with_context(
+                    TextServiceFactory::MOVE_CURSOR_POP_CLAUSE_SNAPSHOT,
+                    &previous_candidates,
+                )?;
 
                 *state.preview = restored.preview;
                 *state.suffix = restored.suffix;
@@ -625,11 +669,12 @@ impl ClauseState {
             )?;
         }
 
-        let _ = backend.move_cursor(direction)?;
+        let previous_candidates = state.candidates.clone();
+        let _ = backend.move_cursor_with_context(direction, &previous_candidates)?;
         let boundary_candidates = backend.move_cursor(0)?;
         if boundary_candidates.texts.is_empty() {
             if direction < 0 {
-                let _ = backend.move_cursor(1)?;
+                let _ = backend.move_cursor_with_context(1, &boundary_candidates)?;
                 if let Some(selected) = ClauseState::select_split_left_candidate(
                     &fallback_candidates,
                     *state.corresponding_count,

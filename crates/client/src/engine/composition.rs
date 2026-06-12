@@ -1347,13 +1347,15 @@ impl TextServiceFactory {
     fn clear_clause_snapshots(
         clause_snapshots: &mut Vec<ClauseSnapshot>,
         ipc_service: &mut IPCService,
+        candidates: &Candidates,
     ) -> Result<()> {
         if clause_snapshots.is_empty() {
             return Ok(());
         }
 
         clause_snapshots.clear();
-        let _ = ipc_service.move_cursor(Self::MOVE_CURSOR_CLEAR_CLAUSE_SNAPSHOTS)?;
+        let _ = ipc_service
+            .move_cursor_with_context(Self::MOVE_CURSOR_CLEAR_CLAUSE_SNAPSHOTS, candidates)?;
         Ok(())
     }
 
@@ -1367,9 +1369,10 @@ impl TextServiceFactory {
         clause_snapshots: &mut Vec<ClauseSnapshot>,
         future_clause_snapshots: &mut Vec<FutureClauseSnapshot>,
         ipc_service: &mut IPCService,
+        candidates: &Candidates,
     ) -> Result<()> {
         Self::clear_future_clause_snapshots(future_clause_snapshots);
-        Self::clear_clause_snapshots(clause_snapshots, ipc_service)
+        Self::clear_clause_snapshots(clause_snapshots, ipc_service, candidates)
     }
 
     #[cfg(test)]
@@ -2217,7 +2220,11 @@ impl TextServiceFactory {
         }
 
         for _ in 0..temp_clause_snapshots.len() {
-            let _ = backend.move_cursor(Self::MOVE_CURSOR_POP_CLAUSE_SNAPSHOT)?;
+            let previous_candidates = temp_candidates.clone();
+            let _ = backend.move_cursor_with_context(
+                Self::MOVE_CURSOR_POP_CLAUSE_SNAPSHOT,
+                &previous_candidates,
+            )?;
         }
 
         state.future_clause_snapshots.clear();
@@ -2372,10 +2379,11 @@ impl TextServiceFactory {
                 }
             }
 
-            let _ = backend.move_cursor(-1)?;
+            let previous_candidates = candidates.clone();
+            let _ = backend.move_cursor_with_context(-1, &previous_candidates)?;
             let next_candidates = backend.move_cursor(0)?;
             if next_candidates.texts.is_empty() {
-                let _ = backend.move_cursor(1)?;
+                let _ = backend.move_cursor_with_context(1, &next_candidates)?;
                 return Ok(());
             }
 
@@ -3685,6 +3693,7 @@ impl TextServiceFactory {
                             &mut clause_snapshots,
                             &mut future_clause_snapshots,
                             &mut ipc_service,
+                            &candidates,
                         )?;
                         let resolved_symbol_text = match mode {
                             InputMode::Kana => Self::resolve_symbol_input_text_with_lookup(
@@ -3759,6 +3768,7 @@ impl TextServiceFactory {
                             &mut clause_snapshots,
                             &mut future_clause_snapshots,
                             &mut ipc_service,
+                            &candidates,
                         )?;
                         current_clause_is_split_derived = false;
                         current_clause_is_direct_split_remainder = false;
@@ -3817,6 +3827,7 @@ impl TextServiceFactory {
                             &mut clause_snapshots,
                             &mut future_clause_snapshots,
                             &mut ipc_service,
+                            &candidates,
                         )?;
                         current_clause_is_split_derived = false;
                         current_clause_is_direct_split_remainder = false;
@@ -3880,6 +3891,7 @@ impl TextServiceFactory {
                             &mut clause_snapshots,
                             &mut future_clause_snapshots,
                             &mut ipc_service,
+                            &candidates,
                         )?;
                         current_clause_is_split_derived = false;
                         current_clause_is_direct_split_remainder = false;
@@ -3900,7 +3912,7 @@ impl TextServiceFactory {
                             continue;
                         }
                         raw_input.pop();
-                        candidates = ipc_service.remove_text()?;
+                        candidates = ipc_service.remove_text_with_context(&candidates)?;
                         if ipc_service.take_server_reset_recovered()
                             && Self::has_client_composition_state(
                                 &raw_input,
@@ -3987,7 +3999,7 @@ impl TextServiceFactory {
                             );
                             continue;
                         }
-                        candidates = ipc_service.move_cursor(*offset)?;
+                        candidates = ipc_service.move_cursor_with_context(*offset, &candidates)?;
                         if ipc_service.take_server_reset_recovered()
                             && Self::has_client_composition_state(
                                 &raw_input,
@@ -4526,6 +4538,7 @@ impl TextServiceFactory {
                             &mut clause_snapshots,
                             &mut future_clause_snapshots,
                             &mut ipc_service,
+                            &candidates,
                         )?;
                         current_clause_is_split_derived = false;
                         current_clause_is_direct_split_remainder = false;
@@ -4563,7 +4576,8 @@ impl TextServiceFactory {
                         let shrunk_candidates = if session_changed_before_shrink {
                             Candidates::default()
                         } else {
-                            ipc_service.shrink_text(corresponding_count)?
+                            ipc_service
+                                .shrink_text_with_context(corresponding_count, &candidates)?
                         };
                         let mut fresh_append_after_server_reset = session_changed_before_shrink
                             || shrunk_candidates.is_empty_composition();
@@ -4634,6 +4648,7 @@ impl TextServiceFactory {
                             &mut clause_snapshots,
                             &mut future_clause_snapshots,
                             &mut ipc_service,
+                            &candidates,
                         )?;
                         current_clause_is_split_derived = false;
                         current_clause_is_direct_split_remainder = false;
@@ -4655,7 +4670,8 @@ impl TextServiceFactory {
                         let shrunk_candidates = if session_changed_before_shrink {
                             Candidates::default()
                         } else {
-                            ipc_service.shrink_text(corresponding_count)?
+                            ipc_service
+                                .shrink_text_with_context(corresponding_count, &candidates)?
                         };
                         let mut fresh_append_after_server_reset = session_changed_before_shrink
                             || shrunk_candidates.is_empty_composition();
@@ -4726,6 +4742,7 @@ impl TextServiceFactory {
                             &mut clause_snapshots,
                             &mut future_clause_snapshots,
                             &mut ipc_service,
+                            &candidates,
                         )?;
                         current_clause_is_split_derived = false;
                         current_clause_is_direct_split_remainder = false;
@@ -4747,7 +4764,8 @@ impl TextServiceFactory {
                         let shrunk_candidates = if session_changed_before_shrink {
                             Candidates::default()
                         } else {
-                            ipc_service.shrink_text(corresponding_count)?
+                            ipc_service
+                                .shrink_text_with_context(corresponding_count, &candidates)?
                         };
                         let mut fresh_append_after_server_reset = session_changed_before_shrink
                             || shrunk_candidates.is_empty_composition();
