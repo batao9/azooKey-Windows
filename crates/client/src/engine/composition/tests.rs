@@ -83,6 +83,67 @@ fn reducer_plans_composition_start_without_tsf_or_ipc_state() {
 }
 
 #[test]
+fn append_result_indicates_server_reset_when_result_only_contains_appended_input() {
+    let previous_candidates = candidates(&["感じ"], &[""], "かんじ", &[5]);
+    let appended_candidates = candidates(&["k"], &[""], "k", &[1]);
+
+    assert!(TextServiceFactory::append_result_indicates_server_reset(
+        "kanji",
+        &previous_candidates,
+        "k",
+        &appended_candidates,
+    ));
+}
+
+#[test]
+fn append_result_does_not_indicate_server_reset_when_result_extends_previous_input() {
+    let previous_candidates = candidates(&["感じ"], &[""], "かんじ", &[5]);
+    let appended_candidates = candidates(&["感じk"], &[""], "かんじk", &[6]);
+
+    assert!(!TextServiceFactory::append_result_indicates_server_reset(
+        "kanji",
+        &previous_candidates,
+        "k",
+        &appended_candidates,
+    ));
+}
+
+#[test]
+fn append_result_does_not_indicate_server_reset_for_romaji_rewrite() {
+    let previous_candidates = candidates(&["n"], &[""], "n", &[1]);
+    let appended_candidates = candidates(&["な"], &[""], "な", &[2]);
+
+    assert!(!TextServiceFactory::append_result_indicates_server_reset(
+        "n",
+        &previous_candidates,
+        "a",
+        &appended_candidates,
+    ));
+}
+
+#[test]
+fn client_composition_state_is_empty_when_all_buffers_are_empty() {
+    assert!(!TextServiceFactory::has_client_composition_state(
+        "",
+        "",
+        "",
+        "",
+        &Candidates::default(),
+    ));
+}
+
+#[test]
+fn client_composition_state_is_present_when_candidates_remain() {
+    assert!(TextServiceFactory::has_client_composition_state(
+        "",
+        "",
+        "",
+        "",
+        &candidates(&["漢字"], &[""], "かんじ", &[5]),
+    ));
+}
+
+#[test]
 fn delayed_candidate_window_does_not_show_on_composition_start() {
     let mut app_config = AppConfig::default();
     app_config.general.show_candidate_window_after_space = true;

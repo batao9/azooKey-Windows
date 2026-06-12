@@ -48,6 +48,7 @@ static SERVER_LOG_LEVEL: AtomicU8 = AtomicU8::new(ServerLogLevel::Warn as u8);
 static SERVER_CRASH_TRACE_ENABLED: AtomicBool = AtomicBool::new(true);
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const SERVER_GENERATED_REQUEST_ID_PREFIX: u64 = 1 << 63;
+static SERVER_SESSION_ID: OnceLock<u64> = OnceLock::new();
 static HAS_ACTIVE_COMPOSITION: AtomicBool = AtomicBool::new(false);
 static SERVER_REQUESTS_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 static LAST_INPUT_REQUEST_FINISHED_MS: AtomicU64 = AtomicU64::new(0);
@@ -532,6 +533,13 @@ fn request_id_or_next(request_id: u64) -> u64 {
     } else {
         request_id
     }
+}
+
+fn server_session_id() -> u64 {
+    *SERVER_SESSION_ID.get_or_init(|| {
+        let session_id = (u64::from(std::process::id()) << 32) ^ (now_timestamp_millis() as u64);
+        session_id.max(1)
+    })
 }
 
 fn set_request_id(request_id: u64) {
@@ -1392,6 +1400,7 @@ impl AzookeyService for MyAzookeyService {
                 hiragana: composed_text.hiragana.unwrap_or(composing_text.text),
                 suggestions: composed_text.suggestions,
             }),
+            server_session_id: server_session_id(),
         }))
     }
 
@@ -1444,6 +1453,7 @@ impl AzookeyService for MyAzookeyService {
                 hiragana: composed_text.hiragana.unwrap_or(composing_text.text),
                 suggestions: composed_text.suggestions,
             }),
+            server_session_id: server_session_id(),
         }))
     }
 
@@ -1499,6 +1509,7 @@ impl AzookeyService for MyAzookeyService {
                 hiragana: composed_text.hiragana.unwrap_or(composing_text.text),
                 suggestions: composed_text.suggestions,
             }),
+            server_session_id: server_session_id(),
         }))
     }
 
@@ -1528,7 +1539,9 @@ impl AzookeyService for MyAzookeyService {
             "status=success"
         );
         HAS_ACTIVE_COMPOSITION.store(false, Ordering::Relaxed);
-        Ok(Response::new(ClearTextResponse {}))
+        Ok(Response::new(ClearTextResponse {
+            server_session_id: server_session_id(),
+        }))
     }
 
     async fn shrink_text(
@@ -1581,6 +1594,7 @@ impl AzookeyService for MyAzookeyService {
                 hiragana: composed_text.hiragana.unwrap_or(composing_text.text),
                 suggestions: composed_text.suggestions,
             }),
+            server_session_id: server_session_id(),
         }))
     }
 
@@ -1621,7 +1635,9 @@ impl AzookeyService for MyAzookeyService {
             elapsed_ms(handler_start),
             "status=success"
         );
-        Ok(Response::new(shared::proto::SetContextResponse {}))
+        Ok(Response::new(shared::proto::SetContextResponse {
+            server_session_id: server_session_id(),
+        }))
     }
 
     async fn update_config(
@@ -1652,7 +1668,9 @@ impl AzookeyService for MyAzookeyService {
             elapsed_ms(handler_start),
             "status=success;active_composition={has_active_composition}"
         );
-        Ok(Response::new(shared::proto::UpdateConfigResponse {}))
+        Ok(Response::new(shared::proto::UpdateConfigResponse {
+            server_session_id: server_session_id(),
+        }))
     }
 
     async fn log_performance(

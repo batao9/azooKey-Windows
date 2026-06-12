@@ -29,6 +29,7 @@ message AppendTextRequest {
 // Response message for AppendText.
 message AppendTextResponse {
   ComposingText composing_text = 1; // The resulting text and suggestions.
+  uint64 server_session_id = 2; // Identifies the current server process session.
 }
 
 // Request message for RemoveText.
@@ -39,6 +40,7 @@ message RemoveTextRequest {
 // Response message for RemoveText.
 message RemoveTextResponse {
   ComposingText composing_text = 1; // The resulting text and suggestions.
+  uint64 server_session_id = 2; // Identifies the current server process session.
 }
 
 // Request message for MoveCursor.
@@ -54,12 +56,14 @@ message ShrinkTextRequest {
 }
 
 message ShrinkTextResponse {
-    ComposingText composing_text = 1; // The resulting text and suggestions.
+  ComposingText composing_text = 1; // The resulting text and suggestions.
+  uint64 server_session_id = 2; // Identifies the current server process session.
 }
 
 // Response message for MoveCursor.
 message MoveCursorResponse {
   ComposingText composing_text = 1; // The resulting text and suggestions.
+  uint64 server_session_id = 2; // Identifies the current server process session.
 }
 
 // Request message for ClearText.
@@ -68,19 +72,25 @@ message ClearTextRequest {
 }
 
 // Response message for ClearText.
-message ClearTextResponse {}
+message ClearTextResponse {
+  uint64 server_session_id = 1; // Identifies the current server process session.
+}
 
 message SetContextRequest {
   string context = 1;
   uint64 request_id = 2;
 }
 
-message SetContextResponse {}
+message SetContextResponse {
+  uint64 server_session_id = 1; // Identifies the current server process session.
+}
 
 message UpdateConfigRequest {
   uint64 request_id = 1;
 }
-message UpdateConfigResponse {}
+message UpdateConfigResponse {
+  uint64 server_session_id = 1; // Identifies the current server process session.
+}
 
 message PerformanceLogRequest {
   uint64 request_id = 1;

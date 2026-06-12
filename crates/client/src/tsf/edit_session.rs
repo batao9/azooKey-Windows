@@ -189,6 +189,12 @@ impl TextServiceFactory {
     }
 
     #[tracing::instrument]
+    pub fn discard_composition_text(&self) -> Result<()> {
+        tracing::debug!("discard_composition_text");
+        self.close_composition(true)
+    }
+
+    #[tracing::instrument]
     pub fn set_text(&self, text: &str, subtext: &str) -> Result<()> {
         let text_service = self.borrow()?;
 
