@@ -3,6 +3,7 @@ pub(super) mod composition;
 pub(super) mod full_width;
 pub(super) mod input_mode;
 pub(super) mod ipc_service;
+pub(super) mod romaji_lookup;
 pub(super) mod state;
 pub(super) mod text_util;
 pub(super) mod theme;

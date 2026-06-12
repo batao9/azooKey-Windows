@@ -894,6 +894,10 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    pub fn settings_path() -> Result<PathBuf, ConfigError> {
+        Ok(get_config_root()?.join(SETTINGS_FILENAME))
+    }
+
     pub fn write(&self) -> Result<(), ConfigError> {
         let config_root = get_config_root()?;
         ensure_config_dir(&config_root)?;
