@@ -83,6 +83,31 @@ impl CandidateWindowPositionState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CandidateWindowVisibilityState {
+    visible: bool,
+}
+
+impl CandidateWindowVisibilityState {
+    pub fn apply_visibility_update(&mut self, visible: Option<bool>) {
+        if let Some(visible) = visible {
+            self.visible = visible;
+        }
+    }
+
+    pub fn should_update_position(&self, update_pos: bool, visible: Option<bool>) -> bool {
+        if !update_pos {
+            return false;
+        }
+
+        match visible {
+            Some(true) => true,
+            Some(false) => false,
+            None => self.visible,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SurroundingTextContextState {
     connection_id: Option<u64>,
@@ -110,6 +135,7 @@ pub struct TextService {
     pub composition: RefCell<Composition>,
     pub update_pos_state: UpdatePosState,
     pub candidate_window_position_state: CandidateWindowPositionState,
+    pub candidate_window_visibility_state: CandidateWindowVisibilityState,
     pub surrounding_text_context_state: SurroundingTextContextState,
     pub sink_cookies: HashMap<GUID, u32>,
     pub display_attribute_atom: HashMap<GUID, u32>,
@@ -146,7 +172,9 @@ impl TextService {
 
 #[cfg(test)]
 mod tests {
-    use super::{CandidateWindowPositionState, SurroundingTextContextState};
+    use super::{
+        CandidateWindowPositionState, CandidateWindowVisibilityState, SurroundingTextContextState,
+    };
     use std::time::{Duration, Instant};
 
     #[test]
@@ -171,5 +199,21 @@ mod tests {
 
         assert!(state.should_throttle(now + Duration::from_millis(10)));
         assert!(!state.should_throttle(now + Duration::from_millis(60)));
+    }
+
+    #[test]
+    fn candidate_window_visibility_state_keeps_none_updates_dependent_on_known_visibility() {
+        let mut state = CandidateWindowVisibilityState::default();
+
+        assert!(!state.should_update_position(true, None));
+        assert!(state.should_update_position(true, Some(true)));
+        assert!(!state.should_update_position(true, Some(false)));
+        assert!(!state.should_update_position(false, Some(true)));
+
+        state.apply_visibility_update(Some(true));
+        assert!(state.should_update_position(true, None));
+
+        state.apply_visibility_update(Some(false));
+        assert!(!state.should_update_position(true, None));
     }
 }
