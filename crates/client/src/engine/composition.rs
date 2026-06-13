@@ -1341,9 +1341,15 @@ impl TextServiceFactory {
         let trace_request_id = current_input_trace_request_id();
         let total_start = trace_request_id.map(|_| Instant::now());
         let result: Result<()> = (|| {
-            let position = if update_pos {
+            let should_update_pos =
+                self.should_update_candidate_window_position(update_pos, visible);
+            let position = if should_update_pos {
                 let position_start = trace_request_id.map(|_| Instant::now());
-                let position = self.candidate_window_position()?;
+                let position = if visible == Some(true) {
+                    self.candidate_window_position()?
+                } else {
+                    self.candidate_window_position_for_update()?
+                };
                 if let (Some(request_id), Some(position_start)) = (trace_request_id, position_start)
                 {
                     Self::log_client_performance(
@@ -1360,6 +1366,11 @@ impl TextServiceFactory {
                 }
                 position
             } else {
+                if update_pos {
+                    tracing::debug!(
+                        "Skip candidate_window_position while candidate window is hidden"
+                    );
+                }
                 None
             };
             ipc_service.update_candidate_window(
@@ -1369,6 +1380,7 @@ impl TextServiceFactory {
                 Some(selection_index),
                 None,
             )?;
+            self.remember_candidate_window_visibility(visible);
             Ok(())
         })();
 
@@ -1396,6 +1408,43 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn should_update_candidate_window_position(
+        &self,
+        update_pos: bool,
+        visible: Option<bool>,
+    ) -> bool {
+        match self.borrow() {
+            Ok(text_service) => text_service
+                .candidate_window_visibility_state
+                .should_update_position(update_pos, visible),
+            Err(error) => {
+                tracing::warn!(
+                    "Assume candidate window position should update after visibility state borrow failed: {error:?}"
+                );
+                update_pos && visible != Some(false)
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn remember_candidate_window_visibility(&self, visible: Option<bool>) {
+        if visible.is_none() {
+            return;
+        }
+
+        match self.borrow_mut() {
+            Ok(mut text_service) => {
+                text_service
+                    .candidate_window_visibility_state
+                    .apply_visibility_update(visible);
+            }
+            Err(error) => {
+                tracing::warn!("Failed to remember candidate window visibility state: {error:?}");
+            }
+        }
+    }
+
+    #[inline]
     fn sync_candidate_window_after_text_update(
         &self,
         ipc_service: &mut IPCService,
@@ -1411,7 +1460,29 @@ impl TextServiceFactory {
         } else {
             None
         };
-        self.sync_candidate_window_update(ipc_service, candidates, selection_index, visible, true)
+        let update_pos = *transition != CompositionState::None;
+        self.sync_candidate_window_update(
+            ipc_service,
+            candidates,
+            selection_index,
+            visible,
+            update_pos,
+        )
+    }
+
+    #[inline]
+    fn actions_need_context_update(actions: &[ClientAction]) -> bool {
+        actions.iter().any(|action| {
+            matches!(
+                action,
+                ClientAction::AppendText(_)
+                    | ClientAction::AppendTextRaw(_)
+                    | ClientAction::AppendTextDirect(_)
+                    | ClientAction::ShrinkText(_)
+                    | ClientAction::ShrinkTextRaw(_)
+                    | ClientAction::ShrinkTextDirect(_)
+            )
+        })
     }
 
     #[inline]
@@ -3349,8 +3420,12 @@ impl TextServiceFactory {
         let ipc_service = IMEState::ipc_service().ok().flatten();
 
         if let Some(mut ipc_service) = ipc_service {
-            let _ =
+            let update_result =
                 ipc_service.update_candidate_window(Some(false), None, Some(vec![]), Some(0), None);
+            if update_result.is_ok() {
+                self.remember_candidate_window_visibility(Some(false));
+            }
+            let _ = update_result;
             let _ = ipc_service.clear_text();
 
             let _ = IMEState::set_ipc_service(ipc_service);
@@ -3428,7 +3503,7 @@ impl TextServiceFactory {
             let mut selection_index = composition.selection_index;
             let mut temporary_latin = composition.temporary_latin;
             let mut temporary_latin_shift_pending = composition.temporary_latin_shift_pending;
-            let mut ipc_service = IMEState::ipc_service()?.context("ipc_service is None")?;
+            let mut ipc_service;
             let mut transition = transition;
             let mut deferred_clause_navigation_ready_ui_sync = None;
 
@@ -3466,6 +3541,7 @@ impl TextServiceFactory {
                         Some(0),
                         None,
                     )?;
+                    self.remember_candidate_window_visibility(Some(false));
                     ipc_service.clear_text()?;
                 }};
             }
@@ -3499,7 +3575,10 @@ impl TextServiceFactory {
                 }};
             }
 
-            self.update_context(&preview)?;
+            if Self::actions_need_context_update(actions) {
+                self.update_context(&preview)?;
+            }
+            ipc_service = IMEState::ipc_service()?.context("ipc_service is None")?;
 
             for (action_index, action) in actions.iter().enumerate() {
                 match action {
@@ -3513,6 +3592,7 @@ impl TextServiceFactory {
                                 None,
                                 None,
                             )?;
+                            self.remember_candidate_window_visibility(Some(false));
                         }
                     }
                     ClientAction::ShowCandidateWindow => {
@@ -3524,6 +3604,7 @@ impl TextServiceFactory {
                             None,
                             None,
                         )?;
+                        self.remember_candidate_window_visibility(Some(true));
                     }
                     ClientAction::EndComposition => {
                         self.end_composition()?;
@@ -3550,6 +3631,7 @@ impl TextServiceFactory {
                             Some(0),
                             None,
                         )?;
+                        self.remember_candidate_window_visibility(Some(false));
                         ipc_service.clear_text()?;
                     }
                     ClientAction::AppendText(text) => {
@@ -3842,6 +3924,7 @@ impl TextServiceFactory {
                                 Some(0),
                                 None,
                             )?;
+                            self.remember_candidate_window_visibility(Some(false));
                             ipc_service.clear_text()?;
 
                             preview.clear();

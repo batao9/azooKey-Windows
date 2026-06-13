@@ -25,6 +25,12 @@ use shared::proto::WindowPosition;
 
 use super::factory::TextServiceFactory;
 
+#[derive(Clone, Copy)]
+enum CandidateWindowPositionMode {
+    Force,
+    Throttled,
+}
+
 #[implement(ITfEditSession)]
 struct EditSession<'a, T> {
     callback: Rc<dyn Fn(u32) -> anyhow::Result<T>>,
@@ -310,8 +316,10 @@ impl TextServiceFactory {
         Ok(())
     }
 
-    #[tracing::instrument]
-    pub fn candidate_window_position(&self) -> Result<Option<WindowPosition>> {
+    fn candidate_window_position_with_mode(
+        &self,
+        mode: CandidateWindowPositionMode,
+    ) -> Result<Option<WindowPosition>> {
         let trace_request_id = current_input_trace_request_id();
         let total_start = trace_request_id.map(|_| Instant::now());
         {
@@ -333,10 +341,25 @@ impl TextServiceFactory {
                 }
             };
 
-            if !text_service
-                .update_pos_state
-                .try_begin_update(Instant::now())
+            let now = Instant::now();
+            if matches!(mode, CandidateWindowPositionMode::Throttled)
+                && text_service
+                    .candidate_window_position_state
+                    .should_throttle(now)
             {
+                tracing::debug!("Skip throttled candidate_window_position call");
+                if let (Some(request_id), Some(total_start)) = (trace_request_id, total_start) {
+                    Self::log_candidate_window_position_performance(
+                        request_id,
+                        "total",
+                        total_start,
+                        "status=skipped;reason=throttled".to_string(),
+                    );
+                }
+                return Ok(None);
+            }
+
+            if !text_service.update_pos_state.try_begin_update(now) {
                 tracing::debug!("Skip re-entrant candidate_window_position call");
                 if let (Some(request_id), Some(total_start)) = (trace_request_id, total_start) {
                     Self::log_candidate_window_position_performance(
@@ -348,6 +371,9 @@ impl TextServiceFactory {
                 }
                 return Ok(None);
             }
+            text_service
+                .candidate_window_position_state
+                .mark_attempt(now);
         }
 
         let result: Result<Option<WindowPosition>> = (|| {
@@ -423,8 +449,17 @@ impl TextServiceFactory {
     }
 
     #[tracing::instrument]
+    pub fn candidate_window_position(&self) -> Result<Option<WindowPosition>> {
+        self.candidate_window_position_with_mode(CandidateWindowPositionMode::Force)
+    }
+
+    pub(crate) fn candidate_window_position_for_update(&self) -> Result<Option<WindowPosition>> {
+        self.candidate_window_position_with_mode(CandidateWindowPositionMode::Throttled)
+    }
+
+    #[tracing::instrument]
     pub fn update_pos(&self) -> Result<()> {
-        if let Some(position) = self.candidate_window_position()? {
+        if let Some(position) = self.candidate_window_position_for_update()? {
             if let Some(mut ipc_service) = IMEState::ipc_service()? {
                 ipc_service.update_candidate_window(None, Some(position), None, None, None)?;
                 IMEState::set_ipc_service(ipc_service)?;

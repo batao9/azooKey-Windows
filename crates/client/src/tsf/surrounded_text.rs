@@ -126,14 +126,16 @@ impl TextServiceFactory {
         let trace_request_id = current_input_trace_request_id();
         let total_start = trace_request_id.map(|_| Instant::now());
         let result: Result<()> = (|| unsafe {
-            let text_service = self.borrow()?;
-
-            let context = text_service.context::<ITfContext>()?;
-            let parent_context = self.to_parent_context_if_exists(Some(context))?;
+            let (tid, parent_context) = {
+                let text_service = self.borrow()?;
+                let context = text_service.context::<ITfContext>()?;
+                let parent_context = self.to_parent_context_if_exists(Some(context))?;
+                (text_service.tid, parent_context)
+            };
 
             let edit_session_start = trace_request_id.map(|_| Instant::now());
             let preceding_text = edit_session::<String>(
-                text_service.tid,
+                tid,
                 parent_context.clone(),
                 Rc::new({
                     let preview_count = preview.chars().count() as i32;
@@ -218,7 +220,38 @@ impl TextServiceFactory {
                 return Ok(());
             };
 
-            ipc_service.set_context(preceding_text)?;
+            let connection_id = ipc_service.connection_id();
+            let should_set_context = {
+                let text_service = self.borrow_mut()?;
+                text_service
+                    .surrounding_text_context_state
+                    .should_send(connection_id, &preceding_text)
+            };
+            if !should_set_context {
+                if let Some(request_id) = trace_request_id {
+                    Self::log_update_context_performance(
+                        request_id,
+                        "set_context",
+                        Instant::now(),
+                        format!(
+                            "status=skipped;reason=unchanged;preview_len={};context_len={};connection_id={connection_id}",
+                            preview.chars().count(),
+                            preceding_text.chars().count()
+                        ),
+                    );
+                }
+                return Ok(());
+            }
+
+            ipc_service.set_context(preceding_text.clone())?;
+            let connection_id = ipc_service.connection_id();
+            {
+                let mut text_service = self.borrow_mut()?;
+                text_service
+                    .surrounding_text_context_state
+                    .remember(connection_id, &preceding_text);
+            }
+            IMEState::set_ipc_service(ipc_service)?;
 
             Ok(())
         })();
