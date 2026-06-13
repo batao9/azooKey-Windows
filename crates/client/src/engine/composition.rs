@@ -1345,7 +1345,11 @@ impl TextServiceFactory {
                 self.should_update_candidate_window_position(update_pos, visible);
             let position = if should_update_pos {
                 let position_start = trace_request_id.map(|_| Instant::now());
-                let position = self.candidate_window_position_for_update()?;
+                let position = if visible == Some(true) {
+                    self.candidate_window_position()?
+                } else {
+                    self.candidate_window_position_for_update()?
+                };
                 if let (Some(request_id), Some(position_start)) = (trace_request_id, position_start)
                 {
                     Self::log_client_performance(
