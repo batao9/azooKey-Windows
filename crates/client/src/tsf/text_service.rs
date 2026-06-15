@@ -141,6 +141,7 @@ pub struct TextService {
     pub display_attribute_atom: HashMap<GUID, u32>,
     pub mode: InputMode,
     pub this: Option<ITfTextInputProcessor>,
+    pub shift_key_down: bool,
 }
 
 impl TextService {

@@ -241,6 +241,7 @@ export const General = () => {
     const [shortcutValue, setShortcutValue] = useState({
         ctrlSpaceToggle: true,
         altBackquoteToggle: true,
+        eisuToggle: true,
     });
     const [generalValue, setGeneralValue] = useState<GeneralConfigState>(
         DEFAULT_GENERAL_CONFIG,
@@ -267,6 +268,7 @@ export const General = () => {
                 setShortcutValue({
                     ctrlSpaceToggle: shortcuts.ctrl_space_toggle ?? true,
                     altBackquoteToggle: shortcuts.alt_backquote_toggle ?? true,
+                    eisuToggle: shortcuts.eisu_toggle ?? true,
                 });
 
                 setGeneralValue(normalizeGeneralConfig(data.general));
@@ -422,6 +424,18 @@ export const General = () => {
 
         if (data) {
             setShortcutValue((prev) => ({ ...prev, altBackquoteToggle: nextValue }));
+        }
+    };
+
+    const handleEisuToggle = async () => {
+        const nextValue = !shortcutValue.eisuToggle;
+        const data = await updateConfig((config) => {
+            config.shortcuts = config.shortcuts ?? {};
+            config.shortcuts.eisu_toggle = nextValue;
+        });
+
+        if (data) {
+            setShortcutValue((prev) => ({ ...prev, eisuToggle: nextValue }));
         }
     };
 
@@ -832,27 +846,39 @@ export const General = () => {
                     </div>
                 </section>
 
-                <section className="space-y-2">
+                <section className="space-y-3">
                     <h1 className="text-sm font-bold text-foreground">入力モード切替ショートカット</h1>
-                    <div className="flex items-center space-x-4 rounded-md border p-4">
-                        <Keyboard />
-                        <div className="flex-1 space-y-1">
-                            <p className="text-sm font-medium leading-none">Ctrl + Space を有効化</p>
-                            <p className="text-xs text-muted-foreground">
-                                英数/かな切り替えのショートカットとして Ctrl + Space を使用します
-                            </p>
+                    <div className="divide-y rounded-md border">
+                        <div className="flex items-center gap-4 p-4">
+                            <Keyboard className="h-4 w-4 shrink-0" />
+                            <div className="flex-1 space-y-1">
+                                <p className="text-sm font-medium leading-none">Ctrl + Space を有効化</p>
+                                <p className="text-xs text-muted-foreground">
+                                    英数/かな切り替えのショートカットとして Ctrl + Space を使用します
+                                </p>
+                            </div>
+                            <Switch checked={shortcutValue.ctrlSpaceToggle} onCheckedChange={handleCtrlSpaceToggle} />
                         </div>
-                        <Switch checked={shortcutValue.ctrlSpaceToggle} onCheckedChange={handleCtrlSpaceToggle} />
-                    </div>
-                    <div className="flex items-center space-x-4 rounded-md border p-4">
-                        <Keyboard />
-                        <div className="flex-1 space-y-1">
-                            <p className="text-sm font-medium leading-none">Alt + ` を有効化</p>
-                            <p className="text-xs text-muted-foreground">
-                                英数/かな切り替えのショートカットとして Alt + ` を使用します
-                            </p>
+                        <div className="flex items-center gap-4 p-4">
+                            <Keyboard className="h-4 w-4 shrink-0" />
+                            <div className="flex-1 space-y-1">
+                                <p className="text-sm font-medium leading-none">Alt + ` を有効化</p>
+                                <p className="text-xs text-muted-foreground">
+                                    英数/かな切り替えのショートカットとして Alt + ` を使用します
+                                </p>
+                            </div>
+                            <Switch checked={shortcutValue.altBackquoteToggle} onCheckedChange={handleAltBackquoteToggle} />
                         </div>
-                        <Switch checked={shortcutValue.altBackquoteToggle} onCheckedChange={handleAltBackquoteToggle} />
+                        <div className="flex items-center gap-4 p-4">
+                            <Keyboard className="h-4 w-4 shrink-0" />
+                            <div className="flex-1 space-y-1">
+                                <p className="text-sm font-medium leading-none">英数 (CapsLock) を有効化</p>
+                                <p className="text-xs text-muted-foreground">
+                                    英数/かな切り替えのショートカットとして英数 (CapsLock) を使用します
+                                </p>
+                            </div>
+                            <Switch checked={shortcutValue.eisuToggle} onCheckedChange={handleEisuToggle} />
+                        </div>
                     </div>
                 </section>
 

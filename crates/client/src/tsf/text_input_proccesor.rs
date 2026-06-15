@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     engine::{ipc_service, state::IMEState},
-    globals::{DllModule, GUID_DISPLAY_ATTRIBUTE},
+    globals::{DllModule, GUID_DISPLAY_ATTRIBUTE, GUID_PRESERVED_KEY_EISU_CAPSLOCK_ANY_MODIFIER},
 };
 
 use super::factory::TextServiceFactory_Impl;
@@ -15,6 +15,7 @@ use windows::{
             CLSID_TF_CategoryMgr, ITfCategoryMgr, ITfKeyEventSink, ITfKeystrokeMgr,
             ITfLangBarItemButton, ITfLangBarItemMgr, ITfSource, ITfTextInputProcessorEx_Impl,
             ITfTextInputProcessor_Impl, ITfThreadFocusSink, ITfThreadMgr, ITfThreadMgrEventSink,
+            TF_MOD_IGNORE_ALL_MODIFIER, TF_PRESERVEDKEY,
         },
     },
 };
@@ -51,13 +52,15 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         // initialize key event sink
         tracing::debug!("AdviseKeyEventSink");
 
+        let keystroke_mgr = thread_mgr.cast::<ITfKeystrokeMgr>()?;
         unsafe {
-            thread_mgr.cast::<ITfKeystrokeMgr>()?.AdviseKeyEventSink(
+            keystroke_mgr.AdviseKeyEventSink(
                 tid,
                 &text_service.this::<ITfKeyEventSink>()?,
                 BOOL::from(true),
             )?;
         };
+        preserve_eisu_keys(&keystroke_mgr, tid);
 
         // initialize thread manager event sink
         tracing::debug!("AdviseThreadMgrEventSink");
@@ -136,10 +139,10 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
 
             // remove key event sink
             tracing::debug!("UnadviseKeyEventSink");
+            let keystroke_mgr = thread_mgr.cast::<ITfKeystrokeMgr>()?;
+            unpreserve_eisu_keys(&keystroke_mgr);
             unsafe {
-                thread_mgr
-                    .cast::<ITfKeystrokeMgr>()?
-                    .UnadviseKeyEventSink(text_service.tid)?;
+                keystroke_mgr.UnadviseKeyEventSink(text_service.tid)?;
             };
 
             tracing::debug!("Remove langbar");
@@ -184,6 +187,39 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         tracing::debug!("Deactivate success");
 
         Ok(())
+    }
+}
+
+fn eisu_capslock_preserved_keys() -> [(windows::core::GUID, TF_PRESERVEDKEY); 1] {
+    [(
+        GUID_PRESERVED_KEY_EISU_CAPSLOCK_ANY_MODIFIER,
+        TF_PRESERVEDKEY {
+            uVKey: 0x14,
+            uModifiers: TF_MOD_IGNORE_ALL_MODIFIER,
+        },
+    )]
+}
+
+fn preserve_eisu_keys(keystroke_mgr: &ITfKeystrokeMgr, tid: u32) {
+    let description = "azooKey input mode toggle"
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    for (guid, preserved_key) in eisu_capslock_preserved_keys() {
+        let result = unsafe { keystroke_mgr.PreserveKey(tid, &guid, &preserved_key, &description) };
+
+        if let Err(error) = result {
+            tracing::warn!(?error, ?guid, "Failed to preserve CapsLock eisu shortcut");
+        }
+    }
+}
+
+fn unpreserve_eisu_keys(keystroke_mgr: &ITfKeystrokeMgr) {
+    for (guid, preserved_key) in eisu_capslock_preserved_keys() {
+        let result = unsafe { keystroke_mgr.UnpreserveKey(&guid, &preserved_key) };
+
+        if let Err(error) = result {
+            tracing::debug!(?error, ?guid, "Failed to unpreserve CapsLock eisu shortcut");
+        }
     }
 }
 

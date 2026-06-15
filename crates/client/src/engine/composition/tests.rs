@@ -1,7 +1,7 @@
 use super::{
-    Candidates, ClauseActionBackend, ClauseActionEffect, ClauseActionStateMut,
-    ClauseNavigationReadyUiSync, ClauseSnapshot, ClauseState, Composition, CompositionReducer,
-    CompositionState, FutureClauseSnapshot, TextServiceFactory,
+    Candidates, CapsLockKeyboardLayout, ClauseActionBackend, ClauseActionEffect,
+    ClauseActionStateMut, ClauseNavigationReadyUiSync, ClauseSnapshot, ClauseState, Composition,
+    CompositionReducer, CompositionState, FutureClauseSnapshot, TextServiceFactory,
 };
 use crate::engine::{
     client_action::{ClientAction, SetSelectionType, SetTextType},
@@ -9,6 +9,7 @@ use crate::engine::{
     user_action::{Function, Navigation, UserAction},
 };
 use shared::{get_default_romaji_rows, AppConfig, PunctuationStyle, RomajiRule, WidthMode};
+use windows::Win32::Foundation::LPARAM;
 
 pub(super) fn row(input: &str, output: &str, next_input: &str) -> RomajiRule {
     RomajiRule {
@@ -231,6 +232,151 @@ fn ctrl_conversion_shortcuts_do_not_capture_non_ctrl_or_alt_modified_keys() {
     assert_eq!(
         TextServiceFactory::ctrl_conversion_shortcut_function(0x41, true, false),
         None
+    );
+}
+
+#[test]
+fn eisu_shortcut_matches_ms_ime_capslock_rules_by_keyboard_layout() {
+    assert!(TextServiceFactory::is_eisu_shortcut(
+        0x14,
+        LPARAM(0),
+        false,
+        false,
+        false,
+        CapsLockKeyboardLayout::Japanese
+    ));
+    assert!(TextServiceFactory::is_eisu_shortcut(
+        0xF0,
+        LPARAM(0x003A0000),
+        false,
+        false,
+        false,
+        CapsLockKeyboardLayout::Japanese
+    ));
+    assert!(!TextServiceFactory::is_eisu_shortcut(
+        0xF0,
+        LPARAM(0x003A0000),
+        true,
+        false,
+        false,
+        CapsLockKeyboardLayout::Japanese
+    ));
+    assert!(!TextServiceFactory::is_eisu_shortcut(
+        0x14,
+        LPARAM(0),
+        true,
+        false,
+        false,
+        CapsLockKeyboardLayout::Japanese
+    ));
+    assert!(!TextServiceFactory::is_eisu_shortcut(
+        0x14,
+        LPARAM(0),
+        false,
+        false,
+        false,
+        CapsLockKeyboardLayout::English
+    ));
+    assert!(TextServiceFactory::is_eisu_shortcut(
+        0x14,
+        LPARAM(0),
+        true,
+        false,
+        false,
+        CapsLockKeyboardLayout::English
+    ));
+    assert!(TextServiceFactory::is_eisu_shortcut(
+        0xF0,
+        LPARAM(0x003A0000),
+        true,
+        false,
+        false,
+        CapsLockKeyboardLayout::English
+    ));
+    assert!(!TextServiceFactory::is_eisu_shortcut(
+        0xF0,
+        LPARAM(0x002A0000),
+        true,
+        false,
+        false,
+        CapsLockKeyboardLayout::English
+    ));
+    assert!(!TextServiceFactory::is_eisu_shortcut(
+        0xF0,
+        LPARAM(0x003A0000),
+        false,
+        false,
+        false,
+        CapsLockKeyboardLayout::English
+    ));
+    assert!(!TextServiceFactory::is_eisu_shortcut(
+        0x14,
+        LPARAM(0),
+        false,
+        true,
+        false,
+        CapsLockKeyboardLayout::Japanese
+    ));
+    assert!(!TextServiceFactory::is_eisu_shortcut(
+        0x14,
+        LPARAM(0),
+        false,
+        false,
+        true,
+        CapsLockKeyboardLayout::Japanese
+    ));
+    assert!(!TextServiceFactory::is_eisu_shortcut(
+        0x41,
+        LPARAM(0),
+        false,
+        false,
+        false,
+        CapsLockKeyboardLayout::Japanese
+    ));
+}
+
+#[test]
+fn keyboard_layout_hardware_registry_maps_japanese_default_and_english_override() {
+    assert_eq!(
+        TextServiceFactory::caps_lock_keyboard_layout_from_hardware_registry(None, None),
+        CapsLockKeyboardLayout::Japanese
+    );
+    assert_eq!(
+        TextServiceFactory::caps_lock_keyboard_layout_from_hardware_registry(
+            Some("kbd106.dll"),
+            Some("PCAT_106KEY")
+        ),
+        CapsLockKeyboardLayout::Japanese
+    );
+    assert_eq!(
+        TextServiceFactory::caps_lock_keyboard_layout_from_hardware_registry(
+            Some("kbd101.dll"),
+            Some("PCAT_101KEY")
+        ),
+        CapsLockKeyboardLayout::English
+    );
+    assert_eq!(
+        TextServiceFactory::caps_lock_keyboard_layout_from_hardware_registry(
+            None,
+            Some("PCAT_101KEY")
+        ),
+        CapsLockKeyboardLayout::English
+    );
+}
+
+#[test]
+fn kana_input_lowercases_ascii_uppercase_from_capslock() {
+    assert_eq!(
+        TextServiceFactory::input_text_for_mode('A', &InputMode::Kana),
+        "a"
+    );
+    assert_eq!(
+        TextServiceFactory::input_text_for_mode('A', &InputMode::Latin),
+        "A"
+    );
+    assert_eq!(
+        TextServiceFactory::input_text_for_mode('Ａ', &InputMode::Kana),
+        "Ａ"
     );
 }
 

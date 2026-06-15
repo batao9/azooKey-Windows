@@ -436,8 +436,8 @@ pub fn zenzai_cpu_backend_supported() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, ConfigError, DebugConfig, GeneralConfig, NumpadInputMode, CONFIG_VERSION,
-        SETTINGS_FILENAME,
+        AppConfig, ConfigError, DebugConfig, GeneralConfig, NumpadInputMode, ShortcutConfig,
+        CONFIG_VERSION, SETTINGS_FILENAME,
     };
     use std::{
         env,
@@ -529,6 +529,19 @@ mod tests {
         assert!(!deserialized.server_log_enabled);
         assert_eq!(deserialized.server_log_level, "warn");
         assert!(deserialized.server_crash_trace_enabled);
+    }
+
+    #[test]
+    fn shortcut_toggles_default_to_on() {
+        let default_config = ShortcutConfig::default();
+        assert!(default_config.ctrl_space_toggle);
+        assert!(default_config.alt_backquote_toggle);
+        assert!(default_config.eisu_toggle);
+
+        let deserialized: ShortcutConfig = serde_json::from_str("{}").unwrap();
+        assert!(deserialized.ctrl_space_toggle);
+        assert!(deserialized.alt_backquote_toggle);
+        assert!(deserialized.eisu_toggle);
     }
 
     #[test]
@@ -756,6 +769,8 @@ pub struct ShortcutConfig {
     pub ctrl_space_toggle: bool,
     #[serde(default = "default_shortcut_enabled")]
     pub alt_backquote_toggle: bool,
+    #[serde(default = "default_shortcut_enabled")]
+    pub eisu_toggle: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -852,6 +867,7 @@ impl Default for ShortcutConfig {
         Self {
             ctrl_space_toggle: true,
             alt_backquote_toggle: true,
+            eisu_toggle: true,
         }
     }
 }

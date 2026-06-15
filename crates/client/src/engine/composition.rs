@@ -23,17 +23,24 @@ use super::{
 #[cfg(test)]
 use shared::RomajiRule;
 use shared::{zenzai_cpu_backend_supported, AppConfig, NumpadInputMode, SpaceInputMode};
+use windows::core::{w, PCWSTR};
 use windows::Win32::{
     Foundation::{LPARAM, WPARAM},
+    System::Registry::{RegGetValueW, HKEY, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ},
     UI::{
         Input::KeyboardAndMouse::{
-            VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_MENU, VK_RCONTROL, VK_RMENU, VK_SHIFT,
+            GetAsyncKeyState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL,
+            VK_RMENU, VK_RSHIFT, VK_SHIFT,
         },
         TextServices::{ITfComposition, ITfCompositionSink_Impl, ITfContext},
     },
 };
 
 use anyhow::{Context, Result};
+
+const VK_CAPITAL_KEY_CODE: usize = 0x14;
+const VK_TRANSLATED_CAPSLOCK_KEY_CODE: usize = 0xF0;
+const CAPSLOCK_SCAN_CODE: isize = 0x3A;
 
 mod clause_state;
 pub(super) use clause_state::{
@@ -102,6 +109,12 @@ pub struct Composition {
     pub temporary_latin: bool,
     pub temporary_latin_shift_pending: bool,
     pub tip_composition: Option<ITfComposition>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum CapsLockKeyboardLayout {
+    Japanese,
+    English,
 }
 
 #[derive(Clone, Debug)]
@@ -190,28 +203,164 @@ impl TextServiceFactory {
     }
 
     #[inline]
-    fn is_ctrl_pressed() -> bool {
+    pub(crate) fn is_ctrl_pressed() -> bool {
         VK_CONTROL.is_pressed() || VK_LCONTROL.is_pressed() || VK_RCONTROL.is_pressed()
     }
 
     #[inline]
-    fn is_alt_pressed() -> bool {
+    pub(crate) fn is_alt_pressed() -> bool {
         VK_MENU.is_pressed() || VK_LMENU.is_pressed() || VK_RMENU.is_pressed()
     }
 
     #[inline]
-    fn is_shift_pressed() -> bool {
+    pub(crate) fn is_shift_pressed() -> bool {
         VK_SHIFT.is_pressed()
+            || VK_LSHIFT.is_pressed()
+            || VK_RSHIFT.is_pressed()
+            || unsafe {
+                [VK_SHIFT, VK_LSHIFT, VK_RSHIFT]
+                    .iter()
+                    .any(|key| GetAsyncKeyState(key.0 as i32) as u16 & 0x8000 != 0)
+            }
     }
 
     #[inline]
-    fn is_shift_key(wparam: WPARAM) -> bool {
+    pub(crate) fn is_shift_key(wparam: WPARAM) -> bool {
         matches!(wparam.0, 0x10 | 0xA0 | 0xA1)
     }
 
     #[inline]
     fn is_shift_alphabet_shortcut(wparam: WPARAM, is_shift_pressed: bool) -> bool {
         is_shift_pressed && (0x41..=0x5A).contains(&wparam.0)
+    }
+
+    #[inline]
+    fn is_eisu_shortcut(
+        key_code: usize,
+        lparam: LPARAM,
+        is_shift_pressed: bool,
+        is_ctrl_pressed: bool,
+        is_alt_pressed: bool,
+        keyboard_layout: CapsLockKeyboardLayout,
+    ) -> bool {
+        if is_ctrl_pressed || is_alt_pressed {
+            return false;
+        }
+
+        match keyboard_layout {
+            CapsLockKeyboardLayout::Japanese => {
+                !is_shift_pressed
+                    && (key_code == VK_CAPITAL_KEY_CODE
+                        || Self::is_translated_capslock_key(key_code, lparam))
+            }
+            CapsLockKeyboardLayout::English => {
+                is_shift_pressed
+                    && (key_code == VK_CAPITAL_KEY_CODE
+                        || Self::is_translated_capslock_key(key_code, lparam))
+            }
+        }
+    }
+
+    #[inline]
+    fn is_translated_capslock_key(key_code: usize, lparam: LPARAM) -> bool {
+        key_code == VK_TRANSLATED_CAPSLOCK_KEY_CODE
+            && ((lparam.0 >> 16) & 0xff) == CAPSLOCK_SCAN_CODE
+    }
+
+    #[inline]
+    fn caps_lock_keyboard_layout_from_hardware_registry(
+        layer_driver: Option<&str>,
+        keyboard_identifier: Option<&str>,
+    ) -> CapsLockKeyboardLayout {
+        if let Some(layer_driver) = layer_driver.map(str::trim) {
+            if layer_driver.eq_ignore_ascii_case("kbd101.dll") {
+                return CapsLockKeyboardLayout::English;
+            }
+
+            if layer_driver.eq_ignore_ascii_case("kbd106.dll") {
+                return CapsLockKeyboardLayout::Japanese;
+            }
+        }
+
+        if let Some(keyboard_identifier) = keyboard_identifier.map(str::trim) {
+            if keyboard_identifier.contains("101") {
+                return CapsLockKeyboardLayout::English;
+            }
+
+            if keyboard_identifier.contains("106") {
+                return CapsLockKeyboardLayout::Japanese;
+            }
+        }
+
+        CapsLockKeyboardLayout::Japanese
+    }
+
+    fn registry_string_value(root: HKEY, sub_key: PCWSTR, value: PCWSTR) -> Option<String> {
+        let mut byte_len = 0u32;
+        let result = unsafe {
+            RegGetValueW(
+                root,
+                sub_key,
+                value,
+                RRF_RT_REG_SZ,
+                None,
+                None,
+                Some(&mut byte_len),
+            )
+        };
+        if !result.is_ok() || byte_len == 0 {
+            return None;
+        }
+
+        let mut buffer = vec![0u16; (byte_len as usize + 1) / 2];
+        let result = unsafe {
+            RegGetValueW(
+                root,
+                sub_key,
+                value,
+                RRF_RT_REG_SZ,
+                None,
+                Some(buffer.as_mut_ptr().cast()),
+                Some(&mut byte_len),
+            )
+        };
+        if !result.is_ok() {
+            return None;
+        }
+
+        let end = buffer
+            .iter()
+            .position(|ch| *ch == 0)
+            .unwrap_or(buffer.len());
+        Some(String::from_utf16_lossy(&buffer[..end]))
+    }
+
+    fn current_caps_lock_keyboard_layout() -> CapsLockKeyboardLayout {
+        let layer_driver = Self::registry_string_value(
+            HKEY_LOCAL_MACHINE,
+            w!("SYSTEM\\CurrentControlSet\\Services\\i8042prt\\Parameters"),
+            w!("LayerDriver JPN"),
+        );
+        let keyboard_identifier = Self::registry_string_value(
+            HKEY_LOCAL_MACHINE,
+            w!("SYSTEM\\CurrentControlSet\\Services\\i8042prt\\Parameters"),
+            w!("OverrideKeyboardIdentifier"),
+        );
+
+        Self::caps_lock_keyboard_layout_from_hardware_registry(
+            layer_driver.as_deref(),
+            keyboard_identifier.as_deref(),
+        )
+    }
+
+    #[inline]
+    fn input_text_for_mode(input_char: char, mode: &InputMode) -> String {
+        match mode {
+            InputMode::Kana if input_char.is_ascii_uppercase() => {
+                input_char.to_ascii_lowercase().to_string()
+            }
+            _ => input_char.to_string(),
+        }
     }
 
     #[inline]
@@ -2701,7 +2850,7 @@ impl TextServiceFactory {
                     CompositionState::Composing,
                     vec![
                         ClientAction::StartComposition,
-                        ClientAction::AppendText(char.to_string()),
+                        ClientAction::AppendText(Self::input_text_for_mode(*char, mode)),
                     ],
                 )),
                 UserAction::Number {
@@ -2810,7 +2959,9 @@ impl TextServiceFactory {
                 }
                 UserAction::Input(char) => Some((
                     CompositionState::Composing,
-                    vec![ClientAction::AppendText(char.to_string())],
+                    vec![ClientAction::AppendText(Self::input_text_for_mode(
+                        *char, mode,
+                    ))],
                 )),
                 UserAction::Number {
                     value,
@@ -2947,7 +3098,9 @@ impl TextServiceFactory {
                 }
                 UserAction::Input(char) => Some((
                     CompositionState::Composing,
-                    vec![ClientAction::ShrinkText(char.to_string())],
+                    vec![ClientAction::ShrinkText(Self::input_text_for_mode(
+                        *char, mode,
+                    ))],
                 )),
                 UserAction::Number {
                     value,
@@ -3078,8 +3231,23 @@ impl TextServiceFactory {
 
             let is_ctrl_pressed = Self::is_ctrl_pressed();
             let is_alt_pressed = Self::is_alt_pressed();
-            let is_shift_pressed = Self::is_shift_pressed();
+            let is_shift_pressed = {
+                let tracked_shift = self
+                    .borrow()
+                    .map(|text_service| text_service.shift_key_down)
+                    .unwrap_or(false);
+                tracked_shift || Self::is_shift_pressed()
+            };
             let is_ctrl_space = is_ctrl_pressed && wparam.0 == 0x20;
+            let keyboard_layout = Self::current_caps_lock_keyboard_layout();
+            let is_eisu = Self::is_eisu_shortcut(
+                wparam.0,
+                lparam,
+                is_shift_pressed,
+                is_ctrl_pressed,
+                is_alt_pressed,
+                keyboard_layout,
+            );
             let is_ctrl_enter = is_ctrl_pressed && wparam.0 == 0x0D;
             let is_ctrl_down = is_ctrl_pressed && wparam.0 == 0x28;
             let ctrl_conversion_function =
@@ -3122,7 +3290,7 @@ impl TextServiceFactory {
                 return Ok(None);
             }
 
-            if is_ctrl_space || is_alt_backquote {
+            if is_ctrl_space || is_alt_backquote || is_eisu {
                 let shortcuts = &app_config.shortcuts;
 
                 if is_ctrl_space && !shortcuts.ctrl_space_toggle {
@@ -3133,6 +3301,13 @@ impl TextServiceFactory {
                 }
 
                 if is_alt_backquote && !shortcuts.alt_backquote_toggle {
+                    self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(
+                        wparam,
+                    ))?;
+                    return Ok(None);
+                }
+
+                if is_eisu && !shortcuts.eisu_toggle {
                     self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(
                         wparam,
                     ))?;
@@ -3162,7 +3337,7 @@ impl TextServiceFactory {
             let should_clear_shift_pending =
                 composition.temporary_latin_shift_pending && !is_shift_key;
 
-            let action = if is_alt_backquote {
+            let action = if is_alt_backquote || is_eisu {
                 UserAction::ToggleInputMode
             } else if is_ctrl_enter {
                 UserAction::CommitFirstClause
@@ -3398,6 +3573,92 @@ impl TextServiceFactory {
             Ok(handled) => Ok(handled),
             Err(error) => {
                 tracing::error!("handle_key_up failed: {error:?}");
+                self.recover_after_key_error();
+                Ok(false)
+            }
+        }
+    }
+
+    #[tracing::instrument]
+    pub fn handle_preserved_eisu_shortcut(&self, context: Option<&ITfContext>) -> Result<bool> {
+        let result: Result<bool> = (|| {
+            let Some(context) = context else {
+                self.set_keyboard_disabled_state(true)?;
+                return Ok(false);
+            };
+
+            self.borrow_mut()?.context = Some(context.clone());
+
+            let keyboard_disabled = keyboard_disabled_from_context(context);
+            self.set_keyboard_disabled_state(keyboard_disabled)?;
+            if keyboard_disabled {
+                self.cancel_composition_for_disabled_context();
+                return Ok(false);
+            }
+
+            let is_shift_pressed = {
+                let tracked_shift = self
+                    .borrow()
+                    .map(|text_service| text_service.shift_key_down)
+                    .unwrap_or(false);
+                tracked_shift || Self::is_shift_pressed()
+            };
+            let is_ctrl_pressed = Self::is_ctrl_pressed();
+            let is_alt_pressed = Self::is_alt_pressed();
+            let keyboard_layout = Self::current_caps_lock_keyboard_layout();
+            if !Self::is_eisu_shortcut(
+                VK_CAPITAL_KEY_CODE,
+                LPARAM(0),
+                is_shift_pressed,
+                is_ctrl_pressed,
+                is_alt_pressed,
+                keyboard_layout,
+            ) {
+                return Ok(false);
+            }
+
+            let config_snapshot = IMEState::app_config_snapshot()?;
+            let app_config = config_snapshot.app_config();
+            if !app_config.shortcuts.eisu_toggle {
+                return Ok(false);
+            }
+
+            #[allow(clippy::let_and_return)]
+            let (composition, mode) = {
+                let text_service = self.borrow()?;
+                let composition = text_service.borrow_composition()?.clone();
+                let mode = IMEState::input_mode()?;
+                (composition, mode)
+            };
+
+            let Some((transition, mut actions)) = Self::plan_actions_for_user_action_with_lookup(
+                &composition,
+                &UserAction::ToggleInputMode,
+                &mode,
+                is_shift_pressed,
+                app_config,
+                config_snapshot.romaji_lookup(),
+                false,
+            ) else {
+                return Ok(false);
+            };
+
+            if composition.temporary_latin
+                && !actions
+                    .iter()
+                    .any(|action| matches!(action, ClientAction::SetTemporaryLatin(false)))
+            {
+                actions.insert(0, ClientAction::SetTemporaryLatin(false));
+            }
+
+            self.handle_action_with_config_snapshot(&actions, transition, config_snapshot)?;
+            Ok(true)
+        })();
+
+        match result {
+            Ok(handled) => Ok(handled),
+            Err(error) => {
+                tracing::error!("handle_preserved_eisu_shortcut failed: {error:?}");
                 self.recover_after_key_error();
                 Ok(false)
             }
