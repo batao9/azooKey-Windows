@@ -169,6 +169,11 @@ machine_cfg_file() {
     awk -F= '$1 == "CfgFile" { value=$2 } END { gsub(/"/, "", value); print value }'
 }
 
+machine_snapshot_dir() {
+  vbox showvminfo "$VM_NAME" --machinereadable |
+    awk -F= '$1 == "SnapshotFolder" { value=$2 } END { gsub(/"/, "", value); print value }'
+}
+
 ensure_vm_cache_disk() {
   if [[ -z "$VM_CACHE_DISK_PATH" ]]; then
     return 0
@@ -182,7 +187,7 @@ ensure_vm_cache_disk() {
   cache_disk="$(host_path_for_vbox "$VM_CACHE_DISK_PATH")"
   cache_disk="${cache_disk//$'\r'/}"
 
-  local info vm_state current_key current_medium cache_disk_cmp current_medium_cmp required_port_count
+  local info vm_state current_key current_medium cache_disk_cmp current_medium_cmp required_port_count current_port_count
   info="$(vbox showvminfo "$VM_NAME" --machinereadable)"
   vm_state="$(printf '%s\n' "$info" | awk -F= '$1 == "VMState" { gsub(/"/, "", $2); print $2 }')"
   vm_state="${vm_state//$'\r'/}"
@@ -224,7 +229,29 @@ ensure_vm_cache_disk() {
   fi
 
   required_port_count=$((VM_CACHE_DISK_PORT + 1))
-  vbox storagectl "$VM_NAME" --name "$VM_CACHE_STORAGE_CONTROLLER" --portcount "$required_port_count" >/dev/null
+  current_port_count="$(printf '%s\n' "$info" |
+    awk -F= -v controller="$VM_CACHE_STORAGE_CONTROLLER" '
+      {
+        key=$1; value=$2;
+        gsub(/^"/, "", value); gsub(/"$/, "", value);
+        if (key ~ /^storagecontrollername[0-9]+$/ && value == controller) {
+          idx=key; sub(/^storagecontrollername/, "", idx); controller_idx=idx;
+        }
+        if (key ~ /^storagecontrollerportcount[0-9]+$/) {
+          idx=key; sub(/^storagecontrollerportcount/, "", idx); port_count[idx]=value;
+        }
+      }
+      END {
+        if (controller_idx != "") print port_count[controller_idx];
+      }')"
+  current_port_count="${current_port_count//$'\r'/}"
+  if [[ ! "$current_port_count" =~ ^[0-9]+$ ]]; then
+    log "storage controller の port count が取得できません: $VM_CACHE_STORAGE_CONTROLLER"
+    exit 1
+  fi
+  if (( current_port_count < required_port_count )); then
+    vbox storagectl "$VM_NAME" --name "$VM_CACHE_STORAGE_CONTROLLER" --portcount "$required_port_count" >/dev/null
+  fi
   log "cache disk を VM に接続します: $cache_disk"
   vbox storageattach "$VM_NAME" \
     --storagectl "$VM_CACHE_STORAGE_CONTROLLER" \
@@ -239,7 +266,7 @@ prune_orphan_leaf_media() {
     return 0
   fi
 
-  local cfg_file vm_dir
+  local cfg_file vm_dir snapshot_dir
   cfg_file="$(machine_cfg_file)"
   cfg_file="${cfg_file//\\\\/\\}"
   if [[ -z "$cfg_file" ]]; then
@@ -247,15 +274,22 @@ prune_orphan_leaf_media() {
     return 0
   fi
   vm_dir="${cfg_file%\\*}"
+  snapshot_dir="$(machine_snapshot_dir)"
+  snapshot_dir="${snapshot_dir//\\\\/\\}"
+  if [[ -z "$snapshot_dir" ]]; then
+    snapshot_dir="$vm_dir\\Snapshots"
+  fi
 
   local candidates=()
   mapfile -t candidates < <(
     vbox list hdds --long | tr -d '\r' |
-      VM_DIR="$vm_dir" awk '
+      SNAPSHOT_DIR="$snapshot_dir" awk '
         BEGIN {
           RS="\n\n"; FS="\n";
-          vm_dir = ENVIRON["VM_DIR"];
-          gsub(/\\/, "/", vm_dir);
+          snapshot_dir = ENVIRON["SNAPSHOT_DIR"];
+          gsub(/\\/, "/", snapshot_dir);
+          gsub(/\/+$/, "", snapshot_dir);
+          snapshot_dir = tolower(snapshot_dir "/");
         }
         {
           uuid=""; loc=""; size=""; use="no"; child="no";
@@ -269,7 +303,8 @@ prune_orphan_leaf_media() {
           }
           loc_norm = loc;
           gsub(/\\/, "/", loc_norm);
-          in_scope = (loc_norm == vm_dir || index(loc_norm, vm_dir "/") == 1);
+          loc_norm_lc = tolower(loc_norm);
+          in_scope = (index(loc_norm_lc, snapshot_dir) == 1);
           if (uuid != "" && use == "no" && child == "no" && in_scope && loc_norm ~ /\.vdi$/) {
             print uuid "\t" size "\t" loc
           }
