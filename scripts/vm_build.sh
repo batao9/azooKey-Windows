@@ -585,8 +585,8 @@ function Use-NodeModulesCache {
   $nodeModules = Join-Path $FrontendDir "node_modules"
 
   $sentinel = Join-Path $cacheDir ".azookey-node-modules-ready"
-  $cachePackageLock = Join-Path $cacheDir ".package-lock.json"
-  if ((Test-Path $sentinel) -and (Test-Path $cachePackageLock)) {
+  $cacheHashMarker = Join-Path $cacheDir ".azookey-package-lock.sha256"
+  if ((Test-Path $sentinel) -and (Test-Path $cacheHashMarker)) {
     New-Junction -Path $nodeModules -Target $cacheDir
     Write-Host "reused node_modules cache: $cacheDir"
     return
@@ -607,6 +607,7 @@ function Use-NodeModulesCache {
     }
     New-Item -Path (Split-Path -Parent $cacheDir) -ItemType Directory -Force | Out-Null
     Move-Item -LiteralPath $nodeModules -Destination $cacheDir
+    Set-Content -LiteralPath $cacheHashMarker -Encoding ASCII -Value $hash
     Set-Content -LiteralPath $sentinel -Encoding ASCII -Value $hash
     New-Junction -Path $nodeModules -Target $cacheDir
   } finally {
