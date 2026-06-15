@@ -21,6 +21,7 @@ VM_CACHE_DISK_REQUIRED="${VM_CACHE_DISK_REQUIRED:-0}"
 VM_CACHE_DISK_SIZE_MB="${VM_CACHE_DISK_SIZE_MB:-65536}"
 VM_CACHE_STORAGE_CONTROLLER="${VM_CACHE_STORAGE_CONTROLLER:-SATA}"
 VM_CACHE_DISK_PORT="${VM_CACHE_DISK_PORT:-2}"
+VM_CACHE_GUEST_DISK_NUMBER="${VM_CACHE_GUEST_DISK_NUMBER:-}"
 VM_CACHE_DRIVE_LETTER="${VM_CACHE_DRIVE_LETTER:-Z}"
 VM_CACHE_VOLUME_LABEL="${VM_CACHE_VOLUME_LABEL:-AZOOKEYCACHE}"
 VM_BUILD_CACHE_ROOT_WIN="${VM_BUILD_CACHE_ROOT_WIN:-}"
@@ -465,7 +466,7 @@ param(
   [Parameter(Mandatory = $false)][string]$CacheVolumeLabel = "AZOOKEYCACHE",
   [Parameter(Mandatory = $false)][string]$CacheRootOverride = "",
   [Parameter(Mandatory = $false)][string]$FastInstaller = "0",
-  [Parameter(Mandatory = $false)][string]$AllowRawCacheDisk = "0"
+  [Parameter(Mandatory = $false)][string]$CacheDiskNumber = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -510,7 +511,7 @@ function Initialize-BuildCacheRoot {
     [string]$VolumeLabel,
     [string]$RootOverride,
     [string]$FallbackRoot,
-    [string]$AllowRawDisk
+    [string]$DiskNumber
   )
 
   if (![string]::IsNullOrWhiteSpace($RootOverride)) {
@@ -520,21 +521,20 @@ function Initialize-BuildCacheRoot {
 
   $drive = $DriveLetter.TrimEnd(":")
   $volume = Get-Volume -FileSystemLabel $VolumeLabel -ErrorAction SilentlyContinue | Select-Object -First 1
-  if (!$volume -and $AllowRawDisk -eq "1") {
-    $rawDisk = Get-Disk -ErrorAction SilentlyContinue |
-      Where-Object PartitionStyle -eq "RAW" |
-      Sort-Object Number |
-      Select-Object -First 1
-
-    if ($rawDisk) {
-      Write-Host "initializing build cache disk #$($rawDisk.Number) as ${drive}: ($VolumeLabel)"
-      Initialize-Disk -Number $rawDisk.Number -PartitionStyle GPT -PassThru | Out-Null
-      $partition = New-Partition -DiskNumber $rawDisk.Number -UseMaximumSize -DriveLetter $drive
-      Format-Volume -Partition $partition -FileSystem NTFS -NewFileSystemLabel $VolumeLabel -Confirm:$false | Out-Null
-      $volume = Get-Volume -DriveLetter $drive
+  if (!$volume -and ![string]::IsNullOrWhiteSpace($DiskNumber)) {
+    $rawDiskNumber = [int]$DiskNumber
+    $rawDisk = Get-Disk -Number $rawDiskNumber -ErrorAction Stop
+    if ($rawDisk.PartitionStyle -ne "RAW") {
+      throw "cache disk #$rawDiskNumber is not RAW; refusing to format it as $VolumeLabel"
     }
+
+    Write-Host "initializing explicitly selected build cache disk #$rawDiskNumber as ${drive}: ($VolumeLabel)"
+    Initialize-Disk -Number $rawDiskNumber -PartitionStyle GPT -PassThru | Out-Null
+    $partition = New-Partition -DiskNumber $rawDiskNumber -UseMaximumSize -DriveLetter $drive
+    Format-Volume -Partition $partition -FileSystem NTFS -NewFileSystemLabel $VolumeLabel -Confirm:$false | Out-Null
+    $volume = Get-Volume -DriveLetter $drive
   } elseif (!$volume) {
-    Write-Host "raw cache disk initialization is disabled; falling back to $FallbackRoot"
+    Write-Host "cache disk volume not found and no explicit guest disk number was provided; falling back to $FallbackRoot"
   }
 
   if ($volume) {
@@ -675,7 +675,7 @@ $cacheRoot = Initialize-BuildCacheRoot `
   -VolumeLabel $CacheVolumeLabel `
   -RootOverride $CacheRootOverride `
   -FallbackRoot $fallbackCacheRoot `
-  -AllowRawDisk $AllowRawCacheDisk
+  -DiskNumber $CacheDiskNumber
 Write-Host "build cache root: $cacheRoot"
 
 $env:CARGO_TARGET_DIR = Join-Path $cacheRoot "cargo-target"
@@ -945,13 +945,8 @@ main() {
   scp_to_vm "$TMP_SRC_ARCHIVE" "$REMOTE_TAR_SCP"
   scp_to_vm "$TMP_REMOTE_PS" "$REMOTE_PS_SCP"
 
-  local allow_raw_cache_disk="0"
-  if [[ -n "$VM_CACHE_DISK_PATH" ]]; then
-    allow_raw_cache_disk="1"
-  fi
-
   log "VM 上でビルドを実行します（時間がかかる場合があります）"
-  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -SourceTarPath \"$REMOTE_TAR_WIN\" -SourceDir \"$REMOTE_SRC_WIN\" -ArtifactDir \"$REMOTE_ART_WIN\" -HostTimestampUtc \"$HOST_TIMESTAMP_UTC\" -CacheDriveLetter \"$VM_CACHE_DRIVE_LETTER\" -CacheVolumeLabel \"$VM_CACHE_VOLUME_LABEL\" -CacheRootOverride \"$VM_BUILD_CACHE_ROOT_WIN\" -FastInstaller \"$VM_FAST_INSTALLER\" -AllowRawCacheDisk \"$allow_raw_cache_disk\""
+  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -SourceTarPath \"$REMOTE_TAR_WIN\" -SourceDir \"$REMOTE_SRC_WIN\" -ArtifactDir \"$REMOTE_ART_WIN\" -HostTimestampUtc \"$HOST_TIMESTAMP_UTC\" -CacheDriveLetter \"$VM_CACHE_DRIVE_LETTER\" -CacheVolumeLabel \"$VM_CACHE_VOLUME_LABEL\" -CacheRootOverride \"$VM_BUILD_CACHE_ROOT_WIN\" -FastInstaller \"$VM_FAST_INSTALLER\" -CacheDiskNumber \"$VM_CACHE_GUEST_DISK_NUMBER\""
 
   log "成果物を WSL 側へ回収します"
   scp_from_vm "$REMOTE_ART_SCP" "$LOCAL_ARTIFACT"
