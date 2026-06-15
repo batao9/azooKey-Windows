@@ -583,22 +583,32 @@ function Use-NodeModulesCache {
   $hash = (Get-FileHash -Algorithm SHA256 -Path $packageLock).Hash.ToLowerInvariant()
   $cacheDir = Join-Path $CacheRoot "node_modules\$hash"
   $nodeModules = Join-Path $FrontendDir "node_modules"
-  New-Junction -Path $nodeModules -Target $cacheDir
 
   $sentinel = Join-Path $cacheDir ".azookey-node-modules-ready"
-  if (Test-Path $sentinel) {
+  $cachePackageLock = Join-Path $cacheDir ".package-lock.json"
+  if ((Test-Path $sentinel) -and (Test-Path $cachePackageLock)) {
+    New-Junction -Path $nodeModules -Target $cacheDir
     Write-Host "reused node_modules cache: $cacheDir"
     return
   }
 
-  Write-Host "running npm ci into node_modules cache: $cacheDir"
+  if (Test-Path $sentinel) {
+    Write-Host "node_modules cache sentinel exists but cache content is incomplete; rebuilding: $cacheDir"
+  }
+
+  Write-Host "running npm ci before caching node_modules: $cacheDir"
+  Reset-Path -Path $nodeModules
+  Reset-Path -Path $cacheDir
   Push-Location $FrontendDir
   try {
     npm.cmd ci --prefer-offline --no-audit
     if ($LASTEXITCODE -ne 0) {
       throw "npm ci failed with exit code $LASTEXITCODE"
     }
+    New-Item -Path (Split-Path -Parent $cacheDir) -ItemType Directory -Force | Out-Null
+    Move-Item -LiteralPath $nodeModules -Destination $cacheDir
     Set-Content -LiteralPath $sentinel -Encoding ASCII -Value $hash
+    New-Junction -Path $nodeModules -Target $cacheDir
   } finally {
     Pop-Location
   }
