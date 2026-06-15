@@ -31,6 +31,10 @@ pub const GUID_PROFILE: GUID = GUID::from_u128(0xffdefe7a_2fc2_11ef_b16b_94e70b2
 // DisplayAttribute用のGUID
 pub const GUID_DISPLAY_ATTRIBUTE: GUID = GUID::from_u128(0xffdefe7b_2fc2_11ef_b16b_94e70b2c378c);
 
+// Preserved key for CapsLock input mode toggle.
+pub const GUID_PRESERVED_KEY_EISU_CAPSLOCK_ANY_MODIFIER: GUID =
+    GUID::from_u128(0xffdefe7c_2fc2_11ef_b16b_94e70b2c378c);
+
 pub const DISPLAY_ATTRIBUTE: TF_DISPLAYATTRIBUTE = TF_DISPLAYATTRIBUTE {
     crText: TF_DA_COLOR {
         r#type: TF_CT_NONE,
