@@ -79,6 +79,7 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     fn OnSetFocus(&self, fforeground: BOOL) -> Result<()> {
         if !fforeground.as_bool() {
+            self.clear_tracked_modifier_key_state();
             self.set_keyboard_disabled_state(true)?;
         }
 
@@ -94,6 +95,12 @@ impl TextServiceFactory_Impl {
 
         if let Ok(mut text_service) = self.borrow_mut() {
             text_service.shift_key_down = is_down;
+        }
+    }
+
+    fn clear_tracked_modifier_key_state(&self) {
+        if let Ok(mut text_service) = self.borrow_mut() {
+            text_service.shift_key_down = false;
         }
     }
 }

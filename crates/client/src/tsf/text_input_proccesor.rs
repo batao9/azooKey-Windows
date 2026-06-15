@@ -181,6 +181,7 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         // clear display attribute
         text_service.display_attribute_atom.clear();
 
+        text_service.shift_key_down = false;
         text_service.tid = 0;
         text_service.thread_mgr = None;
 

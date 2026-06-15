@@ -3239,15 +3239,21 @@ impl TextServiceFactory {
                 tracked_shift || Self::is_shift_pressed()
             };
             let is_ctrl_space = is_ctrl_pressed && wparam.0 == 0x20;
-            let keyboard_layout = Self::current_caps_lock_keyboard_layout();
-            let is_eisu = Self::is_eisu_shortcut(
-                wparam.0,
-                lparam,
-                is_shift_pressed,
-                is_ctrl_pressed,
-                is_alt_pressed,
-                keyboard_layout,
-            );
+            let is_capslock_key = wparam.0 == VK_CAPITAL_KEY_CODE
+                || Self::is_translated_capslock_key(wparam.0, lparam);
+            let is_eisu = if is_capslock_key {
+                let keyboard_layout = Self::current_caps_lock_keyboard_layout();
+                Self::is_eisu_shortcut(
+                    wparam.0,
+                    lparam,
+                    is_shift_pressed,
+                    is_ctrl_pressed,
+                    is_alt_pressed,
+                    keyboard_layout,
+                )
+            } else {
+                false
+            };
             let is_ctrl_enter = is_ctrl_pressed && wparam.0 == 0x0D;
             let is_ctrl_down = is_ctrl_pressed && wparam.0 == 0x28;
             let ctrl_conversion_function =
