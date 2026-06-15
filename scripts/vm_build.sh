@@ -237,7 +237,8 @@ prune_orphan_leaf_media() {
           }
           loc_norm = loc;
           gsub(/\\/, "/", loc_norm);
-          if (uuid != "" && use == "no" && child == "no" && index(loc_norm, vm_dir) == 1 && loc_norm ~ /\.vdi$/) {
+          in_scope = (loc_norm == vm_dir || index(loc_norm, vm_dir "/") == 1);
+          if (uuid != "" && use == "no" && child == "no" && in_scope && loc_norm ~ /\.vdi$/) {
             print uuid "\t" size "\t" loc
           }
         }'
@@ -463,7 +464,8 @@ param(
   [Parameter(Mandatory = $false)][string]$CacheDriveLetter = "Z",
   [Parameter(Mandatory = $false)][string]$CacheVolumeLabel = "AZOOKEYCACHE",
   [Parameter(Mandatory = $false)][string]$CacheRootOverride = "",
-  [Parameter(Mandatory = $false)][string]$FastInstaller = "0"
+  [Parameter(Mandatory = $false)][string]$FastInstaller = "0",
+  [Parameter(Mandatory = $false)][string]$AllowRawCacheDisk = "0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -507,7 +509,8 @@ function Initialize-BuildCacheRoot {
     [string]$DriveLetter,
     [string]$VolumeLabel,
     [string]$RootOverride,
-    [string]$FallbackRoot
+    [string]$FallbackRoot,
+    [string]$AllowRawDisk
   )
 
   if (![string]::IsNullOrWhiteSpace($RootOverride)) {
@@ -517,7 +520,7 @@ function Initialize-BuildCacheRoot {
 
   $drive = $DriveLetter.TrimEnd(":")
   $volume = Get-Volume -FileSystemLabel $VolumeLabel -ErrorAction SilentlyContinue | Select-Object -First 1
-  if (!$volume) {
+  if (!$volume -and $AllowRawDisk -eq "1") {
     $rawDisk = Get-Disk -ErrorAction SilentlyContinue |
       Where-Object PartitionStyle -eq "RAW" |
       Sort-Object Number |
@@ -530,6 +533,8 @@ function Initialize-BuildCacheRoot {
       Format-Volume -Partition $partition -FileSystem NTFS -NewFileSystemLabel $VolumeLabel -Confirm:$false | Out-Null
       $volume = Get-Volume -DriveLetter $drive
     }
+  } elseif (!$volume) {
+    Write-Host "raw cache disk initialization is disabled; falling back to $FallbackRoot"
   }
 
   if ($volume) {
@@ -669,7 +674,8 @@ $cacheRoot = Initialize-BuildCacheRoot `
   -DriveLetter $CacheDriveLetter `
   -VolumeLabel $CacheVolumeLabel `
   -RootOverride $CacheRootOverride `
-  -FallbackRoot $fallbackCacheRoot
+  -FallbackRoot $fallbackCacheRoot `
+  -AllowRawDisk $AllowRawCacheDisk
 Write-Host "build cache root: $cacheRoot"
 
 $env:CARGO_TARGET_DIR = Join-Path $cacheRoot "cargo-target"
@@ -939,8 +945,13 @@ main() {
   scp_to_vm "$TMP_SRC_ARCHIVE" "$REMOTE_TAR_SCP"
   scp_to_vm "$TMP_REMOTE_PS" "$REMOTE_PS_SCP"
 
+  local allow_raw_cache_disk="0"
+  if [[ -n "$VM_CACHE_DISK_PATH" ]]; then
+    allow_raw_cache_disk="1"
+  fi
+
   log "VM 上でビルドを実行します（時間がかかる場合があります）"
-  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -SourceTarPath \"$REMOTE_TAR_WIN\" -SourceDir \"$REMOTE_SRC_WIN\" -ArtifactDir \"$REMOTE_ART_WIN\" -HostTimestampUtc \"$HOST_TIMESTAMP_UTC\" -CacheDriveLetter \"$VM_CACHE_DRIVE_LETTER\" -CacheVolumeLabel \"$VM_CACHE_VOLUME_LABEL\" -CacheRootOverride \"$VM_BUILD_CACHE_ROOT_WIN\" -FastInstaller \"$VM_FAST_INSTALLER\""
+  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -SourceTarPath \"$REMOTE_TAR_WIN\" -SourceDir \"$REMOTE_SRC_WIN\" -ArtifactDir \"$REMOTE_ART_WIN\" -HostTimestampUtc \"$HOST_TIMESTAMP_UTC\" -CacheDriveLetter \"$VM_CACHE_DRIVE_LETTER\" -CacheVolumeLabel \"$VM_CACHE_VOLUME_LABEL\" -CacheRootOverride \"$VM_BUILD_CACHE_ROOT_WIN\" -FastInstaller \"$VM_FAST_INSTALLER\" -AllowRawCacheDisk \"$allow_raw_cache_disk\""
 
   log "成果物を WSL 側へ回収します"
   scp_from_vm "$REMOTE_ART_SCP" "$LOCAL_ARTIFACT"

@@ -269,7 +269,8 @@ prune_orphan_leaf_media() {
           }
           loc_norm = loc;
           gsub(/\\/, "/", loc_norm);
-          if (uuid != "" && use == "no" && child == "no" && index(loc_norm, vm_dir) == 1 && loc_norm ~ /\.vdi$/) {
+          in_scope = (loc_norm == vm_dir || index(loc_norm, vm_dir "/") == 1);
+          if (uuid != "" && use == "no" && child == "no" && in_scope && loc_norm ~ /\.vdi$/) {
             print uuid "\t" size "\t" loc
           }
         }'
