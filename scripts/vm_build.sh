@@ -140,7 +140,7 @@ machine_cfg_file() {
 
 machine_snapshot_dir() {
   vbox showvminfo "$VM_NAME" --machinereadable |
-    awk -F= '$1 == "SnapshotFolder" { value=$2 } END { gsub(/"/, "", value); print value }'
+    awk -F= '$1 == "SnapFldr" { value=$2 } END { gsub(/"/, "", value); print value }'
 }
 
 ensure_vm_cache_disk() {
