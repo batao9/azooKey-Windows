@@ -29,8 +29,8 @@ use windows::Win32::{
     System::Registry::{RegGetValueW, HKEY, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ},
     UI::{
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL,
-            VK_RMENU, VK_RSHIFT, VK_SHIFT,
+            GetAsyncKeyState, GetKeyboardType, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT,
+            VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
         },
         TextServices::{ITfComposition, ITfCompositionSink_Impl, ITfContext},
     },
@@ -41,6 +41,8 @@ use anyhow::{Context, Result};
 const VK_CAPITAL_KEY_CODE: usize = 0x14;
 const VK_TRANSLATED_CAPSLOCK_KEY_CODE: usize = 0xF0;
 const CAPSLOCK_SCAN_CODE: isize = 0x3A;
+const KEYBOARD_TYPE_ENHANCED_101_OR_102: i32 = 0x4;
+const KEYBOARD_TYPE_JAPANESE: i32 = 0x7;
 
 mod clause_state;
 pub(super) use clause_state::{
@@ -112,7 +114,7 @@ pub struct Composition {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum CapsLockKeyboardLayout {
+pub(crate) enum CapsLockKeyboardLayout {
     Japanese,
     English,
 }
@@ -268,6 +270,17 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn caps_lock_keyboard_layout_from_keyboard_type(
+        keyboard_type: Option<i32>,
+    ) -> Option<CapsLockKeyboardLayout> {
+        match keyboard_type {
+            Some(KEYBOARD_TYPE_ENHANCED_101_OR_102) => Some(CapsLockKeyboardLayout::English),
+            Some(KEYBOARD_TYPE_JAPANESE) => Some(CapsLockKeyboardLayout::Japanese),
+            _ => None,
+        }
+    }
+
+    #[inline]
     fn caps_lock_keyboard_layout_from_hardware_registry(
         layer_driver: Option<&str>,
         keyboard_identifier: Option<&str>,
@@ -293,6 +306,19 @@ impl TextServiceFactory {
         }
 
         CapsLockKeyboardLayout::Japanese
+    }
+
+    #[inline]
+    fn caps_lock_keyboard_layout_from_sources(
+        keyboard_type: Option<i32>,
+        layer_driver: Option<&str>,
+        keyboard_identifier: Option<&str>,
+    ) -> CapsLockKeyboardLayout {
+        if let Some(layout) = Self::caps_lock_keyboard_layout_from_keyboard_type(keyboard_type) {
+            return layout;
+        }
+
+        Self::caps_lock_keyboard_layout_from_hardware_registry(layer_driver, keyboard_identifier)
     }
 
     fn registry_string_value(root: HKEY, sub_key: PCWSTR, value: PCWSTR) -> Option<String> {
@@ -335,7 +361,8 @@ impl TextServiceFactory {
         Some(String::from_utf16_lossy(&buffer[..end]))
     }
 
-    fn current_caps_lock_keyboard_layout() -> CapsLockKeyboardLayout {
+    pub(crate) fn current_caps_lock_keyboard_layout() -> CapsLockKeyboardLayout {
+        let keyboard_type = unsafe { GetKeyboardType(0) };
         let layer_driver = Self::registry_string_value(
             HKEY_LOCAL_MACHINE,
             w!("SYSTEM\\CurrentControlSet\\Services\\i8042prt\\Parameters"),
@@ -347,7 +374,8 @@ impl TextServiceFactory {
             w!("OverrideKeyboardIdentifier"),
         );
 
-        Self::caps_lock_keyboard_layout_from_hardware_registry(
+        Self::caps_lock_keyboard_layout_from_sources(
+            Some(keyboard_type),
             layer_driver.as_deref(),
             keyboard_identifier.as_deref(),
         )

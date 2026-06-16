@@ -532,16 +532,16 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_toggles_default_to_on() {
+    fn shortcut_toggles_default_to_expected_values() {
         let default_config = ShortcutConfig::default();
         assert!(default_config.ctrl_space_toggle);
         assert!(default_config.alt_backquote_toggle);
-        assert!(default_config.eisu_toggle);
+        assert!(!default_config.eisu_toggle);
 
         let deserialized: ShortcutConfig = serde_json::from_str("{}").unwrap();
         assert!(deserialized.ctrl_space_toggle);
         assert!(deserialized.alt_backquote_toggle);
-        assert!(deserialized.eisu_toggle);
+        assert!(!deserialized.eisu_toggle);
     }
 
     #[test]
@@ -769,7 +769,7 @@ pub struct ShortcutConfig {
     pub ctrl_space_toggle: bool,
     #[serde(default = "default_shortcut_enabled")]
     pub alt_backquote_toggle: bool,
-    #[serde(default = "default_shortcut_enabled")]
+    #[serde(default)]
     pub eisu_toggle: bool,
 }
 
@@ -867,7 +867,7 @@ impl Default for ShortcutConfig {
         Self {
             ctrl_space_toggle: true,
             alt_backquote_toggle: true,
-            eisu_toggle: true,
+            eisu_toggle: false,
         }
     }
 }

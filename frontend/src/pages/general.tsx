@@ -241,7 +241,7 @@ export const General = () => {
     const [shortcutValue, setShortcutValue] = useState({
         ctrlSpaceToggle: true,
         altBackquoteToggle: true,
-        eisuToggle: true,
+        eisuToggle: false,
     });
     const [generalValue, setGeneralValue] = useState<GeneralConfigState>(
         DEFAULT_GENERAL_CONFIG,
@@ -268,7 +268,7 @@ export const General = () => {
                 setShortcutValue({
                     ctrlSpaceToggle: shortcuts.ctrl_space_toggle ?? true,
                     altBackquoteToggle: shortcuts.alt_backquote_toggle ?? true,
-                    eisuToggle: shortcuts.eisu_toggle ?? true,
+                    eisuToggle: shortcuts.eisu_toggle ?? false,
                 });
 
                 setGeneralValue(normalizeGeneralConfig(data.general));

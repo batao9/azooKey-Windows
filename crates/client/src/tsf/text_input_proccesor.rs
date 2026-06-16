@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
 use crate::{
-    engine::{ipc_service, state::IMEState},
+    engine::{composition::CapsLockKeyboardLayout, ipc_service, state::IMEState},
     globals::{DllModule, GUID_DISPLAY_ATTRIBUTE, GUID_PRESERVED_KEY_EISU_CAPSLOCK_ANY_MODIFIER},
 };
 
-use super::factory::TextServiceFactory_Impl;
+use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
 use windows::{
     core::Interface as _,
     Win32::{
@@ -15,7 +15,7 @@ use windows::{
             CLSID_TF_CategoryMgr, ITfCategoryMgr, ITfKeyEventSink, ITfKeystrokeMgr,
             ITfLangBarItemButton, ITfLangBarItemMgr, ITfSource, ITfTextInputProcessorEx_Impl,
             ITfTextInputProcessor_Impl, ITfThreadFocusSink, ITfThreadMgr, ITfThreadMgrEventSink,
-            TF_MOD_IGNORE_ALL_MODIFIER, TF_PRESERVEDKEY,
+            TF_MOD_IGNORE_ALL_MODIFIER, TF_MOD_SHIFT, TF_PRESERVEDKEY,
         },
     },
 };
@@ -191,35 +191,64 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
     }
 }
 
-fn eisu_capslock_preserved_keys() -> [(windows::core::GUID, TF_PRESERVEDKEY); 1] {
-    [(
-        GUID_PRESERVED_KEY_EISU_CAPSLOCK_ANY_MODIFIER,
+fn eisu_capslock_preserved_key_for_layout(
+    keyboard_layout: CapsLockKeyboardLayout,
+) -> TF_PRESERVEDKEY {
+    TF_PRESERVEDKEY {
+        uVKey: 0x14,
+        uModifiers: match keyboard_layout {
+            CapsLockKeyboardLayout::Japanese => 0,
+            CapsLockKeyboardLayout::English => TF_MOD_SHIFT,
+        },
+    }
+}
+
+fn all_eisu_capslock_preserved_keys_to_unpreserve() -> [TF_PRESERVEDKEY; 3] {
+    [
+        eisu_capslock_preserved_key_for_layout(CapsLockKeyboardLayout::Japanese),
+        eisu_capslock_preserved_key_for_layout(CapsLockKeyboardLayout::English),
         TF_PRESERVEDKEY {
             uVKey: 0x14,
             uModifiers: TF_MOD_IGNORE_ALL_MODIFIER,
         },
-    )]
+    ]
 }
 
 fn preserve_eisu_keys(keystroke_mgr: &ITfKeystrokeMgr, tid: u32) {
     let description = "azooKey input mode toggle"
         .encode_utf16()
         .collect::<Vec<_>>();
-    for (guid, preserved_key) in eisu_capslock_preserved_keys() {
-        let result = unsafe { keystroke_mgr.PreserveKey(tid, &guid, &preserved_key, &description) };
+    let keyboard_layout = TextServiceFactory::current_caps_lock_keyboard_layout();
+    let preserved_key = eisu_capslock_preserved_key_for_layout(keyboard_layout);
+    let result = unsafe {
+        keystroke_mgr.PreserveKey(
+            tid,
+            &GUID_PRESERVED_KEY_EISU_CAPSLOCK_ANY_MODIFIER,
+            &preserved_key,
+            &description,
+        )
+    };
 
-        if let Err(error) = result {
-            tracing::warn!(?error, ?guid, "Failed to preserve CapsLock eisu shortcut");
-        }
+    if let Err(error) = result {
+        tracing::warn!(
+            ?error,
+            ?keyboard_layout,
+            "Failed to preserve CapsLock eisu shortcut"
+        );
     }
 }
 
 fn unpreserve_eisu_keys(keystroke_mgr: &ITfKeystrokeMgr) {
-    for (guid, preserved_key) in eisu_capslock_preserved_keys() {
-        let result = unsafe { keystroke_mgr.UnpreserveKey(&guid, &preserved_key) };
+    for preserved_key in all_eisu_capslock_preserved_keys_to_unpreserve() {
+        let result = unsafe {
+            keystroke_mgr.UnpreserveKey(
+                &GUID_PRESERVED_KEY_EISU_CAPSLOCK_ANY_MODIFIER,
+                &preserved_key,
+            )
+        };
 
         if let Err(error) = result {
-            tracing::debug!(?error, ?guid, "Failed to unpreserve CapsLock eisu shortcut");
+            tracing::debug!(?error, "Failed to unpreserve CapsLock eisu shortcut");
         }
     }
 }
