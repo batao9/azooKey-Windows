@@ -10,11 +10,22 @@ RESTORE_BEFORE_BUILD="${RESTORE_BEFORE_BUILD:-1}"
 RESTORE_AFTER_BUILD="${RESTORE_AFTER_BUILD:-1}"
 ALLOW_DIRTY_WORKTREE="${ALLOW_DIRTY_WORKTREE:-1}"
 DISCARD_SAVED_STATE_BEFORE_BUILD="${DISCARD_SAVED_STATE_BEFORE_BUILD:-0}"
+PRUNE_ORPHAN_MEDIA_AFTER_RESTORE="${PRUNE_ORPHAN_MEDIA_AFTER_RESTORE:-1}"
 SSH_USER="${SSH_USER:-}"
 SSH_PORT="${SSH_PORT:-}"
 SSH_KEY="${SSH_KEY:-}"
 VBOX_MANAGE="${VBOX_MANAGE:-}"
 STAGING_VM_NAME="${STAGING_VM_NAME:-}"
+VM_CACHE_DISK_PATH="${VM_CACHE_DISK_PATH:-}"
+VM_CACHE_DISK_REQUIRED="${VM_CACHE_DISK_REQUIRED:-0}"
+VM_CACHE_DISK_SIZE_MB="${VM_CACHE_DISK_SIZE_MB:-65536}"
+VM_CACHE_STORAGE_CONTROLLER="${VM_CACHE_STORAGE_CONTROLLER:-SATA}"
+VM_CACHE_DISK_PORT="${VM_CACHE_DISK_PORT:-2}"
+VM_CACHE_GUEST_DISK_NUMBER="${VM_CACHE_GUEST_DISK_NUMBER:-}"
+VM_CACHE_DRIVE_LETTER="${VM_CACHE_DRIVE_LETTER:-Z}"
+VM_CACHE_VOLUME_LABEL="${VM_CACHE_VOLUME_LABEL:-AZOOKEYCACHE}"
+VM_BUILD_CACHE_ROOT_WIN="${VM_BUILD_CACHE_ROOT_WIN:-}"
+VM_FAST_INSTALLER="${VM_FAST_INSTALLER:-0}"
 
 if [[ -z "$VBOX_MANAGE" ]]; then
   if command -v VBoxManage >/dev/null 2>&1; then
@@ -53,7 +64,7 @@ LOCAL_ARTIFACT="$ARTIFACT_DIR/azookey-setup-${TARGET_BRANCH_SLUG}-$TIMESTAMP.exe
 REMOTE_TMP_WIN="C:\\Users\\$SSH_USER\\AppData\\Local\\Temp"
 REMOTE_TAR_WIN="$REMOTE_TMP_WIN\\azookey-src.tar.gz"
 REMOTE_PS_WIN="$REMOTE_TMP_WIN\\azookey-vm-build.ps1"
-REMOTE_SRC_WIN="C:\\work\\azookey-src-$TIMESTAMP"
+REMOTE_SRC_WIN="${REMOTE_SRC_WIN:-C:\\work\\azookey-src}"
 REMOTE_ART_WIN="C:\\work\\artifacts"
 
 REMOTE_TAR_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-src.tar.gz"
@@ -86,17 +97,17 @@ vbox() {
 
 matches_fixed() {
   if command -v rg >/dev/null 2>&1; then
-    rg -F "$1" -q
+    rg -F "$1" >/dev/null
   else
-    grep -F "$1" -q
+    grep -F "$1" >/dev/null
   fi
 }
 
 matches_regex() {
   if command -v rg >/dev/null 2>&1; then
-    rg -q "$1"
+    rg "$1" >/dev/null
   else
-    grep -q -- "$1"
+    grep -- "$1" >/dev/null
   fi
 }
 
@@ -111,6 +122,175 @@ is_named_vm_running() {
 
 snapshot_exists() {
   vbox snapshot "$VM_NAME" list --machinereadable | matches_fixed "=\"$SNAPSHOT_NAME\""
+}
+
+host_path_for_vbox() {
+  local path="$1"
+  if [[ "$path" == /* ]] && command -v wslpath >/dev/null 2>&1; then
+    wslpath -w "$path"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+machine_cfg_file() {
+  vbox showvminfo "$VM_NAME" --machinereadable |
+    awk -F= '$1 == "CfgFile" { value=$2 } END { gsub(/"/, "", value); print value }'
+}
+
+machine_snapshot_dir() {
+  vbox showvminfo "$VM_NAME" --machinereadable |
+    awk -F= '$1 == "SnapFldr" { value=$2 } END { gsub(/"/, "", value); print value }'
+}
+
+ensure_vm_cache_disk() {
+  if [[ -z "$VM_CACHE_DISK_PATH" ]]; then
+    return 0
+  fi
+
+  if [[ "$VM_CACHE_DISK_PATH" == /* ]]; then
+    mkdir -p "$(dirname "$VM_CACHE_DISK_PATH")"
+  fi
+
+  local cache_disk
+  cache_disk="$(host_path_for_vbox "$VM_CACHE_DISK_PATH")"
+  cache_disk="${cache_disk//$'\r'/}"
+
+  local info vm_state current_key current_medium cache_disk_cmp current_medium_cmp required_port_count current_port_count
+  info="$(vbox showvminfo "$VM_NAME" --machinereadable)"
+  vm_state="$(printf '%s\n' "$info" | awk -F= '$1 == "VMState" { gsub(/"/, "", $2); print $2 }')"
+  vm_state="${vm_state//$'\r'/}"
+  current_key="\"${VM_CACHE_STORAGE_CONTROLLER}-${VM_CACHE_DISK_PORT}-0\""
+  current_medium="$(printf '%s\n' "$info" |
+    awk -F= -v key="$current_key" '$1 == key { gsub(/^"/, "", $2); gsub(/"$/, "", $2); print $2; exit }')"
+  current_medium="${current_medium//$'\r'/}"
+  current_medium="${current_medium//\"/}"
+  current_medium="${current_medium//\\\\/\\}"
+  cache_disk_cmp="$(printf '%s' "$cache_disk" | tr '[:upper:]' '[:lower:]')"
+  current_medium_cmp="$(printf '%s' "$current_medium" | tr '[:upper:]' '[:lower:]')"
+
+  if [[ "$current_medium_cmp" == "$cache_disk_cmp" ]]; then
+    return 0
+  fi
+
+  if [[ "$vm_state" == "saved" ]]; then
+    log "保存状態の VM には cache disk を後付けできないため、この実行では cache disk をスキップします: $cache_disk"
+    if [[ "$VM_CACHE_DISK_REQUIRED" == "1" ]]; then
+      exit 1
+    fi
+    return 0
+  fi
+
+  if ! vbox showmediuminfo disk "$cache_disk" >/dev/null 2>&1; then
+    if [[ "$VM_CACHE_DISK_PATH" == /* && -f "$VM_CACHE_DISK_PATH" ]]; then
+      log "既存の cache disk を登録します: $cache_disk"
+      vbox openmedium disk "$cache_disk" >/dev/null
+    else
+      log "cache disk を作成します: $cache_disk (${VM_CACHE_DISK_SIZE_MB}MB)"
+      vbox createmedium disk --filename "$cache_disk" --size "$VM_CACHE_DISK_SIZE_MB" --format VDI >/dev/null
+    fi
+    vbox modifymedium disk "$cache_disk" --type writethrough >/dev/null
+  fi
+
+  if [[ -n "$current_medium" && "$current_medium" != "none" ]]; then
+    log "cache disk 用 port が使用中です: ${VM_CACHE_STORAGE_CONTROLLER}-${VM_CACHE_DISK_PORT}-0 -> $current_medium"
+    exit 1
+  fi
+
+  required_port_count=$((VM_CACHE_DISK_PORT + 1))
+  current_port_count="$(printf '%s\n' "$info" |
+    awk -F= -v controller="$VM_CACHE_STORAGE_CONTROLLER" '
+      {
+        key=$1; value=$2;
+        gsub(/^"/, "", value); gsub(/"$/, "", value);
+        if (key ~ /^storagecontrollername[0-9]+$/ && value == controller) {
+          idx=key; sub(/^storagecontrollername/, "", idx); controller_idx=idx;
+        }
+        if (key ~ /^storagecontrollerportcount[0-9]+$/) {
+          idx=key; sub(/^storagecontrollerportcount/, "", idx); port_count[idx]=value;
+        }
+      }
+      END {
+        if (controller_idx != "") print port_count[controller_idx];
+      }')"
+  current_port_count="${current_port_count//$'\r'/}"
+  if [[ ! "$current_port_count" =~ ^[0-9]+$ ]]; then
+    log "storage controller の port count が取得できません: $VM_CACHE_STORAGE_CONTROLLER"
+    exit 1
+  fi
+  if (( current_port_count < required_port_count )); then
+    vbox storagectl "$VM_NAME" --name "$VM_CACHE_STORAGE_CONTROLLER" --portcount "$required_port_count" >/dev/null
+  fi
+  log "cache disk を VM に接続します: $cache_disk"
+  vbox storageattach "$VM_NAME" \
+    --storagectl "$VM_CACHE_STORAGE_CONTROLLER" \
+    --port "$VM_CACHE_DISK_PORT" \
+    --device 0 \
+    --type hdd \
+    --medium "$cache_disk" >/dev/null
+}
+
+prune_orphan_leaf_media() {
+  if [[ "$PRUNE_ORPHAN_MEDIA_AFTER_RESTORE" != "1" ]]; then
+    return 0
+  fi
+
+  local cfg_file vm_dir snapshot_dir
+  cfg_file="$(machine_cfg_file)"
+  cfg_file="${cfg_file//\\\\/\\}"
+  if [[ -z "$cfg_file" ]]; then
+    log "VM 設定ファイルが取得できないため orphan media prune をスキップします"
+    return 0
+  fi
+  vm_dir="${cfg_file%\\*}"
+  snapshot_dir="$(machine_snapshot_dir)"
+  snapshot_dir="${snapshot_dir//\\\\/\\}"
+  if [[ -z "$snapshot_dir" ]]; then
+    snapshot_dir="$vm_dir\\Snapshots"
+  fi
+
+  local candidates=()
+  mapfile -t candidates < <(
+    vbox list hdds --long | tr -d '\r' |
+      SNAPSHOT_DIR="$snapshot_dir" awk '
+        BEGIN {
+          RS="\n\n"; FS="\n";
+          snapshot_dir = ENVIRON["SNAPSHOT_DIR"];
+          gsub(/\\/, "/", snapshot_dir);
+          gsub(/\/+$/, "", snapshot_dir);
+          snapshot_dir = tolower(snapshot_dir "/");
+        }
+        {
+          uuid=""; loc=""; size=""; use="no"; child="no";
+          for (i=1; i<=NF; i++) {
+            line=$i;
+            if (line ~ /^UUID:/) { sub(/^UUID:[[:space:]]*/, "", line); uuid=line }
+            if (line ~ /^Location:/) { sub(/^Location:[[:space:]]*/, "", line); loc=line }
+            if (line ~ /^Size on disk:/) { sub(/^Size on disk:[[:space:]]*/, "", line); size=line }
+            if (line ~ /^In use by VMs:/) { use="yes" }
+            if (line ~ /^Child UUIDs:/) { child="yes" }
+          }
+          loc_norm = loc;
+          gsub(/\\/, "/", loc_norm);
+          loc_norm_lc = tolower(loc_norm);
+          in_scope = (index(loc_norm_lc, snapshot_dir) == 1);
+          if (uuid != "" && use == "no" && child == "no" && in_scope && loc_norm ~ /\.vdi$/) {
+            print uuid "\t" size "\t" loc
+          }
+        }'
+  )
+
+  if (( ${#candidates[@]} == 0 )); then
+    log "未接続 leaf VDI はありません"
+    return 0
+  fi
+
+  local entry uuid size loc
+  for entry in "${candidates[@]}"; do
+    IFS=$'\t' read -r uuid size loc <<<"$entry"
+    log "未接続 leaf VDI を削除します: $uuid ($size) $loc"
+    vbox closemedium disk "$uuid" --delete </dev/null
+  done
 }
 
 ssh_run() {
@@ -204,6 +384,11 @@ cleanup() {
 
     if snapshot_exists; then
       vbox snapshot "$VM_NAME" restore "$SNAPSHOT_NAME" >/dev/null || true
+      if [[ "$DISCARD_SAVED_STATE_BEFORE_BUILD" == "1" ]]; then
+        vbox discardstate "$VM_NAME" >/dev/null 2>&1 || true
+      fi
+      ensure_vm_cache_disk || true
+      prune_orphan_leaf_media || true
       FINAL_RESTORE_DONE=1
     else
       log "復元対象スナップショットが見つからないためスキップします: $SNAPSHOT_NAME"
@@ -311,18 +496,159 @@ param(
   [Parameter(Mandatory = $true)][string]$SourceTarPath,
   [Parameter(Mandatory = $true)][string]$SourceDir,
   [Parameter(Mandatory = $true)][string]$ArtifactDir,
-  [Parameter(Mandatory = $true)][string]$HostTimestampUtc
+  [Parameter(Mandatory = $true)][string]$HostTimestampUtc,
+  [Parameter(Mandatory = $false)][string]$CacheDriveLetter = "Z",
+  [Parameter(Mandatory = $false)][string]$CacheVolumeLabel = "AZOOKEYCACHE",
+  [Parameter(Mandatory = $false)][string]$CacheRootOverride = "",
+  [Parameter(Mandatory = $false)][string]$FastInstaller = "0",
+  [Parameter(Mandatory = $false)][string]$CacheDiskNumber = ""
 )
 
 $ErrorActionPreference = "Stop"
 $env:Path += ";$env:USERPROFILE\\.cargo\\bin"
+if ($FastInstaller -eq "1") {
+  $env:AZOOKEY_FAST_INSTALLER = "1"
+} else {
+  Remove-Item Env:AZOOKEY_FAST_INSTALLER -ErrorAction SilentlyContinue
+}
 
 $LLAMA_CPU_URL = "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-avx-x64.zip"
 $LLAMA_CUDA_URL = "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-cuda-cu12.4-x64.zip"
 $LLAMA_VULKAN_URL = "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-vulkan-x64.zip"
 $ZENZ_MODEL_URL = "https://huggingface.co/Miwa-Keita/zenz-v3-small-gguf/resolve/main/ggml-model-Q5_K_M.gguf"
 $downloadAllAssets = $env:DOWNLOAD_ALL_ASSETS -eq "1"
-$cacheRoot = "C:\work\azooKey-Windows"
+$fallbackCacheRoot = "C:\work\azooKey-Windows"
+$script:StepTimings = New-Object System.Collections.Generic.List[object]
+
+function Measure-Step {
+  param(
+    [string]$Name,
+    [scriptblock]$Action
+  )
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  Write-Host "[timing] begin $Name"
+  try {
+    & $Action
+  } finally {
+    $sw.Stop()
+    $seconds = [Math]::Round($sw.Elapsed.TotalSeconds, 3)
+    $script:StepTimings.Add([pscustomobject]@{
+      Name = $Name
+      Seconds = $seconds
+    }) | Out-Null
+    Write-Host "[timing] end $Name ${seconds}s"
+  }
+}
+
+function Initialize-BuildCacheRoot {
+  param(
+    [string]$DriveLetter,
+    [string]$VolumeLabel,
+    [string]$RootOverride,
+    [string]$FallbackRoot,
+    [string]$DiskNumber
+  )
+
+  if (![string]::IsNullOrWhiteSpace($RootOverride)) {
+    New-Item -Path $RootOverride -ItemType Directory -Force | Out-Null
+    return $RootOverride
+  }
+
+  $drive = $DriveLetter.TrimEnd(":")
+  $volume = Get-Volume -FileSystemLabel $VolumeLabel -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (!$volume -and ![string]::IsNullOrWhiteSpace($DiskNumber)) {
+    $rawDiskNumber = [int]$DiskNumber
+    $rawDisk = Get-Disk -Number $rawDiskNumber -ErrorAction Stop
+    if ($rawDisk.PartitionStyle -ne "RAW") {
+      throw "cache disk #$rawDiskNumber is not RAW; refusing to format it as $VolumeLabel"
+    }
+
+    Write-Host "initializing explicitly selected build cache disk #$rawDiskNumber as ${drive}: ($VolumeLabel)"
+    Initialize-Disk -Number $rawDiskNumber -PartitionStyle GPT -PassThru | Out-Null
+    $partition = New-Partition -DiskNumber $rawDiskNumber -UseMaximumSize -DriveLetter $drive
+    Format-Volume -Partition $partition -FileSystem NTFS -NewFileSystemLabel $VolumeLabel -Confirm:$false | Out-Null
+    $volume = Get-Volume -DriveLetter $drive
+  } elseif (!$volume) {
+    Write-Host "cache disk volume not found and no explicit guest disk number was provided; falling back to $FallbackRoot"
+  }
+
+  if ($volume) {
+    $cacheDrive = $drive
+    if (![string]::IsNullOrWhiteSpace($volume.DriveLetter)) {
+      $cacheDrive = $volume.DriveLetter
+    }
+    $root = "${cacheDrive}:\azookey-build-cache"
+    New-Item -Path $root -ItemType Directory -Force | Out-Null
+    return $root
+  }
+
+  Write-Host "build cache disk not found; falling back to $FallbackRoot"
+  New-Item -Path $FallbackRoot -ItemType Directory -Force | Out-Null
+  return $FallbackRoot
+}
+
+function Reset-Path {
+  param([string]$Path)
+  if (Test-Path $Path) {
+    Remove-Item -Path $Path -Recurse -Force
+  }
+}
+
+function New-Junction {
+  param(
+    [string]$Path,
+    [string]$Target
+  )
+  New-Item -Path $Target -ItemType Directory -Force | Out-Null
+  Reset-Path -Path $Path
+  New-Item -ItemType Junction -Path $Path -Target $Target | Out-Null
+}
+
+function Use-NodeModulesCache {
+  param(
+    [string]$FrontendDir,
+    [string]$CacheRoot
+  )
+
+  $packageLock = Join-Path $FrontendDir "package-lock.json"
+  if (!(Test-Path $packageLock)) {
+    throw "package-lock.json not found: $packageLock"
+  }
+
+  $hash = (Get-FileHash -Algorithm SHA256 -Path $packageLock).Hash.ToLowerInvariant()
+  $cacheDir = Join-Path $CacheRoot "node_modules\$hash"
+  $nodeModules = Join-Path $FrontendDir "node_modules"
+
+  $sentinel = Join-Path $cacheDir ".azookey-node-modules-ready"
+  $cacheHashMarker = Join-Path $cacheDir ".azookey-package-lock.sha256"
+  if ((Test-Path $sentinel) -and (Test-Path $cacheHashMarker)) {
+    New-Junction -Path $nodeModules -Target $cacheDir
+    Write-Host "reused node_modules cache: $cacheDir"
+    return
+  }
+
+  if (Test-Path $sentinel) {
+    Write-Host "node_modules cache sentinel exists but cache content is incomplete; rebuilding: $cacheDir"
+  }
+
+  Write-Host "running npm ci before caching node_modules: $cacheDir"
+  Reset-Path -Path $nodeModules
+  Reset-Path -Path $cacheDir
+  Push-Location $FrontendDir
+  try {
+    npm.cmd ci --prefer-offline --no-audit
+    if ($LASTEXITCODE -ne 0) {
+      throw "npm ci failed with exit code $LASTEXITCODE"
+    }
+    New-Item -Path (Split-Path -Parent $cacheDir) -ItemType Directory -Force | Out-Null
+    Move-Item -LiteralPath $nodeModules -Destination $cacheDir
+    Set-Content -LiteralPath $cacheHashMarker -Encoding ASCII -Value $hash
+    Set-Content -LiteralPath $sentinel -Encoding ASCII -Value $hash
+    New-Junction -Path $nodeModules -Target $cacheDir
+  } finally {
+    Pop-Location
+  }
+}
 
 function Sync-GuestClock {
   param([string]$TimestampUtc)
@@ -390,15 +716,37 @@ function Replace-TreeFromCache {
   return $true
 }
 
-if (Test-Path $SourceDir) {
-  Remove-Item -Recurse -Force $SourceDir
-}
-New-Item -Path $SourceDir -ItemType Directory -Force | Out-Null
+$cacheRoot = Initialize-BuildCacheRoot `
+  -DriveLetter $CacheDriveLetter `
+  -VolumeLabel $CacheVolumeLabel `
+  -RootOverride $CacheRootOverride `
+  -FallbackRoot $fallbackCacheRoot `
+  -DiskNumber $CacheDiskNumber
+Write-Host "build cache root: $cacheRoot"
 
-tar -xzf $SourceTarPath -C $SourceDir
+$env:CARGO_TARGET_DIR = Join-Path $cacheRoot "cargo-target"
+$env:npm_config_cache = Join-Path $cacheRoot "npm-cache"
+New-Item -Path $env:CARGO_TARGET_DIR -ItemType Directory -Force | Out-Null
+New-Item -Path $env:npm_config_cache -ItemType Directory -Force | Out-Null
+Write-Host "CARGO_TARGET_DIR=$env:CARGO_TARGET_DIR"
+Write-Host "npm_config_cache=$env:npm_config_cache"
+
+Measure-Step "extract source" {
+  Reset-Path -Path $SourceDir
+  New-Item -Path $SourceDir -ItemType Directory -Force | Out-Null
+  tar -xzf $SourceTarPath -C $SourceDir
+  if ($LASTEXITCODE -ne 0) {
+    throw "tar extraction failed with exit code $LASTEXITCODE"
+  }
+}
 Set-Location $SourceDir
 Write-Host "source extracted: $SourceDir"
 Sync-GuestClock -TimestampUtc $HostTimestampUtc
+
+$sourceSwiftBuildDir = Join-Path $SourceDir "server-swift\.build"
+$cachedSwiftBuildDir = Join-Path $cacheRoot "swift-build"
+New-Junction -Path $sourceSwiftBuildDir -Target $cachedSwiftBuildDir
+Write-Host "swift .build cache: $cachedSwiftBuildDir"
 
 $llamaCpuDir = Join-Path $SourceDir "llama_cpu"
 $llamaCudaDir = Join-Path $SourceDir "llama_cuda"
@@ -449,14 +797,12 @@ if ($downloadAllAssets) {
   New-Item -Path $llamaVulkanDir -ItemType Directory -Force | Out-Null
 
   if (!(Test-Path (Join-Path $llamaCudaDir "llama.dll"))) {
-    if (!(Copy-TreeIfExists -SourceDir (Join-Path $cacheRoot "llama_cuda") -DestDir $llamaCudaDir)) {
-      Copy-Item (Join-Path $llamaCpuDir "llama.dll") -Destination (Join-Path $llamaCudaDir "llama.dll") -Force
-    }
+    Copy-Item (Join-Path $llamaCpuDir "llama.dll") -Destination (Join-Path $llamaCudaDir "llama.dll") -Force
+    Write-Host "created minimal llama cuda assets for fast local build"
   }
   if (!(Test-Path (Join-Path $llamaVulkanDir "llama.dll"))) {
-    if (!(Copy-TreeIfExists -SourceDir (Join-Path $cacheRoot "llama_vulkan") -DestDir $llamaVulkanDir)) {
-      Copy-Item (Join-Path $llamaCpuDir "llama.dll") -Destination (Join-Path $llamaVulkanDir "llama.dll") -Force
-    }
+    Copy-Item (Join-Path $llamaCpuDir "llama.dll") -Destination (Join-Path $llamaVulkanDir "llama.dll") -Force
+    Write-Host "created minimal llama vulkan assets for fast local build"
   }
   if (!(Test-Path $zenzPath)) {
     $cachedZenzPath = Join-Path $cacheRoot "zenz.gguf"
@@ -476,10 +822,12 @@ $cachedMainDictDir = Join-Path $cacheRoot "server-swift\\azooKey_dictionary_stor
 # NOTE:
 # WSL(tar) -> Windows(tar -xzf) で日本語ファイル名が壊れる環境があるため、
 # 辞書は Windows 側 clone のキャッシュを優先して上書きする。
-if (!(Replace-TreeFromCache -CacheDir $cachedEmojiDictDir -DestDir $emojiDictDir -Label "emoji dictionary")) {
+$emojiDictReused = Replace-TreeFromCache -CacheDir $cachedEmojiDictDir -DestDir $emojiDictDir -Label "emoji dictionary"
+if (-not $emojiDictReused) {
   Write-Host "emoji dictionary cache not found; using extracted source files"
 }
-if (!(Replace-TreeFromCache -CacheDir $cachedMainDictDir -DestDir $mainDictDir -Label "main dictionary")) {
+$mainDictReused = Replace-TreeFromCache -CacheDir $cachedMainDictDir -DestDir $mainDictDir -Label "main dictionary"
+if (-not $mainDictReused) {
   Write-Host "main dictionary cache not found; using extracted source files"
 }
 
@@ -567,17 +915,25 @@ if (-not (Get-Command cargo-make -ErrorAction SilentlyContinue)) {
   cargo install --locked cargo-make
 }
 
-Set-Location (Join-Path $SourceDir "frontend")
-Write-Host "running npm ci"
-npm.cmd ci --prefer-offline --no-audit
+Measure-Step "prepare node_modules" {
+  Use-NodeModulesCache -FrontendDir (Join-Path $SourceDir "frontend") -CacheRoot $cacheRoot
+}
 
 Set-Location $SourceDir
-Write-Host "running cargo make build --release"
-cargo make build --release
+Measure-Step "cargo make build --release" {
+  cargo make build --release
+  if ($LASTEXITCODE -ne 0) {
+    throw "cargo make build failed with exit code $LASTEXITCODE"
+  }
+}
 
 New-Item -Path $ArtifactDir -ItemType Directory -Force | Out-Null
 Copy-Item (Join-Path $SourceDir "build\\azookey-setup.exe") -Destination (Join-Path $ArtifactDir "azookey-setup.exe") -Force
 Write-Host "build finished: $ArtifactDir\\azookey-setup.exe"
+Write-Host "[timing] summary"
+foreach ($item in $script:StepTimings) {
+  Write-Host ("[timing] {0}: {1}s" -f $item.Name, $item.Seconds)
+}
 PS1
 }
 
@@ -608,10 +964,14 @@ main() {
       if [[ "$DISCARD_SAVED_STATE_BEFORE_BUILD" == "1" ]]; then
         vbox discardstate "$VM_NAME" >/dev/null 2>&1 || true
       fi
+      ensure_vm_cache_disk
+      prune_orphan_leaf_media
     else
       log "復元対象スナップショットが見つからないためスキップします: $SNAPSHOT_NAME"
     fi
   fi
+
+  ensure_vm_cache_disk
 
   if ! is_vm_running; then
     VM_TOUCHED=1
@@ -632,7 +992,7 @@ main() {
   scp_to_vm "$TMP_REMOTE_PS" "$REMOTE_PS_SCP"
 
   log "VM 上でビルドを実行します（時間がかかる場合があります）"
-  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -SourceTarPath \"$REMOTE_TAR_WIN\" -SourceDir \"$REMOTE_SRC_WIN\" -ArtifactDir \"$REMOTE_ART_WIN\" -HostTimestampUtc \"$HOST_TIMESTAMP_UTC\""
+  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -SourceTarPath \"$REMOTE_TAR_WIN\" -SourceDir \"$REMOTE_SRC_WIN\" -ArtifactDir \"$REMOTE_ART_WIN\" -HostTimestampUtc \"$HOST_TIMESTAMP_UTC\" -CacheDriveLetter \"$VM_CACHE_DRIVE_LETTER\" -CacheVolumeLabel \"$VM_CACHE_VOLUME_LABEL\" -CacheRootOverride \"$VM_BUILD_CACHE_ROOT_WIN\" -FastInstaller \"$VM_FAST_INSTALLER\" -CacheDiskNumber \"$VM_CACHE_GUEST_DISK_NUMBER\""
 
   log "成果物を WSL 側へ回収します"
   scp_from_vm "$REMOTE_ART_SCP" "$LOCAL_ARTIFACT"
@@ -648,6 +1008,11 @@ main() {
     if snapshot_exists; then
       log "ビルド後にクリーン状態へ戻すため復元します: $SNAPSHOT_NAME"
       vbox snapshot "$VM_NAME" restore "$SNAPSHOT_NAME" >/dev/null
+      if [[ "$DISCARD_SAVED_STATE_BEFORE_BUILD" == "1" ]]; then
+        vbox discardstate "$VM_NAME" >/dev/null 2>&1 || true
+      fi
+      ensure_vm_cache_disk
+      prune_orphan_leaf_media
       FINAL_RESTORE_DONE=1
     else
       log "復元対象スナップショットが見つからないためスキップします: $SNAPSHOT_NAME"

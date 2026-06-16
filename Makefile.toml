@@ -17,7 +17,7 @@ cp .build/release/azookey-server.lib ../
 
 [tasks.build_x64]
 command = "cargo"
-args = ["build", "${@}"]
+args = ["build", "--workspace", "--exclude", "frontend", "${@}"]
 
 [tasks.build_x86]
 command = "cargo"
@@ -37,8 +37,20 @@ command = "node"
 args = ["scripts/sync-version.mjs"]
 
 [tasks.build_installer]
-command = "iscc"
-args = ["./installer/Installer.iss"]
+script_runner = "powershell"
+script_extension = "ps1"
+script = """
+$isccArgs = @()
+if ($env:AZOOKEY_FAST_INSTALLER -eq "1") {
+    $isccArgs += "/DLocalFastInstaller=1"
+}
+$isccArgs += "./installer/Installer.iss"
+
+& iscc @isccArgs
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+"""
 
 [tasks.post_build]
 description = "Copy necessary files"
@@ -52,17 +64,21 @@ if ([string]::IsNullOrEmpty($str)) {
     $str=$str.Substring(2)
 }
 
+$targetRoot = $env:CARGO_TARGET_DIR
+if ([string]::IsNullOrEmpty($targetRoot)) {
+    $targetRoot = "target"
+}
 
 mkdir build/x86 -Force
 
-cp target/$str/ui.exe build
-cp target/$str/azookey-server.exe build
-cp target/$str/azookey_windows.dll build
-cp target/$str/launcher.exe build
-cp target/$str/frontend.exe build
+cp (Join-Path $targetRoot "$str/ui.exe") build
+cp (Join-Path $targetRoot "$str/azookey-server.exe") build
+cp (Join-Path $targetRoot "$str/azookey_windows.dll") build
+cp (Join-Path $targetRoot "$str/launcher.exe") build
+cp (Join-Path $targetRoot "$str/frontend.exe") build
 
 
-cp target/i686-pc-windows-msvc/$str/azookey_windows.dll build/x86
+cp (Join-Path $targetRoot "i686-pc-windows-msvc/$str/azookey_windows.dll") build/x86
 
 cp server-swift/.build/x86_64-unknown-windows-msvc/release/azookey-server.dll build
 
