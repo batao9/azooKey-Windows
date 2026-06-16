@@ -34,12 +34,7 @@ DisableProgramGroupPage=yes
 ;PrivilegesRequired=lowest
 OutputDir=../build
 OutputBaseFilename=azookey-setup
-#ifdef LocalFastInstaller
-Compression=zip
-SolidCompression=no
-#else
 SolidCompression=yes
-#endif
 WizardStyle=modern
 PrivilegesRequired=admin
 CloseApplications=yes

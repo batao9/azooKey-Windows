@@ -17,11 +17,6 @@ SSH_TEST_TIMEOUT_SEC="${SSH_TEST_TIMEOUT_SEC:-7200}"
 SCP_COMMAND_TIMEOUT_SEC="${SCP_COMMAND_TIMEOUT_SEC:-300}"
 VBOX_MANAGE="${VBOX_MANAGE:-}"
 STAGING_VM_NAME="${STAGING_VM_NAME:-}"
-VM_CACHE_DISK_PATH="${VM_CACHE_DISK_PATH:-}"
-VM_CACHE_DISK_REQUIRED="${VM_CACHE_DISK_REQUIRED:-0}"
-VM_CACHE_DISK_SIZE_MB="${VM_CACHE_DISK_SIZE_MB:-65536}"
-VM_CACHE_STORAGE_CONTROLLER="${VM_CACHE_STORAGE_CONTROLLER:-SATA}"
-VM_CACHE_DISK_PORT="${VM_CACHE_DISK_PORT:-2}"
 
 if [[ -z "$VBOX_MANAGE" ]]; then
   if command -v VBoxManage >/dev/null 2>&1; then
@@ -72,7 +67,7 @@ REMOTE_TMP_WIN="C:\\Users\\$SSH_USER\\AppData\\Local\\Temp"
 REMOTE_TAR_WIN="$REMOTE_TMP_WIN\\azookey-src.tar.gz"
 REMOTE_PS_WIN="$REMOTE_TMP_WIN\\azookey-vm-client-test.ps1"
 REMOTE_SWIFT_VENDOR_TAR_WIN="$REMOTE_TMP_WIN\\azookey-swift-vendor.tar.gz"
-REMOTE_SRC_WIN="${REMOTE_SRC_WIN:-C:\\w\\azt}"
+REMOTE_SRC_WIN="C:\\w\\azt-$TIMESTAMP"
 
 REMOTE_TAR_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-src.tar.gz"
 REMOTE_PS_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-vm-client-test.ps1"
@@ -128,17 +123,17 @@ vbox() {
 
 matches_fixed() {
   if command -v rg >/dev/null 2>&1; then
-    rg -F "$1" >/dev/null
+    rg -F "$1" -q
   else
-    grep -F "$1" >/dev/null
+    grep -F "$1" -q
   fi
 }
 
 matches_regex() {
   if command -v rg >/dev/null 2>&1; then
-    rg "$1" >/dev/null
+    rg -q "$1"
   else
-    grep -- "$1" >/dev/null
+    grep -q -- "$1"
   fi
 }
 
@@ -155,173 +150,14 @@ snapshot_exists() {
   vbox snapshot "$VM_NAME" list --machinereadable | matches_fixed "=\"$SNAPSHOT_NAME\""
 }
 
-host_path_for_vbox() {
-  local path="$1"
-  if [[ "$path" == /* ]] && command -v wslpath >/dev/null 2>&1; then
-    wslpath -w "$path"
-  else
-    printf '%s\n' "$path"
-  fi
-}
-
-machine_cfg_file() {
-  vbox showvminfo "$VM_NAME" --machinereadable |
-    awk -F= '$1 == "CfgFile" { value=$2 } END { gsub(/"/, "", value); print value }'
-}
-
-machine_snapshot_dir() {
-  vbox showvminfo "$VM_NAME" --machinereadable |
-    awk -F= '$1 == "SnapFldr" { value=$2 } END { gsub(/"/, "", value); print value }'
-}
-
-ensure_vm_cache_disk() {
-  if [[ -z "$VM_CACHE_DISK_PATH" ]]; then
-    return 0
-  fi
-
-  if [[ "$VM_CACHE_DISK_PATH" == /* ]]; then
-    mkdir -p "$(dirname "$VM_CACHE_DISK_PATH")"
-  fi
-
-  local cache_disk
-  cache_disk="$(host_path_for_vbox "$VM_CACHE_DISK_PATH")"
-  cache_disk="${cache_disk//$'\r'/}"
-
-  local info vm_state current_key current_medium cache_disk_cmp current_medium_cmp required_port_count current_port_count
-  info="$(vbox showvminfo "$VM_NAME" --machinereadable)"
-  vm_state="$(printf '%s\n' "$info" | awk -F= '$1 == "VMState" { gsub(/"/, "", $2); print $2 }')"
-  vm_state="${vm_state//$'\r'/}"
-  current_key="\"${VM_CACHE_STORAGE_CONTROLLER}-${VM_CACHE_DISK_PORT}-0\""
-  current_medium="$(printf '%s\n' "$info" |
-    awk -F= -v key="$current_key" '$1 == key { gsub(/^"/, "", $2); gsub(/"$/, "", $2); print $2; exit }')"
-  current_medium="${current_medium//$'\r'/}"
-  current_medium="${current_medium//\"/}"
-  current_medium="${current_medium//\\\\/\\}"
-  cache_disk_cmp="$(printf '%s' "$cache_disk" | tr '[:upper:]' '[:lower:]')"
-  current_medium_cmp="$(printf '%s' "$current_medium" | tr '[:upper:]' '[:lower:]')"
-
-  if [[ "$current_medium_cmp" == "$cache_disk_cmp" ]]; then
-    return 0
-  fi
-
-  if [[ "$vm_state" == "saved" ]]; then
-    log "保存状態の VM には cache disk を後付けできないため、この実行では cache disk をスキップします: $cache_disk"
-    if [[ "$VM_CACHE_DISK_REQUIRED" == "1" ]]; then
-      exit 1
-    fi
-    return 0
-  fi
-
-  if ! vbox showmediuminfo disk "$cache_disk" >/dev/null 2>&1; then
-    if [[ "$VM_CACHE_DISK_PATH" == /* && -f "$VM_CACHE_DISK_PATH" ]]; then
-      log "既存の cache disk を登録します: $cache_disk"
-      vbox openmedium disk "$cache_disk" >/dev/null
-    else
-      log "cache disk を作成します: $cache_disk (${VM_CACHE_DISK_SIZE_MB}MB)"
-      vbox createmedium disk --filename "$cache_disk" --size "$VM_CACHE_DISK_SIZE_MB" --format VDI >/dev/null
-    fi
-    vbox modifymedium disk "$cache_disk" --type writethrough >/dev/null
-  fi
-
-  if [[ -n "$current_medium" && "$current_medium" != "none" ]]; then
-    log "cache disk 用 port が使用中です: ${VM_CACHE_STORAGE_CONTROLLER}-${VM_CACHE_DISK_PORT}-0 -> $current_medium"
-    exit 1
-  fi
-
-  required_port_count=$((VM_CACHE_DISK_PORT + 1))
-  current_port_count="$(printf '%s\n' "$info" |
-    awk -F= -v controller="$VM_CACHE_STORAGE_CONTROLLER" '
-      {
-        key=$1; value=$2;
-        gsub(/^"/, "", value); gsub(/"$/, "", value);
-        if (key ~ /^storagecontrollername[0-9]+$/ && value == controller) {
-          idx=key; sub(/^storagecontrollername/, "", idx); controller_idx=idx;
-        }
-        if (key ~ /^storagecontrollerportcount[0-9]+$/) {
-          idx=key; sub(/^storagecontrollerportcount/, "", idx); port_count[idx]=value;
-        }
-      }
-      END {
-        if (controller_idx != "") print port_count[controller_idx];
-      }')"
-  current_port_count="${current_port_count//$'\r'/}"
-  if [[ ! "$current_port_count" =~ ^[0-9]+$ ]]; then
-    log "storage controller の port count が取得できません: $VM_CACHE_STORAGE_CONTROLLER"
-    exit 1
-  fi
-  if (( current_port_count < required_port_count )); then
-    vbox storagectl "$VM_NAME" --name "$VM_CACHE_STORAGE_CONTROLLER" --portcount "$required_port_count" >/dev/null
-  fi
-  log "cache disk を VM に接続します: $cache_disk"
-  vbox storageattach "$VM_NAME" \
-    --storagectl "$VM_CACHE_STORAGE_CONTROLLER" \
-    --port "$VM_CACHE_DISK_PORT" \
-    --device 0 \
-    --type hdd \
-    --medium "$cache_disk" >/dev/null
-}
-
-prune_orphan_leaf_media() {
+prune_orphan_media_after_restore() {
   if [[ "$PRUNE_ORPHAN_MEDIA_AFTER_RESTORE" != "1" ]]; then
     return 0
   fi
 
-  local cfg_file vm_dir snapshot_dir
-  cfg_file="$(machine_cfg_file)"
-  cfg_file="${cfg_file//\\\\/\\}"
-  if [[ -z "$cfg_file" ]]; then
-    log "VM 設定ファイルが取得できないため orphan media prune をスキップします"
-    return 0
+  if ! "$REPO_ROOT/scripts/vm_prune_orphan_media.sh" "$VM_NAME"; then
+    log "orphan media prune に失敗しました。処理を続行します"
   fi
-  vm_dir="${cfg_file%\\*}"
-  snapshot_dir="$(machine_snapshot_dir)"
-  snapshot_dir="${snapshot_dir//\\\\/\\}"
-  if [[ -z "$snapshot_dir" ]]; then
-    snapshot_dir="$vm_dir\\Snapshots"
-  fi
-
-  local candidates=()
-  mapfile -t candidates < <(
-    vbox list hdds --long | tr -d '\r' |
-      SNAPSHOT_DIR="$snapshot_dir" awk '
-        BEGIN {
-          RS="\n\n"; FS="\n";
-          snapshot_dir = ENVIRON["SNAPSHOT_DIR"];
-          gsub(/\\/, "/", snapshot_dir);
-          gsub(/\/+$/, "", snapshot_dir);
-          snapshot_dir = tolower(snapshot_dir "/");
-        }
-        {
-          uuid=""; loc=""; size=""; use="no"; child="no";
-          for (i=1; i<=NF; i++) {
-            line=$i;
-            if (line ~ /^UUID:/) { sub(/^UUID:[[:space:]]*/, "", line); uuid=line }
-            if (line ~ /^Location:/) { sub(/^Location:[[:space:]]*/, "", line); loc=line }
-            if (line ~ /^Size on disk:/) { sub(/^Size on disk:[[:space:]]*/, "", line); size=line }
-            if (line ~ /^In use by VMs:/) { use="yes" }
-            if (line ~ /^Child UUIDs:/) { child="yes" }
-          }
-          loc_norm = loc;
-          gsub(/\\/, "/", loc_norm);
-          loc_norm_lc = tolower(loc_norm);
-          in_scope = (index(loc_norm_lc, snapshot_dir) == 1);
-          if (uuid != "" && use == "no" && child == "no" && in_scope && loc_norm ~ /\.vdi$/) {
-            print uuid "\t" size "\t" loc
-          }
-        }'
-  )
-
-  if (( ${#candidates[@]} == 0 )); then
-    log "未接続 leaf VDI はありません"
-    return 0
-  fi
-
-  local entry uuid size loc
-  for entry in "${candidates[@]}"; do
-    IFS=$'\t' read -r uuid size loc <<<"$entry"
-    log "未接続 leaf VDI を削除します: $uuid ($size) $loc"
-    vbox closemedium disk "$uuid" --delete </dev/null
-  done
 }
 
 ssh_run() {
@@ -441,8 +277,7 @@ cleanup() {
       if [[ "$DISCARD_SAVED_STATE_BEFORE_TEST" == "1" ]]; then
         vbox discardstate "$VM_NAME" >/dev/null 2>&1 || true
       fi
-      ensure_vm_cache_disk || true
-      prune_orphan_leaf_media || true
+      prune_orphan_media_after_restore
       FINAL_RESTORE_DONE=1
     fi
   fi
@@ -981,12 +816,9 @@ main() {
       if [[ "$DISCARD_SAVED_STATE_BEFORE_TEST" == "1" ]]; then
         vbox discardstate "$VM_NAME" >/dev/null 2>&1 || true
       fi
-      ensure_vm_cache_disk
-      prune_orphan_leaf_media
+      prune_orphan_media_after_restore
     fi
   fi
-
-  ensure_vm_cache_disk
 
   if ! is_vm_running; then
     VM_TOUCHED=1
@@ -1031,8 +863,7 @@ main() {
       if [[ "$DISCARD_SAVED_STATE_BEFORE_TEST" == "1" ]]; then
         vbox discardstate "$VM_NAME" >/dev/null 2>&1 || true
       fi
-      ensure_vm_cache_disk
-      prune_orphan_leaf_media
+      prune_orphan_media_after_restore
       FINAL_RESTORE_DONE=1
     fi
   fi

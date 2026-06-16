@@ -336,27 +336,50 @@ fn eisu_shortcut_matches_ms_ime_capslock_rules_by_keyboard_layout() {
 }
 
 #[test]
-fn keyboard_layout_hardware_registry_maps_japanese_default_and_english_override() {
+fn keyboard_layout_uses_current_keyboard_type_before_legacy_registry_override() {
     assert_eq!(
-        TextServiceFactory::caps_lock_keyboard_layout_from_hardware_registry(None, None),
+        TextServiceFactory::caps_lock_keyboard_layout_from_sources(
+            Some(4),
+            Some("kbd106.dll"),
+            Some("PCAT_106KEY")
+        ),
+        CapsLockKeyboardLayout::English
+    );
+    assert_eq!(
+        TextServiceFactory::caps_lock_keyboard_layout_from_sources(
+            Some(7),
+            Some("kbd101.dll"),
+            Some("PCAT_101KEY")
+        ),
+        CapsLockKeyboardLayout::Japanese
+    );
+}
+
+#[test]
+fn keyboard_layout_falls_back_to_hardware_registry_for_unknown_keyboard_type() {
+    assert_eq!(
+        TextServiceFactory::caps_lock_keyboard_layout_from_sources(None, None, None),
         CapsLockKeyboardLayout::Japanese
     );
     assert_eq!(
-        TextServiceFactory::caps_lock_keyboard_layout_from_hardware_registry(
+        TextServiceFactory::caps_lock_keyboard_layout_from_sources(
+            Some(0x51),
             Some("kbd106.dll"),
             Some("PCAT_106KEY")
         ),
         CapsLockKeyboardLayout::Japanese
     );
     assert_eq!(
-        TextServiceFactory::caps_lock_keyboard_layout_from_hardware_registry(
+        TextServiceFactory::caps_lock_keyboard_layout_from_sources(
+            Some(0x51),
             Some("kbd101.dll"),
             Some("PCAT_101KEY")
         ),
         CapsLockKeyboardLayout::English
     );
     assert_eq!(
-        TextServiceFactory::caps_lock_keyboard_layout_from_hardware_registry(
+        TextServiceFactory::caps_lock_keyboard_layout_from_sources(
+            Some(0x51),
             None,
             Some("PCAT_101KEY")
         ),
