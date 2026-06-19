@@ -18,6 +18,7 @@ const INSTALLER_ASSET_NAME: &str = "azookey-setup.exe";
 const SHA256SUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
 const UPDATE_RESULT_FILENAME: &str = "update-result.json";
 const APP_VERSION_JSON: &str = include_str!("../../../app-version.json");
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 
 #[derive(Debug, Deserialize)]
 struct AppVersionConfig {
@@ -140,11 +141,34 @@ pub fn take_update_install_result() -> Result<Option<UpdateInstallResult>> {
 
     let data = fs::read_to_string(&path)
         .with_context(|| format!("failed to read update result: {}", path.display()))?;
-    let result = serde_json::from_str(&data)
+    let mut result: UpdateInstallResult = serde_json::from_str(&data)
         .with_context(|| format!("failed to parse update result: {}", path.display()))?;
+    normalize_update_install_result(&mut result);
     fs::remove_file(&path)
         .with_context(|| format!("failed to remove update result: {}", path.display()))?;
     Ok(Some(result))
+}
+
+fn normalize_update_install_result(result: &mut UpdateInstallResult) {
+    if result.exit_code == Some(3010) {
+        result.status = "success".to_string();
+        result.needs_restart = true;
+    }
+
+    if result.status == "success" {
+        result.message = if result.needs_restart {
+            "更新が完了しました。Windows の再起動が必要です。".to_string()
+        } else {
+            "更新が完了しました。".to_string()
+        };
+        return;
+    }
+
+    if result.status == "failed" {
+        if let Some(exit_code) = result.exit_code {
+            result.message = format!("更新に失敗しました。終了コード: {exit_code}");
+        }
+    }
 }
 
 async fn fetch_latest_release() -> Result<GithubRelease> {
@@ -399,27 +423,24 @@ fn launch_installer_helper(
 }
 
 fn write_installer_helper_script(script_path: &Path) -> Result<()> {
-    let mut file = fs::File::create(script_path)
-        .with_context(|| format!("failed to create updater helper: {}", script_path.display()))?;
-    file.write_all(INSTALLER_HELPER_PS1.as_bytes())
-        .with_context(|| format!("failed to write updater helper: {}", script_path.display()))?;
-    Ok(())
+    write_powershell_script(script_path, INSTALLER_HELPER_PS1, "updater helper")
 }
 
 fn write_installer_launcher_script(script_path: &Path) -> Result<()> {
-    let mut file = fs::File::create(script_path).with_context(|| {
-        format!(
-            "failed to create updater helper launcher: {}",
-            script_path.display()
-        )
-    })?;
-    file.write_all(INSTALLER_LAUNCHER_PS1.as_bytes())
-        .with_context(|| {
-            format!(
-                "failed to write updater helper launcher: {}",
-                script_path.display()
-            )
-        })?;
+    write_powershell_script(
+        script_path,
+        INSTALLER_LAUNCHER_PS1,
+        "updater helper launcher",
+    )
+}
+
+fn write_powershell_script(script_path: &Path, contents: &str, label: &str) -> Result<()> {
+    let mut file = fs::File::create(script_path)
+        .with_context(|| format!("failed to create {label}: {}", script_path.display()))?;
+    file.write_all(UTF8_BOM)
+        .with_context(|| format!("failed to write {label}: {}", script_path.display()))?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("failed to write {label}: {}", script_path.display()))?;
     Ok(())
 }
 
@@ -750,6 +771,21 @@ mod tests {
     }
 
     #[test]
+    fn helper_scripts_are_written_with_utf8_bom() {
+        let temp = tempfile::tempdir().unwrap();
+        let helper = temp.path().join("azookey-update-helper.ps1");
+        let launcher = temp.path().join("azookey-update-launcher.ps1");
+
+        write_installer_helper_script(&helper).unwrap();
+        write_installer_launcher_script(&launcher).unwrap();
+
+        for path in [helper, launcher] {
+            let data = fs::read(path).unwrap();
+            assert!(data.starts_with(UTF8_BOM));
+        }
+    }
+
+    #[test]
     fn env_overrides_are_used() {
         let _env = EnvGuard::new();
         unsafe {
@@ -787,7 +823,74 @@ mod tests {
 
         assert_eq!(result.exit_code, Some(3010));
         assert!(result.needs_restart);
+        assert_eq!(
+            result.message,
+            "更新が完了しました。Windows の再起動が必要です。"
+        );
         assert!(take_update_install_result().unwrap().is_none());
+    }
+
+    #[test]
+    fn update_result_recovers_legacy_failed_restart_exit_code() {
+        let _env = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        unsafe {
+            env::set_var("APPDATA", temp.path());
+        }
+        let path = update_result_path().unwrap();
+        fs::write(
+            &path,
+            r#"{
+  "status": "failed",
+  "exit_code": 3010,
+  "needs_restart": false,
+  "message": "譖ｴ譁ｰ縺ｫ螟ｱ謨励＠縺ｾ縺励◆縲らｵゆｺ�繧ｳ繝ｼ繝�: 3010",
+  "completed_at": "2026-05-27T00:00:00Z",
+  "installer_path": "installer.exe",
+  "install_log_path": "install.log"
+}"#,
+        )
+        .unwrap();
+
+        let result = take_update_install_result().unwrap().unwrap();
+
+        assert_eq!(result.status, "success");
+        assert_eq!(result.exit_code, Some(3010));
+        assert!(result.needs_restart);
+        assert_eq!(
+            result.message,
+            "更新が完了しました。Windows の再起動が必要です。"
+        );
+    }
+
+    #[test]
+    fn update_result_replaces_failed_exit_code_message() {
+        let _env = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        unsafe {
+            env::set_var("APPDATA", temp.path());
+        }
+        let path = update_result_path().unwrap();
+        fs::write(
+            &path,
+            r#"{
+  "status": "failed",
+  "exit_code": 42,
+  "needs_restart": false,
+  "message": "譖ｴ譁ｰ縺ｫ螟ｱ謨励＠縺ｾ縺励◆縲らｵゆｺ�繧ｳ繝ｼ繝�: 42",
+  "completed_at": "2026-05-27T00:00:00Z",
+  "installer_path": "installer.exe",
+  "install_log_path": "install.log"
+}"#,
+        )
+        .unwrap();
+
+        let result = take_update_install_result().unwrap().unwrap();
+
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.exit_code, Some(42));
+        assert!(!result.needs_restart);
+        assert_eq!(result.message, "更新に失敗しました。終了コード: 42");
     }
 
     #[test]
