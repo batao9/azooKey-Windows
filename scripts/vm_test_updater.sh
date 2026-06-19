@@ -282,12 +282,15 @@ function Start-LocalPseudoRelease {
 
   $job = Start-Job -ArgumentList $pseudoDir, $Port -ScriptBlock {
     param([string]$Root, [int]$ListenPort)
+    $maxRequests = 4
+    $servedRequests = 0
     $listener = [System.Net.HttpListener]::new()
     $listener.Prefixes.Add("http://127.0.0.1:$ListenPort/")
     $listener.Start()
     try {
-      while ($true) {
+      while ($servedRequests -lt $maxRequests) {
         $context = $listener.GetContext()
+        $servedRequests++
         $name = [System.IO.Path]::GetFileName($context.Request.Url.AbsolutePath)
         if ([string]::IsNullOrWhiteSpace($name)) {
           $name = "latest.json"
@@ -308,7 +311,24 @@ function Start-LocalPseudoRelease {
     }
   }
 
-  Start-Sleep -Seconds 2
+  $readyUrl = "$baseUrl/latest.json"
+  for ($i = 1; $i -le 30; $i++) {
+    if ($job.State -ne "Running") {
+      $jobOutput = Receive-Job -Job $job -Keep -ErrorAction Continue | Out-String
+      throw "pseudo release server stopped before becoming ready: state=$($job.State) output=$jobOutput"
+    }
+
+    & curl.exe -fsSL -H "User-Agent: azookey-updater-smoke" -o NUL $readyUrl
+    if ($LASTEXITCODE -eq 0) {
+      break
+    }
+
+    if ($i -eq 30) {
+      throw "pseudo release server did not become ready: $readyUrl"
+    }
+    Start-Sleep -Seconds 1
+  }
+
   [PSCustomObject]@{
     Job = $job
     ApiUrl = "$baseUrl/latest.json"
@@ -320,7 +340,6 @@ $pseudo = Start-LocalPseudoRelease -InstallerPath $LocalInstallerPath -Port $Pse
 try {
   Test-ReleaseDownload -ReleaseApiUrl $pseudo.ApiUrl -Prefix "pseudo" -RunInstaller
 } finally {
-  Stop-Job -Job $pseudo.Job -ErrorAction SilentlyContinue
   Remove-Job -Job $pseudo.Job -Force -ErrorAction SilentlyContinue
 }
 PS1
