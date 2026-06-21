@@ -19,6 +19,9 @@ fn get_config_root() -> Result<PathBuf, ConfigError> {
 
 const SETTINGS_FILENAME: &str = "settings.json";
 const CONFIG_VERSION: &str = "0.1.2";
+pub const LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MIN: i32 = -12;
+pub const LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MAX: i32 = 12;
+pub const LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_DEFAULT: i32 = 4;
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -348,6 +351,10 @@ pub struct GeneralConfig {
     pub punctuation_commit_question: bool,
     #[serde(default)]
     pub show_candidate_window_after_space: bool,
+    #[serde(default = "default_live_conversion_reading_enabled")]
+    pub show_live_conversion_reading: bool,
+    #[serde(default = "default_live_conversion_reading_vertical_adjustment")]
+    pub live_conversion_reading_vertical_adjustment: i32,
 }
 
 impl Default for GeneralConfig {
@@ -362,6 +369,9 @@ impl Default for GeneralConfig {
             punctuation_commit_exclamation: true,
             punctuation_commit_question: true,
             show_candidate_window_after_space: false,
+            show_live_conversion_reading: true,
+            live_conversion_reading_vertical_adjustment:
+                LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_DEFAULT,
         }
     }
 }
@@ -501,6 +511,30 @@ mod tests {
 
         let deserialized: GeneralConfig = serde_json::from_str("{}").unwrap();
         assert!(!deserialized.show_candidate_window_after_space);
+    }
+
+    #[test]
+    fn live_conversion_reading_defaults_to_on() {
+        let default_config = GeneralConfig::default();
+        assert!(default_config.show_live_conversion_reading);
+
+        let deserialized: GeneralConfig = serde_json::from_str("{}").unwrap();
+        assert!(deserialized.show_live_conversion_reading);
+    }
+
+    #[test]
+    fn live_conversion_reading_vertical_adjustment_defaults_to_slightly_higher_position() {
+        let default_config = GeneralConfig::default();
+        assert_eq!(
+            default_config.live_conversion_reading_vertical_adjustment,
+            LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_DEFAULT
+        );
+
+        let deserialized: GeneralConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            deserialized.live_conversion_reading_vertical_adjustment,
+            LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_DEFAULT
+        );
     }
 
     #[test]
@@ -860,6 +894,14 @@ fn default_server_crash_trace_enabled() -> bool {
 
 fn default_punctuation_commit_target_enabled() -> bool {
     true
+}
+
+fn default_live_conversion_reading_enabled() -> bool {
+    true
+}
+
+fn default_live_conversion_reading_vertical_adjustment() -> i32 {
+    LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_DEFAULT
 }
 
 impl Default for ShortcutConfig {

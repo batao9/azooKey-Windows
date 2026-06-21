@@ -198,6 +198,104 @@ fn delayed_candidate_window_shows_when_space_opens_preview() {
 }
 
 #[test]
+fn delete_uses_remove_text_path_while_composing() {
+    let composition = Composition {
+        state: CompositionState::Composing,
+        raw_input: "ab".to_string(),
+        ..Composition::default()
+    };
+
+    let (next_state, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Delete,
+        &InputMode::Kana,
+        false,
+        &AppConfig::default(),
+        false,
+    )
+    .expect("delete should remove composing text");
+
+    assert_eq!(next_state, CompositionState::Composing);
+    assert_eq!(actions, vec![ClientAction::RemoveText]);
+}
+
+#[test]
+fn delete_ends_composition_after_last_character() {
+    let composition = Composition {
+        state: CompositionState::Previewing,
+        raw_input: "a".to_string(),
+        ..Composition::default()
+    };
+
+    let (next_state, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Delete,
+        &InputMode::Kana,
+        false,
+        &AppConfig::default(),
+        false,
+    )
+    .expect("delete should clear the final composing character");
+
+    assert_eq!(next_state, CompositionState::None);
+    assert_eq!(
+        actions,
+        vec![ClientAction::RemoveText, ClientAction::EndComposition]
+    );
+}
+
+#[test]
+fn live_conversion_reading_respects_setting_and_composition_state() {
+    let mut app_config = AppConfig::default();
+    let candidates = candidates(&["今位置"], &[""], "こんにちは", &[5]);
+
+    assert_eq!(
+        TextServiceFactory::live_conversion_reading(
+            &app_config,
+            &candidates,
+            &CompositionState::Composing,
+        ),
+        Some("こんにちは")
+    );
+
+    app_config.general.show_live_conversion_reading = false;
+    assert_eq!(
+        TextServiceFactory::live_conversion_reading(
+            &app_config,
+            &candidates,
+            &CompositionState::Composing,
+        ),
+        None
+    );
+    assert_eq!(
+        TextServiceFactory::live_conversion_reading_update(
+            &app_config,
+            &candidates,
+            &CompositionState::Composing,
+        ),
+        Some("")
+    );
+
+    app_config.general.show_live_conversion_reading = true;
+    assert_eq!(
+        TextServiceFactory::live_conversion_reading(
+            &app_config,
+            &candidates,
+            &CompositionState::None,
+        ),
+        None
+    );
+    assert_eq!(
+        TextServiceFactory::live_conversion_reading(
+            &app_config,
+            &Candidates::default(),
+            &CompositionState::Composing,
+        ),
+        None
+    );
+}
+
+#[test]
 fn ctrl_conversion_shortcuts_are_handled_as_function_keys() {
     let cases = [
         (0x55, Function::Six, SetTextType::Hiragana),

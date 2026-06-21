@@ -69,6 +69,10 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                         display: flex;
                         flex-direction: column;
                     }
+                    main[data-candidate-list-hidden] ol,
+                    main[data-candidate-list-hidden] footer {
+                        display: none;
+                    }
                     ol {
                         margin: 0;
                         padding: 0;
@@ -155,6 +159,19 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                     }
                 </style>
                 <script>
+                    let adjustWindowSizeFrame = null;
+
+                    function scheduleAdjustWindowSize() {
+                        if (adjustWindowSizeFrame !== null) {
+                            return;
+                        }
+
+                        adjustWindowSizeFrame = window.requestAnimationFrame(() => {
+                            adjustWindowSizeFrame = null;
+                            adjustWindowSize();
+                        });
+                    }
+
                     function updateCandidates(candidates) {
                         const candidateList = document.getElementById('candidate-list');
                         if (!candidateList || !Array.isArray(candidates)) {
@@ -176,6 +193,23 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                         while (existingItems.length > candidates.length) {
                             candidateList.removeChild(existingItems.pop());
                         }
+
+                        scheduleAdjustWindowSize();
+                    }
+
+                    function setCandidateListVisible(visible) {
+                        const main = document.querySelector('main');
+                        if (!main) {
+                            return;
+                        }
+
+                        if (visible) {
+                            main.removeAttribute('data-candidate-list-hidden');
+                        } else {
+                            main.setAttribute('data-candidate-list-hidden', '');
+                        }
+
+                        scheduleAdjustWindowSize();
                     }
 
                     function updateSelection(index) {
@@ -224,40 +258,38 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                         );
                     }
 
+                    function measureListItemHeight(candidateList) {
+                        if (candidateList.children.length > 0) {
+                            return candidateList.children[0].offsetHeight;
+                        }
+
+                        const li = document.createElement('li');
+                        li.textContent = 'Item';
+                        li.style.visibility = 'hidden';
+                        candidateList.appendChild(li);
+                        const itemHeight = li.offsetHeight;
+                        candidateList.removeChild(li);
+                        return itemHeight;
+                    }
+
                     function adjustWindowSize() {
                         const candidateList = document.getElementById('candidate-list');
-                        
-                        // Clear any existing items
-                        candidateList.innerHTML = '';
-                        
-                        // Add 5 test items to measure
-                        for (let i = 0; i < 5; i++) {
-                            const li = document.createElement('li');
-                            li.textContent = `Item ${i+1}`;
-                            candidateList.appendChild(li);
-                        }
-                        
-                        // Calculate heights
                         const footer = document.querySelector('footer');
                         const main = document.querySelector('main');
                         const body = document.body;
-                        
-                        // Get the height of a single item
-                        const itemHeight = candidateList.children[0].offsetHeight;
-                        
-                        // Calculate the height needed for exactly 5 items
+                        if (!candidateList || !footer || !main) {
+                            return;
+                        }
+
+                        const candidateListVisible = !main.hasAttribute('data-candidate-list-hidden');
+                        const itemHeight = candidateListVisible ? measureListItemHeight(candidateList) : 0;
                         const candidateListHeight = itemHeight * 5;
-                        const footerHeight = footer.offsetHeight;
+                        const footerHeight = candidateListVisible ? footer.offsetHeight : 0;
                         const mainPadding = parseInt(window.getComputedStyle(main).paddingTop) + 
                                            parseInt(window.getComputedStyle(main).paddingBottom);
                         const bodyPadding = parseInt(window.getComputedStyle(body).paddingTop) + 
                                           parseInt(window.getComputedStyle(body).paddingBottom);
-                        
-                        // Calculate total window height needed
                         const totalHeight = candidateListHeight + footerHeight + mainPadding + bodyPadding;
-                        
-                        // Clear the test items
-                        candidateList.innerHTML = '';
                         
                         window.ipc.postMessage(JSON.stringify({
                             type: 'resize',

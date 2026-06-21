@@ -22,7 +22,11 @@ use super::{
 };
 #[cfg(test)]
 use shared::RomajiRule;
-use shared::{zenzai_cpu_backend_supported, AppConfig, NumpadInputMode, SpaceInputMode};
+use shared::{
+    zenzai_cpu_backend_supported, AppConfig, NumpadInputMode, SpaceInputMode,
+    LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MAX,
+    LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MIN,
+};
 use windows::core::{w, PCWSTR};
 use windows::Win32::{
     Foundation::{LPARAM, WPARAM},
@@ -1494,6 +1498,9 @@ impl TextServiceFactory {
         ipc_service: &mut IPCService,
         visible: Option<bool>,
         update_pos: bool,
+        reading: Option<&str>,
+        candidate_list_visible: Option<bool>,
+        reading_vertical_adjustment: Option<i32>,
     ) -> Result<()> {
         self.set_text(preview, suffix)?;
         self.sync_candidate_window_update(
@@ -1502,8 +1509,69 @@ impl TextServiceFactory {
             selection_index,
             visible,
             update_pos,
+            reading,
+            candidate_list_visible,
+            reading_vertical_adjustment,
         )?;
         Ok(())
+    }
+
+    #[inline]
+    fn live_conversion_reading<'a>(
+        app_config: &AppConfig,
+        candidates: &'a Candidates,
+        transition: &CompositionState,
+    ) -> Option<&'a str> {
+        if app_config.general.show_live_conversion_reading
+            && *transition != CompositionState::None
+            && !candidates.hiragana.is_empty()
+        {
+            Some(candidates.hiragana.as_str())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn live_conversion_reading_update<'a>(
+        app_config: &AppConfig,
+        candidates: &'a Candidates,
+        transition: &CompositionState,
+    ) -> Option<&'a str> {
+        Self::live_conversion_reading(app_config, candidates, transition).or(Some(""))
+    }
+
+    #[inline]
+    fn live_conversion_reading_vertical_adjustment(app_config: &AppConfig) -> i32 {
+        app_config
+            .general
+            .live_conversion_reading_vertical_adjustment
+            .clamp(
+                LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MIN,
+                LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MAX,
+            )
+    }
+
+    #[inline]
+    fn live_conversion_reading_vertical_adjustment_update(
+        app_config: &AppConfig,
+        reading: Option<&str>,
+    ) -> Option<i32> {
+        reading
+            .is_some_and(|value| !value.is_empty())
+            .then(|| Self::live_conversion_reading_vertical_adjustment(app_config))
+    }
+
+    #[inline]
+    fn live_conversion_reading_vertical_adjustment_for_update(
+        app_config: &AppConfig,
+        candidates: &Candidates,
+        transition: &CompositionState,
+    ) -> Option<i32> {
+        Self::live_conversion_reading_vertical_adjustment_update(
+            app_config,
+            Self::live_conversion_reading(app_config, candidates, transition),
+        )
     }
 
     #[inline]
@@ -1514,7 +1582,15 @@ impl TextServiceFactory {
         selection_index: i32,
         visible: Option<bool>,
         update_pos: bool,
+        reading: Option<&str>,
+        candidate_list_visible: Option<bool>,
+        reading_vertical_adjustment: Option<i32>,
     ) -> Result<()> {
+        let reading = if visible == Some(false) && reading.is_none() {
+            Some("")
+        } else {
+            reading
+        };
         let trace_request_id = current_input_trace_request_id();
         let total_start = trace_request_id.map(|_| Instant::now());
         let result: Result<()> = (|| {
@@ -1550,12 +1626,15 @@ impl TextServiceFactory {
                 }
                 None
             };
-            ipc_service.update_candidate_window(
+            ipc_service.update_candidate_window_with_reading(
                 visible,
                 position,
                 Some(candidates.texts.clone()),
                 Some(selection_index),
                 None,
+                reading,
+                candidate_list_visible,
+                reading_vertical_adjustment,
             )?;
             self.remember_candidate_window_visibility(visible);
             Ok(())
@@ -1564,12 +1643,14 @@ impl TextServiceFactory {
         if let (Some(request_id), Some(total_start)) = (trace_request_id, total_start) {
             let details = match &result {
                 Ok(()) => format!(
-                    "status=success;update_pos={update_pos};visible={visible:?};candidate_count={};selection_index={selection_index}",
-                    candidates.texts.len()
+                    "status=success;update_pos={update_pos};visible={visible:?};candidate_count={};selection_index={selection_index};reading_present={};candidate_list_visible={candidate_list_visible:?};reading_vertical_adjustment={reading_vertical_adjustment:?}",
+                    candidates.texts.len(),
+                    reading.is_some_and(|value| !value.is_empty())
                 ),
                 Err(error) => format!(
-                    "status=error;update_pos={update_pos};visible={visible:?};candidate_count={};selection_index={selection_index};error={error:?}",
-                    candidates.texts.len()
+                    "status=error;update_pos={update_pos};visible={visible:?};candidate_count={};selection_index={selection_index};reading_present={};candidate_list_visible={candidate_list_visible:?};reading_vertical_adjustment={reading_vertical_adjustment:?};error={error:?}",
+                    candidates.texts.len(),
+                    reading.is_some_and(|value| !value.is_empty())
                 ),
             };
             Self::log_client_performance(
@@ -1630,9 +1711,18 @@ impl TextServiceFactory {
         app_config: &AppConfig,
         transition: &CompositionState,
     ) -> Result<()> {
-        let visible = if !app_config.general.show_candidate_window_after_space
-            && *transition != CompositionState::None
-        {
+        let reading = Self::live_conversion_reading(app_config, candidates, transition);
+        let reading_update = reading.or(Some(""));
+        let reading_vertical_adjustment =
+            Self::live_conversion_reading_vertical_adjustment_update(app_config, reading);
+        let candidate_list_visible = if *transition != CompositionState::None {
+            Some(!app_config.general.show_candidate_window_after_space)
+        } else {
+            Some(false)
+        };
+        let visible = if *transition == CompositionState::None {
+            Some(false)
+        } else if !app_config.general.show_candidate_window_after_space || reading.is_some() {
             Some(true)
         } else {
             None
@@ -1644,6 +1734,9 @@ impl TextServiceFactory {
             selection_index,
             visible,
             update_pos,
+            reading_update,
+            candidate_list_visible,
+            reading_vertical_adjustment,
         )
     }
 
@@ -3008,7 +3101,7 @@ impl TextServiceFactory {
                     CompositionState::Composing,
                     vec![ClientAction::AppendText(value.to_string())],
                 )),
-                UserAction::Backspace => {
+                UserAction::Backspace | UserAction::Delete => {
                     if composition.raw_input.chars().count() <= 1 {
                         Some((
                             CompositionState::None,
@@ -3147,7 +3240,7 @@ impl TextServiceFactory {
                     CompositionState::Composing,
                     vec![ClientAction::ShrinkText(value.to_string())],
                 )),
-                UserAction::Backspace => {
+                UserAction::Backspace | UserAction::Delete => {
                     if composition.raw_input.chars().count() <= 1 {
                         Some((
                             CompositionState::None,
@@ -3892,12 +3985,23 @@ impl TextServiceFactory {
                     }
                     ClientAction::ShowCandidateWindow => {
                         let position = self.candidate_window_position()?;
-                        ipc_service.update_candidate_window(
+                        ipc_service.update_candidate_window_with_reading(
                             Some(true),
                             position,
                             None,
                             None,
                             None,
+                            Self::live_conversion_reading_update(
+                                app_config,
+                                &candidates,
+                                &transition,
+                            ),
+                            Some(true),
+                            Self::live_conversion_reading_vertical_adjustment_for_update(
+                                app_config,
+                                &candidates,
+                                &transition,
+                            ),
                         )?;
                         self.remember_candidate_window_visibility(Some(true));
                     }
@@ -4185,6 +4289,17 @@ impl TextServiceFactory {
                                 selection_index,
                                 None,
                                 false,
+                                Self::live_conversion_reading_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
+                                None,
+                                Self::live_conversion_reading_vertical_adjustment_for_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
                             )?;
                         } else {
                             // Server side text is fully removed. Close TSF composition too
@@ -4272,6 +4387,17 @@ impl TextServiceFactory {
                                 selection_index,
                                 None,
                                 true,
+                                Self::live_conversion_reading_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
+                                None,
+                                Self::live_conversion_reading_vertical_adjustment_for_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
                             )?;
                         } else if candidates.is_empty_composition() {
                             reset_after_empty_server_composition!(
@@ -4374,6 +4500,17 @@ impl TextServiceFactory {
                                 &mut ipc_service,
                                 ready_ui_sync.and_then(|sync| sync.visible),
                                 effect.update_pos,
+                                Self::live_conversion_reading_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
+                                ready_ui_sync.and_then(|sync| sync.visible),
+                                Self::live_conversion_reading_vertical_adjustment_for_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
                             )?;
                             Self::log_clause_action_state(
                                 "after",
@@ -4482,6 +4619,17 @@ impl TextServiceFactory {
                                 &mut ipc_service,
                                 deferred_ready_ui_sync.and_then(|sync| sync.visible),
                                 effect.update_pos,
+                                Self::live_conversion_reading_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
+                                deferred_ready_ui_sync.and_then(|sync| sync.visible),
+                                Self::live_conversion_reading_vertical_adjustment_for_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
                             )?;
                             Self::log_clause_action_state(
                                 "after",
@@ -4506,6 +4654,17 @@ impl TextServiceFactory {
                                 &mut ipc_service,
                                 sync.visible,
                                 sync.update_pos,
+                                Self::live_conversion_reading_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
+                                sync.visible,
+                                Self::live_conversion_reading_vertical_adjustment_for_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
                             )?;
                             Self::log_clause_action_state(
                                 "after-deferred",
@@ -4618,6 +4777,17 @@ impl TextServiceFactory {
                                 &mut ipc_service,
                                 None,
                                 effect.update_pos,
+                                Self::live_conversion_reading_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
+                                None,
+                                Self::live_conversion_reading_vertical_adjustment_for_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
                             )?;
                             Self::log_clause_action_state(
                                 "after",
@@ -4665,12 +4835,15 @@ impl TextServiceFactory {
                             InputMode::Kana => "あ",
                         };
 
-                        ipc_service.update_candidate_window(
+                        ipc_service.update_candidate_window_with_reading(
                             None,
                             position,
                             None,
                             None,
                             Some(mode),
+                            Some(""),
+                            Some(false),
+                            None,
                         )?;
 
                         selection_index = 0;
@@ -4742,6 +4915,17 @@ impl TextServiceFactory {
                                 &mut ipc_service,
                                 None,
                                 effect.update_pos,
+                                Self::live_conversion_reading_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
+                                None,
+                                Self::live_conversion_reading_vertical_adjustment_for_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
                             )?;
                             Self::log_clause_action_state(
                                 "after",
@@ -4869,6 +5053,17 @@ impl TextServiceFactory {
                                 selection_index,
                                 None,
                                 true,
+                                Self::live_conversion_reading_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
+                                None,
+                                Self::live_conversion_reading_vertical_adjustment_for_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
                             )?;
                             true
                         } else if candidates.is_empty_composition() {
@@ -4963,6 +5158,17 @@ impl TextServiceFactory {
                                 selection_index,
                                 None,
                                 true,
+                                Self::live_conversion_reading_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
+                                None,
+                                Self::live_conversion_reading_vertical_adjustment_for_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
                             )?;
                             true
                         } else if candidates.is_empty_composition() {
@@ -5057,6 +5263,17 @@ impl TextServiceFactory {
                                 selection_index,
                                 None,
                                 true,
+                                Self::live_conversion_reading_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
+                                None,
+                                Self::live_conversion_reading_vertical_adjustment_for_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
                             )?;
                             true
                         } else if candidates.is_empty_composition() {

@@ -41,6 +41,9 @@ message UpdateCandidateWindowRequest {
   CandidateList candidates = 3;
   optional int32 selected_index = 4;
   optional string input_mode = 5;
+  optional string reading = 6;
+  optional bool candidate_list_visible = 7;
+  optional int32 reading_vertical_adjustment = 8;
 }
 
 // 候補ウィンドウ制御に対する空のレスポンス
