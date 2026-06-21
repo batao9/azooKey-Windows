@@ -40,6 +40,9 @@ pub enum WindowAction {
         candidates: Option<Vec<String>>,
         selected_index: Option<i32>,
         input_mode: Option<String>,
+        reading: Option<String>,
+        candidate_list_visible: Option<bool>,
+        reading_vertical_adjustment: Option<i32>,
     },
 }
 
@@ -153,6 +156,9 @@ impl WindowServiceProto for WindowService {
             candidates,
             selected_index: request.selected_index,
             input_mode: request.input_mode,
+            reading: request.reading,
+            candidate_list_visible: request.candidate_list_visible,
+            reading_vertical_adjustment: request.reading_vertical_adjustment,
         })
         .await
     }
@@ -233,6 +239,9 @@ mod tests {
                 }),
                 selected_index: Some(0),
                 input_mode: Some("あ".to_string()),
+                reading: Some("こうほ".to_string()),
+                candidate_list_visible: Some(true),
+                reading_vertical_adjustment: Some(4),
             }))
             .await
             .expect("batched update should be sent");
@@ -244,6 +253,9 @@ mod tests {
                 candidates,
                 selected_index,
                 input_mode,
+                reading,
+                candidate_list_visible,
+                reading_vertical_adjustment,
             } => {
                 assert_eq!(visible, Some(true));
                 let position = position.expect("position should be included");
@@ -254,6 +266,9 @@ mod tests {
                 assert_eq!(candidates, Some(vec!["候補".to_string()]));
                 assert_eq!(selected_index, Some(0));
                 assert_eq!(input_mode, Some("あ".to_string()));
+                assert_eq!(reading, Some("こうほ".to_string()));
+                assert_eq!(candidate_list_visible, Some(true));
+                assert_eq!(reading_vertical_adjustment, Some(4));
             }
             action => panic!("unexpected action: {action:?}"),
         }

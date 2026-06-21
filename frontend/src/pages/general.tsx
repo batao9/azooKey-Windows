@@ -28,6 +28,8 @@ type GeneralConfigState = {
     punctuation_commit_exclamation: boolean;
     punctuation_commit_question: boolean;
     show_candidate_window_after_space: boolean;
+    show_live_conversion_reading: boolean;
+    live_conversion_reading_vertical_adjustment: number;
 };
 
 type CharacterWidthGroupsState = {
@@ -77,6 +79,27 @@ const DEFAULT_GENERAL_CONFIG: GeneralConfigState = {
     punctuation_commit_exclamation: true,
     punctuation_commit_question: true,
     show_candidate_window_after_space: false,
+    show_live_conversion_reading: true,
+    live_conversion_reading_vertical_adjustment: 4,
+};
+
+const LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MIN = -12;
+const LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MAX = 12;
+
+const clampLiveConversionReadingVerticalAdjustment = (value: unknown): number => {
+    const numericValue =
+        typeof value === "number"
+            ? value
+            : typeof value === "string"
+              ? Number.parseInt(value, 10)
+              : Number.NaN;
+    if (!Number.isFinite(numericValue)) {
+        return DEFAULT_GENERAL_CONFIG.live_conversion_reading_vertical_adjustment;
+    }
+    return Math.min(
+        LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MAX,
+        Math.max(LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MIN, Math.round(numericValue)),
+    );
 };
 
 const DEFAULT_WIDTH_GROUPS: CharacterWidthGroupsState = {
@@ -182,6 +205,14 @@ const normalizeGeneralConfig = (value?: Record<string, unknown>): GeneralConfigS
         typeof value?.show_candidate_window_after_space === "boolean"
             ? value.show_candidate_window_after_space
             : DEFAULT_GENERAL_CONFIG.show_candidate_window_after_space,
+    show_live_conversion_reading:
+        typeof value?.show_live_conversion_reading === "boolean"
+            ? value.show_live_conversion_reading
+            : DEFAULT_GENERAL_CONFIG.show_live_conversion_reading,
+    live_conversion_reading_vertical_adjustment:
+        clampLiveConversionReadingVerticalAdjustment(
+            value?.live_conversion_reading_vertical_adjustment,
+        ),
 });
 
 const normalizeWidthGroups = (
@@ -260,6 +291,10 @@ export const General = () => {
     const didCheckUpdatesOnStartup = useRef(false);
     const romajiEditorScrollRef = useRef<HTMLDivElement | null>(null);
     const romajiInputRefs = useRef<Array<HTMLInputElement | null>>([]);
+    const liveConversionReadingAdjustmentSaveRef = useRef<{
+        saving: boolean;
+        pendingValue: number | null;
+    }>({ saving: false, pendingValue: null });
 
     useEffect(() => {
         invoke<any>("get_config")
@@ -447,6 +482,8 @@ export const General = () => {
             | "punctuation_commit_exclamation"
             | "punctuation_commit_question"
             | "show_candidate_window_after_space"
+            | "show_live_conversion_reading"
+            | "live_conversion_reading_vertical_adjustment"
         >,
         nextValue: string,
     ) => {
@@ -466,7 +503,8 @@ export const General = () => {
             | "punctuation_commit_punctuation"
             | "punctuation_commit_exclamation"
             | "punctuation_commit_question"
-            | "show_candidate_window_after_space",
+            | "show_candidate_window_after_space"
+            | "show_live_conversion_reading",
         nextValue: boolean,
     ) => {
         const data = await updateConfig((config) => {
@@ -481,6 +519,45 @@ export const General = () => {
 
     const updateCandidateWindowDelay = async (nextValue: boolean) => {
         await updateGeneralBooleanConfig("show_candidate_window_after_space", nextValue);
+    };
+
+    const updateLiveConversionReading = async (nextValue: boolean) => {
+        await updateGeneralBooleanConfig("show_live_conversion_reading", nextValue);
+    };
+
+    const flushLiveConversionReadingVerticalAdjustmentSave = async () => {
+        const saveState = liveConversionReadingAdjustmentSaveRef.current;
+        if (saveState.saving) {
+            return;
+        }
+
+        saveState.saving = true;
+        try {
+            while (saveState.pendingValue !== null) {
+                const normalizedValue = saveState.pendingValue;
+                saveState.pendingValue = null;
+                const data = await updateConfig((config) => {
+                    config.general = config.general ?? {};
+                    config.general.live_conversion_reading_vertical_adjustment = normalizedValue;
+                });
+
+                if (data && saveState.pendingValue === null) {
+                    setGeneralValue(normalizeGeneralConfig(data.general));
+                }
+            }
+        } finally {
+            saveState.saving = false;
+        }
+
+        if (saveState.pendingValue !== null) {
+            void flushLiveConversionReadingVerticalAdjustmentSave();
+        }
+    };
+
+    const updateLiveConversionReadingVerticalAdjustment = (nextValue: number) => {
+        const normalizedValue = clampLiveConversionReadingVerticalAdjustment(nextValue);
+        liveConversionReadingAdjustmentSaveRef.current.pendingValue = normalizedValue;
+        void flushLiveConversionReadingVerticalAdjustmentSave();
     };
 
     const updateWidthGroup = async (
@@ -717,6 +794,83 @@ export const General = () => {
                                 onCheckedChange={(value) => void updateCandidateWindowDelay(value)}
                             />
                         </div>
+
+                        <div className="flex items-center gap-4">
+                            <div className="flex-1 space-y-1">
+                                <p className="text-sm font-medium leading-none">ライブ変換中の読みを表示</p>
+                                <p className="text-xs text-muted-foreground">
+                                    未確定入力の読みを小さく表示します
+                                </p>
+                            </div>
+                            <Switch
+                                checked={generalValue.show_live_conversion_reading}
+                                onCheckedChange={(value) => void updateLiveConversionReading(value)}
+                            />
+                        </div>
+
+                        {generalValue.show_live_conversion_reading ? (
+                            <div className="space-y-2 border-t pt-3">
+                                <div className="flex items-center gap-4">
+                                    <div className="flex-1 space-y-1">
+                                        <p className="text-sm font-medium leading-none">読み表示の高さ</p>
+                                        <p className="text-xs text-muted-foreground">
+                                            プラスで上、マイナスで下に移動します
+                                        </p>
+                                    </div>
+                                    <span className="w-14 text-right text-sm tabular-nums">
+                                        {generalValue.live_conversion_reading_vertical_adjustment > 0
+                                            ? "+"
+                                            : ""}
+                                        {generalValue.live_conversion_reading_vertical_adjustment}px
+                                    </span>
+                                </div>
+                                <input
+                                    type="range"
+                                    min={LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MIN}
+                                    max={LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MAX}
+                                    step={1}
+                                    value={generalValue.live_conversion_reading_vertical_adjustment}
+                                    className="w-full accent-primary"
+                                    onChange={(event) => {
+                                        const nextValue = clampLiveConversionReadingVerticalAdjustment(
+                                            event.currentTarget.value,
+                                        );
+                                        setGeneralValue((current) => ({
+                                            ...current,
+                                            live_conversion_reading_vertical_adjustment: nextValue,
+                                        }));
+                                    }}
+                                    onPointerUp={(event) => {
+                                        updateLiveConversionReadingVerticalAdjustment(
+                                            event.currentTarget.valueAsNumber,
+                                        );
+                                    }}
+                                    onKeyUp={(event) => {
+                                        if (
+                                            [
+                                                "ArrowDown",
+                                                "ArrowLeft",
+                                                "ArrowRight",
+                                                "ArrowUp",
+                                                "End",
+                                                "Home",
+                                                "PageDown",
+                                                "PageUp",
+                                            ].includes(event.key)
+                                        ) {
+                                            updateLiveConversionReadingVerticalAdjustment(
+                                                event.currentTarget.valueAsNumber,
+                                            );
+                                        }
+                                    }}
+                                    onBlur={(event) => {
+                                        updateLiveConversionReadingVerticalAdjustment(
+                                            event.currentTarget.valueAsNumber,
+                                        );
+                                    }}
+                                />
+                            </div>
+                        ) : null}
                     </div>
                 </section>
 

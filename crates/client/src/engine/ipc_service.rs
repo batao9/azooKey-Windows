@@ -1154,11 +1154,38 @@ impl IPCService {
         selected_index: Option<i32>,
         input_mode: Option<&str>,
     ) -> anyhow::Result<()> {
+        let clear_reading = visible == Some(false);
+        self.update_candidate_window_with_reading(
+            visible,
+            position,
+            candidates,
+            selected_index,
+            input_mode,
+            clear_reading.then_some(""),
+            clear_reading.then_some(false),
+            None,
+        )
+    }
+
+    #[tracing::instrument(skip(candidates))]
+    pub fn update_candidate_window_with_reading(
+        &mut self,
+        visible: Option<bool>,
+        position: Option<shared::proto::WindowPosition>,
+        candidates: Option<Vec<String>>,
+        selected_index: Option<i32>,
+        input_mode: Option<&str>,
+        reading: Option<&str>,
+        candidate_list_visible: Option<bool>,
+        reading_vertical_adjustment: Option<i32>,
+    ) -> anyhow::Result<()> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
         let position_present = performance_start.map(|_| position.is_some());
         let candidate_count = performance_start.map(|_| candidates.as_ref().map(Vec::len));
         let input_mode_present = performance_start.map(|_| input_mode.is_some());
+        let reading_present =
+            performance_start.map(|_| reading.is_some_and(|value| !value.is_empty()));
         let result: anyhow::Result<()> = (|| {
             let request = tonic::Request::new(shared::proto::UpdateCandidateWindowRequest {
                 visible,
@@ -1167,6 +1194,9 @@ impl IPCService {
                     .map(|candidates| shared::proto::CandidateList { candidates }),
                 selected_index,
                 input_mode: input_mode.map(ToString::to_string),
+                reading: reading.map(ToString::to_string),
+                candidate_list_visible,
+                reading_vertical_adjustment,
             });
             self.runtime
                 .clone()
@@ -1183,12 +1213,13 @@ impl IPCService {
                 let position_present = position_present.unwrap_or_default();
                 let candidate_count = candidate_count.unwrap_or_default();
                 let input_mode_present = input_mode_present.unwrap_or_default();
+                let reading_present = reading_present.unwrap_or_default();
                 match &result {
                     Ok(()) => format!(
-                        "status=success;visible={visible:?};position_present={position_present};candidate_count={candidate_count:?};selected_index={selected_index:?};input_mode_present={input_mode_present}"
+                        "status=success;visible={visible:?};position_present={position_present};candidate_count={candidate_count:?};selected_index={selected_index:?};input_mode_present={input_mode_present};reading_present={reading_present};candidate_list_visible={candidate_list_visible:?};reading_vertical_adjustment={reading_vertical_adjustment:?}"
                     ),
                     Err(error) => format!(
-                        "status=error;visible={visible:?};position_present={position_present};candidate_count={candidate_count:?};selected_index={selected_index:?};input_mode_present={input_mode_present};error={error:?}"
+                        "status=error;visible={visible:?};position_present={position_present};candidate_count={candidate_count:?};selected_index={selected_index:?};input_mode_present={input_mode_present};reading_present={reading_present};candidate_list_visible={candidate_list_visible:?};reading_vertical_adjustment={reading_vertical_adjustment:?};error={error:?}"
                     ),
                 }
             },
