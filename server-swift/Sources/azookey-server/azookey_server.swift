@@ -19,6 +19,10 @@ private let fallbackDictionaryURL =
     dictionaryURL: fallbackDictionaryURL,
     preloadDictionary: false
 )
+@MainActor var normalNBestSupplementConverter = KanaKanjiConverter(
+    dictionaryURL: fallbackDictionaryURL,
+    preloadDictionary: false
+)
 @MainActor var composingText = ComposingText()
 @MainActor var composingTextSnapshots: [ComposingText] = []
 @MainActor var currentInputStyle: InputStyle = .roman2kana
@@ -349,6 +353,10 @@ private func readAppSettings(at path: URL) throws -> AppSettings {
         dictionaryURL: converterDictionaryURL,
         preloadDictionary: converterPreloadDictionary
     )
+    normalNBestSupplementConverter = KanaKanjiConverter(
+        dictionaryURL: converterDictionaryURL,
+        preloadDictionary: converterPreloadDictionary
+    )
 }
 
 @MainActor private func converterRuntimeDirectoryURL() -> URL {
@@ -398,7 +406,7 @@ private func makeConvertRequestOptions(
         zenzaiMode: zenzaiEnabled ? .on(
             weight: zenzaiWeightURL,
             inferenceLimit: 1,
-            requestRichCandidates: false,
+            requestRichCandidates: true,
             personalizationMode: nil,
             versionDependentMode: .v3(
                 .init(
@@ -1441,6 +1449,65 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     return result
 }
 
+func mergeZenzaiMainResultsWithNormalNBest(
+    zenzaiResults: [Candidate],
+    normalNBestResults: [Candidate],
+    hiragana: String
+) -> [Candidate] {
+    var seenTexts = Set<String>()
+    var results: [Candidate] = []
+
+    func appendIfNeeded(_ candidate: Candidate) {
+        let text = constructCandidateString(candidate: candidate, hiragana: hiragana)
+        guard seenTexts.insert(text).inserted else {
+            return
+        }
+        results.append(candidate)
+    }
+
+    for candidate in zenzaiResults {
+        appendIfNeeded(candidate)
+    }
+    for candidate in normalNBestResults {
+        appendIfNeeded(candidate)
+    }
+
+    return results
+}
+
+func cursorPrefixBoundaryFirstClauseResults(
+    zenzaiFirstClauseResults: [Candidate],
+    mergedFirstClauseResults: [Candidate]
+) -> [Candidate] {
+    zenzaiFirstClauseResults.isEmpty ? mergedFirstClauseResults : zenzaiFirstClauseResults
+}
+
+@MainActor private func requestNormalNBestSupplementCandidates(
+    inputData: ComposingText,
+    options: ConvertRequestOptions,
+    operation: String,
+    diagnosticDetails: String
+) -> ConversionResult {
+    var normalOptions = options
+    normalOptions.zenzaiMode = .off
+
+    let requestStart = performanceNow()
+    let converted = normalNBestSupplementConverter.requestCandidates(inputData, options: normalOptions)
+    let requestMs = elapsedPerformanceMilliseconds(since: requestStart)
+    performanceLog(
+        operation: operation,
+        stage: "request_normal_nbest_supplement",
+        elapsedMs: requestMs,
+        details: "candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
+    )
+    serverLog(
+        "DEBUG",
+        "\(operation): normal N-best supplement returned candidateCount=\(converted.mainResults.count) \(diagnosticDetails)"
+    )
+
+    return converted
+}
+
 @_silgen_name("LoadConfig")
 @MainActor public func load_config() {
     let loadedSettingsPath = settingsPath()
@@ -1468,6 +1535,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     var dynamicUserDictionary: [DicdataElement] = []
     defer {
         converter.importDynamicUserDictionary(dynamicUserDictionary)
+        normalNBestSupplementConverter.importDynamicUserDictionary(dynamicUserDictionary)
     }
 
     config["enable"] = false
@@ -1558,6 +1626,7 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
             rebuildConverter()
         } else {
             converter.stopComposition()
+            normalNBestSupplementConverter.stopComposition()
         }
         composingText = ComposingText()
         composingTextSnapshots.removeAll()
@@ -1863,6 +1932,17 @@ public func free_candidate_list(
             details: diagnosticDetails
         )
     }
+    let normalNBestConverted: ConversionResult?
+    if useZenzai {
+        normalNBestConverted = requestNormalNBestSupplementCandidates(
+            inputData: previewComposingText,
+            options: options,
+            operation: "get_composed_text",
+            diagnosticDetails: diagnosticDetails
+        )
+    } else {
+        normalNBestConverted = nil
+    }
     let requestStart = performanceNow()
     let converted = converter.requestCandidates(previewComposingText, options: options)
     let requestMs = elapsedPerformanceMilliseconds(since: requestStart)
@@ -1880,12 +1960,25 @@ public func free_candidate_list(
         details: "candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
     )
     serverLog("DEBUG", "GetComposedText: requestCandidates returned candidateCount=\(converted.mainResults.count) \(diagnosticDetails)")
+    let mainResults = normalNBestConverted.map {
+        mergeZenzaiMainResultsWithNormalNBest(
+            zenzaiResults: converted.mainResults,
+            normalNBestResults: $0.mainResults,
+            hiragana: previewHiragana
+        )
+    } ?? converted.mainResults
+    if let normalNBestConverted {
+        serverLog(
+            "DEBUG",
+            "GetComposedText: merged Zenzai candidates candidateCount=\(mainResults.count) zenzaiCandidateCount=\(converted.mainResults.count) normalNBestCandidateCount=\(normalNBestConverted.mainResults.count) \(diagnosticDetails)"
+        )
+    }
     candidateCrashTrace(
         useZenzai: useZenzai,
         operation: "GetComposedText",
         stage: "postprocessCandidates",
         state: "begin",
-        details: "candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
+        details: "candidate_count=\(mainResults.count);zenzai_candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
     )
     let buildStart = performanceEnabled ? performanceNow() : 0
     var constructCandidateStringMs = 0
@@ -1893,10 +1986,10 @@ public func free_candidate_list(
     var strdupCandidatesMs = 0
     var resolutionCache: [String: CandidateDisplayResolution] = [:]
     var result: [FFICandidate] = []
-    result.reserveCapacity(converted.mainResults.count)
+    result.reserveCapacity(mainResults.count)
 
-    for i in 0..<converted.mainResults.count {
-        let candidate = converted.mainResults[i]
+    for i in 0..<mainResults.count {
+        let candidate = mainResults[i]
 
         let constructStart = performanceEnabled ? performanceNow() : 0
         let candidateText = constructCandidateString(candidate: candidate, hiragana: previewHiragana)
@@ -1935,7 +2028,7 @@ public func free_candidate_list(
             operation: "get_composed_text",
             stage: "construct_candidate_string",
             elapsedMs: constructCandidateStringMs,
-            details: "candidate_count=\(result.count);main_candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
+            details: "candidate_count=\(result.count);main_candidate_count=\(mainResults.count);zenzai_candidate_count=\(converted.mainResults.count);normal_nbest_candidate_count=\(normalNBestConverted?.mainResults.count ?? 0);\(diagnosticDetails)"
         )
         performanceLog(
             operation: "get_composed_text",
@@ -1953,7 +2046,7 @@ public func free_candidate_list(
             operation: "get_composed_text",
             stage: "build_ffi_candidates_total",
             elapsedMs: elapsedPerformanceMilliseconds(since: buildStart),
-            details: "candidate_count=\(result.count);main_candidate_count=\(converted.mainResults.count);cache_entries=\(resolutionCache.count);string_allocations=\(stringAllocationCount);\(diagnosticDetails)"
+            details: "candidate_count=\(result.count);main_candidate_count=\(mainResults.count);zenzai_candidate_count=\(converted.mainResults.count);normal_nbest_candidate_count=\(normalNBestConverted?.mainResults.count ?? 0);cache_entries=\(resolutionCache.count);string_allocations=\(stringAllocationCount);\(diagnosticDetails)"
         )
     }
     candidateCrashTrace(
@@ -1961,9 +2054,9 @@ public func free_candidate_list(
         operation: "GetComposedText",
         stage: "postprocessCandidates",
         state: "completed",
-        details: "candidate_count=\(result.count);main_candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
+        details: "candidate_count=\(result.count);main_candidate_count=\(mainResults.count);zenzai_candidate_count=\(converted.mainResults.count);normal_nbest_candidate_count=\(normalNBestConverted?.mainResults.count ?? 0);\(diagnosticDetails)"
     )
-    serverLog("DEBUG", "GetComposedText: postprocessCandidates completed candidateCount=\(result.count) mainCandidateCount=\(converted.mainResults.count) \(diagnosticDetails)")
+    serverLog("DEBUG", "GetComposedText: postprocessCandidates completed candidateCount=\(result.count) mainCandidateCount=\(mainResults.count) zenzaiCandidateCount=\(converted.mainResults.count) normalNBestCandidateCount=\(normalNBestConverted?.mainResults.count ?? 0) \(diagnosticDetails)")
     serverLog("DEBUG", "GetComposedText: completed candidateCount=\(result.count) \(diagnosticDetails)")
 
     return listPointer
@@ -2022,6 +2115,17 @@ public func free_candidate_list(
         )
     }
     let totalStart = performanceNow()
+    let normalNBestConverted: ConversionResult?
+    if useZenzai {
+        normalNBestConverted = requestNormalNBestSupplementCandidates(
+            inputData: previewPrefixComposingText,
+            options: options,
+            operation: "get_composed_text_for_cursor_prefix",
+            diagnosticDetails: "suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
+        )
+    } else {
+        normalNBestConverted = nil
+    }
     let requestStart = performanceNow()
     let converted = converter.requestCandidates(previewPrefixComposingText, options: options)
     let requestMs = elapsedPerformanceMilliseconds(since: requestStart)
@@ -2039,23 +2143,47 @@ public func free_candidate_list(
         details: "first_clause_candidate_count=\(converted.firstClauseResults.count);main_candidate_count=\(converted.mainResults.count);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
     )
     serverLog("DEBUG", "GetComposedTextForCursorPrefix: requestCandidates returned firstClauseCandidateCount=\(converted.firstClauseResults.count) mainCandidateCount=\(converted.mainResults.count) suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)")
+    let cursorPrefixMainResults = normalNBestConverted.map {
+        mergeZenzaiMainResultsWithNormalNBest(
+            zenzaiResults: converted.mainResults,
+            normalNBestResults: $0.mainResults,
+            hiragana: previewPrefixHiragana
+        )
+    } ?? converted.mainResults
+    let cursorPrefixFirstClauseResults = normalNBestConverted.map {
+        mergeZenzaiMainResultsWithNormalNBest(
+            zenzaiResults: converted.firstClauseResults,
+            normalNBestResults: $0.firstClauseResults,
+            hiragana: previewPrefixHiragana
+        )
+    } ?? converted.firstClauseResults
+    if let normalNBestConverted {
+        serverLog(
+            "DEBUG",
+            "GetComposedTextForCursorPrefix: merged Zenzai candidates firstClauseCandidateCount=\(cursorPrefixFirstClauseResults.count) mainCandidateCount=\(cursorPrefixMainResults.count) zenzaiFirstClauseCandidateCount=\(converted.firstClauseResults.count) zenzaiMainCandidateCount=\(converted.mainResults.count) normalNBestFirstClauseCandidateCount=\(normalNBestConverted.firstClauseResults.count) normalNBestMainCandidateCount=\(normalNBestConverted.mainResults.count) suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
+        )
+    }
     candidateCrashTrace(
         useZenzai: useZenzai,
         operation: "GetComposedTextForCursorPrefix",
         stage: "postprocessCandidates",
         state: "begin",
-        details: "phase=first_clause;first_clause_candidate_count=\(converted.firstClauseResults.count);main_candidate_count=\(converted.mainResults.count);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
+        details: "phase=first_clause;first_clause_candidate_count=\(cursorPrefixFirstClauseResults.count);main_candidate_count=\(cursorPrefixMainResults.count);zenzai_first_clause_candidate_count=\(converted.firstClauseResults.count);zenzai_main_candidate_count=\(converted.mainResults.count);normal_nbest_first_clause_candidate_count=\(normalNBestConverted?.firstClauseResults.count ?? 0);normal_nbest_main_candidate_count=\(normalNBestConverted?.mainResults.count ?? 0);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
     )
     var cursorPrefixResolutionCache: [String: CandidateDisplayResolution] = [:]
+    let boundaryFirstClauseResults = cursorPrefixBoundaryFirstClauseResults(
+        zenzaiFirstClauseResults: converted.firstClauseResults,
+        mergedFirstClauseResults: cursorPrefixFirstClauseResults
+    )
     let firstClauseCorrespondingCount = cursorPrefixFirstClauseCorrespondingCount(
-        firstClauseResults: converted.firstClauseResults,
+        firstClauseResults: boundaryFirstClauseResults,
         originalComposingText: prefixComposingText,
         previewComposingText: previewPrefixComposingText,
         resolutionCache: &cursorPrefixResolutionCache
     )
     let preliminaryCursorPrefixResults = cursorPrefixCandidateDisplayResults(
-        mainResults: converted.mainResults,
-        firstClauseResults: converted.firstClauseResults,
+        mainResults: cursorPrefixMainResults,
+        firstClauseResults: cursorPrefixFirstClauseResults,
         firstClauseCorrespondingCount: firstClauseCorrespondingCount,
         originalComposingText: prefixComposingText,
         previewComposingText: previewPrefixComposingText,
@@ -2092,29 +2220,52 @@ public func free_candidate_list(
             "DEBUG",
             "GetComposedTextForCursorPrefix: requestCandidates exactClause begin correspondingCount=\(firstClauseCorrespondingCount) \(exactClauseDiagnosticDetails)"
         )
+        let exactClauseNormalNBestConverted: ConversionResult?
+        if useZenzai {
+            exactClauseNormalNBestConverted = requestNormalNBestSupplementCandidates(
+                inputData: exactClausePreviewState.composingText,
+                options: options,
+                operation: "get_composed_text_for_cursor_prefix_exact_clause",
+                diagnosticDetails: "corresponding_count=\(firstClauseCorrespondingCount);\(exactClauseDiagnosticDetails)"
+            )
+        } else {
+            exactClauseNormalNBestConverted = nil
+        }
         let exactClauseRequestStart = performanceNow()
         let exactClauseConverted = converter.requestCandidates(
             exactClausePreviewState.composingText,
             options: options
         )
-        exactClauseResults = exactClauseConverted.mainResults
+        exactClauseResults = exactClauseNormalNBestConverted.map {
+            mergeZenzaiMainResultsWithNormalNBest(
+                zenzaiResults: exactClauseConverted.mainResults,
+                normalNBestResults: $0.mainResults,
+                hiragana: exactClausePreviewState.composingText.convertTarget
+            )
+        } ?? exactClauseConverted.mainResults
+        if let exactClauseNormalNBestConverted {
+            serverLog(
+                "DEBUG",
+                "GetComposedTextForCursorPrefix: merged exactClause Zenzai candidates candidateCount=\(exactClauseResults.count) zenzaiCandidateCount=\(exactClauseConverted.mainResults.count) normalNBestCandidateCount=\(exactClauseNormalNBestConverted.mainResults.count) correspondingCount=\(firstClauseCorrespondingCount) \(exactClauseDiagnosticDetails)"
+            )
+        }
         let exactClauseRequestMs = elapsedPerformanceMilliseconds(since: exactClauseRequestStart)
         performanceLog(
             operation: "get_composed_text_for_cursor_prefix",
             stage: "request_candidates_exact_clause",
             elapsedMs: exactClauseRequestMs,
-            details: "candidate_count=\(exactClauseResults.count);corresponding_count=\(firstClauseCorrespondingCount);\(exactClauseDiagnosticDetails)"
+            details: "candidate_count=\(exactClauseResults.count);zenzai_candidate_count=\(exactClauseConverted.mainResults.count);normal_nbest_candidate_count=\(exactClauseNormalNBestConverted?.mainResults.count ?? 0);corresponding_count=\(firstClauseCorrespondingCount);\(exactClauseDiagnosticDetails)"
         )
         candidateCrashTrace(
             useZenzai: useZenzai,
             operation: "GetComposedTextForCursorPrefix",
             stage: "requestCandidatesExactClause",
             state: "completed",
-            details: "candidate_count=\(exactClauseResults.count);corresponding_count=\(firstClauseCorrespondingCount);\(exactClauseDiagnosticDetails)"
+            details: "candidate_count=\(exactClauseResults.count);zenzai_candidate_count=\(exactClauseConverted.mainResults.count);normal_nbest_candidate_count=\(exactClauseNormalNBestConverted?.mainResults.count ?? 0);corresponding_count=\(firstClauseCorrespondingCount);\(exactClauseDiagnosticDetails)"
         )
         serverLog(
             "DEBUG",
-            "GetComposedTextForCursorPrefix: requestCandidates exactClause returned candidateCount=\(exactClauseResults.count) correspondingCount=\(firstClauseCorrespondingCount) \(exactClauseDiagnosticDetails)"
+            "GetComposedTextForCursorPrefix: requestCandidates exactClause returned candidateCount=\(exactClauseResults.count) zenzaiCandidateCount=\(exactClauseConverted.mainResults.count) normalNBestCandidateCount=\(exactClauseNormalNBestConverted?.mainResults.count ?? 0) correspondingCount=\(firstClauseCorrespondingCount) \(exactClauseDiagnosticDetails)"
         )
     }
     candidateCrashTrace(
@@ -2127,8 +2278,8 @@ public func free_candidate_list(
     let cursorPrefixResults = exactClauseResults.isEmpty
         ? preliminaryCursorPrefixResults
         : cursorPrefixCandidateDisplayResults(
-            mainResults: converted.mainResults,
-            firstClauseResults: converted.firstClauseResults,
+            mainResults: cursorPrefixMainResults,
+            firstClauseResults: cursorPrefixFirstClauseResults,
             exactClauseResults: exactClauseResults,
             firstClauseCorrespondingCount: firstClauseCorrespondingCount,
             originalComposingText: prefixComposingText,
@@ -2141,7 +2292,7 @@ public func free_candidate_list(
         operation: "get_composed_text_for_cursor_prefix",
         stage: "total_before_ffi_candidates",
         elapsedMs: totalMs,
-        details: "candidate_count=\(cursorPrefixResults.count);first_clause_candidate_count=\(converted.firstClauseResults.count);main_candidate_count=\(converted.mainResults.count);exact_clause_candidate_count=\(exactClauseResults.count);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
+        details: "candidate_count=\(cursorPrefixResults.count);first_clause_candidate_count=\(cursorPrefixFirstClauseResults.count);main_candidate_count=\(cursorPrefixMainResults.count);zenzai_first_clause_candidate_count=\(converted.firstClauseResults.count);zenzai_main_candidate_count=\(converted.mainResults.count);normal_nbest_first_clause_candidate_count=\(normalNBestConverted?.firstClauseResults.count ?? 0);normal_nbest_main_candidate_count=\(normalNBestConverted?.mainResults.count ?? 0);exact_clause_candidate_count=\(exactClauseResults.count);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
     )
     let buildStart = performanceEnabled ? performanceNow() : 0
     var resolveCandidateCompositionMs = 0
@@ -2197,7 +2348,7 @@ public func free_candidate_list(
             operation: "get_composed_text_for_cursor_prefix",
             stage: "build_ffi_candidates_total",
             elapsedMs: elapsedPerformanceMilliseconds(since: buildStart),
-            details: "candidate_count=\(result.count);first_clause_candidate_count=\(converted.firstClauseResults.count);main_candidate_count=\(converted.mainResults.count);exact_clause_candidate_count=\(exactClauseResults.count);cache_entries=\(cursorPrefixResolutionCache.count);string_allocations=\(stringAllocationCount);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
+            details: "candidate_count=\(result.count);first_clause_candidate_count=\(cursorPrefixFirstClauseResults.count);main_candidate_count=\(cursorPrefixMainResults.count);zenzai_first_clause_candidate_count=\(converted.firstClauseResults.count);zenzai_main_candidate_count=\(converted.mainResults.count);normal_nbest_first_clause_candidate_count=\(normalNBestConverted?.firstClauseResults.count ?? 0);normal_nbest_main_candidate_count=\(normalNBestConverted?.mainResults.count ?? 0);exact_clause_candidate_count=\(exactClauseResults.count);cache_entries=\(cursorPrefixResolutionCache.count);string_allocations=\(stringAllocationCount);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
         )
     }
     candidateCrashTrace(
@@ -2205,9 +2356,9 @@ public func free_candidate_list(
         operation: "GetComposedTextForCursorPrefix",
         stage: "postprocessCandidates",
         state: "completed",
-        details: "candidate_count=\(result.count);first_clause_candidate_count=\(converted.firstClauseResults.count);main_candidate_count=\(converted.mainResults.count);exact_clause_candidate_count=\(exactClauseResults.count);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
+        details: "candidate_count=\(result.count);first_clause_candidate_count=\(cursorPrefixFirstClauseResults.count);main_candidate_count=\(cursorPrefixMainResults.count);zenzai_first_clause_candidate_count=\(converted.firstClauseResults.count);zenzai_main_candidate_count=\(converted.mainResults.count);normal_nbest_first_clause_candidate_count=\(normalNBestConverted?.firstClauseResults.count ?? 0);normal_nbest_main_candidate_count=\(normalNBestConverted?.mainResults.count ?? 0);exact_clause_candidate_count=\(exactClauseResults.count);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
     )
-    serverLog("DEBUG", "GetComposedTextForCursorPrefix: postprocessCandidates completed candidateCount=\(result.count) firstClauseCandidateCount=\(converted.firstClauseResults.count) mainCandidateCount=\(converted.mainResults.count) exactClauseCandidateCount=\(exactClauseResults.count) suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)")
+    serverLog("DEBUG", "GetComposedTextForCursorPrefix: postprocessCandidates completed candidateCount=\(result.count) firstClauseCandidateCount=\(cursorPrefixFirstClauseResults.count) mainCandidateCount=\(cursorPrefixMainResults.count) zenzaiFirstClauseCandidateCount=\(converted.firstClauseResults.count) zenzaiMainCandidateCount=\(converted.mainResults.count) normalNBestFirstClauseCandidateCount=\(normalNBestConverted?.firstClauseResults.count ?? 0) normalNBestMainCandidateCount=\(normalNBestConverted?.mainResults.count ?? 0) exactClauseCandidateCount=\(exactClauseResults.count) suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)")
     serverLog("DEBUG", "GetComposedTextForCursorPrefix: completed candidateCount=\(result.count) suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)")
 
     return listPointer

@@ -187,6 +187,110 @@ private func testCandidate(
     #expect(constructCandidateString(candidate: candidate, hiragana: "きょ") == "きょ")
 }
 
+@Test func zenzaiNormalNBestSupplementKeepsZenzaiFirstAndDeduplicates() async throws {
+    let hiragana = "ここではきものをぬいでください"
+    let zenzaiTop = testCandidate(
+        word: "ここでは着物を脱いでください",
+        ruby: hiragana,
+        composingCount: .inputCount(16)
+    )
+    let zenzaiRichSecond = testCandidate(
+        word: "ここで履物を脱いでください",
+        ruby: hiragana,
+        composingCount: .inputCount(16)
+    )
+    let duplicatedTop = testCandidate(
+        word: "ここでは着物を脱いでください",
+        ruby: hiragana,
+        composingCount: .inputCount(16)
+    )
+    let normalSecond = testCandidate(
+        word: "ここでは着物を脱いでくださ異",
+        ruby: hiragana,
+        composingCount: .inputCount(16)
+    )
+    let normalThird = testCandidate(
+        word: "ここでは着物を脱いでくださ偉",
+        ruby: hiragana,
+        composingCount: .inputCount(16)
+    )
+
+    let merged = mergeZenzaiMainResultsWithNormalNBest(
+        zenzaiResults: [zenzaiTop, zenzaiRichSecond],
+        normalNBestResults: [duplicatedTop, normalSecond, normalThird, zenzaiRichSecond],
+        hiragana: hiragana
+    )
+
+    #expect(
+        merged.map { constructCandidateString(candidate: $0, hiragana: hiragana) } == [
+            "ここでは着物を脱いでください",
+            "ここで履物を脱いでください",
+            "ここでは着物を脱いでくださ異",
+            "ここでは着物を脱いでくださ偉",
+        ]
+    )
+}
+
+@Test func zenzaiNormalNBestSupplementUsesNormalCandidatesWhenZenzaiResultsAreEmpty() async throws {
+    let hiragana = "あしたのてんきはあめです"
+    let normal = testCandidate(
+        word: "明日の天気は雨です",
+        ruby: hiragana,
+        composingCount: .inputCount(21)
+    )
+
+    let merged = mergeZenzaiMainResultsWithNormalNBest(
+        zenzaiResults: [],
+        normalNBestResults: [normal],
+        hiragana: hiragana
+    )
+
+    #expect(merged.map { constructCandidateString(candidate: $0, hiragana: hiragana) } == ["明日の天気は雨です"])
+}
+
+@Test func cursorPrefixBoundarySelectionUsesZenzaiFirstClauseBeforeNormalFallback() async throws {
+    let boundaryCounts = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition("aruteidonagaibunsetsudemo", inputStyle: .roman2kana)
+        let preview = makeCandidatePreviewComposingText(from: source).composingText
+        let zenzaiFirstClause = testCandidate(
+            word: "ある程度",
+            ruby: "あるていど",
+            composingCount: .inputCount(8)
+        )
+        let normalLongerClause = testCandidate(
+            word: "ある程度長い",
+            ruby: "あるていどながい",
+            composingCount: .inputCount(13)
+        )
+        let mergedFirstClauseResults = mergeZenzaiMainResultsWithNormalNBest(
+            zenzaiResults: [zenzaiFirstClause],
+            normalNBestResults: [normalLongerClause],
+            hiragana: preview.convertTarget
+        )
+        let boundaryFirstClauseResults = cursorPrefixBoundaryFirstClauseResults(
+            zenzaiFirstClauseResults: [zenzaiFirstClause],
+            mergedFirstClauseResults: mergedFirstClauseResults
+        )
+
+        return (
+            selected: cursorPrefixFirstClauseCorrespondingCount(
+                firstClauseResults: boundaryFirstClauseResults,
+                originalComposingText: source,
+                previewComposingText: preview
+            ),
+            merged: cursorPrefixFirstClauseCorrespondingCount(
+                firstClauseResults: mergedFirstClauseResults,
+                originalComposingText: source,
+                previewComposingText: preview
+            )
+        )
+    }
+
+    #expect(boundaryCounts.selected == 8)
+    #expect(boundaryCounts.merged == 13)
+}
+
 @Test func supportsNextInputCarryForTsuRules() async throws {
     let map = tableMap([
         row("tt", "っ", "t"),
