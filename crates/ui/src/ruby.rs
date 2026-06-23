@@ -11,7 +11,7 @@ use windows::Win32::{
         WS_POPUP,
     },
 };
-use wry::{WebView, WebViewBuilder};
+use wry::WebViewBuilder;
 
 use crate::UserEvent;
 
@@ -39,16 +39,15 @@ pub fn create_ruby_window(event_loop: &EventLoop<UserEvent>) -> Result<Window> {
     Ok(window)
 }
 
-pub fn create_ruby_webview(window: &Window) -> Result<WebView> {
-    WebViewBuilder::new()
-        .with_transparent(true)
-        .with_html(
-            r##"
+pub fn create_ruby_webview<'a>() -> Result<WebViewBuilder<'a>> {
+    let webview_builder = WebViewBuilder::new().with_transparent(true).with_html(
+        r##"
         <html>
             <head>
                 <style>
                     body, html {
                         overscroll-behavior: none;
+                        width: 100%;
                         height: 100%;
                     }
                     body {
@@ -84,8 +83,20 @@ pub fn create_ruby_webview(window: &Window) -> Result<WebView> {
                     }
                     #reading {
                         display: block;
+                        max-width: 100%;
                         overflow: hidden;
                         text-overflow: ellipsis;
+                    }
+                    #measurement {
+                        position: absolute;
+                        left: 0;
+                        top: 0;
+                        display: inline-block;
+                        max-width: none;
+                        overflow: visible;
+                        white-space: nowrap;
+                        visibility: hidden;
+                        pointer-events: none;
                     }
                     main::after {
                         content: "";
@@ -110,21 +121,117 @@ pub fn create_ruby_webview(window: &Window) -> Result<WebView> {
                     }
                 </style>
                 <script>
-	                    function updateReading(reading) {
-	                        const readingElement = document.getElementById('reading');
-	                        if (!readingElement) {
-	                            return;
-	                        }
+                    let currentRequestId = 0;
+                    let measureFrame = null;
+                    let resizeObserver = null;
 
-	                        readingElement.textContent = typeof reading === 'string' ? reading : '';
-	                    }
-	                </script>
-	            </head>
-	            <body>
-	                <main><span id="reading"></span></main>
-	            </body>
-	        </html>"##,
-        )
-        .build(window)
-        .context("Failed to create ruby webview")
+                    function cssPixels(style, property) {
+                        const value = Number.parseFloat(style.getPropertyValue(property));
+                        return Number.isFinite(value) ? value : 0;
+                    }
+
+                    function horizontalBox(style) {
+                        return cssPixels(style, 'padding-left')
+                            + cssPixels(style, 'padding-right')
+                            + cssPixels(style, 'border-left-width')
+                            + cssPixels(style, 'border-right-width');
+                    }
+
+                    function verticalBox(style) {
+                        return cssPixels(style, 'padding-top')
+                            + cssPixels(style, 'padding-bottom')
+                            + cssPixels(style, 'border-top-width')
+                            + cssPixels(style, 'border-bottom-width');
+                    }
+
+                    function scheduleMeasureRuby() {
+                        if (measureFrame !== null) {
+                            return;
+                        }
+
+                        measureFrame = window.requestAnimationFrame(() => {
+                            measureFrame = null;
+                            measureRuby();
+                        });
+                    }
+
+                    function measureRuby() {
+                        const readingElement = document.getElementById('reading');
+                        const measurementElement = document.getElementById('measurement');
+                        const main = document.querySelector('main');
+                        const body = document.body;
+                        if (!readingElement || !measurementElement || !main || !body) {
+                            return;
+                        }
+
+                        const mainStyle = window.getComputedStyle(main);
+                        const bodyStyle = window.getComputedStyle(body);
+                        const measurementRect = measurementElement.getBoundingClientRect();
+                        const bodyHorizontal = horizontalBox(bodyStyle);
+                        const bodyVertical = verticalBox(bodyStyle);
+                        const measurementWidth = Math.max(
+                            measurementElement.scrollWidth,
+                            measurementRect.width
+                        );
+                        const desiredMainWidth = Math.max(
+                            measurementWidth + horizontalBox(mainStyle),
+                            cssPixels(mainStyle, 'min-width')
+                        );
+                        const desiredMainHeight = Math.max(
+                            measurementRect.height + verticalBox(mainStyle),
+                            cssPixels(mainStyle, 'min-height')
+                        );
+                        const width = Math.ceil(desiredMainWidth + bodyHorizontal);
+                        const height = Math.ceil(desiredMainHeight + bodyVertical);
+
+                        if (!Number.isFinite(width) || !Number.isFinite(height)) {
+                            return;
+                        }
+
+                        window.ipc.postMessage(JSON.stringify({
+                            type: 'ruby-resize',
+                            requestId: currentRequestId,
+                            width,
+                            height
+                        }));
+                    }
+
+                    function updateReading(reading, requestId) {
+                        const readingElement = document.getElementById('reading');
+                        const measurementElement = document.getElementById('measurement');
+                        if (!readingElement || !measurementElement) {
+                            return;
+                        }
+
+                        const numericRequestId = Number(requestId);
+                        currentRequestId = Number.isFinite(numericRequestId)
+                            ? numericRequestId
+                            : currentRequestId + 1;
+                        const text = typeof reading === 'string' ? reading : '';
+                        readingElement.textContent = text;
+                        measurementElement.textContent = text;
+                        scheduleMeasureRuby();
+                    }
+
+                    window.addEventListener('DOMContentLoaded', () => {
+                        const main = document.querySelector('main');
+                        if (window.ResizeObserver && main) {
+                            resizeObserver = new ResizeObserver(scheduleMeasureRuby);
+                            resizeObserver.observe(main);
+                        }
+
+                        scheduleMeasureRuby();
+                    });
+                </script>
+            </head>
+            <body>
+                <main>
+                    <span id="reading"></span>
+                    <span id="measurement" aria-hidden="true"></span>
+                </main>
+            </body>
+        </html>"##,
+    );
+
+    Ok(webview_builder)
 }

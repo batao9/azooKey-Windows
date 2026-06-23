@@ -18,7 +18,8 @@ use tokio::task::JoinHandle;
 use tonic::transport::Server;
 use uiaccess::prepare_uiaccess_token;
 use utils::{
-    get_candidate_window_position, get_candidate_window_position_with_ruby_clearance, CandidateRect,
+    get_candidate_window_position, get_candidate_window_position_with_ruby_clearance,
+    get_ruby_window_size_for_rect, CandidateRect,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
@@ -36,11 +37,18 @@ pub mod uiaccess;
 pub mod utils;
 
 const INDICATOR_WINDOW_LEFT_OFFSET: i32 = 45;
-const RUBY_WINDOW_MIN_WIDTH: u32 = 58;
-const RUBY_WINDOW_MAX_WIDTH: u32 = 640;
-const RUBY_WINDOW_HEIGHT: u32 = 42;
-const RUBY_WINDOW_TEXT_WIDTH_PER_CHAR: u32 = 16;
-const RUBY_WINDOW_HORIZONTAL_CHROME: u32 = 40;
+
+#[derive(Clone, Copy, Debug)]
+struct RubyMeasuredSize {
+    width: f64,
+    height: f64,
+}
+
+impl RubyMeasuredSize {
+    fn new(width: f64, height: f64) -> Self {
+        Self { width, height }
+    }
+}
 
 fn place_candidate_windows(
     candidate_window: &tao::window::Window,
@@ -90,13 +98,51 @@ fn place_ruby_window(
     ruby_window.set_outer_position(PhysicalPosition::new(x, y));
 }
 
+fn set_ruby_window_measured_size(
+    ruby_window: &tao::window::Window,
+    rect: Option<CandidateRect>,
+    measured_size: RubyMeasuredSize,
+) {
+    let size = if let Some(rect) = rect {
+        get_ruby_window_size_for_rect(rect, measured_size.width, measured_size.height)
+    } else {
+        utils::RubyWindowSize::new(
+            measured_logical_dimension(measured_size.width),
+            measured_logical_dimension(measured_size.height),
+        )
+    };
+    ruby_window.set_inner_size(LogicalSize::new(size.width, size.height));
+}
+
+fn measured_logical_dimension(value: f64) -> f64 {
+    if value.is_finite() {
+        value.ceil().max(1.0)
+    } else {
+        1.0
+    }
+}
+
+fn set_and_place_ruby_window(
+    ruby_window: &tao::window::Window,
+    rect: CandidateRect,
+    measured_size: RubyMeasuredSize,
+    vertical_adjustment: i32,
+) {
+    set_ruby_window_measured_size(ruby_window, Some(rect), measured_size);
+    place_ruby_window(ruby_window, rect, vertical_adjustment);
+    set_ruby_window_measured_size(ruby_window, Some(rect), measured_size);
+    place_ruby_window(ruby_window, rect, vertical_adjustment);
+}
+
 fn ruby_clearance<'a>(
     ruby_window: &'a tao::window::Window,
     reading: &str,
     candidate_list_visible: bool,
+    ruby_size_ready: bool,
     vertical_adjustment: i32,
 ) -> Option<(&'a tao::window::Window, i32)> {
-    (candidate_list_visible && !reading.is_empty()).then_some((ruby_window, vertical_adjustment))
+    (candidate_list_visible && ruby_size_ready && !reading.is_empty())
+        .then_some((ruby_window, vertical_adjustment))
 }
 
 fn send_user_event(proxy: &EventLoopProxy<UserEvent>, event: UserEvent) {
@@ -125,17 +171,6 @@ fn set_candidate_window_width(candidate_window: &tao::window::Window, candidates
     ));
 }
 
-fn set_ruby_window_width(ruby_window: &tao::window::Window, reading: &str) {
-    let len = reading.chars().count() as u32;
-    let width = max(
-        RUBY_WINDOW_MIN_WIDTH,
-        RUBY_WINDOW_HORIZONTAL_CHROME
-            .saturating_add(len.saturating_mul(RUBY_WINDOW_TEXT_WIDTH_PER_CHAR)),
-    )
-    .min(RUBY_WINDOW_MAX_WIDTH);
-    ruby_window.set_inner_size(PhysicalSize::new(width, RUBY_WINDOW_HEIGHT));
-}
-
 fn update_candidate_list(candidate_webview: &wry::WebView, candidates: &[String]) {
     match serde_json::to_string(candidates) {
         Ok(candidates) => {
@@ -150,14 +185,38 @@ fn update_candidate_list(candidate_webview: &wry::WebView, candidates: &[String]
     }
 }
 
-fn update_ruby_reading(ruby_webview: &wry::WebView, reading: &str) {
+fn update_ruby_reading(ruby_webview: &wry::WebView, reading: &str, request_id: u32) {
     match serde_json::to_string(reading) {
         Ok(reading) => {
-            evaluate_script(ruby_webview, &format!("updateReading({})", reading));
+            evaluate_script(
+                ruby_webview,
+                &format!("updateReading({}, {})", reading, request_id),
+            );
         }
         Err(error) => {
             eprintln!("Warning: Failed to serialize reading: {error:?}");
         }
+    }
+}
+
+fn next_ruby_size_request_id(current_request_id: &mut u32) -> u32 {
+    *current_request_id = (*current_request_id).wrapping_add(1);
+    if *current_request_id == 0 {
+        *current_request_id = 1;
+    }
+
+    *current_request_id
+}
+
+fn show_ruby_window_if_ready(
+    ruby_window: &tao::window::Window,
+    window_visible: bool,
+    reading: &str,
+    ruby_size_ready: bool,
+    has_candidate_rect: bool,
+) {
+    if window_visible && ruby_size_ready && has_candidate_rect && !reading.is_empty() {
+        show_window_no_activate(ruby_window);
     }
 }
 
@@ -234,6 +293,11 @@ fn keep_windows_topmost(
 #[derive(Debug)]
 pub enum UserEvent {
     UpdateHeight(i32),
+    UpdateRubySize {
+        request_id: u32,
+        width: f64,
+        height: f64,
+    },
     UpdateCandidates(String),
     UpdateSelection(i32),
     UpdateInputMethod(String),
@@ -291,7 +355,35 @@ async fn main() -> anyhow::Result<()> {
     let indicator_window = indicator::create_indicator_window(&event_loop)?;
     let indicator_webview = indicator::create_indicator_webview(&indicator_window)?;
     let ruby_window = ruby::create_ruby_window(&event_loop)?;
-    let ruby_webview = ruby::create_ruby_webview(&ruby_window)?;
+    let proxy_clone = event_loop_proxy.clone();
+    let ruby_webview_builder = ruby::create_ruby_webview()?;
+    let ruby_webview = ruby_webview_builder
+        .with_devtools(cfg!(debug_assertions))
+        .with_ipc_handler(move |message| {
+            if let Ok(message) = serde_json::from_str::<serde_json::Value>(message.body()) {
+                if message.get("type").and_then(|value| value.as_str()) == Some("ruby-resize") {
+                    let request_id = message
+                        .get("requestId")
+                        .and_then(|value| value.as_u64())
+                        .and_then(|value| u32::try_from(value).ok());
+                    let width = message.get("width").and_then(|value| value.as_f64());
+                    let height = message.get("height").and_then(|value| value.as_f64());
+                    if let (Some(request_id), Some(width), Some(height)) =
+                        (request_id, width, height)
+                    {
+                        send_user_event(
+                            &proxy_clone,
+                            UserEvent::UpdateRubySize {
+                                request_id,
+                                width,
+                                height,
+                            },
+                        );
+                    }
+                }
+            }
+        })
+        .build(&ruby_window)?;
 
     // handle window actions
     let proxy_clone = event_loop_proxy.clone();
@@ -304,6 +396,10 @@ async fn main() -> anyhow::Result<()> {
     let mut last_candidate_rect: Option<CandidateRect> = None;
     let mut current_reading = String::new();
     let mut current_candidate_list_visible = true;
+    let mut current_window_visible = false;
+    let mut current_ruby_size_request_id = 0_u32;
+    let mut current_ruby_size_ready = false;
+    let mut current_ruby_measured_size: Option<RubyMeasuredSize> = None;
     let mut current_reading_vertical_adjustment =
         LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_DEFAULT;
 
@@ -343,10 +439,11 @@ async fn main() -> anyhow::Result<()> {
                                 &ruby_window,
                                 &current_reading,
                                 current_candidate_list_visible,
+                                current_ruby_size_ready,
                                 current_reading_vertical_adjustment,
                             ),
                         );
-                        if !current_reading.is_empty() {
+                        if current_ruby_size_ready && !current_reading.is_empty() {
                             place_ruby_window(
                                 &ruby_window,
                                 rect,
@@ -354,6 +451,51 @@ async fn main() -> anyhow::Result<()> {
                             );
                         }
                     }
+                }
+                UserEvent::UpdateRubySize {
+                    request_id,
+                    width,
+                    height,
+                } => {
+                    if request_id != current_ruby_size_request_id || current_reading.is_empty() {
+                        return;
+                    }
+
+                    let measured_size = RubyMeasuredSize::new(width, height);
+                    current_ruby_measured_size = Some(measured_size);
+                    current_ruby_size_ready = true;
+
+                    if let Some(rect) = last_candidate_rect {
+                        set_and_place_ruby_window(
+                            &ruby_window,
+                            rect,
+                            measured_size,
+                            current_reading_vertical_adjustment,
+                        );
+                        place_candidate_windows(
+                            &candidate_window,
+                            &indicator_window,
+                            rect,
+                            ruby_clearance(
+                                &ruby_window,
+                                &current_reading,
+                                current_candidate_list_visible,
+                                current_ruby_size_ready,
+                                current_reading_vertical_adjustment,
+                            ),
+                        );
+                        place_ruby_window(&ruby_window, rect, current_reading_vertical_adjustment);
+                    } else {
+                        set_ruby_window_measured_size(&ruby_window, None, measured_size);
+                    }
+
+                    show_ruby_window_if_ready(
+                        &ruby_window,
+                        current_window_visible,
+                        &current_reading,
+                        current_ruby_size_ready,
+                        last_candidate_rect.is_some(),
+                    );
                 }
                 UserEvent::WindowAction(action) => {
                     match action {
@@ -378,14 +520,24 @@ async fn main() -> anyhow::Result<()> {
                                 };
                             }
 
+                            current_window_visible = true;
                             show_window_no_activate(&candidate_window);
-                            if !current_reading.is_empty() {
-                                show_window_no_activate(&ruby_window);
-                            }
+                            show_ruby_window_if_ready(
+                                &ruby_window,
+                                current_window_visible,
+                                &current_reading,
+                                current_ruby_size_ready,
+                                last_candidate_rect.is_some(),
+                            );
                         }
                         WindowAction::Hide => {
+                            current_window_visible = false;
                             current_reading.clear();
-                            update_ruby_reading(&ruby_webview, "");
+                            current_ruby_size_ready = false;
+                            current_ruby_measured_size = None;
+                            let request_id =
+                                next_ruby_size_request_id(&mut current_ruby_size_request_id);
+                            update_ruby_reading(&ruby_webview, "", request_id);
                             hide_window(&candidate_window);
                             hide_window(&ruby_window);
                         }
@@ -399,6 +551,16 @@ async fn main() -> anyhow::Result<()> {
                             last_candidate_rect = Some(rect);
 
                             keep_windows_topmost(&candidate_window, &ruby_window, indicator_hwnd);
+                            if current_ruby_size_ready && !current_reading.is_empty() {
+                                if let Some(measured_size) = current_ruby_measured_size {
+                                    set_and_place_ruby_window(
+                                        &ruby_window,
+                                        rect,
+                                        measured_size,
+                                        current_reading_vertical_adjustment,
+                                    );
+                                }
+                            }
                             place_candidate_windows(
                                 &candidate_window,
                                 &indicator_window,
@@ -407,16 +569,24 @@ async fn main() -> anyhow::Result<()> {
                                     &ruby_window,
                                     &current_reading,
                                     current_candidate_list_visible,
+                                    current_ruby_size_ready,
                                     current_reading_vertical_adjustment,
                                 ),
                             );
-                            if !current_reading.is_empty() {
+                            if current_ruby_size_ready && !current_reading.is_empty() {
                                 place_ruby_window(
                                     &ruby_window,
                                     rect,
                                     current_reading_vertical_adjustment,
                                 );
                             }
+                            show_ruby_window_if_ready(
+                                &ruby_window,
+                                current_window_visible,
+                                &current_reading,
+                                current_ruby_size_ready,
+                                last_candidate_rect.is_some(),
+                            );
                         }
                         WindowAction::SetCandidate { candidates } => {
                             current_candidate_list_visible = true;
@@ -432,10 +602,11 @@ async fn main() -> anyhow::Result<()> {
                                         &ruby_window,
                                         &current_reading,
                                         current_candidate_list_visible,
+                                        current_ruby_size_ready,
                                         current_reading_vertical_adjustment,
                                     ),
                                 );
-                                if !current_reading.is_empty() {
+                                if current_ruby_size_ready && !current_reading.is_empty() {
                                     place_ruby_window(
                                         &ruby_window,
                                         rect,
@@ -500,12 +671,16 @@ async fn main() -> anyhow::Result<()> {
                             }
 
                             if let Some(ref reading) = reading {
+                                let keep_current_ruby_size =
+                                    !reading.is_empty() && current_ruby_measured_size.is_some();
                                 current_reading = reading.clone();
-                                update_ruby_reading(&ruby_webview, reading);
-                                if reading.is_empty() {
+                                let request_id =
+                                    next_ruby_size_request_id(&mut current_ruby_size_request_id);
+                                update_ruby_reading(&ruby_webview, reading, request_id);
+                                current_ruby_size_ready = keep_current_ruby_size;
+                                if !keep_current_ruby_size {
+                                    current_ruby_measured_size = None;
                                     hide_window(&ruby_window);
-                                } else {
-                                    set_ruby_window_width(&ruby_window, reading);
                                 }
                             }
 
@@ -530,6 +705,16 @@ async fn main() -> anyhow::Result<()> {
                                 );
                                 last_candidate_rect = Some(rect);
                                 keep_windows_topmost(&candidate_window, &ruby_window, indicator_hwnd);
+                                if current_ruby_size_ready && !current_reading.is_empty() {
+                                    if let Some(measured_size) = current_ruby_measured_size {
+                                        set_and_place_ruby_window(
+                                            &ruby_window,
+                                            rect,
+                                            measured_size,
+                                            current_reading_vertical_adjustment,
+                                        );
+                                    }
+                                }
                                 place_candidate_windows(
                                     &candidate_window,
                                     &indicator_window,
@@ -538,16 +723,24 @@ async fn main() -> anyhow::Result<()> {
                                         &ruby_window,
                                         &current_reading,
                                         current_candidate_list_visible,
+                                        current_ruby_size_ready,
                                         current_reading_vertical_adjustment,
                                     ),
                                 );
-                                if !current_reading.is_empty() {
+                                if current_ruby_size_ready && !current_reading.is_empty() {
                                     place_ruby_window(
                                         &ruby_window,
                                         rect,
                                         current_reading_vertical_adjustment,
                                     );
                                 }
+                                show_ruby_window_if_ready(
+                                    &ruby_window,
+                                    current_window_visible,
+                                    &current_reading,
+                                    current_ruby_size_ready,
+                                    last_candidate_rect.is_some(),
+                                );
                             } else if candidates.is_some() || reading.is_some() {
                                 if let Some(rect) = last_candidate_rect {
                                     place_candidate_windows(
@@ -558,10 +751,11 @@ async fn main() -> anyhow::Result<()> {
                                             &ruby_window,
                                             &current_reading,
                                             current_candidate_list_visible,
+                                            current_ruby_size_ready,
                                             current_reading_vertical_adjustment,
                                         ),
                                     );
-                                    if !current_reading.is_empty() {
+                                    if current_ruby_size_ready && !current_reading.is_empty() {
                                         place_ruby_window(
                                             &ruby_window,
                                             rect,
@@ -602,6 +796,7 @@ async fn main() -> anyhow::Result<()> {
 
                             if let Some(visible) = visible {
                                 if visible {
+                                    current_window_visible = true;
                                     let mut task_guard = match task_guard.try_lock() {
                                         Ok(guard) => guard,
                                         Err(_) => {
@@ -627,17 +822,32 @@ async fn main() -> anyhow::Result<()> {
                                         hide_window(&candidate_window);
                                     }
 
-                                    if !current_reading.is_empty() {
-                                        show_window_no_activate(&ruby_window);
-                                    }
+                                    show_ruby_window_if_ready(
+                                        &ruby_window,
+                                        current_window_visible,
+                                        &current_reading,
+                                        current_ruby_size_ready,
+                                        last_candidate_rect.is_some(),
+                                    );
                                 } else {
+                                    current_window_visible = false;
                                     current_reading.clear();
-                                    update_ruby_reading(&ruby_webview, "");
+                                    current_ruby_size_ready = false;
+                                    current_ruby_measured_size = None;
+                                    let request_id =
+                                        next_ruby_size_request_id(&mut current_ruby_size_request_id);
+                                    update_ruby_reading(&ruby_webview, "", request_id);
                                     hide_window(&candidate_window);
                                     hide_window(&ruby_window);
                                 }
                             } else if reading.is_some() && !current_reading.is_empty() {
-                                show_window_no_activate(&ruby_window);
+                                show_ruby_window_if_ready(
+                                    &ruby_window,
+                                    current_window_visible,
+                                    &current_reading,
+                                    current_ruby_size_ready,
+                                    last_candidate_rect.is_some(),
+                                );
                             }
                         }
                     }
