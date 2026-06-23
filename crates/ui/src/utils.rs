@@ -6,6 +6,7 @@ use tao::window::Window;
 use windows::Win32::{
     Foundation::RECT,
     Graphics::Gdi::{GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST},
+    UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +36,18 @@ pub struct CandidateWindowSize {
 
 impl CandidateWindowSize {
     pub fn new(width: i32, height: i32) -> Self {
+        Self { width, height }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RubyWindowSize {
+    pub width: f64,
+    pub height: f64,
+}
+
+impl RubyWindowSize {
+    pub fn new(width: f64, height: f64) -> Self {
         Self { width, height }
     }
 }
@@ -163,6 +176,83 @@ pub fn get_ruby_window_position(
     let (x, y) = ruby_window_position(target_rect, size, monitor_info.rcWork, vertical_adjustment);
 
     (x as f64, y as f64)
+}
+
+pub fn get_ruby_window_size_for_rect(
+    rect: CandidateRect,
+    measured_width: f64,
+    measured_height: f64,
+) -> RubyWindowSize {
+    let monitor = unsafe {
+        MonitorFromRect(
+            &RECT {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            } as *const _,
+            MONITOR_DEFAULTTONEAREST,
+        )
+    };
+
+    let mut monitor_info = MONITORINFO::default();
+    monitor_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+
+    unsafe {
+        let _ = GetMonitorInfoW(monitor, &mut monitor_info);
+    }
+
+    ruby_window_size_for_work_area(
+        measured_width,
+        measured_height,
+        monitor_info.rcWork,
+        monitor_scale_factor(monitor),
+    )
+}
+
+fn monitor_scale_factor(monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> f64 {
+    let mut dpi_x = 96_u32;
+    let mut dpi_y = 96_u32;
+
+    if unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }.is_ok()
+        && dpi_x > 0
+    {
+        dpi_x as f64 / 96.0
+    } else {
+        1.0
+    }
+}
+
+pub fn ruby_window_size_for_work_area(
+    measured_width: f64,
+    measured_height: f64,
+    work_area: RECT,
+    scale_factor: f64,
+) -> RubyWindowSize {
+    let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    let width = if measured_width.is_finite() {
+        measured_width.ceil().max(1.0)
+    } else {
+        1.0
+    };
+    let height = if measured_height.is_finite() {
+        measured_height.ceil().max(1.0)
+    } else {
+        1.0
+    };
+
+    let work_area_width = work_area.right.saturating_sub(work_area.left);
+    let max_width = if work_area_width > 0 {
+        (work_area_width as f64 / scale_factor).max(1.0)
+    } else {
+        width
+    };
+
+    RubyWindowSize::new(width.min(max_width), height)
 }
 
 pub fn candidate_window_position(
@@ -314,7 +404,8 @@ fn clamp_start(preferred: i32, length: i32, min: i32, max: i32) -> i32 {
 mod tests {
     use super::{
         candidate_window_position, candidate_window_position_with_ruby_clearance,
-        ruby_window_position, CandidateRect, CandidateWindowSize,
+        ruby_window_position, ruby_window_size_for_work_area, CandidateRect, CandidateWindowSize,
+        RubyWindowSize,
     };
     use windows::Win32::Foundation::RECT;
 
@@ -480,5 +571,26 @@ mod tests {
         );
 
         assert_eq!(pos, (85, 394));
+    }
+
+    #[test]
+    fn keeps_measured_ruby_width_when_it_fits_work_area() {
+        let size = ruby_window_size_for_work_area(320.2, 39.1, work_area(), 1.0);
+
+        assert_eq!(size, RubyWindowSize::new(321.0, 40.0));
+    }
+
+    #[test]
+    fn clamps_ruby_width_to_work_area_logical_width() {
+        let size = ruby_window_size_for_work_area(1000.0, 39.0, work_area(), 1.0);
+
+        assert_eq!(size, RubyWindowSize::new(800.0, 39.0));
+    }
+
+    #[test]
+    fn clamps_ruby_width_using_monitor_scale_factor() {
+        let size = ruby_window_size_for_work_area(1000.0, 39.0, work_area(), 2.0);
+
+        assert_eq!(size, RubyWindowSize::new(400.0, 39.0));
     }
 }
