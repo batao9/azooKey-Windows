@@ -231,6 +231,88 @@ private func testCandidate(
     )
 }
 
+@Test func zenzaiNormalNBestSupplementFiltersWeakRichCandidates() async throws {
+    let hiragana = "ここではきものをぬいでください"
+    let zenzaiTop = testCandidate(
+        word: "ここでは着物を脱いでください",
+        ruby: hiragana,
+        composingCount: .inputCount(16)
+    )
+    let partialRich = testCandidate(
+        word: "ここでは",
+        ruby: "ここでは",
+        composingCount: .inputCount(4)
+    )
+    let katakanaEchoRich = testCandidate(
+        word: "ココデハキモノヲヌイデクダサイ",
+        ruby: hiragana,
+        composingCount: .inputCount(16)
+    )
+    let hiraganaEchoRich = testCandidate(
+        word: hiragana,
+        ruby: hiragana,
+        composingCount: .inputCount(16)
+    )
+    let usefulRich = testCandidate(
+        word: "ここで履物を脱いでください",
+        ruby: hiragana,
+        composingCount: .inputCount(16)
+    )
+    let normalSecond = testCandidate(
+        word: "ここでは着物を抜いてください",
+        ruby: hiragana,
+        composingCount: .inputCount(16)
+    )
+
+    let merged = mergeZenzaiMainResultsWithNormalNBest(
+        zenzaiResults: [zenzaiTop, partialRich, katakanaEchoRich, hiraganaEchoRich, usefulRich],
+        normalNBestResults: [normalSecond],
+        hiragana: hiragana
+    )
+
+    #expect(
+        merged.map { constructCandidateString(candidate: $0, hiragana: hiragana) } == [
+            "ここでは着物を脱いでください",
+            "ここで履物を脱いでください",
+            "ここでは着物を抜いてください",
+        ]
+    )
+}
+
+@Test func zenzaiNormalNBestSupplementCanKeepFirstClauseRichCandidates() async throws {
+    let hiragana = "ここではきものをぬいでください"
+    let firstClause = testCandidate(
+        word: "ここでは",
+        ruby: "ここでは",
+        composingCount: .inputCount(4)
+    )
+    let alternativeFirstClause = testCandidate(
+        word: "ここで",
+        ruby: "ここで",
+        composingCount: .inputCount(3)
+    )
+    let normalFirstClause = testCandidate(
+        word: "此処では",
+        ruby: "ここでは",
+        composingCount: .inputCount(4)
+    )
+
+    let merged = mergeZenzaiMainResultsWithNormalNBest(
+        zenzaiResults: [firstClause, alternativeFirstClause],
+        normalNBestResults: [normalFirstClause],
+        hiragana: hiragana,
+        filterZenzaiAlternatives: false
+    )
+
+    #expect(
+        merged.map { constructCandidateString(candidate: $0, hiragana: hiragana) } == [
+            "ここでは",
+            "ここで",
+            "此処では",
+        ]
+    )
+}
+
 @Test func zenzaiNormalNBestSupplementUsesNormalCandidatesWhenZenzaiResultsAreEmpty() async throws {
     let hiragana = "あしたのてんきはあめです"
     let normal = testCandidate(

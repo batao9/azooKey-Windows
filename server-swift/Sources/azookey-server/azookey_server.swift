@@ -1449,10 +1449,41 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
     return result
 }
 
+func hiraganaToKatakana(_ text: String) -> String {
+    var scalars = String.UnicodeScalarView()
+    scalars.reserveCapacity(text.unicodeScalars.count)
+
+    for scalar in text.unicodeScalars {
+        let value = scalar.value
+        if (0x3041...0x3096).contains(value), let converted = UnicodeScalar(value + 0x60) {
+            scalars.append(converted)
+        } else {
+            scalars.append(scalar)
+        }
+    }
+
+    return String(scalars)
+}
+
+func shouldKeepZenzaiAlternativeCandidate(candidate: Candidate, hiragana: String) -> Bool {
+    guard candidate.rubyCount >= hiragana.count else {
+        return false
+    }
+
+    let text = constructCandidateString(candidate: candidate, hiragana: hiragana)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !text.isEmpty else {
+        return false
+    }
+
+    return text != hiragana && text != hiraganaToKatakana(hiragana)
+}
+
 func mergeZenzaiMainResultsWithNormalNBest(
     zenzaiResults: [Candidate],
     normalNBestResults: [Candidate],
-    hiragana: String
+    hiragana: String,
+    filterZenzaiAlternatives: Bool = true
 ) -> [Candidate] {
     var seenTexts = Set<String>()
     var results: [Candidate] = []
@@ -1465,7 +1496,13 @@ func mergeZenzaiMainResultsWithNormalNBest(
         results.append(candidate)
     }
 
-    for candidate in zenzaiResults {
+    if let topCandidate = zenzaiResults.first {
+        appendIfNeeded(topCandidate)
+    }
+    for candidate in zenzaiResults.dropFirst() {
+        if filterZenzaiAlternatives && !shouldKeepZenzaiAlternativeCandidate(candidate: candidate, hiragana: hiragana) {
+            continue
+        }
         appendIfNeeded(candidate)
     }
     for candidate in normalNBestResults {
@@ -2154,7 +2191,8 @@ public func free_candidate_list(
         mergeZenzaiMainResultsWithNormalNBest(
             zenzaiResults: converted.firstClauseResults,
             normalNBestResults: $0.firstClauseResults,
-            hiragana: previewPrefixHiragana
+            hiragana: previewPrefixHiragana,
+            filterZenzaiAlternatives: false
         )
     } ?? converted.firstClauseResults
     if let normalNBestConverted {
