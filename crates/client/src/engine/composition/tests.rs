@@ -198,6 +198,71 @@ fn delayed_candidate_window_shows_when_space_opens_preview() {
 }
 
 #[test]
+fn input_after_space_conversion_commits_preview_before_starting_new_composition() {
+    let composition = Composition {
+        state: CompositionState::Previewing,
+        preview: "今日は".to_string(),
+        raw_input: "kyouha".to_string(),
+        raw_hiragana: "きょうは".to_string(),
+        corresponding_count: 6,
+        ..Composition::default()
+    };
+
+    let (transition, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input('a'),
+        &InputMode::Kana,
+        false,
+        &AppConfig::default(),
+        false,
+    )
+    .expect("input should commit preview and start new composition");
+
+    assert_eq!(transition, CompositionState::Composing);
+    assert_eq!(
+        actions,
+        vec![
+            ClientAction::EndComposition,
+            ClientAction::StartComposition,
+            ClientAction::AppendText("a".to_string())
+        ]
+    );
+}
+
+#[test]
+fn temporary_latin_after_space_conversion_starts_new_direct_composition() {
+    let composition = Composition {
+        state: CompositionState::Previewing,
+        preview: "今日は".to_string(),
+        raw_input: "kyouha".to_string(),
+        raw_hiragana: "きょうは".to_string(),
+        corresponding_count: 6,
+        ..Composition::default()
+    };
+
+    let (transition, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input('Ａ'),
+        &InputMode::Kana,
+        true,
+        &AppConfig::default(),
+        true,
+    )
+    .expect("temporary latin should commit preview and start direct composition");
+
+    assert_eq!(transition, CompositionState::Composing);
+    assert_eq!(
+        actions,
+        vec![
+            ClientAction::EndComposition,
+            ClientAction::StartComposition,
+            ClientAction::SetTemporaryLatin(true),
+            ClientAction::AppendTextDirect("A".to_string())
+        ]
+    );
+}
+
+#[test]
 fn delete_uses_remove_text_path_while_composing() {
     let composition = Composition {
         state: CompositionState::Composing,

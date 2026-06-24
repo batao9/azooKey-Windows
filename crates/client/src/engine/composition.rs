@@ -1741,18 +1741,16 @@ impl TextServiceFactory {
     }
 
     #[inline]
-    fn actions_need_context_update(actions: &[ClientAction]) -> bool {
-        actions.iter().any(|action| {
-            matches!(
-                action,
-                ClientAction::AppendText(_)
-                    | ClientAction::AppendTextRaw(_)
-                    | ClientAction::AppendTextDirect(_)
-                    | ClientAction::ShrinkText(_)
-                    | ClientAction::ShrinkTextRaw(_)
-                    | ClientAction::ShrinkTextDirect(_)
-            )
-        })
+    fn action_needs_context_update(action: &ClientAction) -> bool {
+        matches!(
+            action,
+            ClientAction::AppendText(_)
+                | ClientAction::AppendTextRaw(_)
+                | ClientAction::AppendTextDirect(_)
+                | ClientAction::ShrinkText(_)
+                | ClientAction::ShrinkTextRaw(_)
+                | ClientAction::ShrinkTextDirect(_)
+        )
     }
 
     #[inline]
@@ -2853,6 +2851,21 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn commit_preview_then_append_actions(
+        append_action: ClientAction,
+        start_temporary_latin: bool,
+    ) -> (CompositionState, Vec<ClientAction>) {
+        let mut actions = Vec::with_capacity(4);
+        actions.push(ClientAction::EndComposition);
+        actions.push(ClientAction::StartComposition);
+        if start_temporary_latin {
+            actions.push(ClientAction::SetTemporaryLatin(true));
+        }
+        actions.push(append_action);
+        (CompositionState::Composing, actions)
+    }
+
+    #[inline]
     fn clause_navigation_actions(composition: &Composition, direction: i32) -> Vec<ClientAction> {
         if ClauseState::is_active_for_composition(composition) || !composition.suffix.is_empty() {
             return vec![
@@ -3201,27 +3214,23 @@ impl TextServiceFactory {
                     && Self::direct_text_for_action(action).is_some() =>
                 {
                     let text = Self::direct_text_for_action(action)?;
-                    let mut actions = vec![];
-                    if start_temporary_latin {
-                        actions.push(ClientAction::SetTemporaryLatin(true));
-                    }
-                    actions.push(ClientAction::ShrinkTextDirect(text));
-                    Some((CompositionState::Composing, actions))
+                    Some(Self::commit_preview_then_append_actions(
+                        ClientAction::AppendTextDirect(text),
+                        start_temporary_latin,
+                    ))
                 }
                 UserAction::NumpadSymbol(symbol) if *mode == InputMode::Kana => {
                     let text =
                         Self::numpad_text_for_mode(*symbol, app_config.general.numpad_input, false)
                             .unwrap_or_else(|| symbol.to_string());
-                    Some((
-                        CompositionState::Composing,
-                        vec![ClientAction::ShrinkTextRaw(text)],
+                    Some(Self::commit_preview_then_append_actions(
+                        ClientAction::AppendTextRaw(text),
+                        false,
                     ))
                 }
-                UserAction::Input(char) => Some((
-                    CompositionState::Composing,
-                    vec![ClientAction::ShrinkText(Self::input_text_for_mode(
-                        *char, mode,
-                    ))],
+                UserAction::Input(char) => Some(Self::commit_preview_then_append_actions(
+                    ClientAction::AppendText(Self::input_text_for_mode(*char, mode)),
+                    false,
                 )),
                 UserAction::Number {
                     value,
@@ -3231,14 +3240,14 @@ impl TextServiceFactory {
                     let text =
                         Self::numpad_text_for_mode(digit, app_config.general.numpad_input, false)
                             .unwrap_or_else(|| digit.to_string());
-                    Some((
-                        CompositionState::Composing,
-                        vec![ClientAction::ShrinkTextRaw(text)],
+                    Some(Self::commit_preview_then_append_actions(
+                        ClientAction::AppendTextRaw(text),
+                        false,
                     ))
                 }
-                UserAction::Number { value, .. } => Some((
-                    CompositionState::Composing,
-                    vec![ClientAction::ShrinkText(value.to_string())],
+                UserAction::Number { value, .. } => Some(Self::commit_preview_then_append_actions(
+                    ClientAction::AppendText(value.to_string()),
+                    false,
                 )),
                 UserAction::Backspace | UserAction::Delete => {
                     if composition.raw_input.chars().count() <= 1 {
@@ -3963,12 +3972,15 @@ impl TextServiceFactory {
                 }};
             }
 
-            if Self::actions_need_context_update(actions) {
-                self.update_context(&preview)?;
-            }
             ipc_service = IMEState::ipc_service()?.context("ipc_service is None")?;
 
             for (action_index, action) in actions.iter().enumerate() {
+                if Self::action_needs_context_update(action) {
+                    IMEState::set_ipc_service(ipc_service.clone())?;
+                    self.update_context(&preview)?;
+                    ipc_service = IMEState::ipc_service()?.context("ipc_service is None")?;
+                }
+
                 match action {
                     ClientAction::StartComposition => {
                         self.start_composition()?;
