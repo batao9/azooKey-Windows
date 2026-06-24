@@ -16,13 +16,16 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{net::windows::named_pipe::ClientOptions, time};
-use tonic::transport::Endpoint;
+use tonic::transport::{channel::Channel, Endpoint};
 use tower::service_fn;
 use windows::Win32::Foundation::ERROR_PIPE_BUSY;
 
 const INPUT_STYLE_ROMAN2KANA: i32 = 0;
 const INPUT_STYLE_DIRECT: i32 = 1;
 const CLIENT_LOG_CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const PIPE_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const SERVER_PIPE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+const UI_PIPE_BUSY_TIMEOUT: Duration = Duration::ZERO;
 
 static CLIENT_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static IPC_CONNECTION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -43,9 +46,9 @@ struct ClientLogConfigCache {
 pub struct IPCService {
     connection_id: u64,
     // kkc server client
-    azookey_client: AzookeyServiceClient<tonic::transport::channel::Channel>,
+    azookey_client: AzookeyServiceClient<Channel>,
     // candidate window server client
-    window_client: WindowServiceClient<tonic::transport::channel::Channel>,
+    window_client: Option<WindowServiceClient<Channel>>,
     runtime: Arc<tokio::runtime::Runtime>,
     performance_log_tx: tokio::sync::mpsc::UnboundedSender<PerformanceLogRequest>,
     server_session_id: Option<u64>,
@@ -174,44 +177,29 @@ impl IPCService {
         let runtime = Arc::new(tokio::runtime::Runtime::new()?);
         let connection_id = IPC_CONNECTION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
 
-        let server_channel = runtime.block_on(
-            Endpoint::try_from("http://[::]:50051")?.connect_with_connector(service_fn(
-                |_| async {
-                    let client = loop {
-                        match ClientOptions::new().open(r"\\.\pipe\azookey_server") {
-                            Ok(client) => break client,
-                            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => (),
-                            Err(e) => return Err(e),
-                        }
-
-                        time::sleep(Duration::from_millis(50)).await;
-                    };
-
-                    Ok::<_, std::io::Error>(TokioIo::new(client))
-                },
-            )),
+        let server_channel = Self::connect_named_pipe_channel(
+            &runtime,
+            "http://[::]:50051",
+            r"\\.\pipe\azookey_server",
+            SERVER_PIPE_BUSY_TIMEOUT,
         )?;
-
-        let ui_channel = runtime.block_on(
-            Endpoint::try_from("http://[::]:50052")?.connect_with_connector(service_fn(
-                |_| async {
-                    let client = loop {
-                        match ClientOptions::new().open(r"\\.\pipe\azookey_ui") {
-                            Ok(client) => break client,
-                            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => (),
-                            Err(e) => return Err(e),
-                        }
-
-                        time::sleep(Duration::from_millis(50)).await;
-                    };
-
-                    Ok::<_, std::io::Error>(TokioIo::new(client))
-                },
-            )),
-        )?;
+        let window_client = match Self::connect_named_pipe_channel(
+            &runtime,
+            "http://[::]:50052",
+            r"\\.\pipe\azookey_ui",
+            UI_PIPE_BUSY_TIMEOUT,
+        ) {
+            Ok(ui_channel) => Some(WindowServiceClient::new(ui_channel)),
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "Candidate window IPC is unavailable; continuing without UI connection"
+                );
+                None
+            }
+        };
 
         let azookey_client = AzookeyServiceClient::new(server_channel);
-        let window_client = WindowServiceClient::new(ui_channel);
         let (performance_log_tx, mut performance_log_rx) =
             tokio::sync::mpsc::unbounded_channel::<PerformanceLogRequest>();
         let mut performance_log_client = azookey_client.clone();
@@ -236,6 +224,41 @@ impl IPCService {
             server_session_id: None,
             server_reset_recovered: false,
         })
+    }
+
+    fn connect_named_pipe_channel(
+        runtime: &tokio::runtime::Runtime,
+        endpoint: &'static str,
+        pipe_name: &'static str,
+        busy_timeout: Duration,
+    ) -> Result<Channel> {
+        let channel = runtime.block_on(Endpoint::try_from(endpoint)?.connect_with_connector(
+            service_fn(move |_| async move {
+                let busy_started_at = Instant::now();
+                let client = loop {
+                    match ClientOptions::new().open(pipe_name) {
+                        Ok(client) => break client,
+                        Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => {
+                            if busy_started_at.elapsed() >= busy_timeout {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    format!(
+                                        "{pipe_name} remained busy for at least {busy_timeout:?}"
+                                    ),
+                                ));
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
+
+                    time::sleep(PIPE_BUSY_RETRY_INTERVAL).await;
+                };
+
+                Ok::<_, std::io::Error>(TokioIo::new(client))
+            }),
+        ))?;
+
+        Ok(channel)
     }
 }
 
@@ -970,17 +993,80 @@ impl IPCService {
 
 // implement methods to interact with candidate window server
 impl IPCService {
+    fn ensure_window_client(
+        &mut self,
+        operation: &str,
+    ) -> Option<&mut WindowServiceClient<Channel>> {
+        if self.window_client.is_none() {
+            match Self::connect_named_pipe_channel(
+                self.runtime.as_ref(),
+                "http://[::]:50052",
+                r"\\.\pipe\azookey_ui",
+                UI_PIPE_BUSY_TIMEOUT,
+            ) {
+                Ok(ui_channel) => {
+                    tracing::info!(
+                        operation,
+                        "Candidate window IPC connected after deferred retry"
+                    );
+                    self.window_client = Some(WindowServiceClient::new(ui_channel));
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        ?error,
+                        operation,
+                        "Candidate window IPC remains unavailable"
+                    );
+                    return None;
+                }
+            }
+        }
+
+        self.window_client.as_mut()
+    }
+
+    fn with_window_client(
+        &mut self,
+        operation: &str,
+        send: impl FnOnce(
+            &tokio::runtime::Runtime,
+            &mut WindowServiceClient<Channel>,
+        ) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let runtime = self.runtime.clone();
+        let Some(window_client) = self.ensure_window_client(operation) else {
+            return Ok(());
+        };
+
+        let result = send(runtime.as_ref(), window_client);
+        if result.is_err() {
+            self.window_client = None;
+        }
+        result
+    }
+
+    fn ignore_window_rpc_error(operation: &str, result: anyhow::Result<()>) -> anyhow::Result<()> {
+        if let Err(error) = result {
+            tracing::warn!(
+                ?error,
+                operation,
+                "Candidate window IPC request failed; continuing without UI connection"
+            );
+        }
+
+        Ok(())
+    }
+
     #[tracing::instrument]
     pub fn show_window(&mut self) -> anyhow::Result<()> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
         let result: anyhow::Result<()> = (|| {
             let request = tonic::Request::new(shared::proto::EmptyResponse {});
-            self.runtime
-                .clone()
-                .block_on(self.window_client.show_window(request))?;
-
-            Ok(())
+            self.with_window_client("ui_show_window", |runtime, window_client| {
+                runtime.block_on(window_client.show_window(request))?;
+                Ok(())
+            })
         })();
         self.log_client_performance_from_start(
             performance_start,
@@ -992,7 +1078,7 @@ impl IPCService {
                 Err(error) => format!("status=error;error={error:?}"),
             },
         );
-        result
+        Self::ignore_window_rpc_error("ui_show_window", result)
     }
 
     #[tracing::instrument]
@@ -1001,11 +1087,10 @@ impl IPCService {
         let performance_start = client_performance_start();
         let result: anyhow::Result<()> = (|| {
             let request = tonic::Request::new(shared::proto::EmptyResponse {});
-            self.runtime
-                .clone()
-                .block_on(self.window_client.hide_window(request))?;
-
-            Ok(())
+            self.with_window_client("ui_hide_window", |runtime, window_client| {
+                runtime.block_on(window_client.hide_window(request))?;
+                Ok(())
+            })
         })();
         self.log_client_performance_from_start(
             performance_start,
@@ -1017,7 +1102,7 @@ impl IPCService {
                 Err(error) => format!("status=error;error={error:?}"),
             },
         );
-        result
+        Self::ignore_window_rpc_error("ui_hide_window", result)
     }
 
     #[tracing::instrument]
@@ -1039,11 +1124,10 @@ impl IPCService {
                     right,
                 }),
             });
-            self.runtime
-                .clone()
-                .block_on(self.window_client.set_window_position(request))?;
-
-            Ok(())
+            self.with_window_client("ui_set_window_position", |runtime, window_client| {
+                runtime.block_on(window_client.set_window_position(request))?;
+                Ok(())
+            })
         })();
         self.log_client_performance_from_start(
             performance_start,
@@ -1059,7 +1143,7 @@ impl IPCService {
                 ),
             },
         );
-        result
+        Self::ignore_window_rpc_error("ui_set_window_position", result)
     }
 
     #[tracing::instrument]
@@ -1069,11 +1153,10 @@ impl IPCService {
         let candidate_count = performance_start.map(|_| candidates.len());
         let result: anyhow::Result<()> = (|| {
             let request = tonic::Request::new(shared::proto::SetCandidateRequest { candidates });
-            self.runtime
-                .clone()
-                .block_on(self.window_client.set_candidate(request))?;
-
-            Ok(())
+            self.with_window_client("ui_set_candidates", |runtime, window_client| {
+                runtime.block_on(window_client.set_candidate(request))?;
+                Ok(())
+            })
         })();
         self.log_client_performance_from_start(
             performance_start,
@@ -1090,7 +1173,7 @@ impl IPCService {
                 }
             },
         );
-        result
+        Self::ignore_window_rpc_error("ui_set_candidates", result)
     }
 
     #[tracing::instrument]
@@ -1099,11 +1182,10 @@ impl IPCService {
         let performance_start = client_performance_start();
         let result: anyhow::Result<()> = (|| {
             let request = tonic::Request::new(shared::proto::SetSelectionRequest { index });
-            self.runtime
-                .clone()
-                .block_on(self.window_client.set_selection(request))?;
-
-            Ok(())
+            self.with_window_client("ui_set_selection", |runtime, window_client| {
+                runtime.block_on(window_client.set_selection(request))?;
+                Ok(())
+            })
         })();
         self.log_client_performance_from_start(
             performance_start,
@@ -1115,7 +1197,7 @@ impl IPCService {
                 Err(error) => format!("status=error;index={index};error={error:?}"),
             },
         );
-        result
+        Self::ignore_window_rpc_error("ui_set_selection", result)
     }
 
     #[tracing::instrument]
@@ -1126,11 +1208,10 @@ impl IPCService {
             let request = tonic::Request::new(shared::proto::SetInputModeRequest {
                 mode: mode.to_string(),
             });
-            self.runtime
-                .clone()
-                .block_on(self.window_client.set_input_mode(request))?;
-
-            Ok(())
+            self.with_window_client("ui_set_input_mode", |runtime, window_client| {
+                runtime.block_on(window_client.set_input_mode(request))?;
+                Ok(())
+            })
         })();
         self.log_client_performance_from_start(
             performance_start,
@@ -1142,7 +1223,7 @@ impl IPCService {
                 Err(error) => format!("status=error;mode={mode};error={error:?}"),
             },
         );
-        result
+        Self::ignore_window_rpc_error("ui_set_input_mode", result)
     }
 
     #[tracing::instrument(skip(candidates))]
@@ -1198,11 +1279,10 @@ impl IPCService {
                 candidate_list_visible,
                 reading_vertical_adjustment,
             });
-            self.runtime
-                .clone()
-                .block_on(self.window_client.update_candidate_window(request))?;
-
-            Ok(())
+            self.with_window_client("ui_update_candidate_window", |runtime, window_client| {
+                runtime.block_on(window_client.update_candidate_window(request))?;
+                Ok(())
+            })
         })();
         self.log_client_performance_from_start(
             performance_start,
@@ -1224,7 +1304,7 @@ impl IPCService {
                 }
             },
         );
-        result
+        Self::ignore_window_rpc_error("ui_update_candidate_window", result)
     }
 }
 

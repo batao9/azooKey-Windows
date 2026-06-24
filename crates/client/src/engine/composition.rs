@@ -208,6 +208,24 @@ impl TextServiceFactory {
         }
     }
 
+    fn ensure_ipc_service_for_key_event(operation: &str) -> bool {
+        match IMEState::ensure_ipc_service() {
+            Ok(true) => {
+                tracing::debug!(operation, "Initialized IPC service during key event");
+                true
+            }
+            Ok(false) => true,
+            Err(error) => {
+                tracing::debug!(
+                    ?error,
+                    operation,
+                    "IPC service is unavailable during key event"
+                );
+                false
+            }
+        }
+    }
+
     #[inline]
     pub(crate) fn is_ctrl_pressed() -> bool {
         VK_CONTROL.is_pressed() || VK_LCONTROL.is_pressed() || VK_RCONTROL.is_pressed()
@@ -3537,6 +3555,10 @@ impl TextServiceFactory {
                 actions.insert(0, ClientAction::SetTemporaryLatinShiftPending(false));
             }
 
+            if !Self::ensure_ipc_service_for_key_event("process_key") {
+                return Ok(None);
+            }
+
             Ok(Some((actions, transition, config_snapshot)))
         })();
 
@@ -3596,6 +3618,10 @@ impl TextServiceFactory {
         let mut actions = vec![ClientAction::SetTemporaryLatinShiftPending(false)];
         if composition.temporary_latin {
             actions.insert(0, ClientAction::SetTemporaryLatin(false));
+        }
+
+        if !Self::ensure_ipc_service_for_key_event("process_key_up") {
+            return Ok(None);
         }
 
         Ok(Some((actions, composition.state.clone())))
@@ -3785,6 +3811,10 @@ impl TextServiceFactory {
                     .any(|action| matches!(action, ClientAction::SetTemporaryLatin(false)))
             {
                 actions.insert(0, ClientAction::SetTemporaryLatin(false));
+            }
+
+            if !Self::ensure_ipc_service_for_key_event("handle_preserved_eisu_shortcut") {
+                return Ok(false);
             }
 
             self.handle_action_with_config_snapshot(&actions, transition, config_snapshot)?;

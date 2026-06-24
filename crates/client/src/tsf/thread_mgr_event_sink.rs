@@ -12,6 +12,14 @@ use crate::engine::{
 
 use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
 
+fn ensure_ipc_service_for_tsf_event(event: &str) {
+    match IMEState::ensure_ipc_service() {
+        Ok(true) => tracing::debug!(event, "Initialized IPC service during TSF event"),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(?error, event, "IPC service is unavailable during TSF event"),
+    }
+}
+
 impl TextServiceFactory {
     pub fn set_keyboard_disabled_state(&self, disabled: bool) -> Result<()> {
         let (changed, ipc_service) = IMEState::set_keyboard_disabled_and_clone_ipc(disabled)?;
@@ -74,9 +82,16 @@ impl ITfThreadMgrEventSink_Impl for TextServiceFactory_Impl {
             self.borrow_mut()?.advise_text_layout_sink(focus.clone())?;
         }
         self.set_keyboard_disabled_for_document_mgr(focus)?;
+        ensure_ipc_service_for_tsf_event("OnSetFocus");
 
         let actions = vec![ClientAction::EndComposition];
-        self.handle_action(&actions, CompositionState::None)?;
+        if IMEState::ipc_service()?.is_some() {
+            self.handle_action(&actions, CompositionState::None)?;
+        } else {
+            tracing::debug!(
+                "Skipping focus composition cleanup because IPC service is unavailable"
+            );
+        }
 
         if focus.is_none() {
             let mut text_service = self.borrow_mut()?;
@@ -106,6 +121,7 @@ impl ITfThreadFocusSink_Impl for TextServiceFactory_Impl {
             let thread_mgr = text_service.thread_mgr()?;
             unsafe { thread_mgr.GetFocus().ok() }
         };
+        ensure_ipc_service_for_tsf_event("OnSetThreadFocus");
         self.set_keyboard_disabled_for_document_mgr(focus.as_ref())?;
 
         Ok(())

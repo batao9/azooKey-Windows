@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    engine::{composition::CapsLockKeyboardLayout, ipc_service, state::IMEState},
+    engine::{composition::CapsLockKeyboardLayout, state::IMEState},
     globals::{DllModule, GUID_DISPLAY_ATTRIBUTE, GUID_PRESERVED_KEY_EISU_CAPSLOCK_ANY_MODIFIER},
 };
 
@@ -31,17 +31,6 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         // add reference to the dll instance to prevent it from being unloaded
         let mut dll_instance = DllModule::get()?;
         dll_instance.add_ref();
-
-        // initialize ipc_service
-        if let Ok(mut ipc_service) = ipc_service::IPCService::new() {
-            ipc_service.append_text("".to_string())?;
-            IMEState::set_ipc_service(ipc_service)?;
-        } else {
-            // Activate() should not return an error
-            // if Activate() returns an error, the icon of the previously activated TextService will be displayed, which may confuse the user
-            tracing::error!("Failed to initialize IPC service");
-            return Ok(());
-        }
 
         let mut text_service = self.borrow_mut()?;
 
@@ -115,6 +104,19 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         };
         drop(text_service);
         self.set_keyboard_disabled_for_document_mgr(doc_mgr.as_ref())?;
+        match IMEState::ensure_ipc_service() {
+            Ok(true) => tracing::debug!("Initialized IPC service during Activate"),
+            Ok(false) => {}
+            Err(error) => {
+                // Activate() should not return an error for a transient IPC startup race:
+                // Windows may keep showing the previously active IME icon even though TSF
+                // considers this text service activated.
+                tracing::warn!(
+                    ?error,
+                    "Failed to initialize IPC service during Activate; continuing TSF activation"
+                );
+            }
+        }
 
         tracing::debug!("Activate success");
 
