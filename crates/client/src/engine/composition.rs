@@ -3216,7 +3216,7 @@ impl TextServiceFactory {
                     let text = Self::direct_text_for_action(action)?;
                     Some(Self::commit_preview_then_append_actions(
                         ClientAction::AppendTextDirect(text),
-                        start_temporary_latin,
+                        composition.temporary_latin || start_temporary_latin,
                     ))
                 }
                 UserAction::NumpadSymbol(symbol) if *mode == InputMode::Kana => {

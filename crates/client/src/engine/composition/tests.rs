@@ -263,6 +263,40 @@ fn temporary_latin_after_space_conversion_starts_new_direct_composition() {
 }
 
 #[test]
+fn existing_temporary_latin_after_space_conversion_preserves_direct_composition() {
+    let composition = Composition {
+        state: CompositionState::Previewing,
+        temporary_latin: true,
+        preview: "AB".to_string(),
+        raw_input: "AB".to_string(),
+        raw_hiragana: "AB".to_string(),
+        corresponding_count: 2,
+        ..Composition::default()
+    };
+
+    let (transition, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input('c'),
+        &InputMode::Kana,
+        false,
+        &AppConfig::default(),
+        false,
+    )
+    .expect("existing temporary latin should stay direct after committing preview");
+
+    assert_eq!(transition, CompositionState::Composing);
+    assert_eq!(
+        actions,
+        vec![
+            ClientAction::EndComposition,
+            ClientAction::StartComposition,
+            ClientAction::SetTemporaryLatin(true),
+            ClientAction::AppendTextDirect("c".to_string())
+        ]
+    );
+}
+
+#[test]
 fn delete_uses_remove_text_path_while_composing() {
     let composition = Composition {
         state: CompositionState::Composing,
