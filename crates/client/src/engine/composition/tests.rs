@@ -6,6 +6,7 @@ use super::{
 use crate::engine::{
     client_action::{ClientAction, SetSelectionType, SetTextType},
     input_mode::InputMode,
+    ipc_service::WindowRpcDelivery,
     user_action::{Function, Navigation, UserAction},
 };
 use shared::{get_default_romaji_rows, AppConfig, PunctuationStyle, RomajiRule, WidthMode};
@@ -194,6 +195,35 @@ fn delayed_candidate_window_shows_when_space_opens_preview() {
             ClientAction::ShowCandidateWindow,
             ClientAction::SetSelection(SetSelectionType::Down)
         ]
+    );
+}
+
+#[test]
+fn skipped_candidate_window_update_does_not_remember_visibility() {
+    assert_eq!(
+        TextServiceFactory::delivered_candidate_window_visibility(
+            WindowRpcDelivery::SkippedUnavailable,
+            Some(true),
+        ),
+        None
+    );
+    assert_eq!(
+        TextServiceFactory::delivered_candidate_window_visibility(
+            WindowRpcDelivery::SkippedUnavailable,
+            Some(false),
+        ),
+        None
+    );
+    assert_eq!(
+        TextServiceFactory::delivered_candidate_window_visibility(WindowRpcDelivery::Sent, None),
+        None
+    );
+    assert_eq!(
+        TextServiceFactory::delivered_candidate_window_visibility(
+            WindowRpcDelivery::Sent,
+            Some(true),
+        ),
+        Some(true)
     );
 }
 

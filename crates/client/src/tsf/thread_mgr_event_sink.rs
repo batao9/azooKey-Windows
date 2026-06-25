@@ -25,12 +25,11 @@ impl TextServiceFactory {
         let (changed, ipc_service) = IMEState::set_keyboard_disabled_and_clone_ipc(disabled)?;
 
         if let Some(mut ipc_service) = ipc_service {
-            let update_result =
-                ipc_service.update_candidate_window(Some(false), None, Some(vec![]), Some(0), None);
-            if update_result.is_ok() {
-                self.remember_candidate_window_visibility(Some(false));
+            if let Ok(delivery) =
+                ipc_service.update_candidate_window(Some(false), None, Some(vec![]), Some(0), None)
+            {
+                self.remember_candidate_window_visibility_if_sent(delivery, Some(false));
             }
-            let _ = update_result;
 
             IMEState::set_ipc_service(ipc_service)?;
         }

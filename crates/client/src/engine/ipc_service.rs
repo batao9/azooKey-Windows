@@ -95,6 +95,25 @@ impl NonIdempotentEditRecovery {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowRpcDelivery {
+    Sent,
+    SkippedUnavailable,
+}
+
+impl WindowRpcDelivery {
+    pub(crate) fn was_sent(self) -> bool {
+        matches!(self, Self::Sent)
+    }
+
+    fn log_status(self) -> &'static str {
+        match self {
+            Self::Sent => "success",
+            Self::SkippedUnavailable => "skipped_unavailable",
+        }
+    }
+}
+
 fn next_request_id() -> u64 {
     let counter = CLIENT_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     (u64::from(std::process::id()) << 32) | (counter & 0xffff_ffff)
@@ -1025,6 +1044,26 @@ impl IPCService {
         self.window_client.as_mut()
     }
 
+    fn with_window_client_delivery(
+        &mut self,
+        operation: &str,
+        send: impl FnOnce(
+            &tokio::runtime::Runtime,
+            &mut WindowServiceClient<Channel>,
+        ) -> anyhow::Result<()>,
+    ) -> anyhow::Result<WindowRpcDelivery> {
+        let runtime = self.runtime.clone();
+        let Some(window_client) = self.ensure_window_client(operation) else {
+            return Ok(WindowRpcDelivery::SkippedUnavailable);
+        };
+
+        let result = send(runtime.as_ref(), window_client);
+        if result.is_err() {
+            self.window_client = None;
+        }
+        result.map(|()| WindowRpcDelivery::Sent)
+    }
+
     fn with_window_client(
         &mut self,
         operation: &str,
@@ -1033,16 +1072,8 @@ impl IPCService {
             &mut WindowServiceClient<Channel>,
         ) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
-        let runtime = self.runtime.clone();
-        let Some(window_client) = self.ensure_window_client(operation) else {
-            return Ok(());
-        };
-
-        let result = send(runtime.as_ref(), window_client);
-        if result.is_err() {
-            self.window_client = None;
-        }
-        result
+        self.with_window_client_delivery(operation, send)
+            .map(|_| ())
     }
 
     fn ignore_window_rpc_error(operation: &str, result: anyhow::Result<()>) -> anyhow::Result<()> {
@@ -1055,6 +1086,23 @@ impl IPCService {
         }
 
         Ok(())
+    }
+
+    fn ignore_window_rpc_delivery_error(
+        operation: &str,
+        result: anyhow::Result<WindowRpcDelivery>,
+    ) -> anyhow::Result<WindowRpcDelivery> {
+        match result {
+            Ok(delivery) => Ok(delivery),
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    operation,
+                    "Candidate window IPC request failed; continuing without UI connection"
+                );
+                Ok(WindowRpcDelivery::SkippedUnavailable)
+            }
+        }
     }
 
     #[tracing::instrument]
@@ -1227,14 +1275,14 @@ impl IPCService {
     }
 
     #[tracing::instrument(skip(candidates))]
-    pub fn update_candidate_window(
+    pub(crate) fn update_candidate_window(
         &mut self,
         visible: Option<bool>,
         position: Option<shared::proto::WindowPosition>,
         candidates: Option<Vec<String>>,
         selected_index: Option<i32>,
         input_mode: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<WindowRpcDelivery> {
         let clear_reading = visible == Some(false);
         self.update_candidate_window_with_reading(
             visible,
@@ -1249,7 +1297,7 @@ impl IPCService {
     }
 
     #[tracing::instrument(skip(candidates))]
-    pub fn update_candidate_window_with_reading(
+    pub(crate) fn update_candidate_window_with_reading(
         &mut self,
         visible: Option<bool>,
         position: Option<shared::proto::WindowPosition>,
@@ -1259,7 +1307,7 @@ impl IPCService {
         reading: Option<&str>,
         candidate_list_visible: Option<bool>,
         reading_vertical_adjustment: Option<i32>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<WindowRpcDelivery> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
         let position_present = performance_start.map(|_| position.is_some());
@@ -1267,7 +1315,7 @@ impl IPCService {
         let input_mode_present = performance_start.map(|_| input_mode.is_some());
         let reading_present =
             performance_start.map(|_| reading.is_some_and(|value| !value.is_empty()));
-        let result: anyhow::Result<()> = (|| {
+        let result: anyhow::Result<WindowRpcDelivery> = (|| {
             let request = tonic::Request::new(shared::proto::UpdateCandidateWindowRequest {
                 visible,
                 position,
@@ -1279,10 +1327,13 @@ impl IPCService {
                 candidate_list_visible,
                 reading_vertical_adjustment,
             });
-            self.with_window_client("ui_update_candidate_window", |runtime, window_client| {
-                runtime.block_on(window_client.update_candidate_window(request))?;
-                Ok(())
-            })
+            self.with_window_client_delivery(
+                "ui_update_candidate_window",
+                |runtime, window_client| {
+                    runtime.block_on(window_client.update_candidate_window(request))?;
+                    Ok(())
+                },
+            )
         })();
         self.log_client_performance_from_start(
             performance_start,
@@ -1295,8 +1346,9 @@ impl IPCService {
                 let input_mode_present = input_mode_present.unwrap_or_default();
                 let reading_present = reading_present.unwrap_or_default();
                 match &result {
-                    Ok(()) => format!(
-                        "status=success;visible={visible:?};position_present={position_present};candidate_count={candidate_count:?};selected_index={selected_index:?};input_mode_present={input_mode_present};reading_present={reading_present};candidate_list_visible={candidate_list_visible:?};reading_vertical_adjustment={reading_vertical_adjustment:?}"
+                    Ok(delivery) => format!(
+                        "status={};visible={visible:?};position_present={position_present};candidate_count={candidate_count:?};selected_index={selected_index:?};input_mode_present={input_mode_present};reading_present={reading_present};candidate_list_visible={candidate_list_visible:?};reading_vertical_adjustment={reading_vertical_adjustment:?}",
+                        delivery.log_status()
                     ),
                     Err(error) => format!(
                         "status=error;visible={visible:?};position_present={position_present};candidate_count={candidate_count:?};selected_index={selected_index:?};input_mode_present={input_mode_present};reading_present={reading_present};candidate_list_visible={candidate_list_visible:?};reading_vertical_adjustment={reading_vertical_adjustment:?};error={error:?}"
@@ -1304,7 +1356,7 @@ impl IPCService {
                 }
             },
         );
-        Self::ignore_window_rpc_error("ui_update_candidate_window", result)
+        Self::ignore_window_rpc_delivery_error("ui_update_candidate_window", result)
     }
 }
 
