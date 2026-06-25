@@ -248,6 +248,18 @@ impl IMEState {
         Ok(())
     }
 
+    pub fn ensure_ipc_service() -> anyhow::Result<bool> {
+        if Self::ipc_service()?.is_some() {
+            return Ok(false);
+        }
+
+        let mut ipc_service = IPCService::new()?;
+        ipc_service.append_text(String::new())?;
+        Self::set_ipc_service(ipc_service)?;
+
+        Ok(true)
+    }
+
     pub fn input_mode() -> anyhow::Result<InputMode> {
         Ok(Self::get()?.input_mode.clone())
     }

@@ -13,7 +13,7 @@ use super::{
     input_mode::InputMode,
     ipc_service::{
         client_performance_log_enabled, current_input_trace_request_id, Candidates,
-        ClientInputTraceGuard, IPCService,
+        ClientInputTraceGuard, IPCService, WindowRpcDelivery,
     },
     romaji_lookup::RomajiLookup,
     state::{keyboard_disabled_from_context, AppConfigSnapshot, IMEState},
@@ -205,6 +205,24 @@ impl TextServiceFactory {
                 elapsed,
                 details.into(),
             );
+        }
+    }
+
+    fn ensure_ipc_service_for_key_event(operation: &str) -> bool {
+        match IMEState::ensure_ipc_service() {
+            Ok(true) => {
+                tracing::debug!(operation, "Initialized IPC service during key event");
+                true
+            }
+            Ok(false) => true,
+            Err(error) => {
+                tracing::debug!(
+                    ?error,
+                    operation,
+                    "IPC service is unavailable during key event"
+                );
+                false
+            }
         }
     }
 
@@ -1626,7 +1644,7 @@ impl TextServiceFactory {
                 }
                 None
             };
-            ipc_service.update_candidate_window_with_reading(
+            let delivery = ipc_service.update_candidate_window_with_reading(
                 visible,
                 position,
                 Some(candidates.texts.clone()),
@@ -1636,7 +1654,7 @@ impl TextServiceFactory {
                 candidate_list_visible,
                 reading_vertical_adjustment,
             )?;
-            self.remember_candidate_window_visibility(visible);
+            self.remember_candidate_window_visibility_if_sent(delivery, visible);
             Ok(())
         })();
 
@@ -1682,6 +1700,25 @@ impl TextServiceFactory {
                 update_pos && visible != Some(false)
             }
         }
+    }
+
+    #[inline]
+    fn delivered_candidate_window_visibility(
+        delivery: WindowRpcDelivery,
+        visible: Option<bool>,
+    ) -> Option<bool> {
+        delivery.was_sent().then_some(visible).flatten()
+    }
+
+    #[inline]
+    pub(crate) fn remember_candidate_window_visibility_if_sent(
+        &self,
+        delivery: WindowRpcDelivery,
+        visible: Option<bool>,
+    ) {
+        self.remember_candidate_window_visibility(Self::delivered_candidate_window_visibility(
+            delivery, visible,
+        ));
     }
 
     #[inline]
@@ -3537,6 +3574,10 @@ impl TextServiceFactory {
                 actions.insert(0, ClientAction::SetTemporaryLatinShiftPending(false));
             }
 
+            if !Self::ensure_ipc_service_for_key_event("process_key") {
+                return Ok(None);
+            }
+
             Ok(Some((actions, transition, config_snapshot)))
         })();
 
@@ -3596,6 +3637,10 @@ impl TextServiceFactory {
         let mut actions = vec![ClientAction::SetTemporaryLatinShiftPending(false)];
         if composition.temporary_latin {
             actions.insert(0, ClientAction::SetTemporaryLatin(false));
+        }
+
+        if !Self::ensure_ipc_service_for_key_event("process_key_up") {
+            return Ok(None);
         }
 
         Ok(Some((actions, composition.state.clone())))
@@ -3787,6 +3832,10 @@ impl TextServiceFactory {
                 actions.insert(0, ClientAction::SetTemporaryLatin(false));
             }
 
+            if !Self::ensure_ipc_service_for_key_event("handle_preserved_eisu_shortcut") {
+                return Ok(false);
+            }
+
             self.handle_action_with_config_snapshot(&actions, transition, config_snapshot)?;
             Ok(true)
         })();
@@ -3817,12 +3866,11 @@ impl TextServiceFactory {
         let ipc_service = IMEState::ipc_service().ok().flatten();
 
         if let Some(mut ipc_service) = ipc_service {
-            let update_result =
-                ipc_service.update_candidate_window(Some(false), None, Some(vec![]), Some(0), None);
-            if update_result.is_ok() {
-                self.remember_candidate_window_visibility(Some(false));
+            if let Ok(delivery) =
+                ipc_service.update_candidate_window(Some(false), None, Some(vec![]), Some(0), None)
+            {
+                self.remember_candidate_window_visibility_if_sent(delivery, Some(false));
             }
-            let _ = update_result;
             let _ = ipc_service.clear_text();
 
             let _ = IMEState::set_ipc_service(ipc_service);
@@ -3931,14 +3979,14 @@ impl TextServiceFactory {
                     next_split_group_id = 0;
 
                     self.discard_composition_text()?;
-                    ipc_service.update_candidate_window(
+                    let delivery = ipc_service.update_candidate_window(
                         Some(false),
                         None,
                         Some(vec![]),
                         Some(0),
                         None,
                     )?;
-                    self.remember_candidate_window_visibility(Some(false));
+                    self.remember_candidate_window_visibility_if_sent(delivery, Some(false));
                     ipc_service.clear_text()?;
                 }};
             }
@@ -3985,19 +4033,22 @@ impl TextServiceFactory {
                     ClientAction::StartComposition => {
                         self.start_composition()?;
                         if app_config.general.show_candidate_window_after_space {
-                            ipc_service.update_candidate_window(
+                            let delivery = ipc_service.update_candidate_window(
                                 Some(false),
                                 None,
                                 None,
                                 None,
                                 None,
                             )?;
-                            self.remember_candidate_window_visibility(Some(false));
+                            self.remember_candidate_window_visibility_if_sent(
+                                delivery,
+                                Some(false),
+                            );
                         }
                     }
                     ClientAction::ShowCandidateWindow => {
                         let position = self.candidate_window_position()?;
-                        ipc_service.update_candidate_window_with_reading(
+                        let delivery = ipc_service.update_candidate_window_with_reading(
                             Some(true),
                             position,
                             None,
@@ -4015,7 +4066,7 @@ impl TextServiceFactory {
                                 &transition,
                             ),
                         )?;
-                        self.remember_candidate_window_visibility(Some(true));
+                        self.remember_candidate_window_visibility_if_sent(delivery, Some(true));
                     }
                     ClientAction::EndComposition => {
                         self.end_composition()?;
@@ -4035,14 +4086,14 @@ impl TextServiceFactory {
                         current_clause_has_split_left_neighbor = false;
                         current_clause_split_group_id = None;
                         next_split_group_id = 0;
-                        ipc_service.update_candidate_window(
+                        let delivery = ipc_service.update_candidate_window(
                             Some(false),
                             None,
                             Some(vec![]),
                             Some(0),
                             None,
                         )?;
-                        self.remember_candidate_window_visibility(Some(false));
+                        self.remember_candidate_window_visibility_if_sent(delivery, Some(false));
                         ipc_service.clear_text()?;
                     }
                     ClientAction::AppendText(text) => {
@@ -4339,14 +4390,17 @@ impl TextServiceFactory {
                                 self.set_text(&committed_prefix, "")?;
                             }
                             self.end_composition()?;
-                            ipc_service.update_candidate_window(
+                            let delivery = ipc_service.update_candidate_window(
                                 Some(false),
                                 None,
                                 Some(vec![]),
                                 Some(0),
                                 None,
                             )?;
-                            self.remember_candidate_window_visibility(Some(false));
+                            self.remember_candidate_window_visibility_if_sent(
+                                delivery,
+                                Some(false),
+                            );
                             ipc_service.clear_text()?;
 
                             preview.clear();

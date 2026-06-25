@@ -88,7 +88,29 @@ static MENU_OWNER_WINDOW_CLASS_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 // if not, you will get E_FAIL error in ITfLangBarItemMgr::AddItem
 
 impl TextServiceFactory_Impl {
+    fn ensure_ipc_service_for_language_bar_event(event: &str) -> bool {
+        match IMEState::ensure_ipc_service() {
+            Ok(true) => {
+                tracing::debug!(event, "Initialized IPC service during language bar event");
+                true
+            }
+            Ok(false) => true,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    event,
+                    "IPC service is unavailable during language bar event"
+                );
+                false
+            }
+        }
+    }
+
     fn toggle_input_mode(&self) -> Result<()> {
+        if !Self::ensure_ipc_service_for_language_bar_event("toggle_input_mode") {
+            return Ok(());
+        }
+
         let mode = match IMEState::input_mode()? {
             InputMode::Latin => InputMode::Kana,
             InputMode::Kana => InputMode::Latin,
