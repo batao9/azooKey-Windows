@@ -72,6 +72,14 @@ impl Candidates {
             && self.corresponding_count.is_empty()
             && self.candidate_ids.is_empty()
     }
+
+    #[inline]
+    fn has_same_composition(&self, other: &Self) -> bool {
+        self.texts == other.texts
+            && self.sub_texts == other.sub_texts
+            && self.hiragana == other.hiragana
+            && self.corresponding_count == other.corresponding_count
+    }
 }
 
 #[derive(Debug)]
@@ -429,7 +437,8 @@ impl IPCService {
         refreshed_candidates: &Candidates,
     ) -> bool {
         previous_candidates.is_some_and(|previous| {
-            previous == refreshed_candidates && !refreshed_candidates.is_empty_composition()
+            previous.has_same_composition(refreshed_candidates)
+                && !refreshed_candidates.is_empty_composition()
         })
     }
 
@@ -717,7 +726,8 @@ impl IPCService {
         refreshed_candidates: &Candidates,
     ) -> bool {
         previous_candidates.is_some_and(|previous| {
-            previous == refreshed_candidates || refreshed_candidates.is_empty_composition()
+            previous.has_same_composition(refreshed_candidates)
+                || refreshed_candidates.is_empty_composition()
         })
     }
 
@@ -1440,6 +1450,26 @@ mod tests {
     }
 
     #[test]
+    fn append_retry_ignores_refreshed_candidate_ids() {
+        let previous = Candidates {
+            texts: vec!["か".to_string()],
+            sub_texts: vec![String::new()],
+            hiragana: "か".to_string(),
+            corresponding_count: vec![1],
+            candidate_ids: vec![1],
+        };
+        let refreshed = Candidates {
+            candidate_ids: vec![2],
+            ..previous.clone()
+        };
+
+        assert!(IPCService::should_retry_append_after_refresh(
+            Some(&previous),
+            &refreshed
+        ));
+    }
+
+    #[test]
     fn append_retry_is_disabled_when_server_state_has_changed() {
         let previous = Candidates::default();
         let refreshed = Candidates {
@@ -1521,6 +1551,26 @@ mod tests {
         assert!(IPCService::should_retry_non_idempotent_edit_after_refresh(
             Some(&previous),
             &previous
+        ));
+    }
+
+    #[test]
+    fn non_idempotent_edit_retry_ignores_refreshed_candidate_ids() {
+        let previous = Candidates {
+            texts: vec!["か".to_string()],
+            sub_texts: vec![String::new()],
+            hiragana: "か".to_string(),
+            corresponding_count: vec![1],
+            candidate_ids: vec![1],
+        };
+        let refreshed = Candidates {
+            candidate_ids: vec![2],
+            ..previous.clone()
+        };
+
+        assert!(IPCService::should_retry_non_idempotent_edit_after_refresh(
+            Some(&previous),
+            &refreshed
         ));
     }
 
