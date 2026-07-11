@@ -27,6 +27,10 @@ private let fallbackDictionaryURL =
 @MainActor var composingTextSnapshots: [ComposingText] = []
 @MainActor var currentInputStyle: InputStyle = .roman2kana
 @MainActor var customRomajiTableEnabled = false
+@MainActor var currentLearningType: LearningType = .inputAndOutput
+@MainActor var currentLearningMemoryDirectoryURL: URL?
+@MainActor var nextLearningCandidateId: UInt64 = 1
+@MainActor var learningCandidateCache: [UInt64: Candidate] = [:]
 
 @MainActor var execURL = URL(filePath: "")
 @MainActor var config: [String : Any] = [
@@ -384,20 +388,119 @@ private func shouldOffloadZenzaiToGpu(zenzaiEnabled: Bool, backend: String?) -> 
     )
 }
 
+@MainActor private func learningMemoryDirectoryURL(settingsPath: URL?) -> URL {
+    if let settingsPath {
+        return settingsPath
+            .deletingLastPathComponent()
+            .appendingPathComponent("LearningMemory", isDirectory: true)
+    }
+
+    if let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] {
+        return URL(filePath: appDataPath)
+            .appendingPathComponent("Azookey", isDirectory: true)
+            .appendingPathComponent("LearningMemory", isDirectory: true)
+    }
+
+    return converterRuntimeDirectoryURL()
+        .appendingPathComponent("LearningMemory", isDirectory: true)
+}
+
+private func normalizedLearningMode(_ mode: String?) -> String {
+    (mode ?? "enabled")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+        .replacingOccurrences(of: "-", with: "_")
+}
+
+private func learningType(for mode: String?) -> LearningType {
+    switch normalizedLearningMode(mode) {
+    case "read_only", "readonly", "no_new_learning":
+        return .onlyOutput
+    case "disabled":
+        return .nothing
+    default:
+        return .inputAndOutput
+    }
+}
+
+@MainActor private func ensureLearningMemoryDirectoryIfNeeded() {
+    guard currentLearningType != .nothing,
+          let currentLearningMemoryDirectoryURL else {
+        return
+    }
+
+    do {
+        try FileManager.default.createDirectory(
+            at: currentLearningMemoryDirectoryURL,
+            withIntermediateDirectories: true
+        )
+    } catch {
+        serverLog(
+            "WARN",
+            "Failed to create learning memory directory \(currentLearningMemoryDirectoryURL.path): \(error)"
+        )
+    }
+}
+
+@MainActor private func resetLearningMemoryDirectory() -> Bool {
+    guard let currentLearningMemoryDirectoryURL else {
+        serverLog("WARN", "ResetLearningMemory: learning memory directory is not configured")
+        return false
+    }
+
+    do {
+        if FileManager.default.fileExists(atPath: currentLearningMemoryDirectoryURL.path) {
+            try FileManager.default.removeItem(at: currentLearningMemoryDirectoryURL)
+        }
+        try FileManager.default.createDirectory(
+            at: currentLearningMemoryDirectoryURL,
+            withIntermediateDirectories: true
+        )
+        return true
+    } catch {
+        serverLog(
+            "WARN",
+            "ResetLearningMemory: failed to reset directory \(currentLearningMemoryDirectoryURL.path): \(error)"
+        )
+        return false
+    }
+}
+
+@MainActor private func clearLearningCandidateCache() {
+    learningCandidateCache.removeAll()
+    nextLearningCandidateId = 1
+}
+
+@MainActor private func recordLearningCandidate(_ candidate: Candidate) -> UInt64 {
+    if nextLearningCandidateId == UInt64.max {
+        clearLearningCandidateCache()
+    }
+    let candidateId = nextLearningCandidateId
+    nextLearningCandidateId += 1
+    learningCandidateCache[candidateId] = candidate
+    return candidateId
+}
+
+@MainActor func consumeLearningCandidate(_ candidateId: UInt64) -> Candidate? {
+    learningCandidateCache.removeValue(forKey: candidateId)
+}
+
 private func makeConvertRequestOptions(
     context: String,
     zenzaiEnabled: Bool,
     runtimeDirectoryURL: URL,
     emojiDictionaryURL: URL,
     zenzaiWeightURL: URL,
-    profile: String
+    profile: String,
+    learningType: LearningType = .nothing,
+    learningMemoryDirectoryURL: URL? = nil
 ) -> ConvertRequestOptions {
     return ConvertRequestOptions(
         requireJapanesePrediction: .disabled,
         requireEnglishPrediction: .disabled,
         keyboardLanguage: .ja_JP,
-        learningType: .nothing,
-        memoryDirectoryURL: runtimeDirectoryURL,
+        learningType: learningType,
+        memoryDirectoryURL: learningMemoryDirectoryURL ?? runtimeDirectoryURL,
         sharedContainerURL: runtimeDirectoryURL,
         textReplacer: .init {
             return emojiDictionaryURL
@@ -421,8 +524,13 @@ private func makeConvertRequestOptions(
 
 private struct AppSettings: Decodable {
     let zenzai: ZenzaiSettings?
+    let learning: LearningSettings?
     let user_dictionary: UserDictionarySettings?
     let romaji_table: RomajiTableSettings?
+}
+
+private struct LearningSettings: Decodable {
+    let mode: String?
 }
 
 private struct ZenzaiSettings: Decodable {
@@ -1105,7 +1213,9 @@ private func preferCursorPrefixBoundary(
             .appendingPathComponent("EmojiDictionary")
             .appendingPathComponent("emoji_all_E15.1.txt"),
         zenzaiWeightURL: execURL.appendingPathComponent("zenz.gguf"),
-        profile: (config["profile"] as? String) ?? ""
+        profile: (config["profile"] as? String) ?? "",
+        learningType: currentLearningType,
+        learningMemoryDirectoryURL: currentLearningMemoryDirectoryURL
     )
 }
 
@@ -1569,6 +1679,8 @@ func cursorPrefixBoundaryFirstClauseResults(
         cpuBackendSupported: cpuZenzaiBackendSupportedFromEnvironment()
     )
     let previousUsedCustomRomajiTable = customRomajiTableEnabled
+    let previousLearningType = currentLearningType
+    let previousLearningMemoryDirectoryURL = currentLearningMemoryDirectoryURL
     var dynamicUserDictionary: [DicdataElement] = []
     defer {
         converter.importDynamicUserDictionary(dynamicUserDictionary)
@@ -1579,6 +1691,8 @@ func cursorPrefixBoundaryFirstClauseResults(
     config["profile"] = ""
     config["backend"] = "cpu"
     setRoman2KanaInputStyle()
+    currentLearningType = .inputAndOutput
+    currentLearningMemoryDirectoryURL = learningMemoryDirectoryURL(settingsPath: loadedSettingsPath)
 
     if let settings = loadedSettings {
         if let loadedSettingsPath {
@@ -1600,6 +1714,7 @@ func cursorPrefixBoundaryFirstClauseResults(
         }
 
         applyRomajiInputStyle(rows: settings.romaji_table?.rows)
+        currentLearningType = learningType(for: settings.learning?.mode)
 
         let sourceEntries = settings.user_dictionary?.entries ?? []
         var seen: Set<String> = []
@@ -1668,10 +1783,16 @@ func cursorPrefixBoundaryFirstClauseResults(
         composingText = ComposingText()
         composingTextSnapshots.removeAll()
     }
+    if previousLearningType != currentLearningType
+        || previousLearningMemoryDirectoryURL != currentLearningMemoryDirectoryURL
+    {
+        clearLearningCandidateCache()
+    }
+    ensureLearningMemoryDirectoryIfNeeded()
 
     serverLog(
         "INFO",
-        "LoadConfig: completed enable=\(currentZenzaiEnabled) backend=\(currentBackend) effectiveEnable=\(currentEffectiveZenzaiEnabled) customRomaji=\(currentUsedCustomRomajiTable)"
+        "LoadConfig: completed enable=\(currentZenzaiEnabled) backend=\(currentBackend) effectiveEnable=\(currentEffectiveZenzaiEnabled) customRomaji=\(currentUsedCustomRomajiTable) learningType=\(currentLearningType)"
     )
 }
 
@@ -1686,6 +1807,7 @@ func cursorPrefixBoundaryFirstClauseResults(
     converterDictionaryURL = execURL.appendingPathComponent("Dictionary")
     converterPreloadDictionary = true
     rebuildConverter()
+    clearLearningCandidateCache()
 
     load_config()
 
@@ -1843,7 +1965,50 @@ func cursorPrefixBoundaryFirstClauseResults(
     serverLog("DEBUG", "ClearText: start")
     composingText = ComposingText()
     composingTextSnapshots.removeAll()
+    clearLearningCandidateCache()
     serverLog("DEBUG", "ClearText: completed")
+}
+
+@_silgen_name("CommitLearningCandidate")
+@MainActor public func commit_learning_candidate(
+    candidateId: UInt64,
+    commitKind: Int32
+) -> Bool {
+    guard currentLearningType == .inputAndOutput else {
+        serverLog(
+            "DEBUG",
+            "CommitLearningCandidate: skipped learningType=\(currentLearningType) candidateId=\(candidateId) commitKind=\(commitKind)"
+        )
+        return true
+    }
+
+    guard let candidate = consumeLearningCandidate(candidateId) else {
+        serverLog(
+            "WARN",
+            "CommitLearningCandidate: candidate not found candidateId=\(candidateId) commitKind=\(commitKind)"
+        )
+        return false
+    }
+
+    ensureLearningMemoryDirectoryIfNeeded()
+    converter.setCompletedData(candidate)
+    converter.updateLearningData(candidate)
+    converter.commitUpdateLearningData()
+    serverLog(
+        "DEBUG",
+        "CommitLearningCandidate: completed candidateId=\(candidateId) commitKind=\(commitKind)"
+    )
+    return true
+}
+
+@_silgen_name("ResetLearningMemory")
+@MainActor public func reset_learning_memory() -> Bool {
+    let resetDirectory = resetLearningMemoryDirectory()
+    converter.resetMemory()
+    normalNBestSupplementConverter.resetMemory()
+    clearLearningCandidateCache()
+    serverLog("INFO", "ResetLearningMemory: completed resetDirectory=\(resetDirectory)")
+    return resetDirectory
 }
 
 func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
@@ -2054,7 +2219,15 @@ public func free_candidate_list(
             strdupCandidatesMs += elapsedPerformanceMilliseconds(since: strdupStart)
         }
 
-        result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))
+        result.append(
+            FFICandidate(
+                text: text,
+                subtext: subtext,
+                hiragana: hiragana,
+                correspondingCount: Int32(correspondingCount),
+                candidateId: recordLearningCandidate(candidate)
+            )
+        )
     }
 
     lengthPtr.pointee = CInt(result.count)
@@ -2363,7 +2536,15 @@ public func free_candidate_list(
             strdupCandidatesMs += elapsedPerformanceMilliseconds(since: strdupStart)
         }
 
-        result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))
+        result.append(
+            FFICandidate(
+                text: text,
+                subtext: subtext,
+                hiragana: hiragana,
+                correspondingCount: Int32(correspondingCount),
+                candidateId: recordLearningCandidate(candidate)
+            )
+        )
     }
 
     lengthPtr.pointee = CInt(result.count)

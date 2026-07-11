@@ -405,11 +405,13 @@ fn candidates_owned(
     hiragana: String,
     corresponding_count: Vec<i32>,
 ) -> Candidates {
+    let candidate_ids = (1..=texts.len() as u64).collect();
     Candidates {
         texts,
         sub_texts,
         hiragana,
         corresponding_count,
+        candidate_ids,
     }
 }
 
@@ -1706,6 +1708,7 @@ fn apply_user_action(
                 harness.state = CompositionState::Composing;
             }
             ClientAction::ShowCandidateWindow => {}
+            ClientAction::CommitLearning { .. } => {}
             ClientAction::CommitTextDirect(text) => {
                 harness.committed_clauses.push(SimCommittedClause {
                     display: text.clone(),

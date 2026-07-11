@@ -4,7 +4,9 @@ use super::{
     CompositionReducer, CompositionState, FutureClauseSnapshot, TextServiceFactory,
 };
 use crate::engine::{
-    client_action::{ClientAction, SetSelectionType, SetTextType},
+    client_action::{
+        ClientAction, LearningCommitKind, LearningCommitScope, SetSelectionType, SetTextType,
+    },
     input_mode::InputMode,
     ipc_service::WindowRpcDelivery,
     user_action::{Function, Navigation, UserAction},
@@ -31,7 +33,12 @@ pub(super) fn candidates(
         sub_texts: sub_texts.iter().map(|value| (*value).to_string()).collect(),
         hiragana: hiragana.to_string(),
         corresponding_count: corresponding_count.to_vec(),
+        candidate_ids: (1..=texts.len() as u64).collect(),
     }
+}
+
+fn learning_action(scope: LearningCommitScope, kind: LearningCommitKind) -> ClientAction {
+    ClientAction::CommitLearning { scope, kind }
 }
 
 pub(super) fn actual_future_snapshot(
@@ -196,6 +203,93 @@ fn delayed_candidate_window_shows_when_space_opens_preview() {
             ClientAction::SetSelection(SetSelectionType::Down)
         ]
     );
+}
+
+#[test]
+fn space_preview_does_not_commit_learning() {
+    let composition = Composition {
+        state: CompositionState::Composing,
+        raw_input: "a".to_string(),
+        ..Composition::default()
+    };
+
+    let (_, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Space,
+        &InputMode::Kana,
+        false,
+        &AppConfig::default(),
+        false,
+    )
+    .expect("space should enter preview");
+
+    assert!(!actions
+        .iter()
+        .any(|action| matches!(action, ClientAction::CommitLearning { .. })));
+}
+
+#[test]
+fn learning_candidate_filter_skips_short_latin_and_temporary_latin() {
+    let short_reading = candidates(&["は"], &[""], "は", &[1]);
+    let latin = candidates(&["abc"], &[""], "abc", &[3]);
+    let japanese = candidates(&["私"], &[""], "わたし", &[3]);
+
+    assert!(TextServiceFactory::collect_learning_candidate_ids(
+        LearningCommitScope::CurrentClause,
+        0,
+        &short_reading,
+        &[],
+        &[],
+        false,
+    )
+    .is_empty());
+    assert!(TextServiceFactory::collect_learning_candidate_ids(
+        LearningCommitScope::CurrentClause,
+        0,
+        &latin,
+        &[],
+        &[],
+        false,
+    )
+    .is_empty());
+    assert!(TextServiceFactory::collect_learning_candidate_ids(
+        LearningCommitScope::CurrentClause,
+        0,
+        &japanese,
+        &[],
+        &[],
+        true,
+    )
+    .is_empty());
+    assert_eq!(
+        TextServiceFactory::collect_learning_candidate_ids(
+            LearningCommitScope::CurrentClause,
+            0,
+            &japanese,
+            &[],
+            &[],
+            false,
+        ),
+        vec![1]
+    );
+}
+
+#[test]
+fn display_override_clears_learning_candidate_ids() {
+    let mut current_candidates = candidates(&["私", "渡し"], &["", ""], "わたし", &[3, 3]);
+
+    TextServiceFactory::clear_current_learning_candidate_ids(&mut current_candidates);
+
+    assert_eq!(current_candidates.candidate_ids, vec![0, 0]);
+    assert!(TextServiceFactory::collect_learning_candidate_ids(
+        LearningCommitScope::CurrentClause,
+        0,
+        &current_candidates,
+        &[],
+        &[],
+        false,
+    )
+    .is_empty());
 }
 
 #[test]
@@ -729,7 +823,51 @@ fn enter_commits_all_when_clause_navigation_is_active() {
     .expect("enter should commit active clause navigation");
 
     assert_eq!(transition, CompositionState::None);
-    assert_eq!(actions, vec![ClientAction::EndComposition]);
+    assert_eq!(
+        actions,
+        vec![
+            ClientAction::CommitLearning {
+                scope: LearningCommitScope::Composition,
+                kind: LearningCommitKind::Normal,
+            },
+            ClientAction::EndComposition,
+        ]
+    );
+}
+
+#[test]
+fn enter_learns_only_current_clause_when_suffix_remains() {
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "加減".to_string(),
+        suffix: "統一".to_string(),
+        raw_input: "kagentouitu".to_string(),
+        raw_hiragana: "かげんとういつ".to_string(),
+        corresponding_count: 5,
+        ..Composition::default()
+    };
+
+    let (transition, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Enter,
+        &InputMode::Kana,
+        false,
+        &AppConfig::default(),
+        false,
+    )
+    .expect("enter should commit the current clause");
+
+    assert_eq!(transition, CompositionState::Composing);
+    assert_eq!(
+        actions,
+        vec![
+            learning_action(
+                LearningCommitScope::CurrentClause,
+                LearningCommitKind::Partial,
+            ),
+            ClientAction::ShrinkText("".to_string()),
+        ]
+    );
 }
 
 #[test]

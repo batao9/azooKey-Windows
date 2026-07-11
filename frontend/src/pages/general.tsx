@@ -7,6 +7,17 @@ import { Download, Keyboard, RefreshCcw, Table2, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
+    AlertDialog,
+    AlertDialogAction,
+    AlertDialogCancel,
+    AlertDialogContent,
+    AlertDialogDescription,
+    AlertDialogFooter,
+    AlertDialogHeader,
+    AlertDialogTitle,
+    AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
+import {
     Select,
     SelectContent,
     SelectItem,
@@ -17,6 +28,7 @@ import { Switch } from "@/components/ui/switch";
 import { saveConfigWithToast } from "@/lib/config";
 
 type WidthMode = "half" | "full";
+type LearningMode = "enabled" | "read_only" | "disabled";
 
 type GeneralConfigState = {
     punctuation_style: string;
@@ -59,6 +71,12 @@ type UpdateCheckResponse = {
     release_name: string;
     release_url: string;
     update_available: boolean;
+};
+
+type ResetLearningHistoryResponse = {
+    reset: boolean;
+    server_applied: boolean;
+    message?: string | null;
 };
 
 type UpdateStatus =
@@ -141,6 +159,12 @@ const NUMPAD_OPTIONS = [
     { value: "follow_input_mode", label: "入力モードに従う" },
 ];
 
+const LEARNING_MODE_OPTIONS: Array<{ value: LearningMode; label: string }> = [
+    { value: "enabled", label: "有効" },
+    { value: "read_only", label: "新規学習はしない" },
+    { value: "disabled", label: "無効" },
+];
+
 const WIDTH_OPTIONS = [
     { value: "half", label: "半角" },
     { value: "full", label: "全角" },
@@ -215,6 +239,13 @@ const normalizeGeneralConfig = (value?: Record<string, unknown>): GeneralConfigS
         ),
 });
 
+const normalizeLearningMode = (value?: unknown): LearningMode => {
+    if (value === "enabled" || value === "read_only" || value === "disabled") {
+        return value;
+    }
+    return "enabled";
+};
+
 const normalizeWidthGroups = (
     value?: Record<string, unknown>,
 ): CharacterWidthGroupsState => {
@@ -277,6 +308,7 @@ export const General = () => {
     const [generalValue, setGeneralValue] = useState<GeneralConfigState>(
         DEFAULT_GENERAL_CONFIG,
     );
+    const [learningMode, setLearningMode] = useState<LearningMode>("enabled");
     const [widthGroups, setWidthGroups] =
         useState<CharacterWidthGroupsState>(DEFAULT_WIDTH_GROUPS);
     const [romajiRows, setRomajiRows] = useState<RomajiRow[]>([]);
@@ -307,6 +339,7 @@ export const General = () => {
                 });
 
                 setGeneralValue(normalizeGeneralConfig(data.general));
+                setLearningMode(normalizeLearningMode(data.learning?.mode));
                 setWidthGroups(normalizeWidthGroups(data.character_width?.groups));
                 setRomajiRows(normalizeRomajiRows(data.romaji_table?.rows));
             })
@@ -558,6 +591,38 @@ export const General = () => {
         const normalizedValue = clampLiveConversionReadingVerticalAdjustment(nextValue);
         liveConversionReadingAdjustmentSaveRef.current.pendingValue = normalizedValue;
         void flushLiveConversionReadingVerticalAdjustmentSave();
+    };
+
+    const updateLearningMode = async (nextValue: LearningMode) => {
+        const data = await updateConfig((config) => {
+            config.learning = config.learning ?? {};
+            config.learning.mode = nextValue;
+        });
+
+        if (data) {
+            setLearningMode(normalizeLearningMode(data.learning?.mode));
+        }
+    };
+
+    const resetLearningHistory = async () => {
+        try {
+            const result = await invoke<ResetLearningHistoryResponse>(
+                "reset_learning_history",
+            );
+            if (result.reset && result.server_applied) {
+                toast("学習履歴を削除しました");
+                return;
+            }
+
+            toast("学習履歴を削除できませんでした", {
+                description: result.message ?? undefined,
+            });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            toast("学習履歴を削除できませんでした", {
+                description: message,
+            });
+        }
     };
 
     const updateWidthGroup = async (
@@ -871,6 +936,72 @@ export const General = () => {
                                 />
                             </div>
                         ) : null}
+                    </div>
+                </section>
+
+                <section className="space-y-3">
+                    <h1 className="text-sm font-bold text-foreground">変換学習</h1>
+                    <div className="space-y-3 rounded-md border p-4">
+                        <div className="grid grid-cols-[1fr_220px] items-center gap-4">
+                            <div className="space-y-1">
+                                <p className="text-sm font-medium leading-none">変換学習</p>
+                                <p className="text-xs text-muted-foreground">
+                                    確定した候補を次回以降の変換順位に反映します
+                                </p>
+                            </div>
+                            <div className="flex justify-end">
+                                <Select
+                                    value={learningMode}
+                                    onValueChange={(value: LearningMode) =>
+                                        void updateLearningMode(value)
+                                    }
+                                >
+                                    <SelectTrigger>
+                                        <SelectValue placeholder="変換学習" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        {LEARNING_MODE_OPTIONS.map((option) => (
+                                            <SelectItem key={option.value} value={option.value}>
+                                                {option.label}
+                                            </SelectItem>
+                                        ))}
+                                    </SelectContent>
+                                </Select>
+                            </div>
+                        </div>
+
+                        <div className="flex items-center gap-4 border-t pt-3">
+                            <div className="flex-1 space-y-1">
+                                <p className="text-sm font-medium leading-none">学習履歴を削除</p>
+                                <p className="text-xs text-muted-foreground">
+                                    保存済みの変換学習データを削除します
+                                </p>
+                            </div>
+                            <AlertDialog>
+                                <AlertDialogTrigger asChild>
+                                    <Button variant="outline">
+                                        <Trash2 />
+                                        削除
+                                    </Button>
+                                </AlertDialogTrigger>
+                                <AlertDialogContent>
+                                    <AlertDialogHeader>
+                                        <AlertDialogTitle>学習履歴を削除</AlertDialogTitle>
+                                        <AlertDialogDescription>
+                                            これまでの変換学習データを削除します。
+                                        </AlertDialogDescription>
+                                    </AlertDialogHeader>
+                                    <AlertDialogFooter>
+                                        <AlertDialogCancel>キャンセル</AlertDialogCancel>
+                                        <AlertDialogAction
+                                            onClick={() => void resetLearningHistory()}
+                                        >
+                                            削除
+                                        </AlertDialogAction>
+                                    </AlertDialogFooter>
+                                </AlertDialogContent>
+                            </AlertDialog>
+                        </div>
                     </div>
                 </section>
 

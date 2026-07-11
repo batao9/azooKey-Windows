@@ -17,6 +17,7 @@ pub(crate) struct CandidateSelection {
     pub(crate) sub_text: String,
     pub(crate) hiragana: String,
     pub(crate) corresponding_count: i32,
+    pub(crate) candidate_id: u64,
 }
 
 pub(crate) trait ClauseActionBackend {
