@@ -25,6 +25,7 @@ pub enum ClientAction {
     CommitLearning {
         scope: LearningCommitScope,
         kind: LearningCommitKind,
+        was_temporary_latin: bool,
     },
     SetTemporaryLatin(bool),
     SetTemporaryLatinShiftPending(bool),

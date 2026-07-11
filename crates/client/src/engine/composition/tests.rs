@@ -38,7 +38,11 @@ pub(super) fn candidates(
 }
 
 fn learning_action(scope: LearningCommitScope, kind: LearningCommitKind) -> ClientAction {
-    ClientAction::CommitLearning { scope, kind }
+    ClientAction::CommitLearning {
+        scope,
+        kind,
+        was_temporary_latin: false,
+    }
 }
 
 pub(super) fn actual_future_snapshot(
@@ -829,10 +833,42 @@ fn enter_commits_all_when_clause_navigation_is_active() {
             ClientAction::CommitLearning {
                 scope: LearningCommitScope::Composition,
                 kind: LearningCommitKind::Normal,
+                was_temporary_latin: false,
             },
             ClientAction::EndComposition,
         ]
     );
+}
+
+#[test]
+fn enter_learning_preserves_temporary_latin_state() {
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "私A".to_string(),
+        raw_input: "watasiA".to_string(),
+        raw_hiragana: "わたしA".to_string(),
+        corresponding_count: 4,
+        temporary_latin: true,
+        ..Composition::default()
+    };
+
+    let (_, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Enter,
+        &InputMode::Kana,
+        false,
+        &AppConfig::default(),
+        false,
+    )
+    .expect("enter should commit temporary latin composition");
+
+    assert!(matches!(
+        actions.first(),
+        Some(ClientAction::CommitLearning {
+            was_temporary_latin: true,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -1262,6 +1298,15 @@ fn ensure_clause_navigation_preserves_fkey_display_preview() {
     assert_eq!(corresponding_count, 5);
     assert_eq!(current_candidates.texts[0], "カゲン");
     assert_eq!(current_candidates.sub_texts[0], "トウイツ");
+    assert!(current_candidates
+        .candidate_ids
+        .iter()
+        .all(|candidate_id| *candidate_id == 0));
+    assert!(future_clause_snapshots.iter().all(|snapshot| snapshot
+        .candidates
+        .candidate_ids
+        .iter()
+        .all(|candidate_id| *candidate_id == 0)));
 }
 
 #[test]

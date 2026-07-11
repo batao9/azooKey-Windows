@@ -394,6 +394,10 @@ impl ClauseState {
             }
             *state.preview =
                 TextServiceFactory::merge_preview_with_prefix(state.fixed_prefix, &selected.text);
+            TextServiceFactory::clear_current_learning_candidate_ids(state.candidates);
+            for snapshot in state.future_clause_snapshots.iter_mut() {
+                TextServiceFactory::clear_current_learning_candidate_ids(&mut snapshot.candidates);
+            }
         }
         *state.suffix = TextServiceFactory::sync_current_clause_future_suffix(
             state.candidates,

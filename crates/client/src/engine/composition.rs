@@ -2959,6 +2959,7 @@ impl TextServiceFactory {
                     ClientAction::CommitLearning {
                         scope: LearningCommitScope::Composition,
                         kind: LearningCommitKind::Normal,
+                        was_temporary_latin: composition.temporary_latin,
                     },
                     ClientAction::EndComposition,
                 ],
@@ -2979,6 +2980,7 @@ impl TextServiceFactory {
                         LearningCommitScope::CurrentClause
                     },
                     kind,
+                    was_temporary_latin: composition.temporary_latin,
                 },
             );
             (state, actions)
@@ -4332,7 +4334,11 @@ impl TextServiceFactory {
                         )?;
                         self.remember_candidate_window_visibility_if_sent(delivery, Some(true));
                     }
-                    ClientAction::CommitLearning { scope, kind } => {
+                    ClientAction::CommitLearning {
+                        scope,
+                        kind,
+                        was_temporary_latin,
+                    } => {
                         if learning_blocked {
                             tracing::debug!(
                                 ?scope,
@@ -4348,7 +4354,7 @@ impl TextServiceFactory {
                                 &candidates,
                                 &clause_snapshots,
                                 &future_clause_snapshots,
-                                temporary_latin,
+                                *was_temporary_latin,
                             )
                             .into_iter()
                             .map(|candidate_id| {
