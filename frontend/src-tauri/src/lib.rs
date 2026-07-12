@@ -70,6 +70,13 @@ struct UpdateConfigResponse {
     message: Option<String>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+struct ResetLearningHistoryResponse {
+    reset: bool,
+    server_applied: bool,
+    message: Option<String>,
+}
+
 fn notice_from_recovery(recovery: &ConfigRecovery) -> ConfigStartupNotice {
     ConfigStartupNotice {
         kind: "recovered".to_string(),
@@ -164,6 +171,48 @@ fn update_config_impl(
         server_applied: true,
         message: None,
     })
+}
+
+#[tauri::command]
+fn reset_learning_history(
+    state: tauri::State<AppState>,
+) -> Result<ResetLearningHistoryResponse, String> {
+    Ok(reset_learning_history_impl(&state))
+}
+
+fn reset_learning_history_impl(state: &AppState) -> ResetLearningHistoryResponse {
+    if let Some(ipc) = state.ipc.lock().unwrap().as_mut() {
+        let reset = match ipc.reset_learning_memory() {
+            Ok(reset) => reset,
+            Err(error) => {
+                eprintln!("Failed to reset learning memory: {}", error);
+                return ResetLearningHistoryResponse {
+                    reset: false,
+                    server_applied: false,
+                    message: Some(error.to_string()),
+                };
+            }
+        };
+        if !reset {
+            return ResetLearningHistoryResponse {
+                reset: false,
+                server_applied: true,
+                message: Some("サーバー側で学習履歴の削除に失敗しました。".to_string()),
+            };
+        }
+    } else {
+        return ResetLearningHistoryResponse {
+            reset: false,
+            server_applied: false,
+            message: Some("IPC service is not initialized".to_string()),
+        };
+    }
+
+    ResetLearningHistoryResponse {
+        reset: true,
+        server_applied: true,
+        message: None,
+    }
 }
 
 #[tauri::command]
@@ -272,7 +321,8 @@ pub fn run() {
             check_for_updates,
             start_update,
             take_update_install_result,
-            restart_server
+            restart_server,
+            reset_learning_history
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -372,6 +422,17 @@ mod tests {
 
         assert!(error.contains("APPDATA"));
         assert!(!state.settings.lock().unwrap().zenzai.enable);
+    }
+
+    #[test]
+    fn reset_learning_history_reports_unavailable_server() {
+        let state = test_state();
+
+        let result = reset_learning_history_impl(&state);
+
+        assert!(!result.reset);
+        assert!(!result.server_applied);
+        assert!(result.message.is_some());
     }
 
     #[test]

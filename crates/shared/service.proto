@@ -6,6 +6,7 @@ message Suggestion {
   string text = 1;    // The main suggestion text.
   string subtext = 2; // Additional information or subtext for the suggestion.
   int32 corresponding_count = 3;
+  uint64 candidate_id = 4;
 }
 
 // ComposingText represents the text and its associated suggestions.
@@ -92,6 +93,32 @@ message UpdateConfigResponse {
   uint64 server_session_id = 1; // Identifies the current server process session.
 }
 
+enum LearningCommitKind {
+  LEARNING_COMMIT_KIND_UNSPECIFIED = 0;
+  LEARNING_COMMIT_KIND_NORMAL = 1;
+  LEARNING_COMMIT_KIND_PUNCTUATION = 2;
+  LEARNING_COMMIT_KIND_PARTIAL = 3;
+}
+
+message CommitLearningCandidateRequest {
+  uint64 candidate_id = 1;
+  LearningCommitKind commit_kind = 2;
+  uint64 request_id = 3;
+}
+
+message CommitLearningCandidateResponse {
+  uint64 server_session_id = 1; // Identifies the current server process session.
+}
+
+message ResetLearningMemoryRequest {
+  uint64 request_id = 1;
+}
+
+message ResetLearningMemoryResponse {
+  uint64 server_session_id = 1; // Identifies the current server process session.
+  bool reset = 2;
+}
+
 message PerformanceLogRequest {
   uint64 request_id = 1;
   string component = 2;
@@ -113,5 +140,7 @@ service AzookeyService {
   rpc ClearText (ClearTextRequest) returns (ClearTextResponse);
   rpc SetContext (SetContextRequest) returns (SetContextResponse);
   rpc UpdateConfig (UpdateConfigRequest) returns (UpdateConfigResponse);
+  rpc CommitLearningCandidate (CommitLearningCandidateRequest) returns (CommitLearningCandidateResponse);
+  rpc ResetLearningMemory (ResetLearningMemoryRequest) returns (ResetLearningMemoryResponse);
   rpc LogPerformance (PerformanceLogRequest) returns (PerformanceLogResponse);
 }

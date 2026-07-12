@@ -393,6 +393,7 @@ struct FFICandidate {
     subtext: *mut c_char,
     hiragana: *mut c_char,
     corresponding_count: c_int,
+    candidate_id: u64,
 }
 
 unsafe extern "C" {
@@ -410,6 +411,8 @@ unsafe extern "C" {
     fn GetComposedTextForCursorPrefix(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
     fn FreeCString(ptr: *mut c_char);
     fn FreeCandidateList(ptr: *mut *mut FFICandidate, length: c_int);
+    fn CommitLearningCandidate(candidateId: u64, commitKind: c_int) -> bool;
+    fn ResetLearningMemory() -> bool;
     fn LoadConfig();
     fn SetRequestId(request_id: u64);
     fn SetServerLogCallbacks(
@@ -1184,6 +1187,14 @@ fn clear_text() {
     }
 }
 
+fn swift_commit_learning_candidate(candidate_id: u64, commit_kind: i32) -> bool {
+    unsafe { CommitLearningCandidate(candidate_id, commit_kind as c_int) }
+}
+
+fn swift_reset_learning_memory() -> bool {
+    unsafe { ResetLearningMemory() }
+}
+
 fn warmup() -> bool {
     unsafe { Warmup() }
 }
@@ -1298,6 +1309,7 @@ fn get_composed_text(use_cursor_prefix: bool, request_id: u64) -> Result<Compose
             text,
             subtext,
             corresponding_count,
+            candidate_id: candidate.candidate_id,
         };
 
         suggestions.push(suggestion);
@@ -1670,6 +1682,89 @@ impl AzookeyService for MyAzookeyService {
         );
         Ok(Response::new(shared::proto::UpdateConfigResponse {
             server_session_id: server_session_id(),
+        }))
+    }
+
+    async fn commit_learning_candidate(
+        &self,
+        request: Request<shared::proto::CommitLearningCandidateRequest>,
+    ) -> Result<Response<shared::proto::CommitLearningCandidateResponse>, Status> {
+        let request = request.into_inner();
+        let _request_guard = ServerRequestGuard::begin(true);
+        let request_id = request_id_or_next(request.request_id);
+        set_request_id(request_id);
+        let handler_start = Instant::now();
+        let candidate_id = request.candidate_id;
+        let commit_kind = request.commit_kind;
+
+        let commit_start = Instant::now();
+        let committed = swift_commit_learning_candidate(candidate_id, commit_kind);
+        if !committed {
+            log_event(
+                ServerLogLevel::Warn,
+                &format!(
+                    "[commit_learning_candidate] candidate not learned candidate_id={candidate_id};commit_kind={commit_kind}"
+                ),
+            );
+        }
+        performance_event_lazy!(
+            request_id,
+            "commit_learning_candidate",
+            "swift_commit_learning_candidate",
+            elapsed_ms(commit_start),
+            "candidate_id={candidate_id};commit_kind={commit_kind};committed={committed}"
+        );
+        performance_event_lazy!(
+            request_id,
+            "commit_learning_candidate",
+            "total",
+            elapsed_ms(handler_start),
+            "status=success;candidate_id={candidate_id};commit_kind={commit_kind};committed={committed}"
+        );
+
+        Ok(Response::new(
+            shared::proto::CommitLearningCandidateResponse {
+                server_session_id: server_session_id(),
+            },
+        ))
+    }
+
+    async fn reset_learning_memory(
+        &self,
+        request: Request<shared::proto::ResetLearningMemoryRequest>,
+    ) -> Result<Response<shared::proto::ResetLearningMemoryResponse>, Status> {
+        let request = request.into_inner();
+        let _request_guard = ServerRequestGuard::begin(false);
+        let request_id = request_id_or_next(request.request_id);
+        set_request_id(request_id);
+        let handler_start = Instant::now();
+
+        let reset_start = Instant::now();
+        let reset = swift_reset_learning_memory();
+        if !reset {
+            log_event(
+                ServerLogLevel::Warn,
+                "[reset_learning_memory] Swift reset returned false",
+            );
+        }
+        performance_event_lazy!(
+            request_id,
+            "reset_learning_memory",
+            "swift_reset_learning_memory",
+            elapsed_ms(reset_start),
+            "reset={reset}"
+        );
+        performance_event_lazy!(
+            request_id,
+            "reset_learning_memory",
+            "total",
+            elapsed_ms(handler_start),
+            "status=success;reset={reset}"
+        );
+
+        Ok(Response::new(shared::proto::ResetLearningMemoryResponse {
+            server_session_id: server_session_id(),
+            reset,
         }))
     }
 

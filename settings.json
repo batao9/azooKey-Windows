@@ -5,6 +5,9 @@
         "profile": "",
         "backend": "cpu"
     },
+    "learning": {
+        "mode": "enabled"
+    },
     "shortcuts": {
         "ctrl_space_toggle": true,
         "alt_backquote_toggle": true

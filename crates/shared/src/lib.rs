@@ -224,6 +224,14 @@ pub enum NumpadInputMode {
     FollowInputMode,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LearningMode {
+    Enabled,
+    ReadOnly,
+    Disabled,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct CharacterWidthGroups {
     pub alphabet: WidthMode,
@@ -446,8 +454,9 @@ pub fn zenzai_cpu_backend_supported() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, ConfigError, DebugConfig, GeneralConfig, NumpadInputMode, ShortcutConfig,
-        CONFIG_VERSION, SETTINGS_FILENAME,
+        AppConfig, ConfigError, DebugConfig, GeneralConfig, LearningConfig, LearningMode,
+        NumpadInputMode, ShortcutConfig, CONFIG_VERSION,
+        LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_DEFAULT, SETTINGS_FILENAME,
     };
     use std::{
         env,
@@ -576,6 +585,24 @@ mod tests {
         assert!(deserialized.ctrl_space_toggle);
         assert!(deserialized.alt_backquote_toggle);
         assert!(!deserialized.eisu_toggle);
+    }
+
+    #[test]
+    fn learning_defaults_to_enabled() {
+        let default_config = LearningConfig::default();
+        assert_eq!(default_config.mode, LearningMode::Enabled);
+
+        let deserialized: LearningConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(deserialized.mode, LearningMode::Enabled);
+
+        let app_config: AppConfig = serde_json::from_str(
+            r#"{
+                "version": "0.1.2",
+                "zenzai": { "enable": false, "profile": "", "backend": "cpu" }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(app_config.learning.mode, LearningMode::Enabled);
     }
 
     #[test]
@@ -847,6 +874,20 @@ pub struct UserDictionaryConfig {
     pub entries: Vec<UserDictionaryEntry>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct LearningConfig {
+    #[serde(default)]
+    pub mode: LearningMode,
+}
+
+impl Default for LearningConfig {
+    fn default() -> Self {
+        Self {
+            mode: LearningMode::Enabled,
+        }
+    }
+}
+
 impl Default for CharacterWidthConfig {
     fn default() -> Self {
         Self {
@@ -877,6 +918,12 @@ impl Default for SpaceInputMode {
 impl Default for NumpadInputMode {
     fn default() -> Self {
         Self::DirectInput
+    }
+}
+
+impl Default for LearningMode {
+    fn default() -> Self {
+        Self::Enabled
     }
 }
 
@@ -930,6 +977,8 @@ pub struct AppConfig {
     pub character_width: CharacterWidthConfig,
     #[serde(default)]
     pub user_dictionary: UserDictionaryConfig,
+    #[serde(default)]
+    pub learning: LearningConfig,
 }
 
 impl Default for AppConfig {
@@ -947,6 +996,7 @@ impl Default for AppConfig {
             romaji_table: RomajiTableConfig::default(),
             character_width: CharacterWidthConfig::default(),
             user_dictionary: UserDictionaryConfig::default(),
+            learning: LearningConfig::default(),
         }
     }
 }

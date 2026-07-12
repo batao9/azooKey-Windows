@@ -107,6 +107,18 @@ impl IPCService {
 
         Ok(())
     }
+
+    pub fn reset_learning_memory(&mut self) -> anyhow::Result<bool> {
+        let request =
+            tonic::Request::new(shared::proto::ResetLearningMemoryRequest { request_id: 0 });
+        let response = self
+            .runtime
+            .clone()
+            .block_on(self.azookey_client.reset_learning_memory(request))?
+            .into_inner();
+
+        Ok(response.reset)
+    }
 }
 
 #[cfg(test)]

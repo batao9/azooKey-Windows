@@ -78,6 +78,24 @@ private func testCandidate(
     )
 }
 
+@Test func learningCandidateCanOnlyBeConsumedOnce() async throws {
+    let candidate = testCandidate(
+        word: "今日",
+        ruby: "きょう",
+        composingCount: .inputCount(3)
+    )
+
+    await MainActor.run {
+        learningCandidateCache.removeAll()
+        learningCandidateCache[42] = candidate
+
+        #expect(consumeLearningCandidate(42) != nil)
+        #expect(consumeLearningCandidate(42) == nil)
+
+        learningCandidateCache.removeAll()
+    }
+}
+
 @Test func ffiFreeCStringAcceptsNullAndAllocatedStrings() async throws {
     free_c_string(nil)
 
@@ -99,7 +117,8 @@ private func testCandidate(
             text: text,
             subtext: subtext,
             hiragana: hiragana,
-            correspondingCount: 1
+            correspondingCount: 1,
+            candidateId: 1
         )
     ]
 
@@ -112,7 +131,8 @@ private func testCandidate(
             text: nilHiraganaText,
             subtext: nilHiraganaSubtext,
             hiragana: nil,
-            correspondingCount: 1
+            correspondingCount: 1,
+            candidateId: 2
         )
     ]
 
@@ -127,7 +147,8 @@ private func testCandidate(
             text: firstLegacyText,
             subtext: firstLegacySubtext,
             hiragana: firstLegacyHiragana,
-            correspondingCount: 1
+            correspondingCount: 1,
+            candidateId: 3
         )
     )
 
@@ -139,7 +160,8 @@ private func testCandidate(
             text: secondLegacyText,
             subtext: secondLegacySubtext,
             hiragana: nil,
-            correspondingCount: 1
+            correspondingCount: 1,
+            candidateId: 4
         )
     )
 

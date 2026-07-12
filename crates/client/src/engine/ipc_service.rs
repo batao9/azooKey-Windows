@@ -61,6 +61,7 @@ pub struct Candidates {
     pub sub_texts: Vec<String>,
     pub hiragana: String,
     pub corresponding_count: Vec<i32>,
+    pub candidate_ids: Vec<u64>,
 }
 
 impl Candidates {
@@ -69,6 +70,15 @@ impl Candidates {
             && self.sub_texts.is_empty()
             && self.hiragana.is_empty()
             && self.corresponding_count.is_empty()
+            && self.candidate_ids.is_empty()
+    }
+
+    #[inline]
+    fn has_same_composition(&self, other: &Self) -> bool {
+        self.texts == other.texts
+            && self.sub_texts == other.sub_texts
+            && self.hiragana == other.hiragana
+            && self.corresponding_count == other.corresponding_count
     }
 }
 
@@ -304,6 +314,11 @@ impl IPCService {
                     .iter()
                     .map(|s| s.corresponding_count)
                     .collect(),
+                candidate_ids: composing_text
+                    .suggestions
+                    .iter()
+                    .map(|s| s.candidate_id)
+                    .collect(),
             })
         } else {
             anyhow::bail!("composing_text is None");
@@ -422,7 +437,8 @@ impl IPCService {
         refreshed_candidates: &Candidates,
     ) -> bool {
         previous_candidates.is_some_and(|previous| {
-            previous == refreshed_candidates && !refreshed_candidates.is_empty_composition()
+            previous.has_same_composition(refreshed_candidates)
+                && !refreshed_candidates.is_empty_composition()
         })
     }
 
@@ -544,6 +560,26 @@ impl IPCService {
             .block_on(self.azookey_client.clear_text(request))?;
         let response = response.into_inner();
         self.observe_server_session("clear_text", response.server_session_id);
+        Ok(())
+    }
+
+    fn send_commit_learning_candidate(
+        &mut self,
+        candidate_id: u64,
+        commit_kind: i32,
+        request_id: u64,
+    ) -> anyhow::Result<()> {
+        let request = tonic::Request::new(shared::proto::CommitLearningCandidateRequest {
+            candidate_id,
+            commit_kind,
+            request_id,
+        });
+        let response = self
+            .runtime
+            .clone()
+            .block_on(self.azookey_client.commit_learning_candidate(request))?;
+        let response = response.into_inner();
+        self.observe_server_session("commit_learning_candidate", response.server_session_id);
         Ok(())
     }
 
@@ -690,7 +726,8 @@ impl IPCService {
         refreshed_candidates: &Candidates,
     ) -> bool {
         previous_candidates.is_some_and(|previous| {
-            previous == refreshed_candidates || refreshed_candidates.is_empty_composition()
+            previous.has_same_composition(refreshed_candidates)
+                || refreshed_candidates.is_empty_composition()
         })
     }
 
@@ -888,6 +925,38 @@ impl IPCService {
             || match &result {
                 Ok(((), retried)) => format!("status=success;retry={retried}"),
                 Err(error) => format!("status=error;error={error:?}"),
+            },
+        );
+        result.map(|((), _)| ())
+    }
+
+    #[tracing::instrument]
+    pub fn commit_learning_candidate(
+        &mut self,
+        candidate_id: u64,
+        commit_kind: i32,
+    ) -> anyhow::Result<()> {
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
+        let result = self.run_rpc_with_reconnect("commit_learning_candidate", |this| {
+            this.send_commit_learning_candidate(candidate_id, commit_kind, request_id)
+        });
+        self.log_client_performance_from_start(
+            performance_start,
+            request_id,
+            "commit_learning_candidate",
+            "rpc_total",
+            || match &result {
+                Ok(((), retried)) => {
+                    format!(
+                        "status=success;retry={retried};candidate_id={candidate_id};commit_kind={commit_kind}"
+                    )
+                }
+                Err(error) => {
+                    format!(
+                        "status=error;candidate_id={candidate_id};commit_kind={commit_kind};error={error:?}"
+                    )
+                }
             },
         );
         result.map(|((), _)| ())
@@ -1371,11 +1440,32 @@ mod tests {
             sub_texts: vec![String::new()],
             hiragana: "か".to_string(),
             corresponding_count: vec![1],
+            candidate_ids: vec![1],
         };
 
         assert!(IPCService::should_retry_append_after_refresh(
             Some(&previous),
             &previous
+        ));
+    }
+
+    #[test]
+    fn append_retry_ignores_refreshed_candidate_ids() {
+        let previous = Candidates {
+            texts: vec!["か".to_string()],
+            sub_texts: vec![String::new()],
+            hiragana: "か".to_string(),
+            corresponding_count: vec![1],
+            candidate_ids: vec![1],
+        };
+        let refreshed = Candidates {
+            candidate_ids: vec![2],
+            ..previous.clone()
+        };
+
+        assert!(IPCService::should_retry_append_after_refresh(
+            Some(&previous),
+            &refreshed
         ));
     }
 
@@ -1387,6 +1477,7 @@ mod tests {
             sub_texts: vec![String::new()],
             hiragana: "か".to_string(),
             corresponding_count: vec![1],
+            candidate_ids: vec![1],
         };
 
         assert!(!IPCService::should_retry_append_after_refresh(
@@ -1402,6 +1493,7 @@ mod tests {
             sub_texts: vec![String::new()],
             hiragana: "かんじ".to_string(),
             corresponding_count: vec![5],
+            candidate_ids: vec![1],
         };
 
         assert!(IPCService::should_retry_append_after_refresh(
@@ -1417,6 +1509,7 @@ mod tests {
             sub_texts: vec![String::new()],
             hiragana: "かんじ".to_string(),
             corresponding_count: vec![5],
+            candidate_ids: vec![1],
         };
 
         assert!(
@@ -1434,6 +1527,7 @@ mod tests {
             sub_texts: vec![String::new()],
             hiragana: "か".to_string(),
             corresponding_count: vec![1],
+            candidate_ids: vec![1],
         };
 
         assert!(
@@ -1451,11 +1545,32 @@ mod tests {
             sub_texts: vec![String::new()],
             hiragana: "か".to_string(),
             corresponding_count: vec![1],
+            candidate_ids: vec![1],
         };
 
         assert!(IPCService::should_retry_non_idempotent_edit_after_refresh(
             Some(&previous),
             &previous
+        ));
+    }
+
+    #[test]
+    fn non_idempotent_edit_retry_ignores_refreshed_candidate_ids() {
+        let previous = Candidates {
+            texts: vec!["か".to_string()],
+            sub_texts: vec![String::new()],
+            hiragana: "か".to_string(),
+            corresponding_count: vec![1],
+            candidate_ids: vec![1],
+        };
+        let refreshed = Candidates {
+            candidate_ids: vec![2],
+            ..previous.clone()
+        };
+
+        assert!(IPCService::should_retry_non_idempotent_edit_after_refresh(
+            Some(&previous),
+            &refreshed
         ));
     }
 
@@ -1466,12 +1581,14 @@ mod tests {
             sub_texts: vec![String::new()],
             hiragana: "か".to_string(),
             corresponding_count: vec![1],
+            candidate_ids: vec![1],
         };
         let refreshed = Candidates {
             texts: vec!["".to_string()],
             sub_texts: vec![String::new()],
             hiragana: String::new(),
             corresponding_count: vec![0],
+            candidate_ids: vec![1],
         };
 
         assert!(!IPCService::should_retry_non_idempotent_edit_after_refresh(
@@ -1487,6 +1604,7 @@ mod tests {
             sub_texts: vec![String::new()],
             hiragana: "か".to_string(),
             corresponding_count: vec![1],
+            candidate_ids: vec![1],
         };
 
         assert!(!IPCService::should_retry_non_idempotent_edit_after_refresh(
@@ -1543,6 +1661,7 @@ mod tests {
             sub_texts: vec![String::new()],
             hiragana: "か".to_string(),
             corresponding_count: vec![1],
+            candidate_ids: vec![1],
         };
 
         let attempt =

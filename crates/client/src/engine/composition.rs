@@ -1,5 +1,10 @@
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashSet,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
+use crate::tsf::edit_session::edit_session;
 use crate::{
     engine::user_action::UserAction,
     extension::VKeyExt as _,
@@ -8,7 +13,9 @@ use crate::{
 };
 
 use super::{
-    client_action::{ClientAction, SetSelectionType, SetTextType},
+    client_action::{
+        ClientAction, LearningCommitKind, LearningCommitScope, SetSelectionType, SetTextType,
+    },
     full_width::{convert_kana_symbol, to_fullwidth, to_halfwidth},
     input_mode::InputMode,
     ipc_service::{
@@ -27,16 +34,21 @@ use shared::{
     LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MAX,
     LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MIN,
 };
-use windows::core::{w, PCWSTR};
+use windows::core::{w, IUnknown, Interface as _, PCWSTR};
 use windows::Win32::{
     Foundation::{LPARAM, WPARAM},
+    System::Com::CoTaskMemFree,
     System::Registry::{RegGetValueW, HKEY, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ},
     UI::{
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, GetKeyboardType, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT,
             VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
         },
-        TextServices::{ITfComposition, ITfCompositionSink_Impl, ITfContext},
+        TextServices::{
+            ITfComposition, ITfCompositionSink_Impl, ITfContext, ITfInputScope, InputScope,
+            GUID_PROP_INPUTSCOPE, IS_NUMERIC_PASSWORD, IS_PASSWORD, IS_PRIVATE,
+            TF_DEFAULT_SELECTION, TF_SELECTION,
+        },
     },
 };
 
@@ -155,6 +167,12 @@ pub struct FutureClauseSnapshot {
     selected_text: String,
     selected_sub_text: String,
     candidates: Candidates,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct PendingLearningCommit {
+    candidate_id: u64,
+    kind: LearningCommitKind,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -774,6 +792,7 @@ impl TextServiceFactory {
                 .get(index)
                 .copied()
                 .unwrap_or(0),
+            candidate_id: candidates.candidate_ids.get(index).copied().unwrap_or(0),
         })
     }
 
@@ -996,6 +1015,7 @@ impl TextServiceFactory {
                 sub_text: suffix.to_string(),
                 hiragana: raw_hiragana.to_string(),
                 corresponding_count,
+                candidate_id: 0,
             });
 
         FutureClauseSnapshot {
@@ -1029,6 +1049,7 @@ impl TextServiceFactory {
             sub_texts: vec![suffix.to_string()],
             hiragana: raw_hiragana.to_string(),
             corresponding_count: vec![corresponding_count],
+            candidate_ids: vec![0],
         };
         FutureClauseSnapshot {
             clause_preview: clause_preview.to_string(),
@@ -1352,6 +1373,7 @@ impl TextServiceFactory {
             ClientAction::AdjustBoundary(_) => "AdjustBoundary",
             ClientAction::SetIMEMode(_) => "SetIMEMode",
             ClientAction::SetSelection(_) => "SetSelection",
+            ClientAction::CommitLearning { .. } => "CommitLearning",
             ClientAction::ShrinkText(_) => "ShrinkText",
             ClientAction::ShrinkTextRaw(_) => "ShrinkTextRaw",
             ClientAction::ShrinkTextDirect(_) => "ShrinkTextDirect",
@@ -2706,6 +2728,215 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn selected_learning_candidate_from_snapshot(
+        snapshot: &ClauseSnapshot,
+    ) -> Option<CandidateSelection> {
+        Self::select_candidate(&snapshot.candidates, snapshot.selection_index)
+    }
+
+    #[inline]
+    fn selected_learning_candidate_from_future_snapshot(
+        snapshot: &FutureClauseSnapshot,
+    ) -> Option<CandidateSelection> {
+        Self::select_candidate(&snapshot.candidates, snapshot.selection_index)
+    }
+
+    #[inline]
+    fn learning_candidate_reading(selection: &CandidateSelection) -> String {
+        selection
+            .hiragana
+            .chars()
+            .take(selection.corresponding_count.max(0) as usize)
+            .collect()
+    }
+
+    #[inline]
+    fn reading_has_japanese_kana(reading: &str) -> bool {
+        reading
+            .chars()
+            .any(|ch| matches!(ch, '\u{3040}'..='\u{30ff}' | '\u{31f0}'..='\u{31ff}'))
+    }
+
+    #[inline]
+    fn should_commit_learning_candidate(
+        selection: &CandidateSelection,
+        temporary_latin: bool,
+    ) -> bool {
+        if temporary_latin || selection.candidate_id == 0 || selection.text.is_empty() {
+            return false;
+        }
+
+        let reading = Self::learning_candidate_reading(selection);
+        reading.chars().count() >= 2 && Self::reading_has_japanese_kana(&reading)
+    }
+
+    #[inline]
+    fn clear_current_learning_candidate_ids(candidates: &mut Candidates) {
+        for candidate_id in &mut candidates.candidate_ids {
+            *candidate_id = 0;
+        }
+    }
+
+    fn collect_learning_candidate_ids(
+        scope: LearningCommitScope,
+        selection_index: i32,
+        candidates: &Candidates,
+        clause_snapshots: &[ClauseSnapshot],
+        future_clause_snapshots: &[FutureClauseSnapshot],
+        temporary_latin: bool,
+    ) -> Vec<u64> {
+        let mut candidate_ids = Vec::new();
+        let mut seen = HashSet::new();
+
+        let mut push_candidate = |selection: Option<CandidateSelection>| {
+            let Some(selection) = selection else {
+                return;
+            };
+            if !Self::should_commit_learning_candidate(&selection, temporary_latin) {
+                return;
+            }
+            if seen.insert(selection.candidate_id) {
+                candidate_ids.push(selection.candidate_id);
+            }
+        };
+
+        match scope {
+            LearningCommitScope::CurrentClause => {
+                push_candidate(Self::select_candidate(candidates, selection_index));
+            }
+            LearningCommitScope::Composition => {
+                for snapshot in clause_snapshots {
+                    push_candidate(Self::selected_learning_candidate_from_snapshot(snapshot));
+                }
+                push_candidate(Self::select_candidate(candidates, selection_index));
+                for snapshot in future_clause_snapshots.iter().rev() {
+                    push_candidate(Self::selected_learning_candidate_from_future_snapshot(
+                        snapshot,
+                    ));
+                }
+            }
+        }
+
+        candidate_ids
+    }
+
+    fn flush_pending_learning_commits(
+        ipc_service: &mut IPCService,
+        pending_learning_commits: &mut Vec<PendingLearningCommit>,
+    ) {
+        for commit in pending_learning_commits.drain(..) {
+            if let Err(error) = ipc_service
+                .commit_learning_candidate(commit.candidate_id, commit.kind.proto_value())
+            {
+                tracing::warn!(
+                    ?error,
+                    candidate_id = commit.candidate_id,
+                    kind = ?commit.kind,
+                    "Failed to commit conversion learning candidate"
+                );
+            }
+        }
+    }
+
+    #[inline]
+    fn is_sensitive_input_scope(scope: InputScope) -> bool {
+        scope == IS_PASSWORD || scope == IS_NUMERIC_PASSWORD || scope == IS_PRIVATE
+    }
+
+    fn input_scope_list_contains_sensitive(input_scope: &ITfInputScope) -> bool {
+        unsafe {
+            let mut scopes_ptr: *mut InputScope = std::ptr::null_mut();
+            let mut scope_count = 0;
+            if input_scope
+                .GetInputScopes(&mut scopes_ptr, &mut scope_count)
+                .is_err()
+            {
+                return false;
+            }
+            if scopes_ptr.is_null() {
+                return false;
+            }
+
+            let scopes = std::slice::from_raw_parts(scopes_ptr, scope_count as usize);
+            let sensitive = scopes.iter().copied().any(Self::is_sensitive_input_scope);
+            CoTaskMemFree(Some(scopes_ptr.cast()));
+            sensitive
+        }
+    }
+
+    fn context_has_sensitive_input_scope(tid: u32, context: ITfContext) -> Result<bool> {
+        Ok(edit_session::<bool>(
+            tid,
+            context.clone(),
+            Rc::new({
+                move |cookie| {
+                    let mut selection: [TF_SELECTION; 1] = [TF_SELECTION::default()];
+                    let mut fetched = 0;
+                    unsafe {
+                        context.GetSelection(
+                            cookie,
+                            TF_DEFAULT_SELECTION,
+                            &mut selection,
+                            &mut fetched,
+                        )?;
+                    }
+                    if fetched == 0 {
+                        return Ok(false);
+                    }
+
+                    let range = match selection[0].range.as_ref() {
+                        Some(range) => unsafe { range.Clone()? },
+                        None => return Ok(false),
+                    };
+                    let input_scope_property =
+                        unsafe { context.GetAppProperty(&GUID_PROP_INPUTSCOPE)? };
+                    let value = unsafe { input_scope_property.GetValue(cookie, &range)? };
+                    let unknown = IUnknown::try_from(&value)?;
+                    let input_scope = unknown.cast::<ITfInputScope>()?;
+                    Ok(Self::input_scope_list_contains_sensitive(&input_scope))
+                }
+            }),
+        )?
+        .unwrap_or(false))
+    }
+
+    fn current_context_has_sensitive_input_scope(&self) -> bool {
+        let (tid, context) = match self.borrow() {
+            Ok(text_service) => {
+                let tid = text_service.tid;
+                match text_service.context::<ITfContext>() {
+                    Ok(context) => (tid, context),
+                    Err(error) => {
+                        tracing::debug!(
+                            ?error,
+                            "Skip learning input scope check because context is unavailable"
+                        );
+                        return false;
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::debug!(
+                    ?error,
+                    "Skip learning input scope check because text service borrow failed"
+                );
+                return false;
+            }
+        };
+
+        match Self::context_has_sensitive_input_scope(tid, context) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::debug!(
+                    ?error,
+                    "Skip learning input scope check because input scope could not be read"
+                );
+                false
+            }
+        }
+    }
+
+    #[inline]
     fn commit_current_clause_actions(
         composition: &Composition,
     ) -> (CompositionState, Vec<ClientAction>) {
@@ -2722,9 +2953,37 @@ impl TextServiceFactory {
     #[inline]
     fn commit_enter_actions(composition: &Composition) -> (CompositionState, Vec<ClientAction>) {
         if ClauseState::is_active_for_composition(composition) {
-            (CompositionState::None, vec![ClientAction::EndComposition])
+            (
+                CompositionState::None,
+                vec![
+                    ClientAction::CommitLearning {
+                        scope: LearningCommitScope::Composition,
+                        kind: LearningCommitKind::Normal,
+                        was_temporary_latin: composition.temporary_latin,
+                    },
+                    ClientAction::EndComposition,
+                ],
+            )
         } else {
-            Self::commit_current_clause_actions(composition)
+            let (state, mut actions) = Self::commit_current_clause_actions(composition);
+            let kind = if composition.suffix.is_empty() {
+                LearningCommitKind::Normal
+            } else {
+                LearningCommitKind::Partial
+            };
+            actions.insert(
+                0,
+                ClientAction::CommitLearning {
+                    scope: if composition.suffix.is_empty() {
+                        LearningCommitScope::Composition
+                    } else {
+                        LearningCommitScope::CurrentClause
+                    },
+                    kind,
+                    was_temporary_latin: composition.temporary_latin,
+                },
+            );
+            (state, actions)
         }
     }
 
@@ -3951,6 +4210,13 @@ impl TextServiceFactory {
             let mut ipc_service;
             let mut transition = transition;
             let mut deferred_clause_navigation_ready_ui_sync = None;
+            let mut pending_learning_commits = Vec::new();
+            let has_learning_action = actions
+                .iter()
+                .any(|action| matches!(action, ClientAction::CommitLearning { .. }));
+            let learning_blocked = has_learning_action
+                && (IMEState::keyboard_disabled().unwrap_or(true)
+                    || self.current_context_has_sensitive_input_scope());
 
             macro_rules! reset_after_empty_server_composition {
                 ($reason:expr) => {{
@@ -4068,6 +4334,37 @@ impl TextServiceFactory {
                         )?;
                         self.remember_candidate_window_visibility_if_sent(delivery, Some(true));
                     }
+                    ClientAction::CommitLearning {
+                        scope,
+                        kind,
+                        was_temporary_latin,
+                    } => {
+                        if learning_blocked {
+                            tracing::debug!(
+                                ?scope,
+                                ?kind,
+                                "Skip conversion learning in disabled or sensitive context"
+                            );
+                            continue;
+                        }
+                        pending_learning_commits.extend(
+                            Self::collect_learning_candidate_ids(
+                                *scope,
+                                selection_index,
+                                &candidates,
+                                &clause_snapshots,
+                                &future_clause_snapshots,
+                                *was_temporary_latin,
+                            )
+                            .into_iter()
+                            .map(|candidate_id| {
+                                PendingLearningCommit {
+                                    candidate_id,
+                                    kind: *kind,
+                                }
+                            }),
+                        );
+                    }
                     ClientAction::EndComposition => {
                         self.end_composition()?;
                         selection_index = 0;
@@ -4094,6 +4391,10 @@ impl TextServiceFactory {
                             None,
                         )?;
                         self.remember_candidate_window_visibility_if_sent(delivery, Some(false));
+                        Self::flush_pending_learning_commits(
+                            &mut ipc_service,
+                            &mut pending_learning_commits,
+                        );
                         ipc_service.clear_text()?;
                     }
                     ClientAction::AppendText(text) => {
@@ -5142,6 +5443,10 @@ impl TextServiceFactory {
                         };
 
                         if recovered {
+                            Self::flush_pending_learning_commits(
+                                &mut ipc_service,
+                                &mut pending_learning_commits,
+                            );
                             transition = CompositionState::Composing;
                         }
                     }
@@ -5247,6 +5552,10 @@ impl TextServiceFactory {
                         };
 
                         if recovered {
+                            Self::flush_pending_learning_commits(
+                                &mut ipc_service,
+                                &mut pending_learning_commits,
+                            );
                             transition = CompositionState::Composing;
                         }
                     }
@@ -5352,6 +5661,10 @@ impl TextServiceFactory {
                         };
 
                         if recovered {
+                            Self::flush_pending_learning_commits(
+                                &mut ipc_service,
+                                &mut pending_learning_commits,
+                            );
                             transition = CompositionState::Composing;
                         }
                     }
@@ -5382,6 +5695,7 @@ impl TextServiceFactory {
                         );
 
                         preview = Self::merge_preview_with_prefix(&fixed_prefix, &converted_clause);
+                        Self::clear_current_learning_candidate_ids(&mut candidates);
                         Self::sync_clause_snapshot_suffixes(
                             &mut clause_snapshots,
                             &preview,
