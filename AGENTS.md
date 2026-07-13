@@ -31,6 +31,15 @@
 6. 必要に応じて CI で生成したビルドを実機にインストールし、動作を確認する。
 7. `origin/master` へ PR を出す。
 
+## Issue のクローズ運用
+
+- 機能追加・不具合修正の PR では、PR 本文に `Issue: #<issue-number>` と記載して関連 Issue を参照する。
+- PR 本文や commit message では `Closes`、`Fixes`、`Resolves` などの closing keyword を使わず、PR の merge 時点では Issue を close しない。
+- GitHub の Issue / PR sidebar から Development link を設定する場合は、repository の auto-close 設定が無効であることを確認する。
+- Issue は、その変更を含む GitHub Release が公開され、tag・CI・配布 asset の確認が完了した後に `completed` として close する。
+- リリース時は、前回 release 以降に merge された PR の Issue 参照から close 候補を作り、リリース内容の承認時に対象を確定する。部分対応や残作業がある Issue は open のまま残す。
+- Issue を close するときは、対象 release の URL を comment に記載する。
+
 ## ビルド / 検証
 
 - 正式なビルド判定は GitHub CI とする。
