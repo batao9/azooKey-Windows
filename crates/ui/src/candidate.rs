@@ -81,7 +81,6 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                         scroll-snap-type: y proximity;
                         list-style-position: inside;
                         list-style-type: none;
-                        counter-reset: number 0;
                         user-select: none;
                         cursor: pointer;
 
@@ -102,8 +101,7 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                         scroll-snap-align: start;
 
                         &::before {
-                            content: counter(number);
-                            counter-increment: number 1;
+                            content: attr(data-number);
                             color: #636363;
                             font-weight: bold;
                             font-size: 0.75rem;
@@ -118,6 +116,12 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                             outline: 1px solid #2CB5FF;
                             outline-offset: -1px;
                         }
+                    }
+                    .candidate-text {
+                        min-width: 0;
+                        overflow: hidden;
+                        text-overflow: ellipsis;
+                        white-space: nowrap;
                     }
                     footer {
                         display: flex;
@@ -159,6 +163,10 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                     }
                 </style>
                 <script>
+                    const candidatePageSize = 5;
+                    let currentCandidates = [];
+                    let currentSelectionIndex = 0;
+                    let renderedPageStart = -1;
                     let adjustWindowSizeFrame = null;
 
                     function scheduleAdjustWindowSize() {
@@ -172,27 +180,59 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                         });
                     }
 
-                    function updateCandidates(candidates) {
+                    function candidatePageStart(index) {
+                        return Math.floor(index / candidatePageSize) * candidatePageSize;
+                    }
+
+                    function clampSelectionIndex(index) {
+                        if (currentCandidates.length === 0) {
+                            return 0;
+                        }
+
+                        const numericIndex = Number(index);
+                        return Number.isFinite(numericIndex)
+                            ? Math.min(Math.max(Math.trunc(numericIndex), 0), currentCandidates.length - 1)
+                            : 0;
+                    }
+
+                    function renderCandidatePage() {
                         const candidateList = document.getElementById('candidate-list');
-                        if (!candidateList || !Array.isArray(candidates)) {
+                        if (!candidateList) {
                             return;
                         }
 
-                        const existingItems = Array.from(candidateList.children);
+                        const pageStart = candidatePageStart(currentSelectionIndex);
+                        const pageEnd = Math.min(pageStart + candidatePageSize, currentCandidates.length);
+                        const fragment = document.createDocumentFragment();
 
-                        candidates.forEach((candidate, index) => {
-                            if (existingItems[index]) {
-                                existingItems[index].textContent = candidate;
-                            } else {
-                                const li = document.createElement('li');
-                                li.textContent = candidate;
-                                candidateList.appendChild(li);
+                        for (let index = pageStart; index < pageEnd; index += 1) {
+                            const li = document.createElement('li');
+                            const text = document.createElement('span');
+                            text.className = 'candidate-text';
+                            text.textContent = currentCandidates[index];
+                            text.title = currentCandidates[index];
+                            li.appendChild(text);
+                            li.setAttribute('data-number', String(index + 1));
+                            if (index === currentSelectionIndex) {
+                                li.setAttribute('data-selected', '');
                             }
-                        });
-
-                        while (existingItems.length > candidates.length) {
-                            candidateList.removeChild(existingItems.pop());
+                            fragment.appendChild(li);
                         }
+
+                        candidateList.replaceChildren(fragment);
+                        renderedPageStart = pageStart;
+                    }
+
+                    function updateCandidates(candidates, selectedIndex = null) {
+                        if (!Array.isArray(candidates)) {
+                            return;
+                        }
+
+                        currentCandidates = candidates;
+                        currentSelectionIndex = clampSelectionIndex(
+                            selectedIndex === null ? currentSelectionIndex : selectedIndex
+                        );
+                        renderCandidatePage();
 
                         scheduleAdjustWindowSize();
                     }
@@ -214,48 +254,29 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
 
                     function updateSelection(index) {
                         const candidateList = document.getElementById('candidate-list');
-                        if (!candidateList || candidateList.children.length === 0) {
+                        if (!candidateList || currentCandidates.length === 0) {
                             return;
                         }
 
-                        const childCount = candidateList.children.length;
-                        const numericIndex = Number(index);
-                        const safeIndex = Number.isFinite(numericIndex)
-                            ? Math.min(Math.max(Math.trunc(numericIndex), 0), childCount - 1)
-                            : 0;
+                        const safeIndex = clampSelectionIndex(index);
+                        const pageStart = candidatePageStart(safeIndex);
+                        currentSelectionIndex = safeIndex;
+
+                        if (pageStart !== renderedPageStart) {
+                            renderCandidatePage();
+                            scheduleAdjustWindowSize();
+                            return;
+                        }
 
                         const selected = candidateList.querySelector('[data-selected]');
                         if (selected) {
                             selected.removeAttribute('data-selected');
                         }
                         
-                        const target = candidateList.children[safeIndex];
-                        target.setAttribute('data-selected', '');
-                        
-                        const itemHeight = candidateList.children[0].offsetHeight;
-                        if (itemHeight <= 0) {
-                            return;
+                        const target = candidateList.children[safeIndex - pageStart];
+                        if (target) {
+                            target.setAttribute('data-selected', '');
                         }
-                        const visibleItems = Math.floor(candidateList.clientHeight / itemHeight);
-                        
-                        const groupSize = 5;
-                        const groupIndex = Math.floor(safeIndex / groupSize);
-                        const scrollToIndex = groupIndex * groupSize;
-                        const scrollTarget = candidateList.children[scrollToIndex];
-                        
-                        if (scrollTarget && (safeIndex === scrollToIndex || !isElementInView(target, candidateList))) {
-                            scrollTarget.scrollIntoView({ behavior: "instant", block: "start", inline: "start" });
-                        }
-                    }
-                    
-                    function isElementInView(element, container) {
-                        const containerRect = container.getBoundingClientRect();
-                        const elementRect = element.getBoundingClientRect();
-                        
-                        return (
-                            elementRect.top >= containerRect.top &&
-                            elementRect.bottom <= containerRect.bottom
-                        );
                     }
 
                     function measureListItemHeight(candidateList) {
