@@ -1,4 +1,3 @@
-use std::cmp::max;
 use std::sync::Arc;
 
 use azookey_server::TonicNamedPipeServer;
@@ -37,6 +36,10 @@ pub mod uiaccess;
 pub mod utils;
 
 const INDICATOR_WINDOW_LEFT_OFFSET: i32 = 45;
+const CANDIDATE_WINDOW_MIN_WIDTH: u32 = 225;
+const CANDIDATE_WINDOW_MAX_WIDTH: u32 = 640;
+const CANDIDATE_WINDOW_BASE_WIDTH: u32 = 120;
+const CANDIDATE_CHARACTER_WIDTH: u32 = 18;
 
 #[derive(Clone, Copy, Debug)]
 struct RubyMeasuredSize {
@@ -157,26 +160,48 @@ fn evaluate_script(webview: &wry::WebView, script: &str) {
     }
 }
 
-fn set_candidate_window_width(candidate_window: &tao::window::Window, candidates: &[String]) {
+fn candidate_window_width(candidates: &[String]) -> u32 {
     let max_len = candidates
         .iter()
         .map(|s| s.chars().count())
         .max()
         .unwrap_or(0) as u32;
 
-    let height = candidate_window.inner_size().height as i32;
+    CANDIDATE_WINDOW_BASE_WIDTH
+        .saturating_add(max_len.saturating_mul(CANDIDATE_CHARACTER_WIDTH))
+        .clamp(CANDIDATE_WINDOW_MIN_WIDTH, CANDIDATE_WINDOW_MAX_WIDTH)
+}
+
+fn logical_width_for_physical_width(physical_width: u32, scale_factor: f64) -> f64 {
+    let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    physical_width as f64 / scale_factor
+}
+
+fn set_candidate_window_width(candidate_window: &tao::window::Window, candidates: &[String]) {
+    let height = candidate_window.inner_size().height;
     candidate_window.set_inner_size(PhysicalSize::new(
-        max(225, 120 + max_len * 18),
-        height as u32,
+        candidate_window_width(candidates),
+        height,
     ));
 }
 
-fn update_candidate_list(candidate_webview: &wry::WebView, candidates: &[String]) {
+fn update_candidate_list(
+    candidate_webview: &wry::WebView,
+    candidates: &[String],
+    selected_index: Option<i32>,
+) {
     match serde_json::to_string(candidates) {
         Ok(candidates) => {
+            let selected_index = selected_index
+                .map(|index| index.to_string())
+                .unwrap_or_else(|| "null".to_string());
             evaluate_script(
                 candidate_webview,
-                &format!("updateCandidates({})", candidates),
+                &format!("updateCandidates({}, {})", candidates, selected_index),
             );
         }
         Err(error) => {
@@ -428,8 +453,11 @@ async fn main() -> anyhow::Result<()> {
                     update_indicator(&indicator_webview, &input_method);
                 }
                 UserEvent::UpdateHeight(height) => {
-                    let width = candidate_window.inner_size().width as i32;
-                    candidate_window.set_inner_size(LogicalSize::new(width, height));
+                    let width = candidate_window.inner_size().width;
+                    let logical_width =
+                        logical_width_for_physical_width(width, candidate_window.scale_factor());
+                    candidate_window
+                        .set_inner_size(LogicalSize::new(logical_width, height.max(0) as f64));
                     if let Some(rect) = last_candidate_rect {
                         place_candidate_windows(
                             &candidate_window,
@@ -592,7 +620,7 @@ async fn main() -> anyhow::Result<()> {
                             current_candidate_list_visible = true;
                             set_candidate_list_visible(&candidate_webview, true);
                             set_candidate_window_width(&candidate_window, &candidates);
-                            update_candidate_list(&candidate_webview, &candidates);
+                            update_candidate_list(&candidate_webview, &candidates, None);
                             if let Some(rect) = last_candidate_rect {
                                 place_candidate_windows(
                                     &candidate_window,
@@ -686,14 +714,20 @@ async fn main() -> anyhow::Result<()> {
 
                             if let Some(ref candidates) = candidates {
                                 set_candidate_window_width(&candidate_window, candidates);
-                                update_candidate_list(&candidate_webview, candidates);
+                                update_candidate_list(
+                                    &candidate_webview,
+                                    candidates,
+                                    selected_index,
+                                );
                             }
 
-                            if let Some(index) = selected_index {
-                                evaluate_script(
-                                    &candidate_webview,
-                                    &format!("updateSelection({})", index),
-                                );
+                            if candidates.is_none() {
+                                if let Some(index) = selected_index {
+                                    evaluate_script(
+                                        &candidate_webview,
+                                        &format!("updateSelection({})", index),
+                                    );
+                                }
                             }
 
                             if let Some(position) = position {
@@ -856,4 +890,44 @@ async fn main() -> anyhow::Result<()> {
             _ => (),
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        candidate_window_width, logical_width_for_physical_width, CANDIDATE_WINDOW_MAX_WIDTH,
+        CANDIDATE_WINDOW_MIN_WIDTH,
+    };
+
+    #[test]
+    fn candidate_window_width_uses_minimum_for_short_candidates() {
+        let candidates = vec!["候補".to_string(), "candidate".to_string()];
+
+        assert_eq!(
+            candidate_window_width(&candidates),
+            CANDIDATE_WINDOW_MIN_WIDTH
+        );
+    }
+
+    #[test]
+    fn candidate_window_width_is_capped_for_unusually_long_candidates() {
+        let candidates = vec!["候補".repeat(1_000)];
+
+        assert_eq!(
+            candidate_window_width(&candidates),
+            CANDIDATE_WINDOW_MAX_WIDTH
+        );
+    }
+
+    #[test]
+    fn candidate_window_resize_preserves_physical_width_at_high_dpi() {
+        assert_eq!(logical_width_for_physical_width(300, 1.25), 240.0);
+        assert_eq!(logical_width_for_physical_width(300, 1.5), 200.0);
+    }
+
+    #[test]
+    fn candidate_window_resize_uses_safe_scale_for_invalid_dpi() {
+        assert_eq!(logical_width_for_physical_width(300, 0.0), 300.0);
+        assert_eq!(logical_width_for_physical_width(300, f64::NAN), 300.0);
+    }
 }
