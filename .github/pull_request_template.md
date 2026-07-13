@@ -2,7 +2,8 @@
 - <変更の要約を1-3行で記載>
 
 ## Background
-- Issue: Closes #<issue_number>
+- Issue: #<issue_number>（該当なしの場合は N/A）
+- Issue close: 対象リリース公開・成果物確認後（該当なしの場合は N/A）
 - <背景、再現条件、目的を記載>
 
 ## Changes
