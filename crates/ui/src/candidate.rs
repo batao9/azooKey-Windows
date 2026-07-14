@@ -15,6 +15,8 @@ use wry::WebViewBuilder;
 
 use crate::UserEvent;
 
+const CANDIDATE_SCROLLER_SCRIPT: &str = include_str!("candidate_scroller.js");
+
 pub fn create_candidate_window(event_loop: &EventLoop<UserEvent>) -> Result<Window> {
     let window = WindowBuilder::new()
         .with_decorations(false)
@@ -43,10 +45,7 @@ pub fn create_candidate_window(event_loop: &EventLoop<UserEvent>) -> Result<Wind
 }
 
 pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
-    let webview_builder = WebViewBuilder::new()
-    .with_transparent(true)
-    .with_html(
-        r##"
+    let html = r##"
         <html>
             <head>
                 <style>
@@ -78,7 +77,7 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                         padding: 0;
                         flex: 1;
                         overflow-y: auto;
-                        scroll-snap-type: y proximity;
+                        overflow-anchor: none;
                         list-style-position: inside;
                         list-style-type: none;
                         user-select: none;
@@ -98,7 +97,6 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                         font-size: 0.9rem;
                         display: flex;
                         align-items: center;
-                        scroll-snap-align: start;
 
                         &::before {
                             content: attr(data-number);
@@ -116,6 +114,16 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                             outline: 1px solid #2CB5FF;
                             outline-offset: -1px;
                         }
+                    }
+                    .virtual-spacer {
+                        display: block;
+                        margin: 0;
+                        padding: 0;
+                        border: 0;
+                        pointer-events: none;
+                    }
+                    .virtual-spacer::before {
+                        content: none;
                     }
                     .candidate-text {
                         min-width: 0;
@@ -163,11 +171,23 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                     }
                 </style>
                 <script>
-                    const candidatePageSize = 5;
+                    __CANDIDATE_SCROLLER_SCRIPT__
+
+                    const {
+                        VISIBLE_ITEM_COUNT,
+                        clampCandidateIndex,
+                        clampScrollTop,
+                        selectionPageScrollTop,
+                        isSelectionFullyVisible,
+                        calculateRenderRange,
+                    } = CandidateScroller;
                     let currentCandidates = [];
                     let currentSelectionIndex = 0;
-                    let renderedPageStart = -1;
+                    let currentItemHeight = 0;
+                    let renderedRangeStart = -1;
+                    let renderedRangeEnd = -1;
                     let adjustWindowSizeFrame = null;
+                    let renderCandidateRangeFrame = null;
 
                     function scheduleAdjustWindowSize() {
                         if (adjustWindowSizeFrame !== null) {
@@ -180,47 +200,119 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                         });
                     }
 
-                    function candidatePageStart(index) {
-                        return Math.floor(index / candidatePageSize) * candidatePageSize;
+                    function scheduleRenderCandidateRange() {
+                        if (renderCandidateRangeFrame !== null) {
+                            return;
+                        }
+
+                        renderCandidateRangeFrame = window.requestAnimationFrame(() => {
+                            renderCandidateRangeFrame = null;
+                            renderCandidateRange();
+                        });
                     }
 
                     function clampSelectionIndex(index) {
-                        if (currentCandidates.length === 0) {
-                            return 0;
-                        }
-
-                        const numericIndex = Number(index);
-                        return Number.isFinite(numericIndex)
-                            ? Math.min(Math.max(Math.trunc(numericIndex), 0), currentCandidates.length - 1)
-                            : 0;
+                        return clampCandidateIndex(index, currentCandidates.length);
                     }
 
-                    function renderCandidatePage() {
+                    function createCandidateItem(index) {
+                        const li = document.createElement('li');
+                        const text = document.createElement('span');
+                        li.className = 'candidate-item';
+                        text.className = 'candidate-text';
+                        text.textContent = currentCandidates[index];
+                        text.title = currentCandidates[index];
+                        li.appendChild(text);
+                        li.setAttribute('data-number', String(index + 1));
+                        if (index === currentSelectionIndex) {
+                            li.setAttribute('data-selected', '');
+                        }
+                        return li;
+                    }
+
+                    function createVirtualSpacer(height) {
+                        const spacer = document.createElement('li');
+                        spacer.className = 'virtual-spacer';
+                        spacer.setAttribute('aria-hidden', 'true');
+                        spacer.setAttribute('role', 'presentation');
+                        spacer.style.height = `${height}px`;
+                        return spacer;
+                    }
+
+                    function measureListItemHeight(candidateList) {
+                        const existingItem = candidateList.querySelector('.candidate-item');
+                        if (existingItem && existingItem.offsetHeight > 0) {
+                            currentItemHeight = existingItem.offsetHeight;
+                            return currentItemHeight;
+                        }
+
+                        const li = document.createElement('li');
+                        const text = document.createElement('span');
+                        li.className = 'candidate-item';
+                        li.style.visibility = 'hidden';
+                        li.setAttribute('data-number', '1');
+                        text.className = 'candidate-text';
+                        text.textContent = 'Item';
+                        li.appendChild(text);
+                        candidateList.appendChild(li);
+                        currentItemHeight = li.offsetHeight;
+                        candidateList.removeChild(li);
+                        return currentItemHeight;
+                    }
+
+                    function renderCandidateRange(force = false) {
                         const candidateList = document.getElementById('candidate-list');
                         if (!candidateList) {
                             return;
                         }
 
-                        const pageStart = candidatePageStart(currentSelectionIndex);
-                        const pageEnd = Math.min(pageStart + candidatePageSize, currentCandidates.length);
-                        const fragment = document.createDocumentFragment();
+                        if (currentCandidates.length === 0) {
+                            candidateList.replaceChildren();
+                            candidateList.scrollTop = 0;
+                            renderedRangeStart = 0;
+                            renderedRangeEnd = 0;
+                            return;
+                        }
 
-                        for (let index = pageStart; index < pageEnd; index += 1) {
-                            const li = document.createElement('li');
-                            const text = document.createElement('span');
-                            text.className = 'candidate-text';
-                            text.textContent = currentCandidates[index];
-                            text.title = currentCandidates[index];
-                            li.appendChild(text);
-                            li.setAttribute('data-number', String(index + 1));
-                            if (index === currentSelectionIndex) {
-                                li.setAttribute('data-selected', '');
-                            }
-                            fragment.appendChild(li);
+                        const itemHeight = currentItemHeight || measureListItemHeight(candidateList);
+                        if (itemHeight <= 0) {
+                            return;
+                        }
+
+                        const scrollTop = candidateList.scrollTop;
+                        const safeScrollTop = clampScrollTop(
+                            scrollTop,
+                            currentCandidates.length,
+                            itemHeight
+                        );
+                        const range = calculateRenderRange(
+                            currentCandidates.length,
+                            safeScrollTop,
+                            itemHeight
+                        );
+                        if (!force &&
+                            range.start === renderedRangeStart &&
+                            range.end === renderedRangeEnd) {
+                            return;
+                        }
+
+                        const fragment = document.createDocumentFragment();
+                        if (range.topSpacerHeight > 0) {
+                            fragment.appendChild(createVirtualSpacer(range.topSpacerHeight));
+                        }
+                        for (let index = range.start; index < range.end; index += 1) {
+                            fragment.appendChild(createCandidateItem(index));
+                        }
+                        if (range.bottomSpacerHeight > 0) {
+                            fragment.appendChild(createVirtualSpacer(range.bottomSpacerHeight));
                         }
 
                         candidateList.replaceChildren(fragment);
-                        renderedPageStart = pageStart;
+                        if (safeScrollTop !== scrollTop) {
+                            candidateList.scrollTop = safeScrollTop;
+                        }
+                        renderedRangeStart = range.start;
+                        renderedRangeEnd = range.end;
                     }
 
                     function updateCandidates(candidates, selectedIndex = null) {
@@ -232,7 +324,17 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                         currentSelectionIndex = clampSelectionIndex(
                             selectedIndex === null ? currentSelectionIndex : selectedIndex
                         );
-                        renderCandidatePage();
+
+                        const candidateList = document.getElementById('candidate-list');
+                        if (candidateList) {
+                            const itemHeight = currentItemHeight || measureListItemHeight(candidateList);
+                            candidateList.scrollTop = selectionPageScrollTop(
+                                currentSelectionIndex,
+                                currentCandidates.length,
+                                itemHeight
+                            );
+                        }
+                        renderCandidateRange(true);
 
                         scheduleAdjustWindowSize();
                     }
@@ -245,6 +347,7 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
 
                         if (visible) {
                             main.removeAttribute('data-candidate-list-hidden');
+                            renderCandidateRange(true);
                         } else {
                             main.setAttribute('data-candidate-list-hidden', '');
                         }
@@ -258,39 +361,22 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                             return;
                         }
 
+                        const itemHeight = currentItemHeight || measureListItemHeight(candidateList);
                         const safeIndex = clampSelectionIndex(index);
-                        const pageStart = candidatePageStart(safeIndex);
                         currentSelectionIndex = safeIndex;
-
-                        if (pageStart !== renderedPageStart) {
-                            renderCandidatePage();
-                            scheduleAdjustWindowSize();
-                            return;
+                        if (!isSelectionFullyVisible(
+                            safeIndex,
+                            candidateList.scrollTop,
+                            currentCandidates.length,
+                            itemHeight
+                        )) {
+                            candidateList.scrollTop = selectionPageScrollTop(
+                                safeIndex,
+                                currentCandidates.length,
+                                itemHeight
+                            );
                         }
-
-                        const selected = candidateList.querySelector('[data-selected]');
-                        if (selected) {
-                            selected.removeAttribute('data-selected');
-                        }
-                        
-                        const target = candidateList.children[safeIndex - pageStart];
-                        if (target) {
-                            target.setAttribute('data-selected', '');
-                        }
-                    }
-
-                    function measureListItemHeight(candidateList) {
-                        if (candidateList.children.length > 0) {
-                            return candidateList.children[0].offsetHeight;
-                        }
-
-                        const li = document.createElement('li');
-                        li.textContent = 'Item';
-                        li.style.visibility = 'hidden';
-                        candidateList.appendChild(li);
-                        const itemHeight = li.offsetHeight;
-                        candidateList.removeChild(li);
-                        return itemHeight;
+                        renderCandidateRange(true);
                     }
 
                     function adjustWindowSize() {
@@ -304,7 +390,7 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
 
                         const candidateListVisible = !main.hasAttribute('data-candidate-list-hidden');
                         const itemHeight = candidateListVisible ? measureListItemHeight(candidateList) : 0;
-                        const candidateListHeight = itemHeight * 5;
+                        const candidateListHeight = itemHeight * VISIBLE_ITEM_COUNT;
                         const footerHeight = candidateListVisible ? footer.offsetHeight : 0;
                         const mainPadding = parseInt(window.getComputedStyle(main).paddingTop) + 
                                            parseInt(window.getComputedStyle(main).paddingBottom);
@@ -320,6 +406,12 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
 
                     
                     window.addEventListener('DOMContentLoaded', () => {
+                        const candidateList = document.getElementById('candidate-list');
+                        if (candidateList) {
+                            candidateList.addEventListener('scroll', scheduleRenderCandidateRange, {
+                                passive: true,
+                            });
+                        }
                         setTimeout(adjustWindowSize, 50); // Small delay to ensure rendering is complete
                     });
                 </script>
@@ -335,8 +427,10 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                     </footer>
                 </main>
             </body>
-        </html>"##,
-    );
+        </html>"##
+        .replace("__CANDIDATE_SCROLLER_SCRIPT__", CANDIDATE_SCROLLER_SCRIPT);
+
+    let webview_builder = WebViewBuilder::new().with_transparent(true).with_html(html);
 
     Ok(webview_builder)
 }

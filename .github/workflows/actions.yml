@@ -117,6 +117,9 @@ jobs:
         cd frontend
         npm ci --prefer-offline --no-audit
 
+    - name: Test candidate scroller
+      run: node --test crates/ui/tests/candidate_scroller.test.cjs
+
     - name: Build
       run: cargo make build --release
 
