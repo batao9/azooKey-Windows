@@ -260,7 +260,7 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                         return currentItemHeight;
                     }
 
-                    function renderCandidateRange(force = false) {
+                    function renderCandidateRange(force = false, requestedScrollTop = null) {
                         const candidateList = document.getElementById('candidate-list');
                         if (!candidateList) {
                             return;
@@ -279,7 +279,9 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                             return;
                         }
 
-                        const scrollTop = candidateList.scrollTop;
+                        const scrollTop = requestedScrollTop === null
+                            ? candidateList.scrollTop
+                            : requestedScrollTop;
                         const safeScrollTop = clampScrollTop(
                             scrollTop,
                             currentCandidates.length,
@@ -308,7 +310,8 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                         }
 
                         candidateList.replaceChildren(fragment);
-                        if (safeScrollTop !== scrollTop) {
+                        // Spacers must establish the new scroll height before applying a requested offset.
+                        if (requestedScrollTop !== null || safeScrollTop !== scrollTop) {
                             candidateList.scrollTop = safeScrollTop;
                         }
                         renderedRangeStart = range.start;
@@ -328,13 +331,13 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                         const candidateList = document.getElementById('candidate-list');
                         if (candidateList) {
                             const itemHeight = currentItemHeight || measureListItemHeight(candidateList);
-                            candidateList.scrollTop = selectionPageScrollTop(
+                            const desiredScrollTop = selectionPageScrollTop(
                                 currentSelectionIndex,
                                 currentCandidates.length,
                                 itemHeight
                             );
+                            renderCandidateRange(true, desiredScrollTop);
                         }
-                        renderCandidateRange(true);
 
                         scheduleAdjustWindowSize();
                     }
