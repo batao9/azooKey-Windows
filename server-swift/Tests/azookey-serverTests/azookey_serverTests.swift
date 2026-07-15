@@ -56,6 +56,27 @@ private func testConvertRequestOptions(memoryURL: URL) -> ConvertRequestOptions 
     )
 }
 
+private func testLearningConvertRequestOptions(memoryURL: URL) -> ConvertRequestOptions {
+    let packageRoot = packageRootURL()
+    return ConvertRequestOptions(
+        requireJapanesePrediction: .disabled,
+        requireEnglishPrediction: .disabled,
+        keyboardLanguage: .ja_JP,
+        learningType: .inputAndOutput,
+        memoryDirectoryURL: memoryURL,
+        sharedContainerURL: memoryURL,
+        textReplacer: .init {
+            packageRoot
+                .appending(path: "azooKey_emoji_dictionary_storage")
+                .appending(path: "EmojiDictionary")
+                .appending(path: "emoji_all_E15.1.txt")
+        },
+        specialCandidateProviders: nil,
+        zenzaiMode: .off,
+        metadata: .init(versionString: "Azookey for Windows learning test")
+    )
+}
+
 private func testCandidate(
     word: String,
     ruby: String,
@@ -86,13 +107,251 @@ private func testCandidate(
     )
 
     await MainActor.run {
+        let previousLearningType = currentLearningType
+        currentLearningType = .inputAndOutput
         learningCandidateCache.removeAll()
-        learningCandidateCache[42] = candidate
+        let batchFirstId = cacheLearningCandidates([candidate])
+        let candidateId = learningCandidateId(at: 0, batchFirstId: batchFirstId)
 
-        #expect(consumeLearningCandidate(42) != nil)
-        #expect(consumeLearningCandidate(42) == nil)
+        #expect(candidateId != 0)
+        #expect(consumeLearningCandidate(candidateId) != nil)
+        #expect(consumeLearningCandidate(candidateId) == nil)
 
         learningCandidateCache.removeAll()
+        currentLearningType = previousLearningType
+    }
+}
+
+@Test func learningCandidateIdsUseDenseSequentialSlots() async throws {
+    let first = testCandidate(
+        word: "今日",
+        ruby: "きょう",
+        composingCount: .inputCount(3)
+    )
+    let second = testCandidate(
+        word: "教",
+        ruby: "きょう",
+        composingCount: .inputCount(3)
+    )
+
+    await MainActor.run {
+        let previousLearningType = currentLearningType
+        currentLearningType = .inputAndOutput
+        learningCandidateCache.removeAll()
+
+        let batchFirstId = cacheLearningCandidates([first, second])
+        let firstId = learningCandidateId(at: 0, batchFirstId: batchFirstId)
+        let secondId = learningCandidateId(at: 1, batchFirstId: batchFirstId)
+
+        #expect(firstId != 0)
+        #expect(secondId == firstId + 1)
+        #expect(learningCandidateCache.slotCount == 2)
+
+        learningCandidateCache.removeAll()
+        currentLearningType = previousLearningType
+    }
+}
+
+@Test func learningCandidateIdsRemainValidAcrossLaterBatches() {
+    var cache = LearningCandidateCache()
+    let first = testCandidate(
+        word: "今日",
+        ruby: "きょう",
+        composingCount: .inputCount(3)
+    )
+    let second = testCandidate(
+        word: "教",
+        ruby: "きょう",
+        composingCount: .inputCount(3)
+    )
+
+    let firstBatchId = cache.appendBatch([first, second])!
+    let firstId = cache.candidateId(at: 0, batchFirstId: firstBatchId)
+    let firstBatchLastId = cache.candidateId(at: 1, batchFirstId: firstBatchId)
+    let secondBatchId = cache.appendBatch([second])!
+    let secondId = cache.candidateId(at: 0, batchFirstId: secondBatchId)
+
+    #expect(firstId != secondId)
+    #expect(firstBatchLastId + 1 == secondId)
+    #expect(cache.batchCount == 2)
+    #expect(cache.consume(firstId)?.text == "今日")
+    #expect(cache.consume(firstBatchLastId)?.text == "教")
+    #expect(cache.consume(secondId)?.text == "教")
+}
+
+@Test func clearingLearningCandidateCacheInvalidatesAllBatches() {
+    var cache = LearningCandidateCache()
+    let candidate = testCandidate(
+        word: "今日",
+        ruby: "きょう",
+        composingCount: .inputCount(3)
+    )
+    let batchFirstId = cache.appendBatch([candidate])!
+    let oldCandidateId = cache.candidateId(at: 0, batchFirstId: batchFirstId)
+
+    cache.removeAll()
+    let newBatchFirstId = cache.appendBatch([candidate])!
+    let newCandidateId = cache.candidateId(at: 0, batchFirstId: newBatchFirstId)
+
+    #expect(oldCandidateId != newCandidateId)
+    #expect(cache.consume(oldCandidateId) == nil)
+    #expect(cache.consume(newCandidateId)?.text == "今日")
+    #expect(cache.batchCount == 1)
+}
+
+@Test func emptyLearningCandidateBatchDoesNotAllocateIds() {
+    var cache = LearningCandidateCache()
+
+    #expect(cache.appendBatch([]) == nil)
+    #expect(cache.batchCount == 0)
+    #expect(cache.slotCount == 0)
+}
+
+@Test func learningCandidateCacheIsSkippedWhenLearningDoesNotAcceptInput() async throws {
+    let candidate = testCandidate(
+        word: "今日",
+        ruby: "きょう",
+        composingCount: .inputCount(3)
+    )
+
+    await MainActor.run {
+        let previousLearningType = currentLearningType
+        learningCandidateCache.removeAll()
+
+        currentLearningType = .onlyOutput
+        #expect(cacheLearningCandidates([candidate]) == nil)
+        #expect(learningCandidateCache.slotCount == 0)
+
+        currentLearningType = .nothing
+        #expect(cacheLearningCandidates([candidate]) == nil)
+        #expect(learningCandidateCache.slotCount == 0)
+
+        learningCandidateCache.removeAll()
+        currentLearningType = previousLearningType
+    }
+}
+
+@Test func latestLearningSelectionIsPrioritizedOnlyForItsReading() async {
+    let katouSugar = testCandidate(
+        word: "果糖",
+        ruby: "かとう",
+        composingCount: .inputCount(3)
+    )
+    let today = testCandidate(
+        word: "今日",
+        ruby: "きょう",
+        composingCount: .inputCount(3)
+    )
+    let katouSurname = testCandidate(
+        word: "加藤",
+        ruby: "かとう",
+        composingCount: .inputCount(3)
+    )
+    let candidates = [katouSugar, today, katouSurname]
+
+    await MainActor.run {
+        let previousLearningType = currentLearningType
+        let previousLearningSelectionOverrides = learningSelectionOverrides
+        defer {
+            currentLearningType = previousLearningType
+            learningSelectionOverrides = previousLearningSelectionOverrides
+        }
+
+        currentLearningType = .inputAndOutput
+        learningSelectionOverrides = ["カトウ": "加藤"]
+        let prioritized = prioritizeLearningSelectionOverrides(candidates, ruby: "かとう") { $0 }
+        #expect(prioritized.map(\.text) == ["加藤", "今日", "果糖"])
+
+        var unrelatedCandidateAccessCount = 0
+        let unrelated = prioritizeLearningSelectionOverrides(candidates, ruby: "しゅう") {
+            unrelatedCandidateAccessCount += 1
+            return $0
+        }
+        #expect(unrelated.map(\.text) == ["果糖", "今日", "加藤"])
+        #expect(unrelatedCandidateAccessCount == 0)
+
+        currentLearningType = .nothing
+        let learningDisabled = prioritizeLearningSelectionOverrides(candidates, ruby: "かとう") { $0 }
+        #expect(learningDisabled.map(\.text) == ["果糖", "今日", "加藤"])
+    }
+}
+
+@Test func latestSelectionReplacesPreviouslyLearnedFirstCandidate() async throws {
+    let packageRoot = packageRootURL()
+    let dictionaryURL = packageRoot
+        .appending(path: "azooKey_dictionary_storage")
+        .appending(path: "Dictionary")
+    let memoryURL = FileManager.default.temporaryDirectory
+        .appending(path: "azookey-server-learning-test-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: memoryURL, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: memoryURL)
+    }
+
+    try await MainActor.run {
+        let previousConverter = converter
+        let previousSupplementConverter = normalNBestSupplementConverter
+        let previousComposingText = composingText
+        let previousComposingTextSnapshots = composingTextSnapshots
+        let previousLearningType = currentLearningType
+        let previousLearningMemoryDirectoryURL = currentLearningMemoryDirectoryURL
+        let previousLearningCandidateCache = learningCandidateCache
+        let previousLearningSelectionOverrides = learningSelectionOverrides
+        defer {
+            converter = previousConverter
+            normalNBestSupplementConverter = previousSupplementConverter
+            composingText = previousComposingText
+            composingTextSnapshots = previousComposingTextSnapshots
+            currentLearningType = previousLearningType
+            currentLearningMemoryDirectoryURL = previousLearningMemoryDirectoryURL
+            learningCandidateCache = previousLearningCandidateCache
+            learningSelectionOverrides = previousLearningSelectionOverrides
+        }
+
+        var source = ComposingText()
+        source.insertAtCursorPosition("かとう", inputStyle: .direct)
+        let options = testLearningConvertRequestOptions(memoryURL: memoryURL)
+        converter = KanaKanjiConverter(dictionaryURL: dictionaryURL, preloadDictionary: true)
+        normalNBestSupplementConverter = KanaKanjiConverter(
+            dictionaryURL: dictionaryURL,
+            preloadDictionary: false
+        )
+        currentLearningType = .inputAndOutput
+        currentLearningMemoryDirectoryURL = memoryURL
+        learningCandidateCache.removeAll()
+        learningSelectionOverrides.removeAll()
+
+        @MainActor func candidates() -> [Candidate] {
+            prioritizeLearningSelectionOverrides(
+                converter.requestCandidates(source, options: options).mainResults,
+                ruby: source.convertTarget
+            ) { $0 }
+        }
+
+        @MainActor func commit(_ candidate: Candidate, from candidates: [Candidate]) throws {
+            let index = try #require(candidates.firstIndex { $0.text == candidate.text })
+            let batchFirstId = try #require(cacheLearningCandidates(candidates))
+            let candidateId = learningCandidateId(at: index, batchFirstId: batchFirstId)
+            #expect(commit_learning_candidate(candidateId: candidateId, commitKind: 1))
+            clear_text()
+        }
+
+        let initial = candidates()
+        let katouSugar = try #require(initial.first { $0.text == "果糖" })
+        try commit(katouSugar, from: initial)
+
+        let afterFirstCommit = candidates()
+        #expect(afterFirstCommit.first?.text == "果糖")
+        let katouSurname = try #require(afterFirstCommit.first { $0.text == "加藤" })
+        try commit(katouSurname, from: afterFirstCommit)
+
+        learningSelectionOverrides.removeAll()
+        loadLearningSelectionOverrides()
+        let afterSecondCommit = candidates()
+        #expect(
+            afterSecondCommit.first?.text == "加藤",
+            "first candidates: \(afterSecondCommit.prefix(5).map(\.text))"
+        )
     }
 }
 
