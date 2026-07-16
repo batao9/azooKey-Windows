@@ -29,8 +29,8 @@ private let fallbackDictionaryURL =
 @MainActor var customRomajiTableEnabled = false
 @MainActor var currentLearningType: LearningType = .inputAndOutput
 @MainActor var currentLearningMemoryDirectoryURL: URL?
-@MainActor var nextLearningCandidateId: UInt64 = 1
-@MainActor var learningCandidateCache: [UInt64: Candidate] = [:]
+@MainActor var learningCandidateCache = LearningCandidateCache()
+@MainActor var learningSelectionOverrides: [String: String] = [:]
 
 @MainActor var execURL = URL(filePath: "")
 @MainActor var config: [String : Any] = [
@@ -45,6 +45,8 @@ let zenzaiWarmupRomanInput = "nihongo"
 let warmupRequestCandidatesWarningMs = 5_000
 // Request exact-clause supplements only when boundary-matched candidates are sparse.
 let cursorPrefixExactClauseSupplementCandidateThreshold = 5
+let maxLearningSelectionOverrideCount = 4_096
+let learningSelectionOverridesFilename = "selection-overrides.json"
 
 @MainActor var currentRequestId: UInt64 = 0
 
@@ -466,23 +468,245 @@ private func learningType(for mode: String?) -> LearningType {
     }
 }
 
-@MainActor private func clearLearningCandidateCache() {
-    learningCandidateCache.removeAll()
-    nextLearningCandidateId = 1
+struct LearningCandidateCache {
+    private struct Batch {
+        let firstId: UInt64
+        let candidates: [Candidate]
+    }
+
+    private var batches: [Batch] = []
+    private var nextCandidateId: UInt64 = 1
+    private var idSpaceExhausted = false
+    private var consumedCandidateIds: Set<UInt64> = []
+
+    var slotCount: Int {
+        batches.reduce(into: 0) { $0 += $1.candidates.count }
+    }
+
+    var batchCount: Int {
+        batches.count
+    }
+
+    mutating func appendBatch(_ candidates: [Candidate]) -> UInt64? {
+        guard !candidates.isEmpty, !idSpaceExhausted else {
+            return nil
+        }
+
+        let candidateCount = UInt64(candidates.count)
+        let (nextId, overflow) = nextCandidateId.addingReportingOverflow(candidateCount)
+        if overflow {
+            idSpaceExhausted = true
+            return nil
+        }
+
+        let firstId = nextCandidateId
+        batches.append(Batch(firstId: firstId, candidates: candidates))
+        nextCandidateId = nextId
+        return firstId
+    }
+
+    func candidateId(at index: Int, batchFirstId: UInt64) -> UInt64 {
+        guard index >= 0,
+              let batch = batches.last,
+              batch.firstId == batchFirstId,
+              index < batch.candidates.count else {
+            return 0
+        }
+
+        return batchFirstId + UInt64(index)
+    }
+
+    mutating func consume(_ candidateId: UInt64) -> Candidate? {
+        guard candidateId > 0,
+              consumedCandidateIds.insert(candidateId).inserted else {
+            return nil
+        }
+
+        var lowerBound = 0
+        var upperBound = batches.count
+        while lowerBound < upperBound {
+            let middle = lowerBound + (upperBound - lowerBound) / 2
+            if batches[middle].firstId <= candidateId {
+                lowerBound = middle + 1
+            } else {
+                upperBound = middle
+            }
+        }
+
+        guard lowerBound > 0 else {
+            consumedCandidateIds.remove(candidateId)
+            return nil
+        }
+        let batch = batches[lowerBound - 1]
+        let offset = candidateId - batch.firstId
+        guard offset < UInt64(batch.candidates.count) else {
+            consumedCandidateIds.remove(candidateId)
+            return nil
+        }
+
+        return batch.candidates[Int(offset)]
+    }
+
+    mutating func removeAll() {
+        batches.removeAll(keepingCapacity: false)
+        consumedCandidateIds.removeAll(keepingCapacity: true)
+    }
 }
 
-@MainActor private func recordLearningCandidate(_ candidate: Candidate) -> UInt64 {
-    if nextLearningCandidateId == UInt64.max {
-        clearLearningCandidateCache()
+@MainActor private func clearLearningCandidateCache() {
+    learningCandidateCache.removeAll()
+}
+
+@MainActor func cacheLearningCandidates(_ candidates: [Candidate]) -> UInt64? {
+    guard currentLearningType == .inputAndOutput else {
+        return nil
     }
-    let candidateId = nextLearningCandidateId
-    nextLearningCandidateId += 1
-    learningCandidateCache[candidateId] = candidate
-    return candidateId
+
+    return learningCandidateCache.appendBatch(candidates)
+}
+
+@MainActor func learningCandidateId(at index: Int, batchFirstId: UInt64?) -> UInt64 {
+    guard let batchFirstId else {
+        return 0
+    }
+
+    return learningCandidateCache.candidateId(at: index, batchFirstId: batchFirstId)
 }
 
 @MainActor func consumeLearningCandidate(_ candidateId: UInt64) -> Candidate? {
-    learningCandidateCache.removeValue(forKey: candidateId)
+    learningCandidateCache.consume(candidateId)
+}
+
+private func normalizedLearningRuby(_ ruby: String) -> String {
+    ruby.unicodeScalars.reduce(into: "") { normalized, scalar in
+        let value = scalar.value
+        let normalizedValue = switch value {
+        case 0x3041...0x3096, 0x309D...0x309F:
+            value + 0x60
+        default:
+            value
+        }
+        normalized.unicodeScalars.append(UnicodeScalar(normalizedValue)!)
+    }
+}
+
+private func learningCandidateRuby(_ candidate: Candidate) -> String {
+    normalizedLearningRuby(candidate.data.reduce(into: "") { $0 += $1.ruby })
+}
+
+private func learningCandidateOutput(_ candidate: Candidate) -> String {
+    candidate.data.reduce(into: "") { $0 += $1.word }
+}
+
+@MainActor private func learningSelectionOverridesURL() -> URL? {
+    currentLearningMemoryDirectoryURL?.appendingPathComponent(
+        learningSelectionOverridesFilename,
+        isDirectory: false
+    )
+}
+
+@MainActor func loadLearningSelectionOverrides() {
+    guard currentLearningType != .nothing,
+          let overridesURL = learningSelectionOverridesURL() else {
+        learningSelectionOverrides.removeAll(keepingCapacity: false)
+        return
+    }
+
+    guard FileManager.default.fileExists(atPath: overridesURL.path) else {
+        learningSelectionOverrides.removeAll(keepingCapacity: false)
+        return
+    }
+
+    do {
+        let data = try Data(contentsOf: overridesURL)
+        let decoded = try JSONDecoder().decode([String: String].self, from: data)
+        learningSelectionOverrides = Dictionary(
+            uniqueKeysWithValues: decoded.prefix(maxLearningSelectionOverrideCount).map {
+                ($0.key, $0.value)
+            }
+        )
+    } catch {
+        learningSelectionOverrides.removeAll(keepingCapacity: false)
+        serverLog(
+            "WARN",
+            "Failed to load learning selection overrides at \(overridesURL.path): \(error)"
+        )
+    }
+}
+
+@MainActor private func saveLearningSelectionOverrides() {
+    guard let overridesURL = learningSelectionOverridesURL() else {
+        return
+    }
+
+    do {
+        ensureLearningMemoryDirectoryIfNeeded()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(learningSelectionOverrides)
+        try data.write(to: overridesURL, options: .atomic)
+    } catch {
+        serverLog(
+            "WARN",
+            "Failed to save learning selection overrides at \(overridesURL.path): \(error)"
+        )
+    }
+}
+
+@MainActor private func recordLearningSelectionOverride(_ candidate: Candidate) {
+    guard candidate.isLearningTarget else {
+        return
+    }
+
+    let ruby = learningCandidateRuby(candidate)
+    let output = learningCandidateOutput(candidate)
+    guard !ruby.isEmpty, !output.isEmpty else {
+        return
+    }
+
+    if learningSelectionOverrides[ruby] == nil,
+       learningSelectionOverrides.count >= maxLearningSelectionOverrideCount,
+       let evictedRuby = learningSelectionOverrides.keys.first {
+        learningSelectionOverrides.removeValue(forKey: evictedRuby)
+    }
+    learningSelectionOverrides[ruby] = output
+    saveLearningSelectionOverrides()
+}
+
+@MainActor func prioritizeLearningSelectionOverrides<Element>(
+    _ elements: [Element],
+    ruby: String,
+    candidate: (Element) -> Candidate
+) -> [Element] {
+    let normalizedRuby = normalizedLearningRuby(ruby)
+    guard currentLearningType != .nothing,
+          let preferredOutput = learningSelectionOverrides[normalizedRuby],
+          elements.count > 1 else {
+        return elements
+    }
+
+    var firstIndex: Int?
+    var preferredIndex: Int?
+    for (index, element) in elements.enumerated() {
+        let value = candidate(element)
+        guard learningCandidateRuby(value) == normalizedRuby else {
+            continue
+        }
+        if firstIndex == nil {
+            firstIndex = index
+        }
+        if preferredOutput == learningCandidateOutput(value) {
+            preferredIndex = index
+            break
+        }
+    }
+
+    guard let firstIndex, let preferredIndex, firstIndex != preferredIndex else {
+        return elements
+    }
+    var prioritized = elements
+    prioritized.swapAt(firstIndex, preferredIndex)
+    return prioritized
 }
 
 private func makeConvertRequestOptions(
@@ -1789,6 +2013,7 @@ func cursorPrefixBoundaryFirstClauseResults(
         clearLearningCandidateCache()
     }
     ensureLearningMemoryDirectoryIfNeeded()
+    loadLearningSelectionOverrides()
 
     serverLog(
         "INFO",
@@ -1963,6 +2188,8 @@ func cursorPrefixBoundaryFirstClauseResults(
 @_silgen_name("ClearText")
 @MainActor public func clear_text() {
     serverLog("DEBUG", "ClearText: start")
+    converter.stopComposition()
+    normalNBestSupplementConverter.stopComposition()
     composingText = ComposingText()
     composingTextSnapshots.removeAll()
     clearLearningCandidateCache()
@@ -1994,6 +2221,7 @@ func cursorPrefixBoundaryFirstClauseResults(
     converter.setCompletedData(candidate)
     converter.updateLearningData(candidate)
     converter.commitUpdateLearningData()
+    recordLearningSelectionOverride(candidate)
     serverLog(
         "DEBUG",
         "CommitLearningCandidate: completed candidateId=\(candidateId) commitKind=\(commitKind)"
@@ -2007,6 +2235,7 @@ func cursorPrefixBoundaryFirstClauseResults(
     converter.resetMemory()
     normalNBestSupplementConverter.resetMemory()
     clearLearningCandidateCache()
+    learningSelectionOverrides.removeAll(keepingCapacity: false)
     serverLog("INFO", "ResetLearningMemory: completed resetDirectory=\(resetDirectory)")
     return resetDirectory
 }
@@ -2162,13 +2391,17 @@ public func free_candidate_list(
         details: "candidate_count=\(converted.mainResults.count);\(diagnosticDetails)"
     )
     serverLog("DEBUG", "GetComposedText: requestCandidates returned candidateCount=\(converted.mainResults.count) \(diagnosticDetails)")
-    let mainResults = normalNBestConverted.map {
+    let mergedMainResults = normalNBestConverted.map {
         mergeZenzaiMainResultsWithNormalNBest(
             zenzaiResults: converted.mainResults,
             normalNBestResults: $0.mainResults,
             hiragana: previewHiragana
         )
     } ?? converted.mainResults
+    let mainResults = prioritizeLearningSelectionOverrides(
+        mergedMainResults,
+        ruby: previewHiragana
+    ) { $0 }
     if let normalNBestConverted {
         serverLog(
             "DEBUG",
@@ -2189,6 +2422,7 @@ public func free_candidate_list(
     var resolutionCache: [String: CandidateDisplayResolution] = [:]
     var result: [FFICandidate] = []
     result.reserveCapacity(mainResults.count)
+    let learningCandidateBatchFirstId = cacheLearningCandidates(mainResults)
 
     for i in 0..<mainResults.count {
         let candidate = mainResults[i]
@@ -2225,7 +2459,7 @@ public func free_candidate_list(
                 subtext: subtext,
                 hiragana: hiragana,
                 correspondingCount: Int32(correspondingCount),
-                candidateId: recordLearningCandidate(candidate)
+                candidateId: learningCandidateId(at: i, batchFirstId: learningCandidateBatchFirstId)
             )
         )
     }
@@ -2486,7 +2720,7 @@ public func free_candidate_list(
         state: "begin",
         details: "phase=merge;preliminary_candidate_count=\(preliminaryCursorPrefixResults.count);exact_clause_candidate_count=\(exactClauseResults.count);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
     )
-    let cursorPrefixResults = exactClauseResults.isEmpty
+    let rawCursorPrefixResults = exactClauseResults.isEmpty
         ? preliminaryCursorPrefixResults
         : cursorPrefixCandidateDisplayResults(
             mainResults: cursorPrefixMainResults,
@@ -2498,6 +2732,10 @@ public func free_candidate_list(
             previewHiragana: previewPrefixHiragana,
             resolutionCache: &cursorPrefixResolutionCache
         )
+    let cursorPrefixResults = prioritizeLearningSelectionOverrides(
+        rawCursorPrefixResults,
+        ruby: previewPrefixHiragana
+    ) { $0.candidate }
     let totalMs = elapsedPerformanceMilliseconds(since: totalStart)
     performanceLog(
         operation: "get_composed_text_for_cursor_prefix",
@@ -2510,6 +2748,9 @@ public func free_candidate_list(
     var strdupCandidatesMs = 0
     var result: [FFICandidate] = []
     result.reserveCapacity(cursorPrefixResults.count)
+    let learningCandidateBatchFirstId = cacheLearningCandidates(
+        cursorPrefixResults.map(\.candidate)
+    )
     let ffiHiragana = previewPrefixHiragana + suffixAfterCursor
 
     for i in 0..<cursorPrefixResults.count {
@@ -2542,7 +2783,7 @@ public func free_candidate_list(
                 subtext: subtext,
                 hiragana: hiragana,
                 correspondingCount: Int32(correspondingCount),
-                candidateId: recordLearningCandidate(candidate)
+                candidateId: learningCandidateId(at: i, batchFirstId: learningCandidateBatchFirstId)
             )
         )
     }
