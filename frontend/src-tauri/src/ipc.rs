@@ -12,6 +12,8 @@ use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERR
 
 const SERVER_PIPE_PATH: &str = r"\\.\pipe\azookey_server";
 const IPC_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const IPC_CONNECT_DEADLINE: Duration = Duration::from_secs(2);
+const SETTINGS_RPC_DEADLINE: Duration = Duration::from_secs(5);
 
 // connect to kkc server
 #[derive(Debug, Clone)]
@@ -48,29 +50,32 @@ impl IPCService {
     fn new_inner(timeout: Option<Duration>) -> Result<Self> {
         let runtime = tokio::runtime::Runtime::new()?;
 
-        let server_channel = runtime.block_on(
-            Endpoint::try_from("http://[::]:50051")?.connect_with_connector(service_fn(
-                move |_| async move {
-                    let started_at = Instant::now();
-                    let client = loop {
-                        match ClientOptions::new().open(SERVER_PIPE_PATH) {
-                            Ok(client) => break client,
-                            Err(e)
-                                if should_retry_pipe_connect_error(
-                                    e.raw_os_error(),
-                                    started_at,
-                                    timeout,
-                                ) => {}
-                            Err(e) => return Err(e),
-                        }
+        let endpoint = Endpoint::try_from("http://[::]:50051")?;
+        let connect = endpoint.connect_with_connector(service_fn(move |_| async move {
+            let started_at = Instant::now();
+            let client = loop {
+                match ClientOptions::new().open(SERVER_PIPE_PATH) {
+                    Ok(client) => break client,
+                    Err(e)
+                        if should_retry_pipe_connect_error(
+                            e.raw_os_error(),
+                            started_at,
+                            timeout,
+                        ) => {}
+                    Err(e) => return Err(e),
+                }
 
-                        time::sleep(IPC_RETRY_INTERVAL).await;
-                    };
+                time::sleep(IPC_RETRY_INTERVAL).await;
+            };
 
-                    Ok::<_, std::io::Error>(TokioIo::new(client))
-                },
-            )),
-        )?;
+            Ok::<_, std::io::Error>(TokioIo::new(client))
+        }));
+        let server_channel: tonic::transport::Channel = runtime.block_on(async {
+            match time::timeout(IPC_CONNECT_DEADLINE, connect).await {
+                Ok(result) => result.map_err(anyhow::Error::from),
+                Err(_) => Err(anyhow::anyhow!("settings IPC connect deadline exceeded")),
+            }
+        })?;
 
         let azookey_client = AzookeyServiceClient::new(server_channel);
 
@@ -100,21 +105,41 @@ fn should_retry_pipe_connect_error(
 // implement methods to interact with kkc server
 impl IPCService {
     pub fn update_config(&mut self) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::UpdateConfigRequest { request_id: 0 });
-        self.runtime
-            .clone()
-            .block_on(self.azookey_client.update_config(request))?;
+        let mut request = tonic::Request::new(shared::proto::UpdateConfigRequest { request_id: 0 });
+        request.set_timeout(SETTINGS_RPC_DEADLINE);
+        self.runtime.clone().block_on(async {
+            time::timeout(
+                SETTINGS_RPC_DEADLINE,
+                self.azookey_client.update_config(request),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("update_config IPC deadline exceeded"))??;
+            anyhow::Ok(())
+        })?;
 
         Ok(())
     }
 
     pub fn reset_learning_memory(&mut self) -> anyhow::Result<bool> {
-        let request =
+        let mut request =
             tonic::Request::new(shared::proto::ResetLearningMemoryRequest { request_id: 0 });
+        request.set_timeout(SETTINGS_RPC_DEADLINE);
         let response = self
             .runtime
             .clone()
-            .block_on(self.azookey_client.reset_learning_memory(request))?
+            .block_on(async {
+                match time::timeout(
+                    SETTINGS_RPC_DEADLINE,
+                    self.azookey_client.reset_learning_memory(request),
+                )
+                .await
+                {
+                    Ok(result) => result.map_err(anyhow::Error::from),
+                    Err(_) => Err(anyhow::anyhow!(
+                        "reset_learning_memory IPC deadline exceeded"
+                    )),
+                }
+            })?
             .into_inner();
 
         Ok(response.reset)

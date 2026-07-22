@@ -4,7 +4,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyboardState, ToUnicode, VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_SHIFT,
 };
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum UserAction {
     Input(char),
     Backspace,
@@ -26,7 +26,7 @@ pub enum UserAction {
     InputModeOff,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Navigation {
     Up,
     Down,
