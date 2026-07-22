@@ -177,14 +177,12 @@ where
         let (sender, receiver) = std::sync::mpsc::channel();
 
         std::thread::spawn(move || {
-            while let Ok(_) = receiver.recv() {
+            if receiver.recv().is_ok() {
                 let writer = writer_rc.lock().unwrap();
                 let trace = ChromeTrace::new();
                 trace
                     .write_entries(&mut writer.try_clone().unwrap())
                     .unwrap();
-
-                break;
             }
         });
 

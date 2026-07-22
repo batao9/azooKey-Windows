@@ -3,6 +3,20 @@ name: Rust
 on:
   push:
   workflow_dispatch:
+    inputs:
+      run_installer_smoke:
+        description: Run silent installer verification on the GitHub-hosted Windows runner
+        required: false
+        type: boolean
+        default: false
+      require_signature:
+        description: Fail unless the installer has a valid Authenticode signature
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 env:
   SWIFT_VERSION: swift-6.1.2-release
@@ -14,7 +28,146 @@ env:
   ZENZ_MODEL_URL: https://huggingface.co/Miwa-Keita/zenz-v3-small-gguf/resolve/main/ggml-model-Q5_K_M.gguf
 
 jobs:
+  static-checks:
+    name: Static checks and frontend tests
+    runs-on: windows-2022
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Cache Rust
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-bin: false
+
+    - name: Install Protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22
+        cache: npm
+        cache-dependency-path: frontend/package-lock.json
+
+    - name: Install frontend dependencies
+      working-directory: frontend
+      run: npm ci --prefer-offline --no-audit
+
+    - name: Install Rust lint components
+      run: rustup component add clippy rustfmt
+
+    - name: Check Rust formatting
+      run: cargo fmt --all -- --check
+
+    - name: Run Clippy
+      run: cargo clippy --workspace --all-targets
+
+    - name: Typecheck frontend
+      working-directory: frontend
+      run: npm run typecheck
+
+    - name: Test candidate scroller
+      run: node --test crates/ui/tests/candidate_scroller.test.cjs
+
+  windows-tests:
+    name: Windows Rust and Swift tests
+    runs-on: windows-2022
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Cache Rust
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-bin: false
+
+    - name: Install Swift
+      uses: compnerd/gha-setup-swift@eeda069c5bc95ac8a9ac5cea7d4f588ae5420ca5
+      with:
+        swift-version: ${{ env.SWIFT_VERSION }}
+        swift-build: ${{ env.SWIFT_BUILD }}
+        cache: true
+
+    - name: Fix Swift SDK
+      shell: pwsh
+      run: |
+        $swiftVersionDir = $env:RESOLVED_SWIFT_BUILD -replace "-RELEASE$", ""
+        $swiftPath = "$env:LOCALAPPDATA\Programs\Swift\Platforms\$swiftVersionDir\Windows.platform\Developer\SDKs\Windows.sdk\usr"
+        $modulemapUrl = "https://gist.githubusercontent.com/fkunn1326/ef8be2217082302b291f2b8d4178194a/raw/c424968c250afcd5afa1131aea1329dc0744a7f9/ucrt.modulemap"
+        Invoke-WebRequest -Uri $modulemapUrl -OutFile "$swiftPath\share\ucrt.modulemap"
+
+    - name: Install Protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Cache llama CPU runtime
+      id: cache-llama-cpu
+      uses: actions/cache@v4
+      with:
+        path: llama_cpu
+        key: ${{ runner.os }}-llama-${{ env.LLAMA_RELEASE_VERSION }}-cpu
+
+    - name: Download llama CPU runtime
+      if: steps.cache-llama-cpu.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: |
+        $archive = Join-Path $env:RUNNER_TEMP "llama-cpu.zip"
+        Invoke-WebRequest -Uri "${{ env.LLAMA_CPU_URL }}" -OutFile $archive
+        Expand-Archive -Path $archive -DestinationPath llama_cpu -Force
+
+    - name: Add Swift test runtimes to PATH
+      shell: pwsh
+      run: |
+        $swiftRoot = Join-Path $env:LOCALAPPDATA "Programs\Swift"
+        $runtimeDir = Get-ChildItem (Join-Path $swiftRoot "Runtimes") -Directory |
+          Sort-Object Name -Descending |
+          Select-Object -First 1
+        $platformDir = Get-ChildItem (Join-Path $swiftRoot "Platforms") -Directory |
+          Sort-Object Name -Descending |
+          Select-Object -First 1
+        $paths = @(
+          (Resolve-Path "llama_cpu").Path,
+          (Join-Path $runtimeDir.FullName "usr\bin"),
+          (Join-Path $platformDir.FullName "Windows.platform\Developer\Library\XCTest-development\usr\bin64"),
+          (Join-Path $platformDir.FullName "Windows.platform\Developer\Library\Testing-development\usr\bin64")
+        )
+        foreach ($path in $paths) {
+          if (-not (Test-Path -LiteralPath $path)) {
+            throw "Required Swift test runtime path is missing: $path"
+          }
+          $path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        }
+
+    - name: Prepare Swift linker input
+      shell: pwsh
+      run: Copy-Item "llama_cpu\llama.lib" -Destination "server-swift\" -Force
+
+    - name: Run all Swift tests serially
+      run: swift test --package-path server-swift -c release --no-parallel --verbose -Xcc -D_CRT_USE_C_COMPLEX_H -Xcxx -D_CRT_USE_C_COMPLEX_H
+
+    - name: Prepare Rust linker input
+      shell: pwsh
+      run: |
+        $library = "server-swift\.build\x86_64-unknown-windows-msvc\release\azookey-server.lib"
+        New-Item -Path "crates\server\target" -ItemType Directory -Force | Out-Null
+        Copy-Item $library -Destination ".\" -Force
+        Copy-Item $library -Destination "crates\server\target\" -Force
+
+    - name: Run all Rust tests
+      run: cargo test --workspace --all-targets
+
   build:
+    needs:
+    - static-checks
+    - windows-tests
     runs-on: windows-2022
 
     steps:
@@ -28,29 +181,29 @@ jobs:
         cache-bin: true
 
     - name: Install Swift
-      uses: compnerd/gha-setup-swift@main
+      uses: compnerd/gha-setup-swift@eeda069c5bc95ac8a9ac5cea7d4f588ae5420ca5
       with:
         swift-version: ${{ env.SWIFT_VERSION }}
         swift-build: ${{ env.SWIFT_BUILD }}
         cache: true
 
-    - name: Fix swift sdk
+    - name: Fix Swift SDK
       shell: pwsh
       run: |
         $swiftVersionDir = $env:RESOLVED_SWIFT_BUILD -replace "-RELEASE$", ""
-        $SwiftPath = "$env:APPDATA\..\Local\Programs\Swift\Platforms\$swiftVersionDir\Windows.platform\Developer\SDKs\Windows.sdk\usr"
+        $swiftPath = "$env:LOCALAPPDATA\Programs\Swift\Platforms\$swiftVersionDir\Windows.platform\Developer\SDKs\Windows.sdk\usr"
         $modulemapUrl = "https://gist.githubusercontent.com/fkunn1326/ef8be2217082302b291f2b8d4178194a/raw/c424968c250afcd5afa1131aea1329dc0744a7f9/ucrt.modulemap"
-        $destination = "$SwiftPath\share\ucrt.modulemap"
-        Invoke-WebRequest -Uri $modulemapUrl -OutFile $destination
-    
+        Invoke-WebRequest -Uri $modulemapUrl -OutFile "$swiftPath\share\ucrt.modulemap"
+
     - name: Install Protoc
       uses: arduino/setup-protoc@v3
       with:
         repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Setup Node cache
+    - name: Setup Node
       uses: actions/setup-node@v4
       with:
+        node-version: 22
         cache: npm
         cache-dependency-path: frontend/package-lock.json
 
@@ -92,40 +245,76 @@ jobs:
           Remove-Item $tempZip
         }
 
-        # Create directories
-        $llamaCpuDir = "llama_cpu"
-        $llamaCudaDir = "llama_cuda"
-        $llamaVulkanDir = "llama_vulkan"
-        New-Item -Path $llamaCpuDir, $llamaCudaDir, $llamaVulkanDir -ItemType Directory -Force
-
-        # Download and extract files
-        Download-Extract -url "${{ env.LLAMA_CPU_URL }}" -destFolder $llamaCpuDir
-        Download-Extract -url "${{ env.LLAMA_CUDA_URL }}" -destFolder $llamaCudaDir
-        Download-Extract -url "${{ env.LLAMA_VULKAN_URL }}" -destFolder $llamaVulkanDir
-
-        # Download the zenz model
-        $zenzDest = "zenz.gguf"
-        Invoke-WebRequest -Uri "${{ env.ZENZ_MODEL_URL }}" -OutFile $zenzDest
+        Download-Extract -url "${{ env.LLAMA_CPU_URL }}" -destFolder "llama_cpu"
+        Download-Extract -url "${{ env.LLAMA_CUDA_URL }}" -destFolder "llama_cuda"
+        Download-Extract -url "${{ env.LLAMA_VULKAN_URL }}" -destFolder "llama_vulkan"
+        Invoke-WebRequest -Uri "${{ env.ZENZ_MODEL_URL }}" -OutFile "zenz.gguf"
 
     - name: Prepare llama.lib
       shell: pwsh
-      run: |
-        Copy-Item "llama_cpu\llama.lib" -Destination "server-swift\" -Force
+      run: Copy-Item "llama_cpu\llama.lib" -Destination "server-swift\" -Force
 
-    - name: Install node dependencies
-      run: |
-        cd frontend
-        npm ci --prefer-offline --no-audit
-
-    - name: Test candidate scroller
-      run: node --test crates/ui/tests/candidate_scroller.test.cjs
+    - name: Install frontend dependencies
+      working-directory: frontend
+      run: npm ci --prefer-offline --no-audit
 
     - name: Build
       run: cargo make build --release
+
+    - name: Verify installer metadata
+      shell: pwsh
+      run: |
+        $parameters = @{
+          InstallerPath = "build\azookey-setup.exe"
+          Sha256Path = "build\SHA256SUMS.txt"
+        }
+        if ("${{ github.event_name }}" -eq "workflow_dispatch" -and "${{ inputs.require_signature }}" -eq "true") {
+          $parameters.RequireSignature = $true
+        }
+        & "scripts\verify_release_artifact.ps1" @parameters
 
     - name: Upload Setup Artifact
       uses: actions/upload-artifact@v4
       with:
         name: azookey-setup
-        path: build/azookey-setup.exe
+        path: |
+          build/azookey-setup.exe
+          build/SHA256SUMS.txt
         if-no-files-found: error
+
+  installer-smoke:
+    name: Silent installer smoke test
+    if: ${{ startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.run_installer_smoke) }}
+    needs: build
+    runs-on: windows-2022
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download Setup Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: azookey-setup
+        path: build
+
+    - name: Verify silent install and uninstall
+      shell: pwsh
+      run: |
+        $parameters = @{
+          InstallerPath = "build\azookey-setup.exe"
+          Sha256Path = "build\SHA256SUMS.txt"
+          LogDirectory = "installer-logs"
+          SilentInstall = $true
+        }
+        if ("${{ github.event_name }}" -eq "workflow_dispatch" -and "${{ inputs.require_signature }}" -eq "true") {
+          $parameters.RequireSignature = $true
+        }
+        & "scripts\verify_release_artifact.ps1" @parameters
+
+    - name: Upload installer logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: installer-smoke-logs
+        path: installer-logs
+        if-no-files-found: warn
