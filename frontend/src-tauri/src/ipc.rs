@@ -49,6 +49,7 @@ impl IPCService {
 
     fn new_inner(timeout: Option<Duration>) -> Result<Self> {
         let runtime = tokio::runtime::Runtime::new()?;
+        let connect_deadline = connect_deadline(timeout);
 
         let endpoint = Endpoint::try_from("http://[::]:50051")?;
         let connect = endpoint.connect_with_connector(service_fn(move |_| async move {
@@ -71,7 +72,7 @@ impl IPCService {
             Ok::<_, std::io::Error>(TokioIo::new(client))
         }));
         let server_channel: tonic::transport::Channel = runtime.block_on(async {
-            match time::timeout(IPC_CONNECT_DEADLINE, connect).await {
+            match time::timeout(connect_deadline, connect).await {
                 Ok(result) => result.map_err(anyhow::Error::from),
                 Err(_) => Err(anyhow::anyhow!("settings IPC connect deadline exceeded")),
             }
@@ -84,6 +85,10 @@ impl IPCService {
             runtime: Arc::new(runtime),
         })
     }
+}
+
+fn connect_deadline(timeout: Option<Duration>) -> Duration {
+    timeout.unwrap_or(IPC_CONNECT_DEADLINE)
 }
 
 fn should_retry_pipe_connect_error(
@@ -149,10 +154,18 @@ impl IPCService {
 #[cfg(test)]
 mod tests {
     use super::{
-        should_retry_pipe_connect_error, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
-        ERROR_PIPE_BUSY,
+        connect_deadline, should_retry_pipe_connect_error, ERROR_FILE_NOT_FOUND,
+        ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY, IPC_CONNECT_DEADLINE,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn explicit_reconnect_timeout_controls_outer_deadline() {
+        let reconnect_timeout = Duration::from_secs(10);
+
+        assert_eq!(connect_deadline(Some(reconnect_timeout)), reconnect_timeout);
+        assert_eq!(connect_deadline(None), IPC_CONNECT_DEADLINE);
+    }
 
     #[test]
     fn retries_missing_and_busy_pipe_errors_before_timeout() {
