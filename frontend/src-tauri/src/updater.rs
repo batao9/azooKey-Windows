@@ -3,22 +3,92 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    env, fs,
-    io::Write,
+    env,
+    ffi::OsString,
+    fs,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(not(windows))]
+use std::process::Command;
 
 const DEFAULT_RELEASE_API_URL: &str =
     "https://api.github.com/repos/batao9/azooKey-Windows/releases/latest";
 const RELEASE_API_URL_ENV: &str = "AZOOKEY_UPDATE_RELEASE_API_URL";
 const CURRENT_VERSION_ENV: &str = "AZOOKEY_UPDATE_CURRENT_VERSION";
 const INSTALLER_ASSET_NAME: &str = "azookey-setup.exe";
+const UPDATE_DOWNLOAD_STAGING_PREFIX: &str = "azookey-update-";
 const SHA256SUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
+const UPDATE_HELPER_EXE_NAME: &str = "azookey-updater-helper.exe";
+const INSTALLER_LOCK_SHARE_MODE: u32 = 0x0000_0001;
+const PROTECTED_UPDATE_STAGING_DIRECTORY_NAME: &str = ".azookey-updater-staging";
 const UPDATE_RESULT_FILENAME: &str = "update-result.json";
+const UPDATE_RESULT_REGISTRY_KEY: &str = r"Software\Azookey";
+const UPDATE_RESULT_REGISTRY_VALUE: &str = "UpdateResultJson";
+const PENDING_UPDATE_REQUEST_REGISTRY_VALUE: &str = "PendingUpdateRequestId";
 const APP_VERSION_JSON: &str = include_str!("../../../app-version.json");
-const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
+#[cfg(windows)]
+fn reject_reparse_point(path: &Path, label: &str) -> Result<()> {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {label}: {}", path.display()))?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(anyhow!("{label} is a reparse point: {}", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn protected_install_directory(executable: &Path) -> Result<PathBuf> {
+    use windows::Win32::{
+        Foundation::HANDLE,
+        System::Com::CoTaskMemFree,
+        UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath, KF_FLAG_DEFAULT},
+    };
+
+    let raw_program_files =
+        unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, HANDLE::default()) }
+            .context("failed to resolve Program Files")?;
+    let program_files_string = unsafe { raw_program_files.to_string() };
+    unsafe { CoTaskMemFree(Some(raw_program_files.0.cast())) };
+    let expected =
+        PathBuf::from(program_files_string.context("Program Files is not valid UTF-16")?)
+            .join("Azookey");
+    reject_reparse_point(&expected, "expected Azookey install directory")?;
+
+    let install_dir = executable
+        .parent()
+        .ok_or_else(|| anyhow!("updater executable has no parent"))?;
+    reject_reparse_point(install_dir, "updater install directory")?;
+
+    let expected = fs::canonicalize(&expected).with_context(|| {
+        format!(
+            "failed to canonicalize expected Azookey install directory: {}",
+            expected.display()
+        )
+    })?;
+    let actual = fs::canonicalize(install_dir).with_context(|| {
+        format!(
+            "failed to canonicalize updater install directory: {}",
+            install_dir.display()
+        )
+    })?;
+    if !actual
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&expected.to_string_lossy())
+    {
+        return Err(anyhow!(
+            "updater executable is outside the protected install directory: {}",
+            actual.display()
+        ));
+    }
+    Ok(actual)
+}
 
 #[derive(Debug, Deserialize)]
 struct AppVersionConfig {
@@ -72,6 +142,18 @@ pub struct UpdateInstallResult {
     pub install_log_path: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+struct ProtectedUpdateResult {
+    request_id: String,
+    result: UpdateInstallResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpdateResultTarget {
+    user_sid: String,
+    request_id: String,
+}
+
 #[derive(Debug)]
 struct ReleaseAssets {
     installer_url: String,
@@ -84,6 +166,14 @@ pub async fn check_for_updates() -> Result<UpdateCheckResponse> {
 }
 
 pub async fn download_and_launch_update() -> Result<UpdateStartResponse> {
+    download_and_launch_update_impl(false).await
+}
+
+pub async fn download_and_launch_update_for_integration_test() -> Result<UpdateStartResponse> {
+    download_and_launch_update_impl(true).await
+}
+
+async fn download_and_launch_update_impl(silent_installer: bool) -> Result<UpdateStartResponse> {
     let release = fetch_latest_release().await?;
     let check = update_check_response(&release)?;
     if !check.update_available {
@@ -107,12 +197,12 @@ pub async fn download_and_launch_update() -> Result<UpdateStartResponse> {
         match download_file_with_sha256(&client, &assets.installer_url, &installer_path).await {
             Ok(hash) => hash,
             Err(error) => {
-                cleanup_download_paths(&installer_path);
+                cleanup_owned_update_staging(&installer_path);
                 return Err(error);
             }
         };
     if !hashes_match(&expected_hash, &actual_hash) {
-        cleanup_download_paths(&installer_path);
+        cleanup_owned_update_staging(&installer_path);
         return Err(anyhow!(
             "installer hash mismatch: expected {}, actual {}",
             expected_hash,
@@ -120,9 +210,31 @@ pub async fn download_and_launch_update() -> Result<UpdateStartResponse> {
         ));
     }
 
-    let result_path = update_result_path()?;
-    let install_log_path = staging_dir.join("azookey-update-install.log");
-    launch_installer_helper(&installer_path, &result_path, &install_log_path)?;
+    let launch_result = (|| -> Result<(PathBuf, PathBuf)> {
+        let result_path = update_result_path()?;
+        let install_log_path = staging_dir.join("azookey-update-install.log");
+        delete_legacy_update_result(&result_path)?;
+        let result_target = prepare_update_result_target()?;
+        if let Err(error) = launch_installer_helper(
+            &installer_path,
+            &expected_hash,
+            &result_path,
+            &install_log_path,
+            silent_installer,
+            &result_target,
+        ) {
+            let _ = clear_protected_update_result();
+            return Err(error);
+        }
+        Ok((result_path, install_log_path))
+    })();
+    let (result_path, install_log_path) = match launch_result {
+        Ok(paths) => paths,
+        Err(error) => {
+            cleanup_owned_update_staging(&installer_path);
+            return Err(error);
+        }
+    };
 
     Ok(UpdateStartResponse {
         latest_version: check.latest_version,
@@ -135,18 +247,42 @@ pub async fn download_and_launch_update() -> Result<UpdateStartResponse> {
 
 pub fn take_update_install_result() -> Result<Option<UpdateInstallResult>> {
     let path = update_result_path()?;
-    if !path.exists() {
+    // The elevated helper writes the current result to the launching user's
+    // explicit HKEY_USERS hive, rather than its own HKCU. The request id stored
+    // by that user before elevation prevents a stale helper from publishing to
+    // a newer update request. Prefer it over the pre-#129 AppData file.
+    let Some((data, from_legacy_file)) =
+        select_update_result_data(read_protected_update_result()?, &path)?
+    else {
         return Ok(None);
-    }
-
-    let data = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read update result: {}", path.display()))?;
+    };
     let mut result: UpdateInstallResult = serde_json::from_str(&data)
         .with_context(|| format!("failed to parse update result: {}", path.display()))?;
     normalize_update_install_result(&mut result);
-    fs::remove_file(&path)
-        .with_context(|| format!("failed to remove update result: {}", path.display()))?;
+    if from_legacy_file {
+        delete_legacy_update_result(&path)?;
+    } else {
+        clear_protected_update_result()?;
+        // Best-effort cleanup of a stale pre-#129 result. It must never prevent
+        // consuming the authenticated current result from the registry.
+        let _ = delete_legacy_update_result(&path);
+    }
     Ok(Some(result))
+}
+
+fn select_update_result_data(
+    protected_result: Option<String>,
+    legacy_path: &Path,
+) -> Result<Option<(String, bool)>> {
+    if let Some(data) = protected_result {
+        return Ok(Some((data, false)));
+    }
+    if legacy_path.exists() {
+        let data = fs::read_to_string(legacy_path)
+            .with_context(|| format!("failed to read update result: {}", legacy_path.display()))?;
+        return Ok(Some((data, true)));
+    }
+    Ok(None)
 }
 
 fn normalize_update_install_result(result: &mut UpdateInstallResult) {
@@ -322,6 +458,37 @@ fn cleanup_download_paths(destination: &Path) {
     let _ = fs::remove_file(partial_download_path(destination));
 }
 
+fn is_owned_update_staging_installer(installer_path: &Path) -> bool {
+    if installer_path.file_name() != Some(std::ffi::OsStr::new(INSTALLER_ASSET_NAME)) {
+        return false;
+    }
+    let Some(staging_dir) = installer_path.parent() else {
+        return false;
+    };
+    let Some(staging_name) = staging_dir.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(nonce) = staging_name.strip_prefix(UPDATE_DOWNLOAD_STAGING_PREFIX) else {
+        return false;
+    };
+    if nonce.is_empty() || !nonce.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    staging_dir.parent() == Some(env::temp_dir().as_path())
+}
+
+fn cleanup_owned_update_staging(installer_path: &Path) {
+    if !is_owned_update_staging_installer(installer_path) {
+        return;
+    }
+    cleanup_download_paths(installer_path);
+    let Some(staging_dir) = installer_path.parent() else {
+        return;
+    };
+    let _ = fs::remove_file(staging_dir.join("azookey-update-install.log"));
+    let _ = fs::remove_dir(staging_dir);
+}
+
 fn partial_download_path(destination: &Path) -> PathBuf {
     let file_name = destination
         .file_name()
@@ -375,182 +542,821 @@ fn update_result_path() -> Result<PathBuf> {
     Ok(dir.join(UPDATE_RESULT_FILENAME))
 }
 
+fn new_update_request_id() -> Result<String> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before UNIX epoch")?
+        .as_nanos();
+    Ok(format!("{:x}-{:x}", std::process::id(), nonce))
+}
+
+fn is_supported_user_sid(value: &str) -> bool {
+    let Some(rest) = value
+        .strip_prefix("S-1-5-21-")
+        .or_else(|| value.strip_prefix("S-1-12-1-"))
+    else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-')
+        && rest.split('-').all(|part| !part.is_empty())
+}
+
+fn is_update_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 96
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+}
+
+#[cfg(windows)]
+fn current_user_sid_string() -> Result<String> {
+    use windows::{
+        core::PWSTR,
+        Win32::{
+            Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL},
+            Security::{
+                Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser, TOKEN_QUERY,
+                TOKEN_USER,
+            },
+            System::Threading::{GetCurrentProcess, OpenProcessToken},
+        },
+    };
+
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+            .context("failed to open updater process token")?;
+        let result = (|| -> Result<String> {
+            let mut token_info_length = 0;
+            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut token_info_length);
+            if token_info_length == 0 {
+                return Err(anyhow!("failed to get updater user SID size"));
+            }
+
+            let mut token_info = vec![0_u8; token_info_length as usize];
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(token_info.as_mut_ptr().cast()),
+                token_info_length,
+                &mut token_info_length,
+            )
+            .context("failed to get updater user SID")?;
+            let token_user = &*(token_info.as_ptr() as *const TOKEN_USER);
+            let mut sid_string = PWSTR::null();
+            ConvertSidToStringSidW(token_user.User.Sid, &mut sid_string)
+                .context("failed to convert updater user SID")?;
+            let result = sid_string
+                .to_string()
+                .context("failed to decode updater user SID");
+            let _ = LocalFree(HLOCAL(sid_string.as_ptr().cast()));
+            result
+        })();
+        let _ = CloseHandle(token);
+        result
+    }
+}
+
+#[cfg(not(windows))]
+fn current_user_sid_string() -> Result<String> {
+    Ok("S-1-5-21-0".to_string())
+}
+
+#[cfg(windows)]
+fn prepare_update_result_target() -> Result<UpdateResultTarget> {
+    let user_sid = current_user_sid_string()?;
+    if !is_supported_user_sid(&user_sid) {
+        return Err(anyhow!("unsupported updater user SID: {user_sid}"));
+    }
+    let request_id = new_update_request_id()?;
+    let key = windows_registry::CURRENT_USER
+        .create(UPDATE_RESULT_REGISTRY_KEY)
+        .context("failed to create updater request registry key")?;
+    key.set_string(PENDING_UPDATE_REQUEST_REGISTRY_VALUE, &request_id)
+        .context("failed to write updater request id")?;
+    Ok(UpdateResultTarget {
+        user_sid,
+        request_id,
+    })
+}
+
+#[cfg(not(windows))]
+fn prepare_update_result_target() -> Result<UpdateResultTarget> {
+    Ok(UpdateResultTarget {
+        user_sid: current_user_sid_string()?,
+        request_id: new_update_request_id()?,
+    })
+}
+
+fn delete_legacy_update_result(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            fs::remove_file(path).with_context(|| {
+                format!("failed to remove legacy update result: {}", path.display())
+            })?;
+        }
+        Ok(_) => {
+            return Err(anyhow!(
+                "legacy update result is not a file: {}",
+                path.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect legacy update result: {}", path.display())
+            });
+        }
+    }
+
+    if fs::symlink_metadata(path).is_ok() {
+        return Err(anyhow!(
+            "legacy update result still exists after deletion: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn updater_staging_dir() -> Result<PathBuf> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before UNIX epoch")?
         .as_secs();
-    Ok(env::temp_dir().join(format!("azookey-update-{nonce}")))
+    Ok(env::temp_dir().join(format!("{UPDATE_DOWNLOAD_STAGING_PREFIX}{nonce}")))
 }
 
+#[cfg(windows)]
 fn launch_installer_helper(
     installer_path: &Path,
+    expected_hash: &str,
     result_path: &Path,
     install_log_path: &Path,
+    silent_installer: bool,
+    result_target: &UpdateResultTarget,
 ) -> Result<()> {
-    let staging_dir = installer_path
-        .parent()
-        .ok_or_else(|| anyhow!("installer path has no parent"))?;
-    let helper_script_path = staging_dir.join("azookey-update-helper.ps1");
-    let launcher_script_path = staging_dir.join("azookey-update-launcher.ps1");
-    write_installer_helper_script(&helper_script_path)?;
-    write_installer_launcher_script(&launcher_script_path)?;
+    use std::{ffi::OsStr, mem::size_of, os::windows::ffi::OsStrExt};
+    use windows::{
+        core::PCWSTR,
+        Win32::{
+            Foundation::{CloseHandle, HANDLE},
+            UI::{
+                Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW},
+                WindowsAndMessaging::SW_SHOWNORMAL,
+            },
+        },
+    };
 
-    let status = Command::new("powershell")
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-WindowStyle")
-        .arg("Hidden")
-        .arg("-File")
-        .arg(&launcher_script_path)
-        .arg("-HelperPath")
-        .arg(&helper_script_path)
-        .arg("-InstallerPath")
-        .arg(installer_path)
-        .arg("-ResultPath")
-        .arg(result_path)
-        .arg("-InstallLogPath")
-        .arg(install_log_path)
-        .status()
-        .context("failed to launch updater helper launcher")?;
+    let executable = env::current_exe().context("failed to resolve updater executable")?;
+    let install_dir = protected_install_directory(&executable)?;
+    let helper_path = install_dir.join(UPDATE_HELPER_EXE_NAME);
+    if !helper_path.is_file() {
+        return Err(anyhow!(
+            "protected updater helper is missing: {}",
+            helper_path.display()
+        ));
+    }
+    reject_reparse_point(&helper_path, "protected updater helper")?;
 
-    if !status.success() {
-        return Err(anyhow!("updater helper launcher failed: {status}"));
+    let quoted = |value: &OsStr| -> Result<String> {
+        let value = value.to_string_lossy();
+        if value.contains('"') {
+            return Err(anyhow!("updater helper argument contains a quote"));
+        }
+        Ok(format!("\"{value}\""))
+    };
+    let mut parameters = format!(
+        "--azookey-apply-update --installer-path {} --expected-sha256 {} --result-path {} --install-log-path {} --result-user-sid {} --result-request-id {}",
+        quoted(installer_path.as_os_str())?,
+        expected_hash,
+        quoted(result_path.as_os_str())?,
+        quoted(install_log_path.as_os_str())?,
+        result_target.user_sid,
+        result_target.request_id,
+    );
+    if silent_installer {
+        parameters.push_str(" --silent");
     }
 
+    let verb: Vec<u16> = OsStr::new("runas").encode_wide().chain(Some(0)).collect();
+    let helper: Vec<u16> = helper_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let parameters: Vec<u16> = OsStr::new(&parameters)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let working_dir: Vec<u16> = install_dir
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let mut execute_info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(helper.as_ptr()),
+        lpParameters: PCWSTR(parameters.as_ptr()),
+        lpDirectory: PCWSTR(working_dir.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut execute_info) }
+        .context("failed to launch elevated protected updater helper")?;
+    if execute_info.hProcess == HANDLE::default() {
+        return Err(anyhow!(
+            "ShellExecuteEx returned no updater helper process handle"
+        ));
+    }
+    let _ = unsafe { CloseHandle(execute_info.hProcess) };
+
     Ok(())
 }
 
-fn write_installer_helper_script(script_path: &Path) -> Result<()> {
-    write_powershell_script(script_path, INSTALLER_HELPER_PS1, "updater helper")
-}
-
-fn write_installer_launcher_script(script_path: &Path) -> Result<()> {
-    write_powershell_script(
-        script_path,
-        INSTALLER_LAUNCHER_PS1,
-        "updater helper launcher",
-    )
-}
-
-fn write_powershell_script(script_path: &Path, contents: &str, label: &str) -> Result<()> {
-    let mut file = fs::File::create(script_path)
-        .with_context(|| format!("failed to create {label}: {}", script_path.display()))?;
-    file.write_all(UTF8_BOM)
-        .with_context(|| format!("failed to write {label}: {}", script_path.display()))?;
-    file.write_all(contents.as_bytes())
-        .with_context(|| format!("failed to write {label}: {}", script_path.display()))?;
+#[cfg(not(windows))]
+fn launch_installer_helper(
+    installer_path: &Path,
+    expected_hash: &str,
+    result_path: &Path,
+    install_log_path: &Path,
+    silent_installer: bool,
+    result_target: &UpdateResultTarget,
+) -> Result<()> {
+    let executable = env::current_exe().context("failed to resolve updater executable")?;
+    let install_dir = executable
+        .parent()
+        .ok_or_else(|| anyhow!("updater executable has no parent"))?;
+    let helper_path = install_dir.join(UPDATE_HELPER_EXE_NAME);
+    let mut command = Command::new(&helper_path);
+    command
+        .arg("--azookey-apply-update")
+        .arg("--installer-path")
+        .arg(installer_path)
+        .arg("--expected-sha256")
+        .arg(expected_hash)
+        .arg("--result-path")
+        .arg(result_path)
+        .arg("--install-log-path")
+        .arg(install_log_path)
+        .arg("--result-user-sid")
+        .arg(&result_target.user_sid)
+        .arg("--result-request-id")
+        .arg(&result_target.request_id);
+    if silent_installer {
+        command.arg("--silent");
+    }
+    command
+        .spawn()
+        .context("failed to launch protected updater helper")?;
     Ok(())
 }
 
-const INSTALLER_LAUNCHER_PS1: &str = r#"
-param(
-  [Parameter(Mandatory = $true)][string]$HelperPath,
-  [Parameter(Mandatory = $true)][string]$InstallerPath,
-  [Parameter(Mandatory = $true)][string]$ResultPath,
-  [Parameter(Mandatory = $true)][string]$InstallLogPath
-)
-
-$ErrorActionPreference = "Stop"
-
-function Quote-ProcessArgument {
-  param([Parameter(Mandatory = $true)][string]$Value)
-  '"' + ($Value -replace '"', '\"') + '"'
+#[derive(Debug, PartialEq, Eq)]
+struct InstallerHelperArgs {
+    installer_path: PathBuf,
+    expected_sha256: String,
+    result_path: PathBuf,
+    install_log_path: PathBuf,
+    result_target: UpdateResultTarget,
+    silent: bool,
 }
 
-$helperArgs = @(
-  "-NoProfile",
-  "-ExecutionPolicy",
-  "Bypass",
-  "-WindowStyle",
-  "Hidden",
-  "-File",
-  (Quote-ProcessArgument $HelperPath),
-  "-InstallerPath",
-  (Quote-ProcessArgument $InstallerPath),
-  "-ResultPath",
-  (Quote-ProcessArgument $ResultPath),
-  "-InstallLogPath",
-  (Quote-ProcessArgument $InstallLogPath)
-)
-
-# Keep the long-running helper out of frontend.exe's process tree. The installer
-# intentionally stops frontend.exe before replacing files, and taskkill /T would
-# otherwise kill the updater helper and its installer child.
-Start-Process -FilePath "powershell.exe" -ArgumentList $helperArgs -WindowStyle Hidden | Out-Null
-"#;
-
-const INSTALLER_HELPER_PS1: &str = r#"
-param(
-  [Parameter(Mandatory = $true)][string]$InstallerPath,
-  [Parameter(Mandatory = $true)][string]$ResultPath,
-  [Parameter(Mandatory = $true)][string]$InstallLogPath
-)
-
-$ErrorActionPreference = "Stop"
-
-function Write-UpdateResult {
-  param(
-    [Parameter(Mandatory = $true)][string]$Status,
-    [object]$ExitCode,
-    [Parameter(Mandatory = $true)][bool]$NeedsRestart,
-    [Parameter(Mandatory = $true)][string]$Message
-  )
-
-  $resultDir = Split-Path -Parent $ResultPath
-  New-Item -ItemType Directory -Force -Path $resultDir | Out-Null
-  $json = [PSCustomObject]@{
-    status = $Status
-    exit_code = $ExitCode
-    needs_restart = $NeedsRestart
-    message = $Message
-    completed_at = (Get-Date).ToUniversalTime().ToString("o")
-    installer_path = $InstallerPath
-    install_log_path = $InstallLogPath
-  } | ConvertTo-Json -Depth 3
-  $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-  [System.IO.File]::WriteAllText($ResultPath, $json, $utf8NoBom)
+fn next_helper_arg(args: &mut impl Iterator<Item = OsString>, option: &str) -> Result<OsString> {
+    args.next()
+        .ok_or_else(|| anyhow!("missing value for updater helper option: {option}"))
 }
 
-function Test-IsProcessElevated {
-  $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-  $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
-  $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+fn parse_installer_helper_args(
+    args: impl IntoIterator<Item = OsString>,
+) -> Result<InstallerHelperArgs> {
+    let mut args = args.into_iter();
+    let mut installer_path = None;
+    let mut expected_sha256 = None;
+    let mut result_path = None;
+    let mut install_log_path = None;
+    let mut result_user_sid = None;
+    let mut result_request_id = None;
+    let mut silent = false;
+
+    while let Some(option) = args.next() {
+        match option.to_string_lossy().as_ref() {
+            "--installer-path" => {
+                installer_path = Some(PathBuf::from(next_helper_arg(
+                    &mut args,
+                    "--installer-path",
+                )?));
+            }
+            "--expected-sha256" => {
+                expected_sha256 = Some(
+                    next_helper_arg(&mut args, "--expected-sha256")?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            "--result-path" => {
+                result_path = Some(PathBuf::from(next_helper_arg(&mut args, "--result-path")?));
+            }
+            "--install-log-path" => {
+                install_log_path = Some(PathBuf::from(next_helper_arg(
+                    &mut args,
+                    "--install-log-path",
+                )?));
+            }
+            "--result-user-sid" => {
+                result_user_sid = Some(
+                    next_helper_arg(&mut args, "--result-user-sid")?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            "--result-request-id" => {
+                result_request_id = Some(
+                    next_helper_arg(&mut args, "--result-request-id")?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            "--silent" => silent = true,
+            unexpected => return Err(anyhow!("unexpected updater helper option: {unexpected}")),
+        }
+    }
+
+    let expected_sha256 = expected_sha256
+        .filter(|value| is_sha256(value))
+        .ok_or_else(|| anyhow!("missing or invalid expected installer SHA-256"))?;
+    let user_sid = result_user_sid
+        .filter(|value| is_supported_user_sid(value))
+        .ok_or_else(|| anyhow!("missing or invalid updater result user SID"))?;
+    let request_id = result_request_id
+        .filter(|value| is_update_request_id(value))
+        .ok_or_else(|| anyhow!("missing or invalid updater result request id"))?;
+    Ok(InstallerHelperArgs {
+        installer_path: installer_path.ok_or_else(|| anyhow!("missing installer path"))?,
+        expected_sha256,
+        result_path: result_path.ok_or_else(|| anyhow!("missing result path"))?,
+        install_log_path: install_log_path.ok_or_else(|| anyhow!("missing install log path"))?,
+        result_target: UpdateResultTarget {
+            user_sid,
+            request_id,
+        },
+        silent,
+    })
 }
 
-try {
-  $installerArgs = @(
-    "/RESTARTEXITCODE=3010",
-    "/LOG=$InstallLogPath"
-  )
-  $startProcessArgs = @{
-    FilePath = $InstallerPath
-    ArgumentList = $installerArgs
-    Wait = $true
-    PassThru = $true
-  }
-  if (-not (Test-IsProcessElevated)) {
-    $startProcessArgs["Verb"] = "RunAs"
-  }
-
-  $proc = Start-Process @startProcessArgs
-  if ($proc.ExitCode -eq 0) {
-    Write-UpdateResult -Status "success" -ExitCode $proc.ExitCode -NeedsRestart $false -Message "更新が完了しました。"
-    exit 0
-  }
-  if ($proc.ExitCode -eq 3010) {
-    Write-UpdateResult -Status "success" -ExitCode $proc.ExitCode -NeedsRestart $true -Message "更新が完了しました。Windows の再起動が必要です。"
-    exit 0
-  }
-
-  Write-UpdateResult -Status "failed" -ExitCode $proc.ExitCode -NeedsRestart $false -Message "更新に失敗しました。終了コード: $($proc.ExitCode)"
-  exit 1
-} catch {
-  Write-UpdateResult -Status "failed" -ExitCode $null -NeedsRestart $false -Message $_.Exception.Message
-  exit 1
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
-"#;
+
+fn sha256_from_reader(reader: &mut impl Read) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .context("failed to read installer")?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format_sha256(&hasher.finalize()))
+}
+
+fn completed_at_string() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    format!("unix:{seconds}")
+}
+
+#[cfg(not(windows))]
+fn write_update_result(
+    path: &Path,
+    result: &UpdateInstallResult,
+    _target: &UpdateResultTarget,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("update result path has no parent"))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create update result dir: {}", parent.display()))?;
+    let temporary = path.with_extension("json.tmp");
+    let data = serde_json::to_vec_pretty(result).context("failed to serialize update result")?;
+    fs::write(&temporary, data)
+        .with_context(|| format!("failed to write update result: {}", temporary.display()))?;
+    if path.exists() {
+        fs::remove_file(path)
+            .with_context(|| format!("failed to replace update result: {}", path.display()))?;
+    }
+    fs::rename(&temporary, path)
+        .with_context(|| format!("failed to publish update result: {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_update_result(
+    _path: &Path,
+    result: &UpdateInstallResult,
+    target: &UpdateResultTarget,
+) -> Result<()> {
+    let registry_path = user_update_result_registry_path(&target.user_sid)?;
+    let envelope = ProtectedUpdateResult {
+        request_id: target.request_id.clone(),
+        result: result.clone(),
+    };
+    let data = serde_json::to_string_pretty(&envelope)
+        .context("failed to serialize protected update result")?;
+    let key = windows_registry::USERS
+        .create(&registry_path)
+        .context("failed to open launching user updater result registry key")?;
+    let pending_request = key
+        .get_string(PENDING_UPDATE_REQUEST_REGISTRY_VALUE)
+        .context("launching user has no pending updater request")?;
+    if pending_request != target.request_id {
+        return Err(anyhow!(
+            "launching user's pending updater request does not match helper request"
+        ));
+    }
+    key.set_string(UPDATE_RESULT_REGISTRY_VALUE, &data)
+        .context("failed to write launching user updater result registry value")?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_protected_update_result() -> Result<Option<String>> {
+    let Some(request_id) = read_pending_update_request()? else {
+        return Ok(None);
+    };
+    let key = match windows_registry::CURRENT_USER.open(UPDATE_RESULT_REGISTRY_KEY) {
+        Ok(key) => key,
+        Err(_) => return Ok(None),
+    };
+    let data = match key.get_string(UPDATE_RESULT_REGISTRY_VALUE) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    select_protected_update_result(&data, &request_id)
+}
+
+#[cfg(not(windows))]
+fn read_protected_update_result() -> Result<Option<String>> {
+    Ok(None)
+}
+
+fn select_protected_update_result(data: &str, request_id: &str) -> Result<Option<String>> {
+    let envelope: ProtectedUpdateResult = serde_json::from_str(data)
+        .context("failed to parse launching user updater result registry value")?;
+    if envelope.request_id != request_id {
+        return Ok(None);
+    }
+    serde_json::to_string(&envelope.result)
+        .map(Some)
+        .context("failed to serialize selected updater result")
+}
+
+#[cfg(windows)]
+fn read_pending_update_request() -> Result<Option<String>> {
+    let key = match windows_registry::CURRENT_USER.open(UPDATE_RESULT_REGISTRY_KEY) {
+        Ok(key) => key,
+        Err(_) => return Ok(None),
+    };
+    match key.get_string(PENDING_UPDATE_REQUEST_REGISTRY_VALUE) {
+        Ok(value) if is_update_request_id(&value) => Ok(Some(value)),
+        Ok(_) => Err(anyhow!("invalid pending updater request id")),
+        Err(_) => Ok(None),
+    }
+}
+
+#[cfg(not(windows))]
+fn read_pending_update_request() -> Result<Option<String>> {
+    Ok(None)
+}
+
+fn user_update_result_registry_path(user_sid: &str) -> Result<String> {
+    if !is_supported_user_sid(user_sid) {
+        return Err(anyhow!("unsupported updater result user SID: {user_sid}"));
+    }
+    Ok(format!("{user_sid}\\{UPDATE_RESULT_REGISTRY_KEY}"))
+}
+
+#[cfg(windows)]
+fn clear_protected_update_result() -> Result<()> {
+    let key = windows_registry::CURRENT_USER
+        .create(UPDATE_RESULT_REGISTRY_KEY)
+        .context("failed to open updater request registry key for deletion")?;
+    let _ = key.remove_value(PENDING_UPDATE_REQUEST_REGISTRY_VALUE);
+    let _ = key.remove_value(UPDATE_RESULT_REGISTRY_VALUE);
+    if key
+        .get_string(PENDING_UPDATE_REQUEST_REGISTRY_VALUE)
+        .is_ok()
+        || key.get_string(UPDATE_RESULT_REGISTRY_VALUE).is_ok()
+    {
+        return Err(anyhow!("failed to remove updater result/request values"));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn clear_protected_update_result() -> Result<()> {
+    Ok(())
+}
+
+#[derive(Debug)]
+struct InstallerExecution {
+    exit_code: i32,
+    install_log_path: PathBuf,
+}
+
+#[cfg(windows)]
+fn execute_verified_installer(
+    installer_path: &Path,
+    expected_sha256: &str,
+    _requested_install_log_path: &Path,
+    silent: bool,
+) -> Result<InstallerExecution> {
+    use std::{
+        mem::size_of,
+        os::windows::{ffi::OsStrExt, fs::OpenOptionsExt},
+        process,
+    };
+    use windows::{
+        core::PCWSTR,
+        Win32::{
+            Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
+            System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE},
+            UI::{
+                Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW},
+                WindowsAndMessaging::SW_SHOWNORMAL,
+            },
+        },
+    };
+
+    // The download directory is user-writable and may contain reparse points.
+    // Pin the downloaded bytes with a deny-write/delete handle, then copy those
+    // exact bytes into a Program Files child that an unprivileged process cannot
+    // replace before execution.
+    let mut installer = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(INSTALLER_LOCK_SHARE_MODE)
+        .open(installer_path)
+        .with_context(|| format!("failed to lock installer: {}", installer_path.display()))?;
+    let actual_hash = sha256_from_reader(&mut installer)?;
+    if !hashes_match(expected_sha256, &actual_hash) {
+        return Err(anyhow!(
+            "installer changed before elevation: expected {}, actual {}",
+            expected_sha256,
+            actual_hash
+        ));
+    }
+
+    let helper_executable = env::current_exe().context("failed to resolve updater helper")?;
+    let install_dir = protected_install_directory(&helper_executable)?;
+    reject_reparse_point(&helper_executable, "protected updater helper")?;
+
+    let protected_staging_dir = install_dir.join(PROTECTED_UPDATE_STAGING_DIRECTORY_NAME);
+    fs::create_dir_all(&protected_staging_dir).with_context(|| {
+        format!(
+            "failed to create protected updater staging dir: {}",
+            protected_staging_dir.display()
+        )
+    })?;
+    reject_reparse_point(
+        &protected_staging_dir,
+        "protected updater staging directory",
+    )?;
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let protected_installer_path = protected_staging_dir.join(format!(
+        ".azookey-setup-verified-{}-{nonce}.exe",
+        process::id()
+    ));
+    let protected_install_log_path = protected_staging_dir.join(format!(
+        "azookey-update-install-{}-{nonce}.log",
+        process::id()
+    ));
+    struct ProtectedInstallerCleanup {
+        file: PathBuf,
+        directory: PathBuf,
+    }
+    impl Drop for ProtectedInstallerCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.file);
+            let _ = fs::remove_dir(&self.directory);
+        }
+    }
+    let _protected_cleanup = ProtectedInstallerCleanup {
+        file: protected_installer_path.clone(),
+        directory: protected_staging_dir.clone(),
+    };
+    let mut protected_installer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(INSTALLER_LOCK_SHARE_MODE)
+        .open(&protected_installer_path)
+        .with_context(|| {
+            format!(
+                "failed to create protected installer copy: {}",
+                protected_installer_path.display()
+            )
+        })?;
+    installer.seek(SeekFrom::Start(0))?;
+    std::io::copy(&mut installer, &mut protected_installer)
+        .context("failed to copy verified installer into Program Files")?;
+    protected_installer
+        .sync_all()
+        .context("failed to flush protected installer copy")?;
+    protected_installer.seek(SeekFrom::Start(0))?;
+    let protected_hash = sha256_from_reader(&mut protected_installer)?;
+    if !hashes_match(expected_sha256, &protected_hash) {
+        return Err(anyhow!(
+            "protected installer copy hash mismatch: expected {}, actual {}",
+            expected_sha256,
+            protected_hash
+        ));
+    }
+
+    // The destination is now an independently verified file under the
+    // protected Program Files ACL. Close the write handle before CreateProcess:
+    // keeping it open with FILE_SHARE_READ only prevents the Windows loader
+    // from reopening the executable and can deadlock ShellExecuteEx.
+    drop(protected_installer);
+    drop(installer);
+
+    // The protected helper was already started with `runas`. Using `runas`
+    // again here can leave a second UAC prompt waiting in a non-interactive
+    // session. `open` inherits the helper's elevated token; the installer's
+    // own requestedExecutionLevel still prompts if the helper was invoked
+    // directly without elevation.
+    let verb: Vec<u16> = std::ffi::OsStr::new("open")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let executable: Vec<u16> = protected_installer_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let parameters = if silent {
+        format!(
+            "/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /RESTARTEXITCODE=3010 /LOG=\"{}\"",
+            protected_install_log_path.display()
+        )
+    } else {
+        format!(
+            "/RESTARTEXITCODE=3010 /LOG=\"{}\"",
+            protected_install_log_path.display()
+        )
+    };
+    let parameters: Vec<u16> = std::ffi::OsStr::new(&parameters)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let working_dir: Vec<u16> = protected_staging_dir
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    let mut execute_info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(executable.as_ptr()),
+        lpParameters: PCWSTR(parameters.as_ptr()),
+        lpDirectory: PCWSTR(working_dir.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    let result = (|| -> Result<InstallerExecution> {
+        unsafe { ShellExecuteExW(&mut execute_info) }
+            .context("failed to create elevated installer process")?;
+        if execute_info.hProcess == HANDLE::default() {
+            return Err(anyhow!(
+                "ShellExecuteEx returned no installer process handle"
+            ));
+        }
+        let process = execute_info.hProcess;
+        let wait = unsafe { WaitForSingleObject(process, INFINITE) };
+        if wait != WAIT_OBJECT_0 {
+            let _ = unsafe { CloseHandle(process) };
+            return Err(anyhow!("failed while waiting for installer: {wait:?}"));
+        }
+        let mut exit_code = 0_u32;
+        let exit_result = unsafe { GetExitCodeProcess(process, &mut exit_code) }
+            .context("failed to read installer exit code");
+        let _ = unsafe { CloseHandle(process) };
+        exit_result?;
+        Ok(InstallerExecution {
+            exit_code: exit_code as i32,
+            install_log_path: protected_install_log_path,
+        })
+    })();
+    result
+}
+
+#[cfg(not(windows))]
+fn execute_verified_installer(
+    _installer_path: &Path,
+    _expected_sha256: &str,
+    _install_log_path: &Path,
+    _silent: bool,
+) -> Result<InstallerExecution> {
+    Err(anyhow!("the Azookey updater helper is Windows-only"))
+}
+
+fn helper_result(args: &InstallerHelperArgs) -> UpdateInstallResult {
+    let execution = execute_verified_installer(
+        &args.installer_path,
+        &args.expected_sha256,
+        &args.install_log_path,
+        args.silent,
+    );
+    // The helper has copied and re-verified the installer under Program Files
+    // before it returns from execution. Remove only the exact staging shape
+    // created by this updater; direct helper invocations must not be able to
+    // turn an arbitrary --installer-path into an elevated delete primitive.
+    cleanup_owned_update_staging(&args.installer_path);
+    match execution {
+        Ok(InstallerExecution {
+            exit_code: exit_code @ (0 | 3010),
+            install_log_path,
+        }) => {
+            let parent = install_log_path.parent().map(Path::to_path_buf);
+            let _ = fs::remove_file(&install_log_path);
+            if let Some(parent) = parent {
+                let _ = fs::remove_dir(parent);
+            }
+            UpdateInstallResult {
+                status: "success".to_string(),
+                exit_code: Some(exit_code),
+                needs_restart: exit_code == 3010,
+                message: if exit_code == 3010 {
+                    "更新が完了しました。Windows の再起動が必要です。".to_string()
+                } else {
+                    "更新が完了しました。".to_string()
+                },
+                completed_at: completed_at_string(),
+                installer_path: Some(args.installer_path.display().to_string()),
+                install_log_path: None,
+            }
+        }
+        Ok(InstallerExecution {
+            exit_code,
+            install_log_path,
+        }) => UpdateInstallResult {
+            status: "failed".to_string(),
+            exit_code: Some(exit_code),
+            needs_restart: false,
+            message: format!("更新に失敗しました。終了コード: {exit_code}"),
+            completed_at: completed_at_string(),
+            installer_path: Some(args.installer_path.display().to_string()),
+            install_log_path: Some(install_log_path.display().to_string()),
+        },
+        Err(error) => UpdateInstallResult {
+            status: "failed".to_string(),
+            exit_code: None,
+            needs_restart: false,
+            message: error.to_string(),
+            completed_at: completed_at_string(),
+            installer_path: Some(args.installer_path.display().to_string()),
+            install_log_path: None,
+        },
+    }
+}
+
+pub fn run_installer_helper_cli(args: impl IntoIterator<Item = OsString>) -> Result<()> {
+    shared::enable_redirection_guard().map_err(anyhow::Error::msg)?;
+    let executable = env::current_exe().context("failed to resolve updater helper executable")?;
+    let file_name = executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if !file_name.eq_ignore_ascii_case(UPDATE_HELPER_EXE_NAME) {
+        return Err(anyhow!(
+            "updater helper mode is only available from {UPDATE_HELPER_EXE_NAME}"
+        ));
+    }
+
+    let args = parse_installer_helper_args(args)?;
+    let result = helper_result(&args);
+    write_update_result(&args.result_path, &result, &args.result_target)?;
+    if result.status == "success" {
+        Ok(())
+    } else {
+        Err(anyhow!(result.message))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -747,42 +1553,180 @@ mod tests {
     }
 
     #[test]
-    fn helper_launches_installer_with_visible_ui() {
-        assert!(!INSTALLER_HELPER_PS1.contains(r#""/VERYSILENT""#));
-        assert!(!INSTALLER_HELPER_PS1.contains(r#""/SUPPRESSMSGBOXES""#));
-        assert!(!INSTALLER_HELPER_PS1.contains(r#""/NORESTART""#));
-        assert!(INSTALLER_HELPER_PS1.contains(r#""/RESTARTEXITCODE=3010""#));
-        assert!(INSTALLER_HELPER_PS1.contains(r#""/LOG=$InstallLogPath""#));
+    fn cleanup_removes_only_the_owned_updater_staging_shape() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let staging = env::temp_dir().join(format!(
+            "{UPDATE_DOWNLOAD_STAGING_PREFIX}{}{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&staging).unwrap();
+        let installer = staging.join(INSTALLER_ASSET_NAME);
+        fs::write(&installer, b"installer").unwrap();
+        fs::write(partial_download_path(&installer), b"partial").unwrap();
+        fs::write(staging.join("azookey-update-install.log"), b"log").unwrap();
+
+        assert!(is_owned_update_staging_installer(&installer));
+        cleanup_owned_update_staging(&installer);
+
+        assert!(!staging.exists());
+        assert!(!is_owned_update_staging_installer(
+            &env::temp_dir().join("unrelated").join(INSTALLER_ASSET_NAME)
+        ));
+        assert!(!is_owned_update_staging_installer(
+            &env::temp_dir()
+                .join(format!("{UPDATE_DOWNLOAD_STAGING_PREFIX}123"))
+                .join("unrelated.exe")
+        ));
+        assert!(!is_owned_update_staging_installer(
+            &env::temp_dir()
+                .join(format!("{UPDATE_DOWNLOAD_STAGING_PREFIX}not-a-nonce"))
+                .join(INSTALLER_ASSET_NAME)
+        ));
     }
 
     #[test]
-    fn helper_elevates_installer_when_needed() {
-        assert!(INSTALLER_HELPER_PS1.contains("Test-IsProcessElevated"));
-        assert!(INSTALLER_HELPER_PS1.contains(r#"$startProcessArgs["Verb"] = "RunAs""#));
-        assert!(INSTALLER_HELPER_PS1.contains("Start-Process @startProcessArgs"));
+    fn parses_protected_helper_arguments_without_losing_path_spaces() {
+        let expected_hash = "a".repeat(64);
+        let args = parse_installer_helper_args(
+            [
+                "--installer-path",
+                r"C:\User Data\azookey-setup.exe",
+                "--expected-sha256",
+                &expected_hash,
+                "--result-path",
+                r"C:\User Data\update-result.json",
+                "--install-log-path",
+                r"C:\User Data\install.log",
+                "--result-user-sid",
+                "S-1-5-21-100-200-300-400",
+                "--result-request-id",
+                "abc123-def456",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .unwrap();
+
+        assert_eq!(
+            args.installer_path,
+            PathBuf::from(r"C:\User Data\azookey-setup.exe")
+        );
+        assert_eq!(args.expected_sha256, expected_hash);
+        assert_eq!(args.result_target.user_sid, "S-1-5-21-100-200-300-400");
+        assert_eq!(args.result_target.request_id, "abc123-def456");
+        assert!(!args.silent);
+        assert_eq!(
+            args.result_path,
+            PathBuf::from(r"C:\User Data\update-result.json")
+        );
     }
 
     #[test]
-    fn launcher_starts_helper_as_separate_process() {
-        assert!(INSTALLER_LAUNCHER_PS1.contains("Start-Process"));
-        assert!(INSTALLER_LAUNCHER_PS1.contains(r#""powershell.exe""#));
-        assert!(INSTALLER_LAUNCHER_PS1.contains("Quote-ProcessArgument $HelperPath"));
-        assert!(!INSTALLER_LAUNCHER_PS1.contains("-Wait"));
+    fn parses_silent_installer_helper_mode() {
+        let expected_hash = "a".repeat(64);
+        let args = parse_installer_helper_args(
+            [
+                "--installer-path",
+                "installer.exe",
+                "--expected-sha256",
+                &expected_hash,
+                "--result-path",
+                "result.json",
+                "--install-log-path",
+                "install.log",
+                "--result-user-sid",
+                "S-1-12-1-100-200-300-400",
+                "--result-request-id",
+                "123abc-456def",
+                "--silent",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .unwrap();
+
+        assert!(args.silent);
     }
 
     #[test]
-    fn helper_scripts_are_written_with_utf8_bom() {
-        let temp = tempfile::tempdir().unwrap();
-        let helper = temp.path().join("azookey-update-helper.ps1");
-        let launcher = temp.path().join("azookey-update-launcher.ps1");
+    fn rejects_invalid_helper_hash() {
+        let error = parse_installer_helper_args(
+            [
+                "--installer-path",
+                "installer.exe",
+                "--expected-sha256",
+                "not-a-hash",
+                "--result-path",
+                "result.json",
+                "--install-log-path",
+                "install.log",
+                "--result-user-sid",
+                "S-1-5-21-100-200-300-400",
+                "--result-request-id",
+                "abc123-def456",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .unwrap_err();
 
-        write_installer_helper_script(&helper).unwrap();
-        write_installer_launcher_script(&launcher).unwrap();
+        assert!(error.to_string().contains("SHA-256"));
+    }
 
-        for path in [helper, launcher] {
-            let data = fs::read(path).unwrap();
-            assert!(data.starts_with(UTF8_BOM));
-        }
+    #[test]
+    fn launching_user_result_path_accepts_only_user_sid_shapes() {
+        assert_eq!(
+            user_update_result_registry_path("S-1-5-21-100-200-300-400").unwrap(),
+            r"S-1-5-21-100-200-300-400\Software\Azookey"
+        );
+        assert!(user_update_result_registry_path(r"S-1-5-21-100\..\Microsoft\Windows").is_err());
+        assert!(user_update_result_registry_path("S-1-5-32-544").is_err());
+    }
+
+    #[test]
+    fn protected_result_must_match_launching_user_request() {
+        let result = UpdateInstallResult {
+            status: "success".to_string(),
+            exit_code: Some(3010),
+            needs_restart: true,
+            message: "updated".to_string(),
+            completed_at: "unix:1".to_string(),
+            installer_path: None,
+            install_log_path: None,
+        };
+        let data = serde_json::to_string(&ProtectedUpdateResult {
+            request_id: "current-request".to_string(),
+            result: result.clone(),
+        })
+        .unwrap();
+
+        let selected = select_protected_update_result(&data, "current-request")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<UpdateInstallResult>(&selected).unwrap(),
+            result
+        );
+        assert!(select_protected_update_result(&data, "stale-request")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn hashes_the_bytes_read_from_the_locked_installer_handle() {
+        let mut bytes = &b"verified installer bytes"[..];
+        assert_eq!(
+            sha256_from_reader(&mut bytes).unwrap(),
+            "f12fa6b847f35162dbbacc2fe6870f73824c25140f77218e49b047beb434cfef"
+        );
+    }
+
+    #[test]
+    fn installer_lock_allows_reads_but_denies_write_and_delete_sharing() {
+        assert_eq!(INSTALLER_LOCK_SHARE_MODE, 0x0000_0001);
     }
 
     #[test]
@@ -828,6 +1772,31 @@ mod tests {
             "更新が完了しました。Windows の再起動が必要です。"
         );
         assert!(take_update_install_result().unwrap().is_none());
+    }
+
+    #[test]
+    fn protected_update_result_takes_priority_over_malformed_legacy_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy_path = temp.path().join(UPDATE_RESULT_FILENAME);
+        fs::write(&legacy_path, "not valid json").unwrap();
+        let protected = r#"{
+  "status": "success",
+  "exit_code": 0,
+  "needs_restart": false,
+  "message": "updated",
+  "completed_at": "2026-07-21T00:00:00Z",
+  "installer_path": "protected-installer.exe",
+  "install_log_path": null
+}"#
+        .to_string();
+
+        let (selected, from_legacy) =
+            select_update_result_data(Some(protected.clone()), &legacy_path)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(selected, protected);
+        assert!(!from_legacy);
     }
 
     #[test]

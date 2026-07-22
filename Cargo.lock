@@ -1214,6 +1214,7 @@ dependencies = [
  "tonic",
  "tower 0.5.2",
  "windows",
+ "windows-registry",
 ]
 
 [[package]]

@@ -12,6 +12,48 @@ pub mod proto {
         tonic::include_file_descriptor_set!("azookey_service_descriptor");
 }
 
+/// Enables RedirectionGuard before a privileged process reads or writes data
+/// below user-writable directories. The policy blocks traversal through
+/// junctions and symbolic links created by non-administrators.
+#[cfg(windows)]
+pub fn enable_redirection_guard() -> Result<(), String> {
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessMitigationPolicy, ProcessRedirectionTrustPolicy,
+        SetProcessMitigationPolicy,
+    };
+
+    const ENFORCE_REDIRECTION_TRUST: u32 = 1;
+    let requested = ENFORCE_REDIRECTION_TRUST;
+    unsafe {
+        SetProcessMitigationPolicy(
+            ProcessRedirectionTrustPolicy,
+            (&requested as *const u32).cast(),
+            std::mem::size_of::<u32>(),
+        )
+        .map_err(|error| format!("failed to enable RedirectionGuard: {error}"))?;
+    }
+
+    let mut actual = 0_u32;
+    unsafe {
+        GetProcessMitigationPolicy(
+            GetCurrentProcess(),
+            ProcessRedirectionTrustPolicy,
+            (&mut actual as *mut u32).cast(),
+            std::mem::size_of::<u32>(),
+        )
+        .map_err(|error| format!("failed to verify RedirectionGuard: {error}"))?;
+    }
+    if actual & ENFORCE_REDIRECTION_TRUST == 0 {
+        return Err("RedirectionGuard is not enforced for this process".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn enable_redirection_guard() -> Result<(), String> {
+    Ok(())
+}
+
 fn get_config_root() -> Result<PathBuf, ConfigError> {
     let appdata = env::var_os("APPDATA").ok_or(ConfigError::MissingAppData)?;
     Ok(PathBuf::from(appdata).join("Azookey"))

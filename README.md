@@ -129,7 +129,7 @@ cargo make build [--debug/--release]
 
 `build`フォルダーが作成され、ビルドされた実行ファイルが格納されます。
 
-配布用インストーラーは Inno Setup で作成する `build/azookey-setup.exe` の 1 種類です。Tauri は設定アプリ `frontend.exe` のビルドにのみ使用し、Tauri/NSIS インストーラーは生成・同梱しません。`frontend.exe` を含むアプリ本体、IME DLL、サーバー、UI、ランチャー、辞書、Zenzai model、llama backend は Inno installer が `{userappdata}\Azookey` に配置します。
+配布用インストーラーは Inno Setup で作成する `build/azookey-setup.exe` の 1 種類です。Tauri は設定アプリ `frontend.exe` のビルドにのみ使用し、Tauri/NSIS インストーラーは生成・同梱しません。`frontend.exe` を含むアプリ本体、IME DLL、サーバー、UI、ランチャー、辞書、Zenzai model、llama backend は Inno installer が `{autopf}\Azookey`（通常は `C:\Program Files\Azookey`）に配置します。設定・学習・ログ・`EngineRuntime` は `%APPDATA%\Azookey`、候補 UI の WebView2 data は `%LOCALAPPDATA%\Azookey\ui-webview` に保存します。
 
 `launcher.exe`を管理者権限で実行すると、azookeyの変換エンジンが起動します。
 

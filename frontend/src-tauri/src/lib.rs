@@ -304,6 +304,37 @@ fn take_update_install_result() -> Result<Option<updater::UpdateInstallResult>, 
     updater::take_update_install_result().map_err(|error| error.to_string())
 }
 
+/// Runs the production updater without starting the Tauri UI for Windows VM
+/// verification. The marker must be created beside the protected executable by
+/// an administrator, so normal users cannot turn environment overrides into an
+/// unattended update trigger.
+pub fn run_updater_integration_test() -> Result<updater::UpdateStartResponse, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let install_dir = executable
+        .parent()
+        .ok_or_else(|| "failed to resolve frontend install directory".to_string())?;
+    let marker = install_dir.join(".azookey-updater-integration-test");
+    if !marker.is_file() {
+        return Err(format!(
+            "protected updater integration marker is missing: {}",
+            marker.display()
+        ));
+    }
+
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+    runtime
+        .block_on(updater::download_and_launch_update_for_integration_test())
+        .map_err(|error| error.to_string())
+}
+
+/// Runs the protected updater helper copy. The helper reopens and hashes the
+/// downloaded installer while denying write/delete sharing, then holds that
+/// handle until Windows has created the elevated installer process.
+pub fn run_updater_helper() -> Result<(), String> {
+    updater::run_installer_helper_cli(std::env::args_os().skip(2))
+        .map_err(|error| error.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = AppState::new();

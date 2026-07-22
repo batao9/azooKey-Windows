@@ -342,11 +342,38 @@ private func elapsedPerformanceMilliseconds(since start: TimeInterval) -> Int {
     Int((performanceNow() - start) * 1000)
 }
 
-private func settingsPath() -> URL? {
-    guard let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] else {
-        return nil
+func applicationDataDirectoryURL(
+    appDataPath: String?,
+    temporaryDirectoryURL: URL
+) -> URL {
+    if let appDataPath,
+       !appDataPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        return URL(filePath: appDataPath)
+            .appendingPathComponent("Azookey", isDirectory: true)
     }
-    return URL(filePath: appDataPath).appendingPathComponent("Azookey/settings.json")
+
+    return temporaryDirectoryURL.appendingPathComponent("Azookey", isDirectory: true)
+}
+
+private func applicationDataDirectoryURL() -> URL {
+    applicationDataDirectoryURL(
+        appDataPath: ProcessInfo.processInfo.environment["APPDATA"],
+        temporaryDirectoryURL: FileManager.default.temporaryDirectory
+    )
+}
+
+func engineRuntimeDirectoryURL(
+    appDataPath: String?,
+    temporaryDirectoryURL: URL
+) -> URL {
+    applicationDataDirectoryURL(
+        appDataPath: appDataPath,
+        temporaryDirectoryURL: temporaryDirectoryURL
+    ).appendingPathComponent("EngineRuntime", isDirectory: true)
+}
+
+private func settingsPath() -> URL {
+    applicationDataDirectoryURL().appendingPathComponent("settings.json")
 }
 
 private func readAppSettings(at path: URL) throws -> AppSettings {
@@ -366,7 +393,25 @@ private func readAppSettings(at path: URL) throws -> AppSettings {
 }
 
 @MainActor private func converterRuntimeDirectoryURL() -> URL {
-    execURL.appendingPathComponent("EngineRuntime", isDirectory: true)
+    engineRuntimeDirectoryURL(
+        appDataPath: ProcessInfo.processInfo.environment["APPDATA"],
+        temporaryDirectoryURL: FileManager.default.temporaryDirectory
+    )
+}
+
+@MainActor private func ensureConverterRuntimeDirectory() {
+    let runtimeDirectoryURL = converterRuntimeDirectoryURL()
+    do {
+        try FileManager.default.createDirectory(
+            at: runtimeDirectoryURL,
+            withIntermediateDirectories: true
+        )
+    } catch {
+        serverLog(
+            "WARN",
+            "Failed to create engine runtime directory \(runtimeDirectoryURL.path): \(error)"
+        )
+    }
 }
 
 func normalizedZenzaiBackend(_ backend: String?) -> String {
@@ -397,13 +442,7 @@ private func shouldOffloadZenzaiToGpu(zenzaiEnabled: Bool, backend: String?) -> 
             .appendingPathComponent("LearningMemory", isDirectory: true)
     }
 
-    if let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] {
-        return URL(filePath: appDataPath)
-            .appendingPathComponent("Azookey", isDirectory: true)
-            .appendingPathComponent("LearningMemory", isDirectory: true)
-    }
-
-    return converterRuntimeDirectoryURL()
+    return applicationDataDirectoryURL()
         .appendingPathComponent("LearningMemory", isDirectory: true)
 }
 
@@ -1884,13 +1923,11 @@ func cursorPrefixBoundaryFirstClauseResults(
     let loadedSettingsPath = settingsPath()
     var loadedSettings: AppSettings?
     var settingsLoadError: Error?
-    if let loadedSettingsPath {
-        do {
-            let settings = try readAppSettings(at: loadedSettingsPath)
-            loadedSettings = settings
-        } catch {
-            settingsLoadError = error
-        }
+    do {
+        let settings = try readAppSettings(at: loadedSettingsPath)
+        loadedSettings = settings
+    } catch {
+        settingsLoadError = error
     }
 
     serverLog("INFO", "LoadConfig: start")
@@ -1919,9 +1956,7 @@ func cursorPrefixBoundaryFirstClauseResults(
     currentLearningMemoryDirectoryURL = learningMemoryDirectoryURL(settingsPath: loadedSettingsPath)
 
     if let settings = loadedSettings {
-        if let loadedSettingsPath {
-            serverLog("INFO", "LoadConfig: reading settingsPath=\(loadedSettingsPath.path)")
-        }
+        serverLog("INFO", "LoadConfig: reading settingsPath=\(loadedSettingsPath.path)")
 
         if let zenzai = settings.zenzai {
             if let enableValue = zenzai.enable {
@@ -2031,6 +2066,7 @@ func cursorPrefixBoundaryFirstClauseResults(
     execURL = URL(filePath: path)
     converterDictionaryURL = execURL.appendingPathComponent("Dictionary")
     converterPreloadDictionary = true
+    ensureConverterRuntimeDirectory()
     rebuildConverter()
     clearLearningCandidateCache()
 

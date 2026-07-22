@@ -16,6 +16,16 @@ UNINSTALL_AFTER_INSTALL="${UNINSTALL_AFTER_INSTALL:-0}"
 VERIFY_LEGACY_NSIS_MIGRATION="${VERIFY_LEGACY_NSIS_MIGRATION:-0}"
 VERIFY_MISSING_LEGACY_NSIS_UNINSTALLER="${VERIFY_MISSING_LEGACY_NSIS_UNINSTALLER:-0}"
 VERIFY_LOCKED_FILE_UPGRADE="${VERIFY_LOCKED_FILE_UPGRADE:-0}"
+VERIFY_PREVIOUS_INNO_MIGRATION="${VERIFY_PREVIOUS_INNO_MIGRATION:-0}"
+VERIFY_LOCKED_PREVIOUS_INNO_MIGRATION="${VERIFY_LOCKED_PREVIOUS_INNO_MIGRATION:-0}"
+PREVIOUS_INNO_INSTALLER="${PREVIOUS_INNO_INSTALLER:-}"
+VERIFY_MISSING_PREVIOUS_INNO_UNINSTALLER="${VERIFY_MISSING_PREVIOUS_INNO_UNINSTALLER:-0}"
+VERIFY_TAMPERED_PREVIOUS_INNO_UNINSTALLER="${VERIFY_TAMPERED_PREVIOUS_INNO_UNINSTALLER:-0}"
+VERIFY_TAMPERED_PREVIOUS_INNO_DATA="${VERIFY_TAMPERED_PREVIOUS_INNO_DATA:-0}"
+VERIFY_PREVIOUS_INNO_REGISTRY_DELETE_FAILURE="${VERIFY_PREVIOUS_INNO_REGISTRY_DELETE_FAILURE:-0}"
+VERIFY_SAFE_REINSTALL="${VERIFY_SAFE_REINSTALL:-0}"
+VERIFY_TASK_CREATION_FAILURE="${VERIFY_TASK_CREATION_FAILURE:-0}"
+VERIFY_TASK_RUN_FAILURE="${VERIFY_TASK_RUN_FAILURE:-0}"
 
 if [[ -z "$VBOX_MANAGE" ]]; then
   if command -v VBoxManage >/dev/null 2>&1; then
@@ -45,11 +55,13 @@ REMOTE_INSTALLER_WIN="$REMOTE_TMP_WIN\\azookey-setup-under-test.exe"
 REMOTE_PS_WIN="$REMOTE_TMP_WIN\\azookey-install-under-test.ps1"
 REMOTE_INSTALL_LOG_WIN="$REMOTE_TMP_WIN\\azookey-install-under-test.log"
 REMOTE_UNINSTALL_LOG_WIN="$REMOTE_TMP_WIN\\azookey-uninstall-under-test.log"
+REMOTE_PREVIOUS_INSTALLER_WIN="$REMOTE_TMP_WIN\\azookey-previous-inno-setup.exe"
 
 REMOTE_INSTALLER_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-setup-under-test.exe"
 REMOTE_PS_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-install-under-test.ps1"
 REMOTE_INSTALL_LOG_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-install-under-test.log"
 REMOTE_UNINSTALL_LOG_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-uninstall-under-test.log"
+REMOTE_PREVIOUS_INSTALLER_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-previous-inno-setup.exe"
 
 SESSION_KNOWN_HOSTS="$(mktemp /tmp/vm-stage-known-hosts.XXXXXX)"
 TMP_REMOTE_PS=""
@@ -213,6 +225,10 @@ ensure_preconditions() {
     log "スナップショットが見つかりません: $SNAPSHOT_NAME"
     exit 1
   fi
+  if { [[ "${VERIFY_PREVIOUS_INNO_MIGRATION,,}" =~ ^(1|true|yes|on)$ ]] || [[ "${VERIFY_LOCKED_PREVIOUS_INNO_MIGRATION,,}" =~ ^(1|true|yes|on)$ ]] || [[ "${VERIFY_MISSING_PREVIOUS_INNO_UNINSTALLER,,}" =~ ^(1|true|yes|on)$ ]] || [[ "${VERIFY_TAMPERED_PREVIOUS_INNO_UNINSTALLER,,}" =~ ^(1|true|yes|on)$ ]] || [[ "${VERIFY_TAMPERED_PREVIOUS_INNO_DATA,,}" =~ ^(1|true|yes|on)$ ]] || [[ "${VERIFY_PREVIOUS_INNO_REGISTRY_DELETE_FAILURE,,}" =~ ^(1|true|yes|on)$ ]]; } && [[ ! -f "$PREVIOUS_INNO_INSTALLER" ]]; then
+    log "旧 Inno installer が見つかりません。PREVIOUS_INNO_INSTALLER を設定してください: ${PREVIOUS_INNO_INSTALLER:-<unset>}"
+    exit 1
+  fi
 }
 
 restore_snapshot_and_boot() {
@@ -249,6 +265,16 @@ param(
   [switch]$VerifyLegacyNsisMigration,
   [switch]$VerifyMissingLegacyNsisUninstaller,
   [switch]$VerifyLockedFileUpgrade,
+  [switch]$VerifyPreviousInnoMigration,
+  [switch]$VerifyLockedPreviousInnoMigration,
+  [string]$PreviousInnoInstallerPath,
+  [switch]$VerifyMissingPreviousInnoUninstaller,
+  [switch]$VerifyTamperedPreviousInnoUninstaller,
+  [switch]$VerifyTamperedPreviousInnoData,
+  [switch]$VerifyPreviousInnoRegistryDeleteFailure,
+  [switch]$VerifySafeReinstall,
+  [switch]$VerifyTaskCreationFailure,
+  [switch]$VerifyTaskRunFailure,
   [switch]$UninstallAfterInstall
 )
 
@@ -371,36 +397,26 @@ public static class Program {
   Write-Host "created fake legacy NSIS install: $legacyRoot"
 }
 
-function Assert-FakeLegacyNsisMigrated {
+function Assert-FakeLegacyNsisInstallRejectedSafely {
   $legacyRoot = Join-Path $env:LOCALAPPDATA "Azookey"
   $legacyUninstallKey = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Azookey"
   $legacyStateKey = "HKCU:\SOFTWARE\batao9\Azookey"
   $sentinelPath = Join-Path $env:TEMP "azookey-legacy-nsis-uninstalled.txt"
 
-  $deadline = (Get-Date).AddSeconds(30)
-  while ((Test-Path -LiteralPath $legacyRoot) -and ((Get-Date) -lt $deadline)) {
-    Start-Sleep -Seconds 1
+  if (!(Test-Path -LiteralPath $legacyRoot)) {
+    throw "Untrusted legacy NSIS install directory was removed."
+  }
+  if (!(Test-Path -LiteralPath $legacyUninstallKey)) {
+    throw "Untrusted legacy NSIS uninstall key was removed."
+  }
+  if (!(Test-Path -LiteralPath $legacyStateKey)) {
+    throw "Untrusted legacy NSIS state key was removed."
+  }
+  if (Test-Path -LiteralPath $sentinelPath) {
+    throw "Untrusted legacy NSIS uninstaller was executed."
   }
 
-  if (Test-Path -LiteralPath $legacyRoot) {
-    throw "Legacy NSIS install directory remains after migration: $legacyRoot"
-  }
-  if (Test-Path -LiteralPath $legacyUninstallKey) {
-    throw "Legacy NSIS uninstall key remains after migration: $legacyUninstallKey"
-  }
-  if (Test-Path -LiteralPath $legacyStateKey) {
-    throw "Legacy NSIS state key remains after migration: $legacyStateKey"
-  }
-  if (!(Test-Path -LiteralPath $sentinelPath)) {
-    throw "Legacy NSIS uninstaller was not executed."
-  }
-
-  $sentinel = Get-Content -LiteralPath $sentinelPath -Raw
-  if ($sentinel -notmatch "(^|\s)/S(\s|$)") {
-    throw "Legacy NSIS uninstaller was not invoked silently: $sentinel"
-  }
-
-  Write-Host "legacy NSIS install migrated before new install"
+  Write-Host "untrusted legacy NSIS install was rejected without executing user-writable code"
 }
 
 function Install-BrokenLegacyNsisInstall {
@@ -441,17 +457,155 @@ function Assert-BrokenLegacyNsisInstallPreserved {
   Write-Host "broken legacy NSIS install preserved after migration failure"
 }
 
+function Install-PreviousInnoVersion {
+  param(
+    [Parameter(Mandatory = $true)][string]$PreviousInstallerPath,
+    [Parameter(Mandatory = $true)][int]$TimeoutSec
+  )
+
+  if (!(Test-Path -LiteralPath $PreviousInstallerPath)) {
+    throw "Previous Inno installer not found: $PreviousInstallerPath"
+  }
+
+  $previousLogPath = Join-Path $env:TEMP "azookey-previous-inno-install.log"
+  $previousProc = Start-Process -FilePath $PreviousInstallerPath -ArgumentList @(
+    "/SP-",
+    "/VERYSILENT",
+    "/SUPPRESSMSGBOXES",
+    "/NORESTART",
+    "/RESTARTEXITCODE=3010",
+    "/LOG=$previousLogPath"
+  ) -PassThru
+  if (-not $previousProc.WaitForExit($TimeoutSec * 1000)) {
+    Stop-ProcessTree -RootPid $previousProc.Id
+    throw "Previous Inno installer timed out."
+  }
+  if (($previousProc.ExitCode -ne 0) -and ($previousProc.ExitCode -ne 3010)) {
+    throw "Previous Inno installer failed. ExitCode=$($previousProc.ExitCode)"
+  }
+
+  $entries = @(Get-AzookeyUninstallEntries)
+  if ($entries.Count -ne 1) {
+    throw "Expected one previous Inno uninstall entry, found $($entries.Count)."
+  }
+  $legacyInstallLocation = Normalize-RegistryPath -Path $entries[0].InstallLocation
+  $expectedLegacyLocation = Join-Path $env:APPDATA "Azookey"
+  if (![string]::Equals($legacyInstallLocation, $expectedLegacyLocation, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Previous Inno install did not use the expected APPDATA location: $legacyInstallLocation"
+  }
+
+  $legacyTask = Get-ScheduledTask -TaskName "Azookey Startup" -ErrorAction Stop
+  $legacyAction = "$($legacyTask.Actions[0].Execute) $($legacyTask.Actions[0].Arguments)".ToLowerInvariant()
+  if (!$legacyAction.Contains("wscript") -or !$legacyAction.Contains(".vbs")) {
+    throw "Previous Inno task does not reproduce the legacy VBS action: $legacyAction"
+  }
+
+  $learningRoot = Join-Path $legacyInstallLocation "LearningMemory"
+  New-Item -ItemType Directory -Force -Path $learningRoot | Out-Null
+  $settingsPath = Join-Path $legacyInstallLocation "settings.json"
+  $settingsSentinel = '{"version":"0.1.2","zenzai":{"enable":false,"profile":"","backend":"cpu"},"general":{"punctuation_commit":true}}'
+  [System.IO.File]::WriteAllText($settingsPath, $settingsSentinel, [System.Text.UTF8Encoding]::new($false))
+  Set-Content -LiteralPath (Join-Path $legacyInstallLocation "settings.json.broken-20260720123456") -Encoding UTF8 -Value "settings backup sentinel"
+  Set-Content -LiteralPath (Join-Path $learningRoot "migration-sentinel.txt") -Encoding UTF8 -Value "learning preserved"
+
+  Write-Host "installed previous Inno version and created migration sentinels"
+}
+
+function Assert-PreviousInnoMigrated {
+  param(
+    [Parameter(Mandatory = $true)][string]$InstallLogPath,
+    [switch]$AllowScheduledLegacyDll
+  )
+
+  $appDataRoot = Join-Path $env:APPDATA "Azookey"
+  $settingsPath = Join-Path $appDataRoot "settings.json"
+  $settingsBackupPath = Join-Path $appDataRoot "settings.json.broken-20260720123456"
+  $learningPath = Join-Path $appDataRoot "LearningMemory\migration-sentinel.txt"
+  foreach ($path in @($settingsPath, $settingsBackupPath, $learningPath)) {
+    if (!(Test-Path -LiteralPath $path)) {
+      throw "Migration did not preserve user data: $path"
+    }
+  }
+  $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+  if ($settings.general.punctuation_commit -ne $true) {
+    throw "Migration did not preserve the settings semantic sentinel."
+  }
+
+  $legacyPayload = @(
+    Get-ChildItem -LiteralPath $appDataRoot -Recurse -Force -ErrorAction SilentlyContinue |
+      Where-Object {
+        $isScheduledLockedDll = $AllowScheduledLegacyDll -and
+          [string]::Equals($_.FullName, (Join-Path $appDataRoot "azookey.dll"), [System.StringComparison]::OrdinalIgnoreCase)
+        ((!$_.PSIsContainer -and $_.Extension -in @(".exe", ".dll", ".vbs", ".gguf") -and !$isScheduledLockedDll) -or
+        ($_.PSIsContainer -and $_.Name -in @("Dictionary", "EmojiDictionary", "llama_cpu", "llama_cuda", "llama_vulkan", "backend")))
+      }
+  )
+  if ($legacyPayload.Count -gt 0) {
+    throw "Legacy executable payload remains under APPDATA: $($legacyPayload.FullName -join ', ')"
+  }
+
+  $broadSids = @("S-1-1-0", "S-1-5-11", "S-1-5-32-545")
+  $writeRights = [System.Security.AccessControl.FileSystemRights]::WriteData -bor
+    [System.Security.AccessControl.FileSystemRights]::AppendData -bor
+    [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor
+    [System.Security.AccessControl.FileSystemRights]::WriteAttributes -bor
+    [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+    [System.Security.AccessControl.FileSystemRights]::Delete -bor
+    [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+    [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+  # The running frontend can create and atomically remove settings.json.tmp-* while
+  # this assertion is executing.  Check only the stable paths whose ACLs are part
+  # of the migration contract so a harmless atomic-save race cannot fail the VM
+  # test between Get-ChildItem and Get-Acl.
+  $migratedPaths = @(
+    Get-Item -LiteralPath $appDataRoot -Force
+    Get-Item -LiteralPath (Join-Path $appDataRoot "LearningMemory") -Force
+    Get-Item -LiteralPath $settingsPath -Force
+    Get-Item -LiteralPath $settingsBackupPath -Force
+    Get-Item -LiteralPath $learningPath -Force
+  )
+  foreach ($migratedPath in $migratedPaths) {
+    $broadWriteRules = @(
+      (Get-Acl -LiteralPath $migratedPath.FullName).Access | Where-Object {
+        try {
+          $identitySid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        } catch {
+          $identitySid = $_.IdentityReference.Value
+        }
+        $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+        $broadSids -contains $identitySid -and
+        (($_.FileSystemRights -band $writeRights) -ne 0)
+      }
+    )
+    if ($broadWriteRules.Count -gt 0) {
+      throw "Migrated user data grants write access to a broad local identity: path=$($migratedPath.FullName) rules=$($broadWriteRules | Out-String)"
+    }
+  }
+  $aclWriteSentinel = Join-Path $appDataRoot ".migration-acl-write-sentinel"
+  Set-Content -LiteralPath $aclWriteSentinel -Encoding ASCII -Value "current user can write"
+  Remove-Item -LiteralPath $aclWriteSentinel -Force
+
+  $installLog = Get-Content -LiteralPath $InstallLogPath -Raw
+  $taskDeleteIndex = $installLog.IndexOf("Startup task was deleted and its absence was verified.")
+  $migrationIndex = $installLog.IndexOf("Migrating previous Inno install without executing its user-writable uninstall data")
+  if (($taskDeleteIndex -lt 0) -or ($migrationIndex -lt 0) -or ($taskDeleteIndex -gt $migrationIndex)) {
+    throw "Installer log does not prove that the legacy task was deleted before migration."
+  }
+
+  Write-Host "previous Inno payload migrated with private writable ACL while settings/backup/learning were preserved"
+}
+
 function Assert-RequiredInstallFiles {
   param([Parameter(Mandatory = $true)][string]$InstallLocation)
 
   $requiredPaths = @(
     "frontend.exe",
+    "azookey-updater-helper.exe",
     "azookey-server.exe",
     "ui.exe",
     "launcher.exe",
     "azookey.dll",
     "azookey32.dll",
-    "launch.vbs",
     "Dictionary",
     "EmojiDictionary",
     "zenz.gguf",
@@ -471,6 +625,214 @@ function Assert-RequiredInstallFiles {
   if ($missing.Count -gt 0) {
     throw "Required installed files are missing: $($missing -join ', ')"
   }
+
+  foreach ($forbiddenPath in @("launch.vbs", ".azookey-startup-task.xml")) {
+    if (Test-Path -LiteralPath (Join-Path $InstallLocation $forbiddenPath)) {
+      throw "Forbidden startup helper remains in install location: $forbiddenPath"
+    }
+  }
+  $userSidHelpers = @(Get-ChildItem -LiteralPath $InstallLocation -Filter ".legacy-user-sid-*" -Force -ErrorAction SilentlyContinue)
+  if ($userSidHelpers.Count -gt 0) {
+    throw "Protected migration user SID helper was not cleaned up: $($userSidHelpers.FullName -join ', ')"
+  }
+}
+
+function Assert-NoUntrustedWriteAccess {
+  param([Parameter(Mandatory = $true)][string]$Path)
+  $unsafeSids = @(
+    "S-1-1-0",
+    "S-1-5-11",
+    "S-1-5-32-545",
+    [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  )
+  # Do not OR composite rights such as FullControl into this mask: FullControl
+  # also contains ReadAndExecute/Synchronize and would classify the normal
+  # BUILTIN\Users read-only Program Files ACL as writable.
+  $writeRights = [System.Security.AccessControl.FileSystemRights]::WriteData -bor
+    [System.Security.AccessControl.FileSystemRights]::AppendData -bor
+    [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor
+    [System.Security.AccessControl.FileSystemRights]::WriteAttributes -bor
+    [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+    [System.Security.AccessControl.FileSystemRights]::Delete -bor
+    [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+    [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+  $unsafeRules = @(
+    (Get-Acl -LiteralPath $Path).Access | Where-Object {
+      try {
+        $identitySid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+      } catch {
+        $identitySid = $_.IdentityReference.Value
+      }
+      $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+      $unsafeSids -contains $identitySid -and
+      (($_.FileSystemRights -band $writeRights) -ne 0)
+    }
+  )
+  if ($unsafeRules.Count -gt 0) {
+    throw "Protected path grants write access to an untrusted identity: path=$Path rules=$($unsafeRules | Out-String)"
+  }
+}
+
+function Assert-ProtectedInstallLocation {
+  param([Parameter(Mandatory = $true)][string]$InstallLocation)
+
+  $expected = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)) "Azookey"
+  if (![string]::Equals(
+      [System.IO.Path]::GetFullPath($InstallLocation).TrimEnd("\"),
+      [System.IO.Path]::GetFullPath($expected).TrimEnd("\"),
+      [System.StringComparison]::OrdinalIgnoreCase
+  )) {
+    throw "Install location is not fixed to Program Files: actual=$InstallLocation expected=$expected"
+  }
+
+  Assert-NoUntrustedWriteAccess -Path $InstallLocation
+
+  Write-Host "install location is fixed and protected: $InstallLocation"
+}
+
+function Assert-BackgroundExecutablesUseGuiSubsystem {
+  param([Parameter(Mandatory = $true)][string]$InstallLocation)
+
+  foreach ($executableName in @("launcher.exe", "azookey-server.exe", "ui.exe")) {
+    $executablePath = Join-Path $InstallLocation $executableName
+    $bytes = [System.IO.File]::ReadAllBytes($executablePath)
+    if ($bytes.Length -lt 256) {
+      throw "$executableName is too small to contain a valid PE header."
+    }
+    $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+    $subsystemOffset = $peOffset + 24 + 68
+    if (($subsystemOffset + 2) -gt $bytes.Length) {
+      throw "$executableName has an invalid PE optional header."
+    }
+    $subsystem = [BitConverter]::ToUInt16($bytes, $subsystemOffset)
+    if ($subsystem -ne 2) {
+      throw "release background executable is not built as Windows GUI subsystem: name=$executableName subsystem=$subsystem"
+    }
+  }
+
+  Write-Host "release launcher/server/ui use Windows GUI subsystem"
+}
+
+function Assert-SecureStartupTask {
+  param([Parameter(Mandatory = $true)][string]$InstallLocation)
+
+  $task = Get-ScheduledTask -TaskName "Azookey Startup" -ErrorAction Stop
+  if ($task.Principal.RunLevel -ne "Highest") {
+    throw "Startup task is not HighestAvailable: $($task.Principal.RunLevel)"
+  }
+  try {
+    if ($task.Principal.GroupId -match '^S-\d-') {
+      $principalSid = $task.Principal.GroupId
+    } else {
+      $principalSid = ([System.Security.Principal.NTAccount]$task.Principal.GroupId).
+        Translate([System.Security.Principal.SecurityIdentifier]).Value
+    }
+  } catch {
+    throw "Startup task principal could not be resolved: $($task.Principal.GroupId): $($_.Exception.Message)"
+  }
+  if ($principalSid -ne "S-1-5-32-544") {
+    throw "Startup task principal is not Administrators: $($task.Principal.GroupId) ($principalSid)"
+  }
+  if ($task.Actions.Count -ne 1) {
+    throw "Startup task must contain exactly one action: $($task.Actions.Count)"
+  }
+
+  $action = $task.Actions[0]
+  $expectedLauncher = Join-Path $InstallLocation "launcher.exe"
+  if (![string]::Equals($action.Execute.Trim('"'), $expectedLauncher, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Startup task does not execute launcher.exe directly: $($action.Execute)"
+  }
+  if (![string]::Equals($action.WorkingDirectory, $InstallLocation, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Startup task working directory is unexpected: $($action.WorkingDirectory)"
+  }
+  $serializedAction = "$($action.Execute) $($action.Arguments)".ToLowerInvariant()
+  if ($serializedAction.Contains("wscript") -or $serializedAction.Contains(".vbs")) {
+    throw "Startup task still uses wscript/VBS: $serializedAction"
+  }
+
+  Write-Host "startup task directly executes protected launcher.exe"
+}
+
+function Assert-ProcessRedirectionGuard {
+  param([Parameter(Mandatory = $true)][string]$ProcessName)
+
+  if ($null -eq ("AzookeyVm.ProcessMitigation" -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace AzookeyVm {
+  public static class ProcessMitigation {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetProcessMitigationPolicy(
+      IntPtr process,
+      int mitigationPolicy,
+      out uint buffer,
+      UIntPtr length);
+  }
+}
+"@
+  }
+
+  $process = Get-Process -Name $ProcessName -ErrorAction Stop | Select-Object -First 1
+  $flags = [uint32]0
+  $ok = [AzookeyVm.ProcessMitigation]::GetProcessMitigationPolicy(
+    $process.Handle,
+    16,
+    [ref]$flags,
+    [UIntPtr]::new([uint64]4)
+  )
+  if (!$ok -or (($flags -band 1) -eq 0)) {
+    $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    throw "RedirectionGuard is not enforced for $ProcessName (flags=$flags win32=$errorCode)."
+  }
+}
+
+function Assert-AzookeyProcessesStarted {
+  $requiredProcesses = @("launcher", "azookey-server", "ui")
+  $deadline = (Get-Date).AddSeconds(45)
+  do {
+    $missing = @($requiredProcesses | Where-Object {
+      $null -eq (Get-Process -Name $_ -ErrorAction SilentlyContinue)
+    })
+    if ($missing.Count -eq 0) {
+      foreach ($processName in $requiredProcesses) {
+        Assert-ProcessRedirectionGuard -ProcessName $processName
+      }
+      Write-Host "launcher/server/ui processes are running with RedirectionGuard enforced"
+      return
+    }
+    Start-Sleep -Seconds 1
+  } while ((Get-Date) -lt $deadline)
+
+  throw "Azookey processes did not start: $($missing -join ', ')"
+}
+
+function Assert-MutableDataOutsideInstallLocation {
+  param([Parameter(Mandatory = $true)][string]$InstallLocation)
+
+  foreach ($relativePath in @("EngineRuntime", "logs", "ui-webview", "frontend.exe.WebView2", "ui.exe.WebView2")) {
+    if (Test-Path -LiteralPath (Join-Path $InstallLocation $relativePath)) {
+      throw "Mutable runtime data was created under Program Files: $relativePath"
+    }
+  }
+
+  $runtimePath = Join-Path $env:APPDATA "Azookey\EngineRuntime"
+  $uiWebViewPath = Join-Path $env:LOCALAPPDATA "Azookey\ui-webview"
+  if (Test-Path -LiteralPath $runtimePath) {
+    Write-Host "EngineRuntime is outside Program Files: $runtimePath"
+  } else {
+    # EngineRuntime is initialized lazily when the IME engine first handles
+    # input, so launcher/server/UI startup alone does not require it to exist.
+    Write-Host "EngineRuntime has not been initialized before IME input (expected lazy behavior)"
+  }
+  if (Test-Path -LiteralPath $uiWebViewPath) {
+    Write-Host "UI WebView data is outside Program Files: $uiWebViewPath"
+  } else {
+    # The candidate UI creates its WebView lazily when it is first shown.
+    Write-Host "UI WebView data has not been initialized before candidate UI display (expected lazy behavior)"
+  }
+
+  Write-Host "no mutable runtime or UI WebView data was created under Program Files"
 }
 
 function Test-WebView2RuntimeInstalled {
@@ -488,7 +850,7 @@ function Test-WebView2RuntimeInstalled {
   return $false
 }
 
-function Assert-OnlySettingsRemainAfterUninstall {
+function Assert-InstallPayloadRemovedAfterUninstall {
   param([Parameter(Mandatory = $true)][string]$InstallLocation)
 
   if (!(Test-Path -LiteralPath $InstallLocation)) {
@@ -496,10 +858,8 @@ function Assert-OnlySettingsRemainAfterUninstall {
     return
   }
 
-  $allowedSettingsPath = Join-Path $InstallLocation "settings.json"
   $remaining = @(
-    Get-ChildItem -LiteralPath $InstallLocation -Force -Recurse -ErrorAction SilentlyContinue |
-      Where-Object { $_.FullName -ne $allowedSettingsPath }
+    Get-ChildItem -LiteralPath $InstallLocation -Force -Recurse -ErrorAction SilentlyContinue
   )
 
   if ($remaining.Count -gt 0) {
@@ -509,7 +869,7 @@ function Assert-OnlySettingsRemainAfterUninstall {
     throw "Unexpected files remain after uninstall: $($sample -join ', ')"
   }
 
-  Write-Host "install directory contains only settings.json after uninstall"
+  Write-Host "Program Files payload was removed after uninstall"
 }
 
 function Wait-ForUninstallerSelfCleanup {
@@ -530,56 +890,72 @@ function Wait-ForUninstallerSelfCleanup {
   } while ((Get-Date) -lt $deadline)
 }
 
-function Ensure-SettingsFileForUninstallVerification {
-  param([Parameter(Mandatory = $true)][string]$InstallLocation)
-
-  $settingsPath = Join-Path $InstallLocation "settings.json"
-  if (!(Test-Path -LiteralPath $settingsPath)) {
-    Set-Content -LiteralPath $settingsPath -Encoding UTF8 -Value '{"createdBy":"vm_stage_for_manual_test"}'
-    Write-Host "created settings.json sentinel for uninstall verification"
-  }
+function Ensure-PreservedUserDataSentinels {
+  $appDataRoot = Join-Path $env:APPDATA "Azookey"
+  $learningRoot = Join-Path $appDataRoot "LearningMemory"
+  New-Item -ItemType Directory -Force -Path $learningRoot | Out-Null
+  $settingsPath = Join-Path $appDataRoot "settings.json"
+  $settingsSentinel = '{"version":"0.1.2","zenzai":{"enable":false,"profile":"","backend":"cpu"},"general":{"punctuation_commit":true}}'
+  [System.IO.File]::WriteAllText($settingsPath, $settingsSentinel, [System.Text.UTF8Encoding]::new($false))
+  Set-Content -LiteralPath (Join-Path $appDataRoot "settings.json.broken-vm-sentinel") -Encoding UTF8 -Value "settings backup sentinel"
+  Set-Content -LiteralPath (Join-Path $learningRoot "learning-sentinel.txt") -Encoding UTF8 -Value "learning sentinel"
+  Write-Host "created settings, backup, and learning sentinels"
 }
 
 function Ensure-GeneratedAppDataForUninstallVerification {
-  param([Parameter(Mandatory = $true)][string]$InstallLocation)
-
-  foreach ($relativePath in @(
-    "EngineRuntime",
-    "frontend.exe.WebView2",
-    "logs",
-    "ui.exe.WebView2"
+  foreach ($dir in @(
+    (Join-Path $env:APPDATA "Azookey\EngineRuntime"),
+    (Join-Path $env:APPDATA "Azookey\logs"),
+    (Join-Path $env:APPDATA "Azookey\frontend.exe.WebView2"),
+    (Join-Path $env:APPDATA "Azookey\ui.exe.WebView2"),
+    (Join-Path $env:LOCALAPPDATA "Azookey\ui-webview"),
+    (Join-Path $env:LOCALAPPDATA "com.azookey.app")
   )) {
-    $dir = Join-Path $InstallLocation $relativePath
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     Set-Content -LiteralPath (Join-Path $dir "uninstall-sentinel.txt") -Encoding UTF8 -Value "generated app data cleanup sentinel"
   }
 
+  $appDataRoot = Join-Path $env:APPDATA "Azookey"
+  Set-Content -LiteralPath (Join-Path $appDataRoot "legacy-payload.exe") -Encoding UTF8 -Value "legacy executable sentinel"
+  $legacyDictionary = Join-Path $appDataRoot "Dictionary"
+  New-Item -ItemType Directory -Force -Path $legacyDictionary | Out-Null
+  Set-Content -LiteralPath (Join-Path $legacyDictionary "legacy-dictionary.txt") -Encoding UTF8 -Value "legacy dictionary sentinel"
+
   Write-Host "created generated app data sentinels for uninstall verification"
 }
 
-function Assert-NoExternalAzookeyDirectoriesAfterUninstall {
-  param([Parameter(Mandatory = $true)][string]$InstallLocation)
-
-  $candidateRoots = @()
-  if (![string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
-    $candidateRoots += Join-Path $env:LOCALAPPDATA "Azookey"
-  }
-  foreach ($tempRoot in @($env:TEMP, $env:TMP)) {
-    if (![string]::IsNullOrWhiteSpace($tempRoot)) {
-      $candidateRoots += Join-Path $tempRoot "Azookey"
+function Assert-UninstallDataPolicy {
+  $appDataRoot = Join-Path $env:APPDATA "Azookey"
+  foreach ($path in @(
+    (Join-Path $appDataRoot "settings.json"),
+    (Join-Path $appDataRoot "settings.json.broken-vm-sentinel"),
+    (Join-Path $appDataRoot "LearningMemory\learning-sentinel.txt")
+  )) {
+    if (!(Test-Path -LiteralPath $path)) {
+      throw "Preserved user data was removed during uninstall: $path"
     }
   }
 
-  foreach ($path in @($candidateRoots | Select-Object -Unique)) {
-    if ($path -eq $InstallLocation) {
-      continue
-    }
+  foreach ($path in @(
+    (Join-Path $appDataRoot "EngineRuntime"),
+    (Join-Path $appDataRoot "logs"),
+    (Join-Path $appDataRoot "frontend.exe.WebView2"),
+    (Join-Path $appDataRoot "ui.exe.WebView2"),
+    (Join-Path $appDataRoot "legacy-payload.exe"),
+    (Join-Path $appDataRoot "Dictionary"),
+    (Join-Path $env:LOCALAPPDATA "Azookey\ui-webview"),
+    (Join-Path $env:LOCALAPPDATA "com.azookey.app")
+  )) {
     if (Test-Path -LiteralPath $path) {
-      throw "Unexpected external Azookey directory remains after uninstall: $path"
+      throw "Generated cache/log remains after uninstall: $path"
     }
   }
 
-  Write-Host "no external Azookey directories remain after uninstall"
+  if (Get-ScheduledTask -TaskName "Azookey Startup" -ErrorAction SilentlyContinue) {
+    throw "Startup task remains after uninstall."
+  }
+
+  Write-Host "uninstall preserved settings/learning and removed generated cache/log/task"
 }
 
 function Start-ExclusiveFileLock {
@@ -615,13 +991,13 @@ try {
     "-ExecutionPolicy",
     "Bypass",
     "-File",
-    $lockScriptPath,
+    ('"{0}"' -f $lockScriptPath),
     "-Path",
-    $Path,
+    ('"{0}"' -f $Path),
     "-ReadyPath",
-    $readyPath,
+    ('"{0}"' -f $readyPath),
     "-ReleasePath",
-    $releasePath
+    ('"{0}"' -f $releasePath)
   ) -PassThru
 
   $deadline = (Get-Date).AddSeconds(30)
@@ -706,23 +1082,185 @@ if ($VerifyLegacyNsisMigration) {
 if ($VerifyMissingLegacyNsisUninstaller) {
   Install-BrokenLegacyNsisInstall
 }
+$previousInnoLock = $null
+if ($VerifyPreviousInnoMigration) {
+  Install-PreviousInnoVersion -PreviousInstallerPath $PreviousInnoInstallerPath -TimeoutSec $InstallerTimeoutSec
+}
+if ($VerifyPreviousInnoRegistryDeleteFailure) {
+  Install-PreviousInnoVersion -PreviousInstallerPath $PreviousInnoInstallerPath -TimeoutSec $InstallerTimeoutSec
+}
+if ($VerifyLockedPreviousInnoMigration) {
+  Install-PreviousInnoVersion -PreviousInstallerPath $PreviousInnoInstallerPath -TimeoutSec $InstallerTimeoutSec
+  $previousInnoLock = Start-ExclusiveFileLock -Path (Join-Path $env:APPDATA "Azookey\azookey.dll")
+  Write-Host "locked previous AppData TSF DLL before migration"
+}
+if ($VerifyMissingPreviousInnoUninstaller) {
+  Install-PreviousInnoVersion -PreviousInstallerPath $PreviousInnoInstallerPath -TimeoutSec $InstallerTimeoutSec
+  $previousEntry = @(Get-AzookeyUninstallEntries)[0]
+  $previousUninstaller = Normalize-RegistryPath -Path $previousEntry.UninstallString
+  $previousUninstallerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $previousUninstaller).Hash.ToLowerInvariant()
+  Write-Host "previous Inno uninstaller SHA-256: $previousUninstallerHash"
+  $previousUninstallerData = [System.IO.Path]::ChangeExtension($previousUninstaller, ".dat")
+  $previousUninstallerDataHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $previousUninstallerData).Hash.ToLowerInvariant()
+  Write-Host "previous Inno uninstaller data SHA-256: $previousUninstallerDataHash"
+  Move-Item -LiteralPath $previousUninstaller -Destination "$previousUninstaller.missing" -Force
+  Write-Host "removed previous Inno uninstaller to inject migration failure"
+}
+if ($VerifyTamperedPreviousInnoData) {
+  Install-PreviousInnoVersion -PreviousInstallerPath $PreviousInnoInstallerPath -TimeoutSec $InstallerTimeoutSec
+  $previousEntry = @(Get-AzookeyUninstallEntries)[0]
+  $previousUninstaller = Normalize-RegistryPath -Path $previousEntry.UninstallString
+  $previousUninstallerData = [System.IO.Path]::ChangeExtension($previousUninstaller, ".dat")
+  $stream = [System.IO.File]::Open($previousUninstallerData, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+  try {
+    $stream.WriteByte(0)
+  } finally {
+    $stream.Dispose()
+  }
+  Write-Host "tampered machine-specific previous Inno data; controlled migration must not execute it"
+}
+if ($VerifyTamperedPreviousInnoUninstaller) {
+  Install-PreviousInnoVersion -PreviousInstallerPath $PreviousInnoInstallerPath -TimeoutSec $InstallerTimeoutSec
+  $previousEntry = @(Get-AzookeyUninstallEntries)[0]
+  $previousUninstaller = Normalize-RegistryPath -Path $previousEntry.UninstallString
+  $stream = [System.IO.File]::Open($previousUninstaller, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+  try {
+    $stream.WriteByte(0)
+  } finally {
+    $stream.Dispose()
+  }
+  Write-Host "tampered previous Inno uninstaller executable to inject trust-validation failure"
+}
 
 $args = @(
   "/SP-",
   "/VERYSILENT",
   "/SUPPRESSMSGBOXES",
   "/NORESTART",
+  "/RESTARTEXITCODE=3010",
+  "/DIR=$(Join-Path $env:LOCALAPPDATA 'Azookey-unsafe-install-override')",
   "/LOG=$InstallLogPath"
 )
+if ($VerifyTaskCreationFailure) {
+  $args += "/AZOOKEY_TEST_FAIL_TASK_CREATE"
+}
+if ($VerifyTaskRunFailure) {
+  $args += "/AZOOKEY_TEST_FAIL_TASK_RUN"
+}
+if ($VerifyPreviousInnoRegistryDeleteFailure) {
+  $args += "/AZOOKEY_TEST_FAIL_LEGACY_REGISTRY_DELETE"
+}
 
 Write-Host "installing: $InstallerPath"
 Write-Host "timeout(sec): $InstallerTimeoutSec"
 $proc = Start-Process -FilePath $InstallerPath -ArgumentList $args -PassThru
 if (-not $proc.WaitForExit($InstallerTimeoutSec * 1000)) {
+  if ($null -ne $previousInnoLock) {
+    Stop-ExclusiveFileLock -Lock $previousInnoLock
+  }
   Stop-ProcessTree -RootPid $proc.Id
   throw "Installer timed out."
 }
 Write-Host "installer exit code: $($proc.ExitCode)"
+if ($null -ne $previousInnoLock) {
+  Stop-ExclusiveFileLock -Lock $previousInnoLock
+}
+
+$setupLogText = Get-Content -LiteralPath $InstallLogPath -Raw
+if ($setupLogText.IndexOf("RedirectionGuard status for current process: Enabled in enforcing mode") -lt 0) {
+  throw "Installer did not run with RedirectionGuard enabled in enforcing mode."
+}
+Write-Host "installer RedirectionGuard is enabled in enforcing mode"
+
+if ($VerifyMissingPreviousInnoUninstaller -or $VerifyTamperedPreviousInnoUninstaller) {
+  if ($proc.ExitCode -eq 0) {
+    throw "Installer succeeded even though the previous Inno uninstaller is missing or untrusted."
+  }
+  $previousEntries = @(Get-AzookeyUninstallEntries)
+  if ($previousEntries.Count -ne 1) {
+    throw "Previous Inno uninstall metadata was removed after failed migration."
+  }
+  $previousLocation = Normalize-RegistryPath -Path $previousEntries[0].InstallLocation
+  foreach ($path in @(
+    (Join-Path $previousLocation "launcher.exe"),
+    (Join-Path $previousLocation "settings.json"),
+    (Join-Path $previousLocation "LearningMemory\migration-sentinel.txt")
+  )) {
+    if (!(Test-Path -LiteralPath $path)) {
+      throw "Previous Inno payload/data was manually removed after failed migration: $path"
+    }
+  }
+  if (Get-ScheduledTask -TaskName "Azookey Startup" -ErrorAction SilentlyContinue) {
+    throw "Unsafe previous startup task remains after failed migration."
+  }
+  Write-Host "missing or untrusted previous Inno uninstaller aborted migration without payload deletion"
+  exit 0
+}
+
+if ($VerifyPreviousInnoRegistryDeleteFailure) {
+  if (($proc.ExitCode -eq 0) -or ($proc.ExitCode -eq 3010)) {
+    throw "Installer reported success even though previous uninstall metadata deletion failure was injected."
+  }
+  $previousEntries = @(Get-AzookeyUninstallEntries)
+  if ($previousEntries.Count -ne 1) {
+    throw "Previous Inno uninstall metadata was removed after the injected preflight failure."
+  }
+  $previousLocation = Normalize-RegistryPath -Path $previousEntries[0].InstallLocation
+  foreach ($path in @(
+    (Join-Path $previousLocation "launcher.exe"),
+    (Join-Path $previousLocation "settings.json"),
+    (Join-Path $previousLocation "LearningMemory\migration-sentinel.txt")
+  )) {
+    if (!(Test-Path -LiteralPath $path)) {
+      throw "Previous Inno payload/data was removed after the injected registry preflight failure: $path"
+    }
+  }
+  if (Get-ScheduledTask -TaskName "Azookey Startup" -ErrorAction SilentlyContinue) {
+    throw "Unsafe previous startup task remains after the injected registry preflight failure."
+  }
+  $failureLog = Get-Content -LiteralPath $InstallLogPath -Raw
+  if ($failureLog.IndexOf("Injecting previous Inno uninstall registry deletion failure for installer verification.") -lt 0) {
+    throw "Installer log does not prove that uninstall metadata deletion failed before migration."
+  }
+  if ($failureLog.IndexOf("Migrating previous Inno install without executing its user-writable uninstall data") -ge 0) {
+    throw "Installer began destructive payload migration after uninstall metadata deletion failed."
+  }
+  Write-Host "previous Inno registry deletion failure aborted before payload migration and preserved retry state"
+  exit 0
+}
+
+if ($VerifyTaskCreationFailure) {
+  if (($proc.ExitCode -eq 0) -or ($proc.ExitCode -eq 3010)) {
+    throw "Installer reported success/restart even though task creation failure was injected: $($proc.ExitCode)"
+  }
+  if (Get-ScheduledTask -TaskName "Azookey Startup" -ErrorAction SilentlyContinue) {
+    throw "Partial startup task remains after injected creation failure."
+  }
+  $failureLog = Get-Content -LiteralPath $InstallLogPath -Raw
+  if ($failureLog.IndexOf("Injecting startup task creation failure for installer verification.") -lt 0) {
+    throw "Installer log does not prove that task creation reached the injected failure path."
+  }
+  Write-Host "task creation failure aborted install without leaving a partial task"
+  exit 0
+}
+
+if ($VerifyTaskRunFailure) {
+  if (($proc.ExitCode -eq 0) -or ($proc.ExitCode -eq 3010)) {
+    throw "Installer reported success/restart even though task run failure was injected: $($proc.ExitCode)"
+  }
+  if (Get-ScheduledTask -TaskName "Azookey Startup" -ErrorAction SilentlyContinue) {
+    throw "Created startup task remains after injected run failure."
+  }
+  $failureLog = Get-Content -LiteralPath $InstallLogPath -Raw
+  $injectionIndex = $failureLog.IndexOf("Injecting startup task run failure after successful creation for installer verification.")
+  $runFailureIndex = $failureLog.IndexOf("Startup task run failed.", $injectionIndex + 1)
+  $cleanupIndex = $failureLog.IndexOf("Startup task was deleted and its absence was verified.", $runFailureIndex + 1)
+  if (($injectionIndex -lt 0) -or ($runFailureIndex -le $injectionIndex) -or ($cleanupIndex -le $runFailureIndex)) {
+    throw "Installer log does not prove create-success, run-failure, and verified cleanup ordering."
+  }
+  Write-Host "task run failure removed the already-created partial task"
+  exit 0
+}
 
 if ($VerifyMissingLegacyNsisUninstaller) {
   if ($proc.ExitCode -eq 0) {
@@ -733,12 +1271,45 @@ if ($VerifyMissingLegacyNsisUninstaller) {
   exit 0
 }
 
-if ($proc.ExitCode -ne 0) {
+if ($VerifyLegacyNsisMigration) {
+  if ($proc.ExitCode -eq 0) {
+    throw "Installer executed or ignored an untrusted legacy NSIS install."
+  }
+  Assert-FakeLegacyNsisInstallRejectedSafely
+  exit 0
+}
+
+if (($proc.ExitCode -ne 0) -and ($proc.ExitCode -ne 3010)) {
   throw "Installer failed. ExitCode=$($proc.ExitCode)"
 }
 
-if ($VerifyLegacyNsisMigration) {
-  Assert-FakeLegacyNsisMigrated
+if (($VerifyPreviousInnoMigration -or $VerifyLockedPreviousInnoMigration -or $VerifyTamperedPreviousInnoData) -and ($proc.ExitCode -ne 3010)) {
+  throw "Previous Inno migration did not propagate restart as exit code 3010: $($proc.ExitCode)"
+}
+
+if ($VerifyPreviousInnoMigration -or $VerifyLockedPreviousInnoMigration -or $VerifyTamperedPreviousInnoData) {
+  Assert-PreviousInnoMigrated -InstallLogPath $InstallLogPath -AllowScheduledLegacyDll:$VerifyLockedPreviousInnoMigration
+}
+
+if ($VerifyLockedPreviousInnoMigration) {
+  $migrationLog = Get-Content -LiteralPath $InstallLogPath -Raw
+  if ($migrationLog.IndexOf("Locked previous payload was queued for deletion in place with RedirectionGuard enforced.") -lt 0) {
+    throw "Locked previous DLL was not queued by the RedirectionGuard-protected fallback."
+  }
+  $lockedLegacyDll = Join-Path $env:APPDATA "Azookey\azookey.dll"
+  if (!(Test-Path -LiteralPath $lockedLegacyDll)) {
+    throw "Locked legacy DLL unexpectedly disappeared before its locking handle was released."
+  }
+  $pendingRename = @(
+    (Get-ItemPropertyValue `
+      -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" `
+      -Name "PendingFileRenameOperations" `
+      -ErrorAction SilentlyContinue)
+  )
+  if (-not ($pendingRename | Where-Object { $_ -like "*$lockedLegacyDll*" })) {
+    throw "Locked legacy DLL is not present in PendingFileRenameOperations: $lockedLegacyDll"
+  }
+  Write-Host "locked previous AppData DLL is the only remaining payload and is queued for restart deletion"
 }
 
 $entries = @(Get-AzookeyUninstallEntries)
@@ -760,6 +1331,11 @@ if ($entry.MainBinaryName -ne "frontend.exe") {
 
 $installLocation = Normalize-RegistryPath -Path $entry.InstallLocation
 Assert-RequiredInstallFiles -InstallLocation $installLocation
+Assert-ProtectedInstallLocation -InstallLocation $installLocation
+Assert-BackgroundExecutablesUseGuiSubsystem -InstallLocation $installLocation
+Assert-SecureStartupTask -InstallLocation $installLocation
+Assert-AzookeyProcessesStarted
+Assert-MutableDataOutsideInstallLocation -InstallLocation $installLocation
 if (-not (Test-WebView2RuntimeInstalled)) {
   throw "WebView2 Runtime is missing after install."
 }
@@ -767,6 +1343,38 @@ if (-not (Test-WebView2RuntimeInstalled)) {
 Write-Host "install complete. entry found: $($entry.PSChildName)"
 Write-Host "install location: $installLocation"
 Write-Host "WebView2 Runtime installed"
+
+if ($VerifySafeReinstall) {
+  Ensure-PreservedUserDataSentinels
+  $learningHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $env:APPDATA "Azookey\LearningMemory\learning-sentinel.txt")).Hash
+  $reinstallLogPath = [System.IO.Path]::ChangeExtension($InstallLogPath, ".safe-reinstall.log")
+  $reinstallProc = Start-Process -FilePath $InstallerPath -ArgumentList @(
+    "/SP-",
+    "/VERYSILENT",
+    "/SUPPRESSMSGBOXES",
+    "/NORESTART",
+    "/RESTARTEXITCODE=3010",
+    "/LOG=$reinstallLogPath"
+  ) -PassThru
+  if (-not $reinstallProc.WaitForExit($InstallerTimeoutSec * 1000)) {
+    Stop-ProcessTree -RootPid $reinstallProc.Id
+    throw "Safe-layout reinstall timed out."
+  }
+  if (($reinstallProc.ExitCode -ne 0) -and ($reinstallProc.ExitCode -ne 3010)) {
+    throw "Safe-layout reinstall failed. ExitCode=$($reinstallProc.ExitCode)"
+  }
+  $settingsAfterReinstall = Get-Content -LiteralPath (Join-Path $env:APPDATA "Azookey\settings.json") -Raw | ConvertFrom-Json
+  if ($settingsAfterReinstall.general.punctuation_commit -ne $true) {
+    throw "Safe-layout reinstall did not preserve the settings semantic sentinel."
+  }
+  if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $env:APPDATA "Azookey\LearningMemory\learning-sentinel.txt")).Hash -ne $learningHash) {
+    throw "Safe-layout reinstall changed learning data."
+  }
+  Assert-SecureStartupTask -InstallLocation $installLocation
+  Assert-AzookeyProcessesStarted
+  Assert-MutableDataOutsideInstallLocation -InstallLocation $installLocation
+  Write-Host "safe-layout to safe-layout update preserved data and recreated the protected task"
+}
 
 if ($VerifyLockedFileUpgrade) {
   if ($UninstallAfterInstall) {
@@ -776,8 +1384,8 @@ if ($VerifyLockedFileUpgrade) {
 }
 
 if ($UninstallAfterInstall) {
-  Ensure-SettingsFileForUninstallVerification -InstallLocation $installLocation
-  Ensure-GeneratedAppDataForUninstallVerification -InstallLocation $installLocation
+  Ensure-PreservedUserDataSentinels
+  Ensure-GeneratedAppDataForUninstallVerification
   $uninstallCommand = $entry.UninstallString
 
   if ([string]::IsNullOrWhiteSpace($uninstallCommand)) {
@@ -810,7 +1418,7 @@ if ($UninstallAfterInstall) {
   }
 
   Wait-ForUninstallerSelfCleanup -InstallLocation $installLocation
-  Assert-NoExternalAzookeyDirectoriesAfterUninstall -InstallLocation $installLocation
+  Assert-UninstallDataPolicy
   foreach ($relativePath in @("frontend.exe", "azookey.dll", "azookey32.dll", "launcher.exe")) {
     $path = Join-Path $installLocation $relativePath
     if (Test-Path $path) {
@@ -818,7 +1426,7 @@ if ($UninstallAfterInstall) {
     }
   }
 
-  Assert-OnlySettingsRemainAfterUninstall -InstallLocation $installLocation
+  Assert-InstallPayloadRemovedAfterUninstall -InstallLocation $installLocation
   Write-Host "uninstall complete. entries found: 0"
 }
 PS1
@@ -836,6 +1444,10 @@ main() {
 
   log "インストーラーを VM に転送します: $(basename "$installer")"
   scp_to_vm "$installer" "$REMOTE_INSTALLER_SCP"
+  if [[ "${VERIFY_PREVIOUS_INNO_MIGRATION,,}" =~ ^(1|true|yes|on)$ ]] || [[ "${VERIFY_LOCKED_PREVIOUS_INNO_MIGRATION,,}" =~ ^(1|true|yes|on)$ ]] || [[ "${VERIFY_MISSING_PREVIOUS_INNO_UNINSTALLER,,}" =~ ^(1|true|yes|on)$ ]] || [[ "${VERIFY_TAMPERED_PREVIOUS_INNO_UNINSTALLER,,}" =~ ^(1|true|yes|on)$ ]] || [[ "${VERIFY_TAMPERED_PREVIOUS_INNO_DATA,,}" =~ ^(1|true|yes|on)$ ]] || [[ "${VERIFY_PREVIOUS_INNO_REGISTRY_DELETE_FAILURE,,}" =~ ^(1|true|yes|on)$ ]]; then
+    log "旧 Inno installer を VM に転送します: $(basename "$PREVIOUS_INNO_INSTALLER")"
+    scp_to_vm "$PREVIOUS_INNO_INSTALLER" "$REMOTE_PREVIOUS_INSTALLER_SCP"
+  fi
   scp_to_vm "$TMP_REMOTE_PS" "$REMOTE_PS_SCP"
 
   log "VM でインストーラーを実行します（サイレント）"
@@ -844,6 +1456,15 @@ main() {
   local legacy_nsis_switch=""
   local missing_legacy_nsis_uninstaller_switch=""
   local locked_file_upgrade_switch=""
+  local previous_inno_migration_switch=""
+  local locked_previous_inno_migration_switch=""
+  local missing_previous_inno_uninstaller_switch=""
+  local tampered_previous_inno_uninstaller_switch=""
+  local tampered_previous_inno_data_switch=""
+  local previous_inno_registry_delete_failure_switch=""
+  local safe_reinstall_switch=""
+  local task_creation_failure_switch=""
+  local task_run_failure_switch=""
   case "${UNINSTALL_AFTER_INSTALL,,}" in
     1|true|yes|on)
       uninstall_switch="-UninstallAfterInstall"
@@ -864,7 +1485,52 @@ main() {
       locked_file_upgrade_switch="-VerifyLockedFileUpgrade"
       ;;
   esac
-  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -InstallerPath \"$REMOTE_INSTALLER_WIN\" -InstallLogPath \"$REMOTE_INSTALL_LOG_WIN\" -UninstallLogPath \"$REMOTE_UNINSTALL_LOG_WIN\" -InstallerTimeoutSec $INSTALL_TIMEOUT_SEC $legacy_nsis_switch $missing_legacy_nsis_uninstaller_switch $locked_file_upgrade_switch $uninstall_switch" || install_rc=$?
+  case "${VERIFY_PREVIOUS_INNO_MIGRATION,,}" in
+    1|true|yes|on)
+      previous_inno_migration_switch="-VerifyPreviousInnoMigration -PreviousInnoInstallerPath \"$REMOTE_PREVIOUS_INSTALLER_WIN\""
+      ;;
+  esac
+  case "${VERIFY_LOCKED_PREVIOUS_INNO_MIGRATION,,}" in
+    1|true|yes|on)
+      locked_previous_inno_migration_switch="-VerifyLockedPreviousInnoMigration -PreviousInnoInstallerPath \"$REMOTE_PREVIOUS_INSTALLER_WIN\""
+      ;;
+  esac
+  case "${VERIFY_MISSING_PREVIOUS_INNO_UNINSTALLER,,}" in
+    1|true|yes|on)
+      missing_previous_inno_uninstaller_switch="-VerifyMissingPreviousInnoUninstaller -PreviousInnoInstallerPath \"$REMOTE_PREVIOUS_INSTALLER_WIN\""
+      ;;
+  esac
+  case "${VERIFY_TAMPERED_PREVIOUS_INNO_UNINSTALLER,,}" in
+    1|true|yes|on)
+      tampered_previous_inno_uninstaller_switch="-VerifyTamperedPreviousInnoUninstaller -PreviousInnoInstallerPath \"$REMOTE_PREVIOUS_INSTALLER_WIN\""
+      ;;
+  esac
+  case "${VERIFY_TAMPERED_PREVIOUS_INNO_DATA,,}" in
+    1|true|yes|on)
+      tampered_previous_inno_data_switch="-VerifyTamperedPreviousInnoData -PreviousInnoInstallerPath \"$REMOTE_PREVIOUS_INSTALLER_WIN\""
+      ;;
+  esac
+  case "${VERIFY_PREVIOUS_INNO_REGISTRY_DELETE_FAILURE,,}" in
+    1|true|yes|on)
+      previous_inno_registry_delete_failure_switch="-VerifyPreviousInnoRegistryDeleteFailure -PreviousInnoInstallerPath \"$REMOTE_PREVIOUS_INSTALLER_WIN\""
+      ;;
+  esac
+  case "${VERIFY_SAFE_REINSTALL,,}" in
+    1|true|yes|on)
+      safe_reinstall_switch="-VerifySafeReinstall"
+      ;;
+  esac
+  case "${VERIFY_TASK_CREATION_FAILURE,,}" in
+    1|true|yes|on)
+      task_creation_failure_switch="-VerifyTaskCreationFailure"
+      ;;
+  esac
+  case "${VERIFY_TASK_RUN_FAILURE,,}" in
+    1|true|yes|on)
+      task_run_failure_switch="-VerifyTaskRunFailure"
+      ;;
+  esac
+  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -InstallerPath \"$REMOTE_INSTALLER_WIN\" -InstallLogPath \"$REMOTE_INSTALL_LOG_WIN\" -UninstallLogPath \"$REMOTE_UNINSTALL_LOG_WIN\" -InstallerTimeoutSec $INSTALL_TIMEOUT_SEC $legacy_nsis_switch $missing_legacy_nsis_uninstaller_switch $locked_file_upgrade_switch $previous_inno_migration_switch $locked_previous_inno_migration_switch $missing_previous_inno_uninstaller_switch $tampered_previous_inno_uninstaller_switch $tampered_previous_inno_data_switch $previous_inno_registry_delete_failure_switch $safe_reinstall_switch $task_creation_failure_switch $task_run_failure_switch $uninstall_switch" || install_rc=$?
   if [[ "$install_rc" -ne 0 ]]; then
     log "インストーラー実行が失敗しました。ログ回収と VM 後処理を継続します: exit=$install_rc"
   fi
