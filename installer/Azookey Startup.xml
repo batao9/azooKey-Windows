@@ -1,4 +1,3 @@
-<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Date>2025-03-28T20:02:06</Date>
@@ -39,8 +38,8 @@
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>wscript.exe</Command>
-      <Arguments>PATH_TO_VBS</Arguments>
+      <Command>PATH_TO_LAUNCHER</Command>
+      <WorkingDirectory>PATH_TO_WORKING_DIRECTORY</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>

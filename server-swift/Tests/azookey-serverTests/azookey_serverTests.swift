@@ -35,6 +35,30 @@ private func packageRootURL() -> URL {
         .deletingLastPathComponent()
 }
 
+@Test func engineRuntimeDirectoryUsesAppData() {
+    let directory = engineRuntimeDirectoryURL(
+        appDataPath: #"C:\Users\test\AppData\Roaming"#,
+        temporaryDirectoryURL: URL(filePath: #"C:\Users\test\AppData\Local\Temp"#)
+    )
+
+    #expect(directory.lastPathComponent == "EngineRuntime")
+    #expect(directory.deletingLastPathComponent().lastPathComponent == "Azookey")
+    #expect(directory.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent == "Roaming")
+}
+
+@Test func engineRuntimeDirectoryFallsBackOutsideInstallDirectory() {
+    let installDirectory = URL(filePath: #"C:\Program Files\Azookey"#)
+    let directory = engineRuntimeDirectoryURL(
+        appDataPath: "  ",
+        temporaryDirectoryURL: URL(filePath: #"C:\Users\test\AppData\Local\Temp"#)
+    )
+
+    #expect(directory.lastPathComponent == "EngineRuntime")
+    #expect(directory.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent == "Temp")
+    #expect(directory.path != installDirectory.path)
+    #expect(!directory.path.hasPrefix(installDirectory.path + "/"))
+}
+
 private func testConvertRequestOptions(memoryURL: URL) -> ConvertRequestOptions {
     let packageRoot = packageRootURL()
     return ConvertRequestOptions(

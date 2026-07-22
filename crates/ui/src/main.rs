@@ -1,4 +1,6 @@
-use std::sync::Arc;
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use std::{fs, sync::Arc};
 
 use azookey_server::TonicNamedPipeServer;
 use ipc::{WindowAction, WindowController, WindowService};
@@ -27,8 +29,10 @@ use windows::Win32::{
     Foundation::HWND,
     UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE},
 };
+use wry::WebContext;
 
 pub mod candidate;
+pub mod data_paths;
 pub mod indicator;
 pub mod ipc;
 pub mod ruby;
@@ -331,8 +335,13 @@ pub enum UserEvent {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    shared::enable_redirection_guard().map_err(anyhow::Error::msg)?;
     // obtain uiaccess token
     prepare_uiaccess_token()?;
+
+    let webview_data_directory = data_paths::ui_webview_data_directory();
+    fs::create_dir_all(&webview_data_directory)?;
+    let mut web_context = WebContext::new(Some(webview_data_directory));
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event()
         .with_any_thread(true)
@@ -360,7 +369,7 @@ async fn main() -> anyhow::Result<()> {
 
     let proxy_clone = event_loop_proxy.clone();
     let candidate_window = candidate::create_candidate_window(&event_loop)?;
-    let candidate_webview_builder = candidate::create_candidate_webview()?;
+    let candidate_webview_builder = candidate::create_candidate_webview(&mut web_context)?;
     let candidate_webview = candidate_webview_builder
         .with_devtools(cfg!(debug_assertions))
         .with_ipc_handler(move |message| {
@@ -378,10 +387,11 @@ async fn main() -> anyhow::Result<()> {
         .build(&candidate_window)?;
 
     let indicator_window = indicator::create_indicator_window(&event_loop)?;
-    let indicator_webview = indicator::create_indicator_webview(&indicator_window)?;
+    let indicator_webview =
+        indicator::create_indicator_webview(&indicator_window, &mut web_context)?;
     let ruby_window = ruby::create_ruby_window(&event_loop)?;
     let proxy_clone = event_loop_proxy.clone();
-    let ruby_webview_builder = ruby::create_ruby_webview()?;
+    let ruby_webview_builder = ruby::create_ruby_webview(&mut web_context)?;
     let ruby_webview = ruby_webview_builder
         .with_devtools(cfg!(debug_assertions))
         .with_ipc_handler(move |message| {

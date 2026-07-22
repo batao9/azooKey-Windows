@@ -8,6 +8,7 @@
 #define MyAppURL "https://github.com/batao9/azooKey-Windows/"
 #define MySettingsAppName "frontend.exe"
 #define MyLegacyNsisUninstallKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\Azookey"
+#define MyInnoUninstallKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\{80B746D4-D74D-4345-8F81-47E06BCAB515}_is1"
 
 [Setup]
 ; NOTE: The value of AppId uniquely identifies this application. Do not use the same AppId value in installers for other applications.
@@ -20,7 +21,9 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-DefaultDirName={userappdata}\{#MyAppName}
+DefaultDirName={autopf}\{#MyAppName}
+UsePreviousAppDir=no
+DisableDirPage=yes
 ; "ArchitecturesAllowed=x64compatible" specifies that Setup cannot run
 ; on anything but x64 and Windows 11 on Arm.
 ArchitecturesAllowed=x64compatible
@@ -37,7 +40,7 @@ OutputBaseFilename=azookey-setup
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
-CloseApplications=yes
+CloseApplications=no
 RestartApplications=no
 
 [Languages]
@@ -54,8 +57,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "../build/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey.dll"; Flags: ignoreversion regserver 64bit restartreplace uninsrestartdelete
 Source: "../build/x86/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey32.dll"; Flags: ignoreversion regserver 32bit restartreplace uninsrestartdelete
 Source: "../build/{#MySettingsAppName}"; DestDir: "{app}"; Flags: ignoreversion restartreplace uninsrestartdelete
-Source: "../build/*"; DestDir: "{app}"; Excludes: "{#MySettingsAppName}"; Flags: ignoreversion recursesubdirs createallsubdirs restartreplace uninsrestartdelete
-Source: "./Azookey Startup.xml"; Flags: dontcopy noencryption
+Source: "../build/{#MySettingsAppName}"; DestDir: "{app}"; DestName: "azookey-updater-helper.exe"; Flags: ignoreversion restartreplace uninsrestartdelete
+Source: "../build/*"; DestDir: "{app}"; Excludes: "{#MySettingsAppName},azookey-updater-helper.exe"; Flags: ignoreversion recursesubdirs createallsubdirs restartreplace uninsrestartdelete
+Source: "./Azookey Startup.xml"; DestDir: "{app}"; DestName: ".azookey-startup-task.xml"; Flags: ignoreversion deleteafterinstall
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [Icons]
@@ -63,45 +67,16 @@ Name: "{userdesktop}\{#MyAppName}"; Filename: "{app}\{#MySettingsAppName}"; Work
 
 [InstallDelete]
 Type: files; Name: "{app}\uninstall.exe"
+Type: files; Name: "{app}\launch.vbs"
+Type: files; Name: "{app}\.azookey-updater-integration-test"
+Type: files; Name: "{app}\.legacy-user-sid-*.ps1"
+Type: files; Name: "{app}\.legacy-user-sid-*.txt"
 
 [Registry]
 Root: HKCU; Subkey: "{#MyLegacyNsisUninstallKey}"; Flags: deletekey
 Root: HKLM; Subkey: "{#MyLegacyNsisUninstallKey}"; Flags: deletekey
 Root: HKLM32; Subkey: "{#MyLegacyNsisUninstallKey}"; Flags: deletekey
 Root: HKLM64; Subkey: "{#MyLegacyNsisUninstallKey}"; Flags: deletekey
-
-[Run]
-Filename: "icacls"; \
-  Parameters: "{app}\azookey.dll /grant ""*S-1-15-2-1:(RX)"""; \
-  Description: "Grant Permission"; \
-  Flags: runhidden postinstall runascurrentuser
-Filename: "icacls"; \
-  Parameters: "{app}\azookey32.dll /grant ""*S-1-15-2-1:(RX)"""; \
-  Description: "Grant Permission"; \
-  Flags: runhidden postinstall runascurrentuser
-
-[UninstallRun]
-Filename: "taskkill"; \
-  Parameters: "/F /IM ""frontend.exe"""; \
-  RunOnceId: "StopFrontend"; \
-  Flags: runhidden
-; Stop launcher before server so the watchdog cannot respawn it during uninstall.
-Filename: "taskkill"; \
-  Parameters: "/F /T /IM ""launcher.exe"""; \
-  RunOnceId: "StopLauncher"; \
-  Flags: runhidden
-Filename: "taskkill"; \
-  Parameters: "/F /T /IM ""azookey-server.exe"""; \
-  RunOnceId: "StopAzookeyServer"; \
-  Flags: runhidden
-Filename: "taskkill"; \
-  Parameters: "/F /T /IM ""ui.exe"""; \
-  RunOnceId: "StopUi"; \
-  Flags: runhidden
-Filename: "schtasks"; \
-  Parameters: "/Delete /TN ""Azookey Startup"" /F"; \
-  RunOnceId: "DeleteStartupTask"; \
-  Flags: runhidden runascurrentuser
 
 [UninstallDelete]
 Type: files; Name: "{app}\*.dll"
@@ -117,8 +92,61 @@ Type: filesandordirs; Name: "{app}\logs"
 Type: filesandordirs; Name: "{app}\EngineRuntime"
 Type: filesandordirs; Name: "{app}\frontend.exe.WebView2"
 Type: filesandordirs; Name: "{app}\ui.exe.WebView2"
+Type: filesandordirs; Name: "{app}\.legacy-migration-*"
+Type: files; Name: "{app}\.legacy-user-sid-*.ps1"
+Type: files; Name: "{app}\.legacy-user-sid-*.txt"
+Type: filesandordirs; Name: "{app}\.azookey-updater-staging"
+Type: filesandordirs; Name: "{userappdata}\Azookey\logs"
+Type: filesandordirs; Name: "{userappdata}\Azookey\EngineRuntime"
+Type: filesandordirs; Name: "{userappdata}\Azookey\frontend.exe.WebView2"
+Type: filesandordirs; Name: "{userappdata}\Azookey\ui.exe.WebView2"
+Type: files; Name: "{userappdata}\Azookey\*.dll"
+Type: files; Name: "{userappdata}\Azookey\*.exe"
+Type: files; Name: "{userappdata}\Azookey\*.vbs"
+Type: files; Name: "{userappdata}\Azookey\*.gguf"
+Type: filesandordirs; Name: "{userappdata}\Azookey\Dictionary"
+Type: filesandordirs; Name: "{userappdata}\Azookey\EmojiDictionary"
+Type: filesandordirs; Name: "{userappdata}\Azookey\llama_cpu"
+Type: filesandordirs; Name: "{userappdata}\Azookey\llama_cuda"
+Type: filesandordirs; Name: "{userappdata}\Azookey\llama_vulkan"
+Type: filesandordirs; Name: "{userappdata}\Azookey\backend"
+Type: filesandordirs; Name: "{localappdata}\Azookey\ui-webview"
+Type: filesandordirs; Name: "{localappdata}\com.azookey.app"
 
 [Code]
+const
+  StartupTaskName = 'Azookey Startup';
+  TaskCreateFailureTestParam = '/AZOOKEY_TEST_FAIL_TASK_CREATE';
+  TaskRunFailureTestParam = '/AZOOKEY_TEST_FAIL_TASK_RUN';
+  LegacyRegistryDeleteFailureTestParam = '/AZOOKEY_TEST_FAIL_LEGACY_REGISTRY_DELETE';
+  UpdaterDownloadStagingPrefix = 'azookey-update-';
+  PostInstallFailureExitCode = 4;
+  PreviousInnoV010Batao10Version = '0.1.0-batao.10';
+  PreviousInnoV010Batao10UninstallerSha256 = 'b8cfe3b8491cf2dd39bc223a2858c003af42e4f4bee49b7f38ff77bd5f36648e';
+  SettingsBackupPrefix = 'settings.json.broken-';
+  ProcessRedirectionTrustPolicy = 16;
+  EnforceRedirectionTrust = 1;
+
+var
+  MigrationNeedsRestart: Boolean;
+  SetupFailureExitCode: Integer;
+
+function GetCurrentProcess(): THandle;
+  external 'GetCurrentProcess@kernel32.dll stdcall';
+function GetProcessMitigationPolicy(
+  ProcessHandle: THandle;
+  MitigationPolicy: Integer;
+  var Buffer: Cardinal;
+  BufferLength: Cardinal
+): Boolean;
+  external 'GetProcessMitigationPolicy@kernel32.dll stdcall delayload';
+
+<event('GetCustomSetupExitCode')>
+function Azookey_GetCustomSetupExitCode(): Integer;
+begin
+  Result := SetupFailureExitCode;
+end;
+
 function RemoveSurroundingQuotes(Value: String): String;
 begin
   Result := Trim(Value);
@@ -170,12 +198,6 @@ begin
 end;
 
 function UninstallLegacyNsisFromRoot(RootKey: Integer; RootName: String): Boolean;
-var
-  InstallLocation: String;
-  UninstallString: String;
-  UninstallExe: String;
-  UninstallParams: String;
-  ResultCode: Integer;
 begin
   Result := True;
 
@@ -184,62 +206,17 @@ begin
     Exit;
   end;
 
-  if not RegQueryStringValue(RootKey, '{#MyLegacyNsisUninstallKey}', 'UninstallString', UninstallString) then
-  begin
-    SuppressibleMsgBox('旧バージョンのアンインストール情報が壊れているため、更新を続行できません。旧バージョンを手動でアンインストールしてから再度実行してください。', mbError, MB_OK, IDOK);
-    Result := False;
-    Exit;
-  end;
-
-  UninstallExe := '';
-  InstallLocation := '';
-
-  if RegQueryStringValue(RootKey, '{#MyLegacyNsisUninstallKey}', 'InstallLocation', InstallLocation) then
-  begin
-    InstallLocation := RemoveSurroundingQuotes(InstallLocation);
-    if InstallLocation <> '' then
-    begin
-      UninstallExe := InstallLocation + '\uninstall.exe';
-      if not FileExists(UninstallExe) then
-      begin
-        UninstallExe := '';
-      end;
-    end;
-  end;
-
-  if UninstallExe = '' then
-  begin
-    UninstallExe := ExtractExecutablePath(UninstallString);
-  end;
-
-  if (UninstallExe = '') or (not FileExists(UninstallExe)) then
-  begin
-    Log('Legacy NSIS uninstaller was registered but not found under ' + RootName + ': ' + UninstallString);
-    SuppressibleMsgBox('旧バージョンのアンインストーラーが見つからないため、更新を続行できません: ' + UninstallString, mbError, MB_OK, IDOK);
-    Result := False;
-    Exit;
-  end;
-
-  UninstallParams := '/S';
-  if InstallLocation <> '' then
-  begin
-    UninstallParams := UninstallParams + ' _?=' + InstallLocation;
-  end;
-
-  Log('Running legacy NSIS uninstaller from ' + RootName + ': ' + UninstallExe + ' ' + UninstallParams);
-  if not Exec(UninstallExe, UninstallParams, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-  begin
-    SuppressibleMsgBox('旧バージョンのアンインストーラーを実行できませんでした: ' + UninstallExe, mbError, MB_OK, IDOK);
-    Result := False;
-    Exit;
-  end;
-
-  if ResultCode <> 0 then
-  begin
-    SuppressibleMsgBox('旧バージョンのアンインストールに失敗しました。終了コード: ' + IntToStr(ResultCode), mbError, MB_OK, IDOK);
-    Result := False;
-    Exit;
-  end;
+  // Legacy NSIS payloads live in a user-writable directory and have no
+  // release-specific trust metadata. Never execute their uninstallers from
+  // this elevated installer.
+  Log('Legacy NSIS install detected under ' + RootName + '; refusing to execute its untrusted uninstaller.');
+  SuppressibleMsgBox(
+    '安全に検証できない旧 NSIS 版がインストールされています。Windows の「インストールされているアプリ」から旧版を手動でアンインストールしてから、再度実行してください。',
+    mbError,
+    MB_OK,
+    IDOK
+  );
+  Result := False;
 end;
 
 function UninstallLegacyNsisInstall(): Boolean;
@@ -278,36 +255,173 @@ begin
   end;
   Parameters := Parameters + '/IM "' + ImageName + '"';
 
-  Exec('taskkill', Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  if ResultCode = 0 then
+  if not Exec(ExpandConstant('{sys}\taskkill.exe'), Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
   begin
-    Log('Stopped Azookey process before install: ' + ImageName);
+    Log('Failed to execute taskkill for Azookey process: ' + ImageName);
+  end
+  else if ResultCode = 0 then
+  begin
+    Log('Stopped Azookey process: ' + ImageName);
   end
   else
   begin
-    Log('Azookey process was not running before install: ' + ImageName + ' (taskkill exit code ' + IntToStr(ResultCode) + ')');
+    Log('Azookey process was not running: ' + ImageName + ' (taskkill exit code ' + IntToStr(ResultCode) + ')');
   end;
 end;
 
-procedure StopAzookeyProcessesBeforeInstall();
+procedure StopAzookeyProcesses();
 begin
   StopAzookeyProcess('frontend.exe', False);
-  // Stop launcher before server so the watchdog cannot respawn it during install/update.
+  // Stop launcher before server so the watchdog cannot respawn it during install/update/uninstall.
   StopAzookeyProcess('launcher.exe', True);
   StopAzookeyProcess('azookey-server.exe', True);
   StopAzookeyProcess('ui.exe', True);
 end;
 
-<event('PrepareToInstall')>
-function Azookey_PrepareToInstall(var NeedsRestart: Boolean): String;
+function QueryStartupTaskExists(var QueryExecuted: Boolean): Boolean;
+var
+  ResultCode: Integer;
 begin
-  StopAzookeyProcessesBeforeInstall();
-  Result := '';
+  QueryExecuted := Exec(
+    ExpandConstant('{sys}\schtasks.exe'),
+    '/Query /TN "' + StartupTaskName + '"',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  );
+  Result := QueryExecuted and (ResultCode = 0);
+  if QueryExecuted then
+  begin
+    Log('Startup task query exit code: ' + IntToStr(ResultCode));
+  end
+  else
+  begin
+    Log('Failed to execute schtasks while querying startup task.');
+  end;
 end;
 
-function UninstallNeedRestart(): Boolean;
+function StartupTaskStorageFileExists(): Boolean;
 begin
+  Result := FileExists(ExpandConstant('{sys}\Tasks\' + StartupTaskName));
+end;
+
+function DeleteStartupTask(): Boolean;
+var
+  QueryExecuted: Boolean;
+  ResultCode: Integer;
+begin
+  Result := False;
+  if not QueryStartupTaskExists(QueryExecuted) then
+  begin
+    if QueryExecuted and (not StartupTaskStorageFileExists()) then
+    begin
+      Log('Startup task is not present; no deletion is needed.');
+      Result := True;
+    end;
+    if StartupTaskStorageFileExists() then
+    begin
+      Log('Startup task storage file exists even though schtasks query failed.');
+    end;
+    Exit;
+  end;
+
+  if Exec(
+    ExpandConstant('{sys}\schtasks.exe'),
+    '/End /TN "' + StartupTaskName + '"',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  ) then
+  begin
+    Log('Startup task end exit code: ' + IntToStr(ResultCode));
+  end;
+
+  if not Exec(
+    ExpandConstant('{sys}\schtasks.exe'),
+    '/Delete /TN "' + StartupTaskName + '" /F',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  ) then
+  begin
+    Log('Failed to execute schtasks while deleting startup task.');
+    Exit;
+  end;
+
+  if ResultCode <> 0 then
+  begin
+    Log('Failed to delete startup task. schtasks exit code: ' + IntToStr(ResultCode));
+    Exit;
+  end;
+
+  if QueryStartupTaskExists(QueryExecuted) then
+  begin
+    Log('Startup task still exists after schtasks /Delete.');
+    Exit;
+  end;
+
+  if not QueryExecuted then
+  begin
+    Exit;
+  end;
+
+  if StartupTaskStorageFileExists() then
+  begin
+    Log('Startup task storage file still exists after schtasks /Delete.');
+    Exit;
+  end;
+
+  Log('Startup task was deleted and its absence was verified.');
   Result := True;
+end;
+
+function DisableStartupTaskIfPresent(): Boolean;
+var
+  QueryExecuted: Boolean;
+  ResultCode: Integer;
+begin
+  Result := False;
+  if not QueryStartupTaskExists(QueryExecuted) then
+  begin
+    if QueryExecuted and (not StartupTaskStorageFileExists()) then
+    begin
+      Result := True;
+    end;
+    Exit;
+  end;
+
+  if not Exec(
+    ExpandConstant('{sys}\schtasks.exe'),
+    '/Change /TN "' + StartupTaskName + '" /DISABLE',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  ) then
+  begin
+    Log('Failed to execute schtasks while disabling startup task.');
+    Exit;
+  end;
+
+  Result := ResultCode = 0;
+  if not Result then
+  begin
+    Log('Failed to disable startup task. schtasks exit code: ' + IntToStr(ResultCode));
+  end;
+end;
+
+function CleanupStartupTaskAfterFailure(): Boolean;
+begin
+  // Make a partially-created task inert before deletion. Verified absence is
+  // the final safety condition, so deletion can still succeed if /DISABLE does not.
+  if not DisableStartupTaskIfPresent() then
+  begin
+    Log('Could not disable startup task before failure cleanup; deletion will still be attempted.');
+  end;
+  Result := DeleteStartupTask();
 end;
 
 function CmdLineContains(Param: String): Boolean;
@@ -324,45 +438,1051 @@ begin
     end;
   end;
 end;
-procedure UpdateTaskXml();
-var
-  TaskXmlPath: string;
-  TaskXmlContentAnsi: AnsiString;
-  TaskXmlContent: String;
-  Dummy: Integer;
+
+function SamePath(LeftPath: String; RightPath: String): Boolean;
 begin
-  ExtractTemporaryFile('Azookey Startup.xml'); // ファイル展開
-  TaskXmlPath := ExpandConstant('{tmp}\Azookey Startup.xml');
-
-  LoadStringFromFile(TaskXmlPath, TaskXmlContentAnsi)
-
-  TaskXmlContent := String(TaskXmlContentAnsi);
-
-  StringChange(TaskXmlContent, 'PATH_TO_VBS', ExpandConstant('{app}\launch.vbs'));
-  TaskXmlContentAnsi := AnsiString(TaskXmlContent);
-  SaveStringToFile(TaskXmlPath, TaskXmlContentAnsi, False);
-
-  ShellExec('', 'schtasks', '/Create /F /TN "Azookey Startup" /XML "' + TaskXmlPath + '"', '', SW_HIDE, ewWaitUntilTerminated, Dummy);
-  ShellExec('', 'schtasks', '/Run /TN "Azookey Startup"', '', SW_HIDE, ewWaitUntilTerminated, Dummy);
+  Result := CompareText(
+    RemoveBackslashUnlessRoot(RemoveSurroundingQuotes(LeftPath)),
+    RemoveBackslashUnlessRoot(RemoveSurroundingQuotes(RightPath))
+  ) = 0;
 end;
 
-procedure CreateVbsFile();
+function ValidatePreviousInnoUninstaller(
+  DisplayVersion: String;
+  UninstallExe: String
+): String;
 var
-  VbsFile: string;
-  VbsContent: AnsiString;
+  UninstallData: String;
+  UninstallerHash: String;
 begin
-  VbsFile := ExpandConstant('{app}\launch.vbs');
-  VbsContent :=
-    'Set objShell = CreateObject("WScript.Shell")' + #13#10 +
-    'objShell.Run "' + ExpandConstant('{app}\launcher.exe') + '", 0, False' + #13#10;
-
-  if SaveStringToFile(VbsFile, VbsContent, False) then
+  Result := '';
+  UninstallData := ChangeFileExt(UninstallExe, '.dat');
+  if not FileExists(UninstallData) then
   begin
-    Log('VBS file created: ' + VbsFile);
+    Result := '旧バージョンのアンインストールデータが見つからないため、更新を中止しました: ' + UninstallData;
+    Exit;
+  end;
+
+  try
+    UninstallerHash := Lowercase(GetSHA256OfFile(UninstallExe));
+  except
+    Result := '旧バージョンのアンインストーラーを安全に検証できないため、更新を中止しました: ' + GetExceptionMessage;
+    Exit;
+  end;
+
+  Log(
+    'Previous Inno trust metadata: version=' + DisplayVersion +
+    ', exe_sha256=' + UninstallerHash
+  );
+  if (CompareText(DisplayVersion, PreviousInnoV010Batao10Version) <> 0) or
+     (CompareText(UninstallerHash, PreviousInnoV010Batao10UninstallerSha256) <> 0) then
+  begin
+    Result := '旧バージョンのアンインストーラーが既知の正規リリースと一致しないため、自動更新を中止しました。旧バージョンを手動でアンインストールしてから再度実行してください。';
+  end;
+end;
+
+function IsSettingsBackupName(FileName: String): Boolean;
+var
+  Suffix: String;
+  I: Integer;
+begin
+  Result := False;
+  if Pos(SettingsBackupPrefix, Lowercase(FileName)) <> 1 then
+  begin
+    Exit;
+  end;
+
+  Suffix := Copy(FileName, Length(SettingsBackupPrefix) + 1, MaxInt);
+  if Length(Suffix) <> 14 then
+  begin
+    Exit;
+  end;
+
+  for I := 1 to Length(Suffix) do
+  begin
+    if (Suffix[I] < '0') or (Suffix[I] > '9') then
+    begin
+      Exit;
+    end;
+  end;
+  Result := True;
+end;
+
+function PathIsReparsePoint(Path: String; var Inspected: Boolean): Boolean;
+var
+  FindRec: TFindRec;
+begin
+  Inspected := FindFirst(RemoveBackslashUnlessRoot(Path), FindRec);
+  Result := Inspected and ((FindRec.Attributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0);
+  if Inspected then
+  begin
+    FindClose(FindRec);
+  end;
+end;
+
+procedure RestorePreservedUserData(
+  PreserveRoot: String;
+  MigrationRoot: String;
+  PreservedNames: TStringList
+);
+var
+  I: Integer;
+begin
+  for I := 0 to PreservedNames.Count - 1 do
+  begin
+    if not RenameFile(
+      AddBackslash(PreserveRoot) + PreservedNames[I],
+      AddBackslash(MigrationRoot) + PreservedNames[I]
+    ) then
+    begin
+      Log('Failed to restore preserved legacy user data: ' + PreservedNames[I]);
+    end;
+  end;
+end;
+
+function RunMigrationIcacls(Path: String; Arguments: String): Boolean;
+var
+  ResultCode: Integer;
+begin
+  ResultCode := -1;
+  Result := Exec(
+    ExpandConstant('{sys}\icacls.exe'),
+    '"' + Path + '" ' + Arguments + ' /L /Q',
+    ExpandConstant('{app}'),
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  ) and (ResultCode = 0);
+  if not Result then
+  begin
+    Log('Migration icacls failed. exit=' + IntToStr(ResultCode) + ', path=' + Path + ', arguments=' + Arguments);
+  end;
+end;
+
+function ApplyMigrationDirectoryAcl(Path: String; WritableUserSid: String): Boolean;
+var
+  Grants: String;
+begin
+  // A directory moved from AppData keeps its old owner and explicit ACEs.
+  // Reset the root against its protected Program Files parent before installing
+  // the final non-inherited ACL; merely disabling inheritance would leave
+  // user-writable explicit ACEs behind. Descendants are intentionally not
+  // reopened here: a loaded legacy DLL may be exclusively locked, while the
+  // protected root ACL is sufficient to prevent new untrusted traversal.
+  Result := RunMigrationIcacls(Path, '/setowner "*S-1-5-32-544"');
+  if not Result then
+  begin
+    Exit;
+  end;
+  Result := RunMigrationIcacls(Path, '/reset');
+  if not Result then
+  begin
+    Exit;
+  end;
+
+  Grants := '/inheritance:r /grant:r ' +
+    '"*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"';
+  if WritableUserSid <> '' then
+  begin
+    Grants := Grants + ' "*' + WritableUserSid + ':(OI)(CI)M"';
+  end;
+  Result := RunMigrationIcacls(Path, Grants);
+end;
+
+function IsExpectedUserSid(Value: String): Boolean;
+var
+  I: Integer;
+  Character: String;
+begin
+  Value := Trim(Value);
+  Result := (Pos('S-1-5-21-', Value) = 1) or (Pos('S-1-12-1-', Value) = 1);
+  if not Result then
+  begin
+    Exit;
+  end;
+
+  for I := 1 to Length(Value) do
+  begin
+    Character := Copy(Value, I, 1);
+    if ((Character < '0') or (Character > '9')) and
+       (Character <> 'S') and (Character <> '-') then
+    begin
+      Result := False;
+      Exit;
+    end;
+  end;
+end;
+
+function IsDecimalNonce(Value: String): Boolean;
+var
+  I: Integer;
+begin
+  Result := Value <> '';
+  if not Result then
+  begin
+    Exit;
+  end;
+  for I := 1 to Length(Value) do
+  begin
+    if (Value[I] < '0') or (Value[I] > '9') then
+    begin
+      Result := False;
+      Exit;
+    end;
+  end;
+end;
+
+procedure CleanupOwnedUpdaterDownloadStaging();
+var
+  TempRoot: String;
+  FindRec: TFindRec;
+  Candidate: String;
+  Nonce: String;
+  Inspected: Boolean;
+begin
+  TempRoot := RemoveBackslashUnlessRoot(GetEnv('TEMP'));
+  if (TempRoot = '') or PathIsReparsePoint(TempRoot, Inspected) or (not Inspected) then
+  begin
+    Log('Updater download staging cleanup skipped because TEMP is missing, inaccessible, or a reparse point.');
+    Exit;
+  end;
+
+  if FindFirst(AddBackslash(TempRoot) + UpdaterDownloadStagingPrefix + '*', FindRec) then
+  begin
+    try
+      repeat
+        Nonce := Copy(
+          FindRec.Name,
+          Length(UpdaterDownloadStagingPrefix) + 1,
+          Length(FindRec.Name)
+        );
+        if ((FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0) and
+           ((FindRec.Attributes and FILE_ATTRIBUTE_REPARSE_POINT) = 0) and
+           IsDecimalNonce(Nonce) then
+        begin
+          Candidate := AddBackslash(TempRoot) + FindRec.Name;
+          if SamePath(Candidate, ExtractFileDir(ExpandConstant('{srcexe}'))) then
+          begin
+            Log('Updater download staging cleanup deferred for the currently running setup source: ' + Candidate);
+          end
+          else if not DelTree(Candidate, True, True, True) then
+          begin
+            Log('Updater download staging cleanup could not remove: ' + Candidate);
+          end
+          else
+          begin
+            Log('Removed updater download staging: ' + Candidate);
+          end;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
+function ReadMigrationUserSid(
+  Timestamp: String;
+  var UserSid: String
+): Boolean;
+var
+  ScriptPath: String;
+  SidPath: String;
+  ScriptBody: String;
+  ResultCode: Integer;
+  UserSidBytes: AnsiString;
+begin
+  Result := False;
+  UserSid := '';
+  ScriptPath := ExpandConstant('{app}\.legacy-user-sid-' + Timestamp + '.ps1');
+  SidPath := ExpandConstant('{app}\.legacy-user-sid-' + Timestamp + '.txt');
+  if (Pos('"', SidPath) > 0) or
+     FileExists(ScriptPath) or FileExists(SidPath) or
+     DirExists(ScriptPath) or DirExists(SidPath) then
+  begin
+    Log('Migration user SID helper paths are unsafe or already exist.');
+    Exit;
+  end;
+
+  ScriptBody :=
+    '$ErrorActionPreference = "Stop"' + #13#10 +
+    '$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value' + #13#10 +
+    '[System.IO.File]::WriteAllText("' + SidPath + '", $sid, ' +
+      '[System.Text.Encoding]::ASCII)' + #13#10;
+
+  try
+    if not SaveStringToFile(ScriptPath, ScriptBody, False) then
+    begin
+      Log('Failed to create protected migration user SID helper.');
+      Exit;
+    end;
+    ResultCode := -1;
+    if not Exec(
+      ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ScriptPath + '"',
+      ExpandConstant('{app}'),
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode
+    ) or (ResultCode <> 0) then
+    begin
+      Log('Failed to resolve migration user SID. exit=' + IntToStr(ResultCode));
+      Exit;
+    end;
+    if not LoadStringFromFile(SidPath, UserSidBytes) then
+    begin
+      Log('Migration user SID output is missing.');
+      Exit;
+    end;
+    UserSid := Trim(String(UserSidBytes));
+    if not IsExpectedUserSid(UserSid) then
+    begin
+      Log('Migration user SID is not an expected local, domain, or Entra user SID: ' + UserSid);
+      UserSid := '';
+      Exit;
+    end;
+    Result := True;
+  finally
+    DeleteFile(ScriptPath);
+    DeleteFile(SidPath);
+  end;
+end;
+
+procedure ScheduleProtectedTreeForDeletion(Root: String);
+var
+  FindRec: TFindRec;
+  ChildPath: String;
+begin
+  if FindFirst(AddBackslash(Root) + '*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+        begin
+          ChildPath := AddBackslash(Root) + FindRec.Name;
+          if ((FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0) and
+             ((FindRec.Attributes and FILE_ATTRIBUTE_REPARSE_POINT) = 0) then
+          begin
+            ScheduleProtectedTreeForDeletion(ChildPath);
+          end
+          else
+          begin
+            RestartReplace(ChildPath, '');
+          end;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+  RestartReplace(Root, '');
+end;
+
+function IsRedirectionGuardEnforced(): Boolean;
+var
+  PolicyFlags: Cardinal;
+begin
+  PolicyFlags := 0;
+  try
+    Result := GetProcessMitigationPolicy(
+      GetCurrentProcess(),
+      ProcessRedirectionTrustPolicy,
+      PolicyFlags,
+      SizeOf(PolicyFlags)
+    ) and ((PolicyFlags and EnforceRedirectionTrust) <> 0);
+  except
+    Log('Failed to query RedirectionGuard process mitigation: ' + GetExceptionMessage);
+    Result := False;
+  end;
+end;
+
+function IsPreservedPreviousInnoRootEntry(Name: String; Attributes: Integer): Boolean;
+begin
+  Result := False;
+  if (Attributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0 then
+  begin
+    Exit;
+  end;
+
+  if (Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+  begin
+    Result := CompareText(Name, 'LearningMemory') = 0;
   end
   else
   begin
-    Log('Failed to create VBS file: ' + VbsFile);
+    Result := (CompareText(Name, 'settings.json') = 0) or IsSettingsBackupName(Name);
+  end;
+end;
+
+function RemovePreviousInnoPayloadInPlace(InstallLocation: String): String;
+var
+  FindRec: TFindRec;
+  ChildPath: String;
+  Inspected: Boolean;
+  QueuedForRestart: Boolean;
+begin
+  Result := '';
+  QueuedForRestart := False;
+  if not IsRedirectionGuardEnforced() then
+  begin
+    Result := 'RedirectionGuard を強制できないため、ロック中の旧バージョンを安全に更新できません。Windows を更新または再起動してから再度実行してください。';
+    Exit;
+  end;
+  if PathIsReparsePoint(InstallLocation, Inspected) or (not Inspected) then
+  begin
+    Result := '旧バージョンのインストール先を安全に検査できないため、更新を中止しました。';
+    Exit;
+  end;
+
+  if FindFirst(AddBackslash(InstallLocation) + '*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') and
+           (not IsPreservedPreviousInnoRootEntry(FindRec.Name, FindRec.Attributes)) then
+        begin
+          ChildPath := AddBackslash(InstallLocation) + FindRec.Name;
+          if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+          begin
+            if not DelTree(ChildPath, True, True, True) then
+            begin
+              try
+                if (FindRec.Attributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0 then
+                begin
+                  RestartReplace(ChildPath, '');
+                end
+                else
+                begin
+                  ScheduleProtectedTreeForDeletion(ChildPath);
+                end;
+                QueuedForRestart := True;
+              except
+                Result := '旧バージョンのロック中ディレクトリを再起動後に安全に削除する設定ができません: ' + GetExceptionMessage;
+                Exit;
+              end;
+            end;
+          end
+          else if not DelTree(ChildPath, False, True, False) then
+          begin
+            try
+              RestartReplace(ChildPath, '');
+              QueuedForRestart := True;
+            except
+              Result := '旧バージョンのロック中ファイルを再起動後に安全に削除する設定ができません: ' + GetExceptionMessage;
+              Exit;
+            end;
+          end;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+
+  if QueuedForRestart then
+  begin
+    MigrationNeedsRestart := True;
+    Log('Locked previous payload was queued for deletion in place with RedirectionGuard enforced.');
+  end;
+  Log('Previous Inno payload was cleaned in place while preserving settings and learning data.');
+end;
+
+function PreservePreviousInnoUserData(
+  InstallLocation: String;
+  PreserveRoot: String;
+  PreservedNames: TStringList
+): String;
+var
+  FindRec: TFindRec;
+  NamesToPreserve: TStringList;
+  SourcePath: String;
+  DestinationPath: String;
+  I: Integer;
+begin
+  Result := '';
+  NamesToPreserve := TStringList.Create;
+  try
+    if FileExists(AddBackslash(InstallLocation) + 'settings.json') then
+    begin
+      NamesToPreserve.Add('settings.json');
+    end;
+    if DirExists(AddBackslash(InstallLocation) + 'LearningMemory') then
+    begin
+      NamesToPreserve.Add('LearningMemory');
+    end;
+
+    if FindFirst(AddBackslash(InstallLocation) + 'settings.json.broken-*', FindRec) then
+    begin
+      try
+        repeat
+          if ((FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) = 0) and
+             IsSettingsBackupName(FindRec.Name) then
+          begin
+            NamesToPreserve.Add(FindRec.Name);
+          end;
+        until not FindNext(FindRec);
+      finally
+        FindClose(FindRec);
+      end;
+    end;
+
+    if not ForceDirectories(PreserveRoot) then
+    begin
+      Result := '旧バージョンの設定・学習データの一時保存先を作成できないため、更新を中止しました。';
+      Exit;
+    end;
+
+    for I := 0 to NamesToPreserve.Count - 1 do
+    begin
+      SourcePath := AddBackslash(InstallLocation) + NamesToPreserve[I];
+      DestinationPath := AddBackslash(PreserveRoot) + NamesToPreserve[I];
+      if not RenameFile(SourcePath, DestinationPath) then
+      begin
+        Result := '旧バージョンの設定・学習データを安全に保持できないため、更新を中止しました: ' + NamesToPreserve[I];
+        RestorePreservedUserData(PreserveRoot, InstallLocation, PreservedNames);
+        Exit;
+      end;
+      PreservedNames.Add(NamesToPreserve[I]);
+    end;
+  finally
+    NamesToPreserve.Free;
+  end;
+end;
+
+function RemovePreviousInnoPayload(InstallLocation: String): String;
+var
+  MigrationRoot: String;
+  PreserveRoot: String;
+  PreservedNames: TStringList;
+  Inspected: Boolean;
+  Timestamp: String;
+  UserSid: String;
+begin
+  Result := '';
+  if PathIsReparsePoint(InstallLocation, Inspected) or (not Inspected) then
+  begin
+    Result := '旧バージョンのインストール先を安全に検査できないため、更新を中止しました。';
+    Log('Previous Inno install root is missing, inaccessible, or a reparse point: ' + InstallLocation);
+    Exit;
+  end;
+
+  if not ForceDirectories(ExpandConstant('{app}')) then
+  begin
+    Result := '保護された移行先を作成できないため、更新を中止しました。';
+    Exit;
+  end;
+  if PathIsReparsePoint(ExpandConstant('{app}'), Inspected) or (not Inspected) then
+  begin
+    Result := '保護された移行先を安全に検査できないため、更新を中止しました。';
+    Exit;
+  end;
+
+  Timestamp := GetDateTimeString('yyyymmddhhnnsszzz', #0, #0);
+  MigrationRoot := ExpandConstant('{app}\.legacy-migration-' + Timestamp);
+  PreserveRoot := ExpandConstant('{app}\.legacy-preserve-' + Timestamp);
+  if FileExists(MigrationRoot) or DirExists(MigrationRoot) or
+     FileExists(PreserveRoot) or DirExists(PreserveRoot) then
+  begin
+    Result := '保護された移行用の一時パスが既に存在するため、更新を中止しました。';
+    Exit;
+  end;
+
+  // Move the directory entry itself into Program Files before any privileged
+  // mutation. If the user races the initial inspection with a junction swap,
+  // RenameFile moves the junction object; the post-move reparse check rejects it.
+  if not RenameFile(InstallLocation, MigrationRoot) then
+  begin
+    Log('Previous Inno root could not be moved atomically; using the RedirectionGuard-protected locked-file fallback.');
+    Result := RemovePreviousInnoPayloadInPlace(InstallLocation);
+    Exit;
+  end;
+  if PathIsReparsePoint(MigrationRoot, Inspected) or (not Inspected) then
+  begin
+    if not RenameFile(MigrationRoot, InstallLocation) then
+    begin
+      RemoveDir(MigrationRoot);
+    end;
+    Result := '旧バージョンのインストール先が移行中に reparse point へ変更されたため、更新を中止しました。';
+    Exit;
+  end;
+  if not ReadMigrationUserSid(Timestamp, UserSid) then
+  begin
+    if not RenameFile(MigrationRoot, InstallLocation) then
+    begin
+      Log('Failed to restore previous install root after user SID validation failed.');
+    end;
+    Result := '旧バージョンの設定ユーザーを安全に確認できないため、更新を中止しました。';
+    Exit;
+  end;
+  if not ApplyMigrationDirectoryAcl(MigrationRoot, '') then
+  begin
+    ApplyMigrationDirectoryAcl(MigrationRoot, UserSid);
+    RenameFile(MigrationRoot, InstallLocation);
+    Result := '旧バージョンの移行元を保護できないため、更新を中止しました。';
+    Exit;
+  end;
+
+  if not ForceDirectories(PreserveRoot) or
+     (not ApplyMigrationDirectoryAcl(PreserveRoot, '')) then
+  begin
+    DelTree(PreserveRoot, True, True, True);
+    ApplyMigrationDirectoryAcl(MigrationRoot, UserSid);
+    RenameFile(MigrationRoot, InstallLocation);
+    Result := '旧バージョンの設定・学習データの保護領域を作成できないため、更新を中止しました。';
+    Exit;
+  end;
+
+  PreservedNames := TStringList.Create;
+  try
+    Result := PreservePreviousInnoUserData(
+      MigrationRoot,
+      PreserveRoot,
+      PreservedNames
+    );
+    if Result <> '' then
+    begin
+      RestorePreservedUserData(PreserveRoot, MigrationRoot, PreservedNames);
+      RemoveDir(PreserveRoot);
+      ApplyMigrationDirectoryAcl(MigrationRoot, UserSid);
+      RenameFile(MigrationRoot, InstallLocation);
+      Exit;
+    end;
+
+    // Restore the allowlisted data by atomically moving one directory entry
+    // back to AppData. Never write through a user-replaceable destination path.
+    // The ACL is relaxed while the directory is still under the protected
+    // parent; only the user's own preserved data can be modified at this point.
+    if not ApplyMigrationDirectoryAcl(PreserveRoot, UserSid) then
+    begin
+      RestorePreservedUserData(PreserveRoot, MigrationRoot, PreservedNames);
+      RemoveDir(PreserveRoot);
+      ApplyMigrationDirectoryAcl(MigrationRoot, UserSid);
+      RenameFile(MigrationRoot, InstallLocation);
+      Result := '保持した旧バージョンの設定・学習データのアクセス権を復元できませんでした。一時保存先: ' + PreserveRoot;
+      Exit;
+    end;
+    if not RenameFile(PreserveRoot, InstallLocation) then
+    begin
+      ApplyMigrationDirectoryAcl(PreserveRoot, '');
+      RestorePreservedUserData(PreserveRoot, MigrationRoot, PreservedNames);
+      RemoveDir(PreserveRoot);
+      ApplyMigrationDirectoryAcl(MigrationRoot, UserSid);
+      RenameFile(MigrationRoot, InstallLocation);
+      Result := '保持した旧バージョンの設定・学習データを安全に復元できませんでした。一時保存先: ' + PreserveRoot;
+      Exit;
+    end;
+
+    // Inno's DelTree removes reparse points without following them. Moving the
+    // explicit user-data allowlist out first lets us remove every old payload,
+    // including the machine-specific uninstaller .dat, without executing it.
+    if not DelTree(MigrationRoot, True, True, True) then
+    begin
+      try
+        ScheduleProtectedTreeForDeletion(MigrationRoot);
+        MigrationNeedsRestart := True;
+        Log('Locked previous payload was queued for deletion from protected Program Files staging.');
+      except
+        Result := '旧バージョンのロック中ファイルを再起動後に安全に削除する設定ができないため、更新を中止しました: ' + GetExceptionMessage;
+        Exit;
+      end;
+    end;
+  finally
+    PreservedNames.Free;
+  end;
+end;
+
+<event('InitializeWizard')>
+procedure Azookey_InitializeWizard();
+begin
+  // DisableDirPage does not make /DIR harmless by itself. Always overwrite the
+  // wizard value so silent installs and updater launches use the protected path.
+  WizardForm.DirEdit.Text := ExpandConstant('{autopf}\{#MyAppName}');
+end;
+
+function MigratePreviousInnoFromRoot(
+  RootKey: Integer;
+  RootName: String;
+  var Found: Boolean
+): String;
+var
+  InstallLocation: String;
+  DisplayVersion: String;
+  UninstallString: String;
+  UninstallExe: String;
+begin
+  Result := '';
+  Found := RegKeyExists(RootKey, '{#MyInnoUninstallKey}');
+  if not Found then
+  begin
+    Exit;
+  end;
+
+  if not RegQueryStringValue(RootKey, '{#MyInnoUninstallKey}', 'InstallLocation', InstallLocation) then
+  begin
+    Result := '旧バージョンのインストール先情報が壊れているため、更新を続行できません。旧バージョンを手動でアンインストールしてから再度実行してください。';
+    Log('Previous Inno InstallLocation is missing under ' + RootName + '.');
+    Exit;
+  end;
+
+  InstallLocation := RemoveSurroundingQuotes(InstallLocation);
+  if InstallLocation = '' then
+  begin
+    Result := '旧バージョンのインストール先情報が空のため、更新を続行できません。旧バージョンを手動でアンインストールしてから再度実行してください。';
+    Log('Previous Inno InstallLocation is empty under ' + RootName + '.');
+    Exit;
+  end;
+
+  if SamePath(InstallLocation, ExpandConstant('{app}')) then
+  begin
+    Log('Previous Inno install already uses the protected install directory: ' + InstallLocation);
+    Exit;
+  end;
+
+  if not SamePath(InstallLocation, ExpandConstant('{userappdata}\{#MyAppName}')) then
+  begin
+    Result := '旧バージョンが標準外の場所にインストールされているため、自動更新を中止しました。旧バージョンを手動でアンインストールしてから再度実行してください: ' + InstallLocation;
+    Log('Previous Inno install uses an unexpected unprotected directory: ' + InstallLocation);
+    Exit;
+  end;
+
+  if not RegQueryStringValue(RootKey, '{#MyInnoUninstallKey}', 'UninstallString', UninstallString) then
+  begin
+    Result := '旧バージョンのアンインストール情報が壊れているため、更新を続行できません。旧バージョンを手動でアンインストールしてから再度実行してください。';
+    Log('Previous Inno UninstallString is missing under ' + RootName + '.');
+    Exit;
+  end;
+
+  if not RegQueryStringValue(RootKey, '{#MyInnoUninstallKey}', 'DisplayVersion', DisplayVersion) then
+  begin
+    Result := '旧バージョンのバージョン情報が壊れているため、更新を続行できません。旧バージョンを手動でアンインストールしてから再度実行してください。';
+    Log('Previous Inno DisplayVersion is missing under ' + RootName + '.');
+    Exit;
+  end;
+
+  UninstallExe := ExtractExecutablePath(UninstallString);
+  if (UninstallExe = '') or (not FileExists(UninstallExe)) then
+  begin
+    Result := '旧バージョンのアンインストーラーが見つからないため、更新を続行できません: ' + UninstallString;
+    Log('Previous Inno uninstaller was registered but not found under ' + RootName + ': ' + UninstallString);
+    Exit;
+  end;
+
+  if not SamePath(ExtractFileDir(UninstallExe), InstallLocation) then
+  begin
+    Result := '旧バージョンのアンインストーラーがインストール先の外を指しているため、更新を中止しました: ' + UninstallExe;
+    Log('Previous Inno uninstaller is outside InstallLocation: ' + UninstallExe);
+    Exit;
+  end;
+
+  if (Pos('unins', Lowercase(ExtractFileName(UninstallExe))) <> 1) or
+     (CompareText(ExtractFileExt(UninstallExe), '.exe') <> 0) then
+  begin
+    Result := '旧バージョンのアンインストーラー名が不正なため、更新を中止しました: ' + UninstallExe;
+    Log('Previous Inno uninstaller filename is unexpected: ' + UninstallExe);
+    Exit;
+  end;
+
+  Result := ValidatePreviousInnoUninstaller(DisplayVersion, UninstallExe);
+  if Result <> '' then
+  begin
+    Log('Previous Inno uninstaller trust validation failed: ' + Result);
+    Exit;
+  end;
+
+  // Establish that the stale uninstall metadata can be removed before making
+  // any destructive payload change. If this operation fails, the old files
+  // and metadata remain available for a safe retry.
+  if CmdLineContains(LegacyRegistryDeleteFailureTestParam) then
+  begin
+    Log('Injecting previous Inno uninstall registry deletion failure for installer verification.');
+    Result := '旧バージョンのアンインストール情報を削除できないため、更新を中止しました。';
+    Exit;
+  end;
+  if not RegDeleteKeyIncludingSubkeys(RootKey, '{#MyInnoUninstallKey}') then
+  begin
+    Result := '旧バージョンのアンインストール情報を削除できないため、更新を中止しました。';
+    Exit;
+  end;
+  Log('Previous Inno uninstall metadata was deleted before payload migration.');
+
+  Log('Migrating previous Inno install without executing its user-writable uninstall data: ' + InstallLocation);
+  Result := RemovePreviousInnoPayload(InstallLocation);
+  if Result <> '' then
+  begin
+    Log('Previous Inno controlled payload migration failed: ' + Result);
+    if not (
+      RegWriteStringValue(RootKey, '{#MyInnoUninstallKey}', 'InstallLocation', InstallLocation) and
+      RegWriteStringValue(RootKey, '{#MyInnoUninstallKey}', 'DisplayVersion', DisplayVersion) and
+      RegWriteStringValue(RootKey, '{#MyInnoUninstallKey}', 'UninstallString', UninstallString)
+    ) then
+    begin
+      Log('Failed to restore retry metadata after previous Inno payload migration failure.');
+      Result := Result + ' 旧バージョンの再試行情報も復元できませんでした。';
+    end
+    else
+    begin
+      Log('Previous Inno retry metadata was restored after payload migration failure.');
+    end;
+    Exit;
+  end;
+
+  // v0.1.0-batao.10 always requested a reboot when uninstalled. Preserve that
+  // upgrade contract even though its user-writable uninstaller is not run.
+  MigrationNeedsRestart := True;
+  Log('Previous Inno payload migration completed and requested restart (3010).');
+end;
+
+function MigratePreviousInnoInstall(): String;
+var
+  Found: Boolean;
+begin
+  Result := MigratePreviousInnoFromRoot(HKLM64, 'HKLM64', Found);
+  if Found then
+  begin
+    Exit;
+  end;
+
+  Result := MigratePreviousInnoFromRoot(HKLM32, 'HKLM32', Found);
+  if Found then
+  begin
+    Exit;
+  end;
+
+  Result := MigratePreviousInnoFromRoot(HKCU, 'HKCU', Found);
+end;
+
+<event('PrepareToInstall')>
+function Azookey_PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  CleanupOwnedUpdaterDownloadStaging();
+  StopAzookeyProcesses();
+  if not DeleteStartupTask() then
+  begin
+    Result := '既存の Azookey 起動タスクを安全に削除できないため、インストールを中止しました。';
+    Exit;
+  end;
+
+  if not SamePath(ExpandConstant('{app}'), ExpandConstant('{autopf}\{#MyAppName}')) then
+  begin
+    Result := '安全でないインストール先が指定されたため、インストールを中止しました。Azookey は Program Files にのみインストールできます。';
+    Log('Rejected non-protected install directory: ' + ExpandConstant('{app}'));
+    Exit;
+  end;
+
+  Result := MigratePreviousInnoInstall();
+end;
+
+<event('NeedRestart')>
+function Azookey_NeedRestart(): Boolean;
+begin
+  Result := MigrationNeedsRestart;
+end;
+
+function UninstallNeedRestart(): Boolean;
+begin
+  Result := True;
+end;
+
+function XmlEscape(Value: String): String;
+begin
+  Result := Value;
+  StringChangeEx(Result, '&', '&amp;', True);
+  StringChangeEx(Result, '<', '&lt;', True);
+  StringChangeEx(Result, '>', '&gt;', True);
+  StringChangeEx(Result, '"', '&quot;', True);
+  StringChangeEx(Result, '''', '&apos;', True);
+end;
+
+function RenderStartupTaskXml(TaskXmlPath: String): Boolean;
+var
+  Lines: TArrayOfString;
+  I: Integer;
+  LauncherReplacementCount: Integer;
+  WorkingDirectoryReplacementCount: Integer;
+begin
+  Result := False;
+  if not LoadStringsFromFile(TaskXmlPath, Lines) then
+  begin
+    Log('Failed to load startup task XML template: ' + TaskXmlPath);
+    Exit;
+  end;
+
+  LauncherReplacementCount := 0;
+  WorkingDirectoryReplacementCount := 0;
+  for I := 0 to GetArrayLength(Lines) - 1 do
+  begin
+    LauncherReplacementCount := LauncherReplacementCount + StringChangeEx(
+      Lines[I],
+      'PATH_TO_LAUNCHER',
+      XmlEscape(ExpandConstant('{app}\launcher.exe')),
+      True
+    );
+    WorkingDirectoryReplacementCount := WorkingDirectoryReplacementCount + StringChangeEx(
+      Lines[I],
+      'PATH_TO_WORKING_DIRECTORY',
+      XmlEscape(ExpandConstant('{app}')),
+      True
+    );
+  end;
+
+  if (LauncherReplacementCount <> 1) or (WorkingDirectoryReplacementCount <> 1) then
+  begin
+    Log(
+      'Startup task XML placeholder count is invalid. launcher=' +
+      IntToStr(LauncherReplacementCount) + ', workingDirectory=' +
+      IntToStr(WorkingDirectoryReplacementCount)
+    );
+    Exit;
+  end;
+
+  if not SaveStringsToUTF8FileWithoutBOM(TaskXmlPath, Lines, False) then
+  begin
+    Log('Failed to save UTF-8 startup task XML: ' + TaskXmlPath);
+    Exit;
+  end;
+
+  Result := True;
+end;
+
+procedure GrantAppContainerReadExecute(FilePath: String);
+var
+  ResultCode: Integer;
+begin
+  if not Exec(
+    ExpandConstant('{sys}\icacls.exe'),
+    '"' + FilePath + '" /grant "*S-1-15-2-1:(RX)"',
+    ExpandConstant('{app}'),
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  ) then
+  begin
+    MigrationNeedsRestart := False;
+    SetupFailureExitCode := PostInstallFailureExitCode;
+    RaiseException('AppContainer 用の読み取り権限を設定できませんでした: ' + FilePath);
+  end;
+
+  if ResultCode <> 0 then
+  begin
+    MigrationNeedsRestart := False;
+    SetupFailureExitCode := PostInstallFailureExitCode;
+    RaiseException(
+      'AppContainer 用の読み取り権限設定に失敗しました。終了コード: ' +
+      IntToStr(ResultCode) + ' (' + FilePath + ')'
+    );
+  end;
+end;
+
+procedure ConfigureStartupTask();
+var
+  TaskXmlPath: String;
+  CreateParameters: String;
+  RunParameters: String;
+  ResultCode: Integer;
+begin
+  TaskXmlPath := ExpandConstant('{app}\.azookey-startup-task.xml');
+  ResultCode := -1;
+  if not RenderStartupTaskXml(TaskXmlPath) then
+  begin
+    DeleteFile(TaskXmlPath);
+    if not CleanupStartupTaskAfterFailure() then
+    begin
+      MigrationNeedsRestart := False;
+      SetupFailureExitCode := PostInstallFailureExitCode;
+      RaiseException(
+        '起動タスク定義の生成に失敗し、起動タスクの安全な後始末にも失敗しました。インストーラーのログを確認してください。'
+      );
+    end;
+    MigrationNeedsRestart := False;
+    SetupFailureExitCode := PostInstallFailureExitCode;
+    RaiseException('Azookey 起動タスクの定義ファイルを安全に生成できませんでした。');
+  end;
+
+  CreateParameters := '/Create /F /TN "' + StartupTaskName + '" /XML "' + TaskXmlPath + '"';
+  if CmdLineContains(TaskCreateFailureTestParam) then
+  begin
+    Log('Injecting startup task creation failure for installer verification.');
+    CreateParameters := CreateParameters + ' /AZOOKEY_INVALID_PARAMETER';
+  end;
+
+  if (not Exec(
+    ExpandConstant('{sys}\schtasks.exe'),
+    CreateParameters,
+    ExpandConstant('{app}'),
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  )) or (ResultCode <> 0) then
+  begin
+    Log('Startup task creation failed. schtasks exit code: ' + IntToStr(ResultCode));
+    DeleteFile(TaskXmlPath);
+    if not CleanupStartupTaskAfterFailure() then
+    begin
+      MigrationNeedsRestart := False;
+      SetupFailureExitCode := PostInstallFailureExitCode;
+      RaiseException(
+        '起動タスクの作成に失敗し、部分的な起動タスクの安全な後始末にも失敗しました。インストーラーのログを確認してください。'
+      );
+    end;
+    MigrationNeedsRestart := False;
+    SetupFailureExitCode := PostInstallFailureExitCode;
+    RaiseException(
+      'Azookey 起動タスクの作成に失敗しました。終了コード: ' + IntToStr(ResultCode)
+    );
+  end;
+
+  RunParameters := '/Run /TN "' + StartupTaskName + '"';
+  if CmdLineContains(TaskRunFailureTestParam) then
+  begin
+    Log('Injecting startup task run failure after successful creation for installer verification.');
+    RunParameters := RunParameters + ' /AZOOKEY_INVALID_PARAMETER';
+  end;
+
+  if (not Exec(
+    ExpandConstant('{sys}\schtasks.exe'),
+    RunParameters,
+    ExpandConstant('{app}'),
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  )) or (ResultCode <> 0) then
+  begin
+    Log('Startup task run failed. schtasks exit code: ' + IntToStr(ResultCode));
+    DeleteFile(TaskXmlPath);
+    if not CleanupStartupTaskAfterFailure() then
+    begin
+      MigrationNeedsRestart := False;
+      SetupFailureExitCode := PostInstallFailureExitCode;
+      RaiseException(
+        '起動タスクの開始に失敗し、起動タスクの安全な後始末にも失敗しました。インストーラーのログを確認してください。'
+      );
+    end;
+    MigrationNeedsRestart := False;
+    SetupFailureExitCode := PostInstallFailureExitCode;
+    RaiseException(
+      'Azookey 起動タスクを開始できませんでした。終了コード: ' + IntToStr(ResultCode)
+    );
+  end;
+
+  DeleteFile(TaskXmlPath);
+  Log('Startup task was created and started successfully.');
+end;
+
+procedure ConfigureInstalledPayload();
+begin
+  GrantAppContainerReadExecute(ExpandConstant('{app}\azookey.dll'));
+  GrantAppContainerReadExecute(ExpandConstant('{app}\azookey32.dll'));
+  ConfigureStartupTask();
+end;
+
+procedure DeleteStartupTaskBeforeUninstall();
+begin
+  StopAzookeyProcesses();
+  if not DeleteStartupTask() then
+  begin
+    RaiseException(
+      'Azookey 起動タスクを削除できないため、ファイルを残したままアンインストールを中止しました。'
+    );
   end;
 end;
 
@@ -386,9 +1506,16 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
+    ConfigureInstalledPayload();
     WriteInstallMetadata();
-    CreateVbsFile();
-    UpdateTaskXml();
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    DeleteStartupTaskBeforeUninstall();
   end;
 end;
 

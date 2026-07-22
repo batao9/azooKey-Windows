@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use azookey_server::TonicNamedPipeServer;
 use tonic::{transport::Server, Request, Response, Status};
 use tonic_reflection::server::Builder as ReflectionBuilder;
@@ -14,10 +16,10 @@ use shared::AppConfig;
 use std::{
     backtrace::Backtrace,
     collections::HashSet,
-    ffi::{c_char, c_int, CStr, CString},
+    ffi::{c_char, c_int, CStr, CString, OsStr},
     fs::{self, File, OpenOptions},
     io::{BufWriter, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         mpsc, OnceLock,
@@ -661,19 +663,23 @@ fn now_timestamp_millis() -> u128 {
 }
 
 fn resolve_log_path(file_name: &str) -> PathBuf {
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        PathBuf::from(appdata)
-            .join("Azookey")
-            .join("logs")
-            .join(file_name)
-    } else {
-        std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("logs")
-            .join(file_name)
-    }
+    resolve_log_path_from_roots(
+        std::env::var_os("APPDATA").as_deref(),
+        &std::env::temp_dir(),
+        file_name,
+    )
+}
+
+fn resolve_log_path_from_roots(
+    app_data: Option<&OsStr>,
+    temporary_directory: &Path,
+    file_name: &str,
+) -> PathBuf {
+    let root = app_data
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| temporary_directory.to_path_buf());
+    root.join("Azookey").join("logs").join(file_name)
 }
 
 fn configure_server_logging(config: &AppConfig) -> Option<LogPaths> {
@@ -1788,6 +1794,7 @@ impl AzookeyService for MyAzookeyService {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    shared::enable_redirection_guard().map_err(std::io::Error::other)?;
     install_panic_hook();
     let log_paths = reload_server_logging_from_settings();
     if let Some(trace) = preserve_crash_trace_if_incomplete(
@@ -1926,4 +1933,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::resolve_log_path_from_roots;
+    use std::{ffi::OsStr, path::Path};
+
+    #[test]
+    fn server_logs_use_app_data() {
+        let path = resolve_log_path_from_roots(
+            Some(OsStr::new("/users/test/roaming")),
+            Path::new("/users/test/temp"),
+            "server.log",
+        );
+
+        assert_eq!(
+            path,
+            Path::new("/users/test/roaming/Azookey/logs/server.log")
+        );
+    }
+
+    #[test]
+    fn server_logs_fall_back_to_temp_instead_of_install_directory() {
+        let install_directory = Path::new("/program-files/Azookey");
+        let path = resolve_log_path_from_roots(
+            Some(OsStr::new("")),
+            Path::new("/users/test/temp"),
+            "server.log",
+        );
+
+        assert_eq!(path, Path::new("/users/test/temp/Azookey/logs/server.log"));
+        assert!(!path.starts_with(install_directory));
+    }
 }

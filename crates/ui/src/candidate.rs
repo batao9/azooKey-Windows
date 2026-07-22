@@ -11,7 +11,7 @@ use windows::Win32::{
         WS_POPUP,
     },
 };
-use wry::WebViewBuilder;
+use wry::{WebContext, WebViewBuilder};
 
 use crate::UserEvent;
 
@@ -44,7 +44,7 @@ pub fn create_candidate_window(event_loop: &EventLoop<UserEvent>) -> Result<Wind
     Ok(window)
 }
 
-pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
+pub fn create_candidate_webview<'a>(web_context: &'a mut WebContext) -> Result<WebViewBuilder<'a>> {
     let html = r##"
         <html>
             <head>
@@ -433,7 +433,9 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
         </html>"##
         .replace("__CANDIDATE_SCROLLER_SCRIPT__", CANDIDATE_SCROLLER_SCRIPT);
 
-    let webview_builder = WebViewBuilder::new().with_transparent(true).with_html(html);
+    let webview_builder = WebViewBuilder::with_web_context(web_context)
+        .with_transparent(true)
+        .with_html(html);
 
     Ok(webview_builder)
 }

@@ -11,7 +11,7 @@ use windows::Win32::{
         WS_POPUP,
     },
 };
-use wry::WebViewBuilder;
+use wry::{WebContext, WebViewBuilder};
 
 use crate::UserEvent;
 
@@ -39,9 +39,11 @@ pub fn create_ruby_window(event_loop: &EventLoop<UserEvent>) -> Result<Window> {
     Ok(window)
 }
 
-pub fn create_ruby_webview<'a>() -> Result<WebViewBuilder<'a>> {
-    let webview_builder = WebViewBuilder::new().with_transparent(true).with_html(
-        r##"
+pub fn create_ruby_webview<'a>(web_context: &'a mut WebContext) -> Result<WebViewBuilder<'a>> {
+    let webview_builder = WebViewBuilder::with_web_context(web_context)
+        .with_transparent(true)
+        .with_html(
+            r##"
         <html>
             <head>
                 <style>
@@ -231,7 +233,7 @@ pub fn create_ruby_webview<'a>() -> Result<WebViewBuilder<'a>> {
                 </main>
             </body>
         </html>"##,
-    );
+        );
 
     Ok(webview_builder)
 }

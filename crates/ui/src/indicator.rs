@@ -12,7 +12,7 @@ use windows::Win32::{
         WS_POPUP,
     },
 };
-use wry::{WebView, WebViewBuilder};
+use wry::{WebContext, WebView, WebViewBuilder};
 
 use crate::UserEvent;
 
@@ -45,8 +45,8 @@ pub fn create_indicator_window(event_loop: &EventLoop<UserEvent>) -> Result<Wind
     Ok(window)
 }
 
-pub fn create_indicator_webview(window: &Window) -> Result<WebView> {
-    let webview = WebViewBuilder::new()
+pub fn create_indicator_webview(window: &Window, web_context: &mut WebContext) -> Result<WebView> {
+    let webview = WebViewBuilder::with_web_context(web_context)
         .with_transparent(true)
         .with_html(
             r##"

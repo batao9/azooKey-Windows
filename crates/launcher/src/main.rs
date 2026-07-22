@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use shared::{zenzai_cpu_backend_supported, AppConfig};
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -41,6 +43,7 @@ const LAUNCHER_CRASH_TRACE_FILE_NAME: &str = "launcher-crash-trace.json";
 const LAUNCHER_PREVIOUS_CRASH_TRACE_FILE_NAME: &str = "launcher-crash-trace.previous.json";
 
 fn main() -> anyhow::Result<()> {
+    shared::enable_redirection_guard().map_err(anyhow::Error::msg)?;
     let cpu_backend_supported = zenzai_cpu_backend_supported();
     env::set_var(
         "AZOOKEY_ZENZAI_CPU_SUPPORTED",
@@ -132,7 +135,7 @@ fn start_server_process(install_dir: &Path, cpu_backend_supported: bool) -> anyh
         eprintln!("[launcher] CPU backend requires AVX support. Zenzai will fall back to standard conversion.");
     }
 
-    let mut command = process_command_with_backend(install_dir, "azookey-server.exe", &config);
+    let mut command = process_command_with_backend(install_dir, "azookey-server.exe", &config)?;
     command.env(
         "AZOOKEY_ZENZAI_CPU_SUPPORTED",
         if cpu_backend_supported { "1" } else { "0" },
@@ -178,26 +181,33 @@ fn start_server_process(install_dir: &Path, cpu_backend_supported: bool) -> anyh
 
 fn start_ui_process(install_dir: &Path) -> anyhow::Result<Child> {
     let config = load_config();
-    let command = process_command_with_backend(install_dir, "ui.exe", &config);
+    let command = process_command_with_backend(install_dir, "ui.exe", &config)?;
     spawn_process(command, "ui.exe", "[ui]")
 }
 
-fn process_command_with_backend(install_dir: &Path, exe: &str, config: &AppConfig) -> Command {
+fn process_command_with_backend(
+    install_dir: &Path,
+    exe: &str,
+    config: &AppConfig,
+) -> anyhow::Result<Command> {
     let backend_path = install_dir.join(backend_dir(config));
-    let mut command = process_command(install_dir, exe);
+    let mut command = process_command(install_dir, exe)?;
     command.env("PATH", prepend_to_path(&backend_path));
-    command
+    Ok(command)
 }
 
-fn process_command(install_dir: &Path, exe: &str) -> Command {
+fn process_command(install_dir: &Path, exe: &str) -> anyhow::Result<Command> {
     let exe_path = install_dir.join(exe);
-    let mut command = if exe_path.is_file() {
-        Command::new(&exe_path)
-    } else {
-        Command::new(exe)
-    };
+    if !exe_path.is_file() {
+        anyhow::bail!(
+            "Refusing to launch {exe} outside the protected install directory; expected file is missing: {}",
+            exe_path.display()
+        );
+    }
+
+    let mut command = Command::new(&exe_path);
     command.current_dir(install_dir);
-    command
+    Ok(command)
 }
 
 fn resolve_log_path(file_name: &str) -> Option<std::path::PathBuf> {
@@ -638,7 +648,7 @@ unsafe impl Sync for UnsafeSecurityAttributes {}
 #[cfg(test)]
 mod tests {
     use super::{
-        launcher_pipe_sddl, launcher_response, parse_launcher_command,
+        launcher_pipe_sddl, launcher_response, parse_launcher_command, process_command,
         restart_delay_after_server_exit, LauncherCommandKind, SERVER_RESTART_BURST_LIMIT,
         SERVER_RESTART_COOLDOWN, SERVER_RESTART_DELAY,
     };
@@ -679,6 +689,16 @@ mod tests {
         assert!(!sddl.contains(";;;AC)"));
         assert!(!sddl.contains(";;;RC)"));
         assert!(!sddl.contains(";;;LW)"));
+    }
+
+    #[test]
+    fn missing_protected_executable_never_falls_back_to_path() {
+        let install_dir = std::env::temp_dir().join("azookey-missing-protected-executable-test");
+
+        let error = process_command(&install_dir, "ui.exe").unwrap_err();
+
+        assert!(error.to_string().contains("protected install directory"));
+        assert!(error.to_string().contains("ui.exe"));
     }
 
     #[test]
