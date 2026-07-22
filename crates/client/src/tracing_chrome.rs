@@ -15,7 +15,7 @@ use std::{
     fs::File,
     io::{Seek, Write},
     marker::PhantomData,
-    sync::{mpsc::Sender, Arc, Mutex},
+    sync::{Arc, Mutex},
 };
 
 type NameFn<S> = Box<dyn Fn(&EventOrSpan<'_, '_, S>) -> String + Send + Sync>;
@@ -116,32 +116,10 @@ where
     }
 
     /// Set the file to which to output the trace.
-    ///
-    /// Defaults to `./trace-{unix epoch in micros}.json`.
-    ///
-    /// # Panics
-    ///
-    /// If `file` could not be opened/created. To handle errors,
-    /// open a file and pass it to [`writer`](crate::ChromeLayerBuilder::writer) instead.
     pub fn file(mut self, file: File) -> Self {
         self.out_writer = Some(file);
         self
     }
-
-    /// Supply an arbitrary writer to which to write trace contents.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use tracing_chrome::ChromeLayerBuilder;
-    /// # use tracing_subscriber::prelude::*;
-    /// let (layer, guard) = ChromeLayerBuilder::new().writer(std::io::sink()).build();
-    /// # tracing_subscriber::registry().with(layer).init();
-    /// ```
-    // pub fn writer<W: Write + Send + 'static>(mut self, writer: W) -> Self {
-    //     self.out_writer = Some();
-    //     self
-    // }
 
     /// Include arguments in each trace entry.
     ///
@@ -170,25 +148,9 @@ where
         self
     }
 
-    pub fn build(self) -> (ChromeLayer<S>, Sender<bool>) {
+    pub fn build(self) -> ChromeLayer<S> {
         let writer = self.out_writer.unwrap();
-        let writer_rc = Mutex::new(Arc::new(writer.try_clone().unwrap()));
-
-        let (sender, receiver) = std::sync::mpsc::channel();
-
-        std::thread::spawn(move || {
-            while let Ok(_) = receiver.recv() {
-                let writer = writer_rc.lock().unwrap();
-                let trace = ChromeTrace::new();
-                trace
-                    .write_entries(&mut writer.try_clone().unwrap())
-                    .unwrap();
-
-                break;
-            }
-        });
-
-        let layer = ChromeLayer {
+        ChromeLayer {
             writer: Mutex::new(writer),
             trace: ChromeTrace::new(),
             start: std::time::Instant::now(),
@@ -197,9 +159,7 @@ where
             include_args: self.include_args,
             include_locations: self.include_locations,
             _inner: PhantomData,
-        };
-
-        (layer, sender)
+        }
     }
 }
 

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::{
     engine::{composition::CapsLockKeyboardLayout, state::IMEState},
     globals::{DllModule, GUID_DISPLAY_ATTRIBUTE, GUID_PRESERVED_KEY_EISU_CAPSLOCK_ANY_MODIFIER},
+    trace,
 };
 
 use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
@@ -26,6 +27,10 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     #[tracing::instrument]
     fn Activate(&self, ptim: Option<&ITfThreadMgr>, tid: u32) -> Result<()> {
+        // Logger setup may allocate and touch the file system, so it must run
+        // after DllMain has returned. Initialization failure is intentionally
+        // contained and must not prevent the text service from activating.
+        trace::initialize_logger();
         tracing::debug!("Activated with tid: {tid}");
 
         // add reference to the dll instance to prevent it from being unloaded
