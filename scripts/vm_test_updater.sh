@@ -443,11 +443,15 @@ function Invoke-ProductionFrontendUpdater {
   $frontendPath = Join-Path $installLocation "frontend.exe"
   $markerPath = Join-Path $installLocation ".azookey-updater-integration-test"
   $resultPath = Join-Path $env:APPDATA "Azookey\update-result.json"
-  $resultRegistryPath = "HKCU:\Software\Azookey"
+  $launchingUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $resultRegistryPath = "Registry::HKEY_USERS\$launchingUserSid\Software\Azookey"
   $resultRegistryName = "UpdateResultJson"
+  $requestRegistryPath = "HKCU:\Software\Azookey"
+  $requestRegistryName = "PendingUpdateRequestId"
   Set-Content -LiteralPath $markerPath -Encoding ASCII -Value "VM-only protected updater integration marker"
   Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
   Remove-ItemProperty -LiteralPath $resultRegistryPath -Name $resultRegistryName -ErrorAction SilentlyContinue
+  Remove-ItemProperty -LiteralPath $requestRegistryPath -Name $requestRegistryName -ErrorAction SilentlyContinue
 
   $previousReleaseApiUrl = $env:AZOOKEY_UPDATE_RELEASE_API_URL
   $previousCurrentVersion = $env:AZOOKEY_UPDATE_CURRENT_VERSION
@@ -479,21 +483,27 @@ function Invoke-ProductionFrontendUpdater {
     }
     # The installer deliberately stops frontend.exe after the protected helper
     # has been launched, so this launcher process may be terminated before a
-    # stable exit code is observable. The helper's atomic result file below is
-    # the authoritative completion signal.
+    # stable exit code is observable. The helper's explicit user-hive result
+    # below is the authoritative completion signal.
     Write-Host "production updater launcher exited: exit=$frontendExitCode stderr=$stderr"
 
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    $resultJson = $null
-    while (($null -eq $resultJson) -and ((Get-Date) -lt $deadline)) {
-      $resultJson = Get-OptionalRegistryValue -Path $resultRegistryPath -Name $resultRegistryName
+    $resultEnvelopeJson = $null
+    while (($null -eq $resultEnvelopeJson) -and ((Get-Date) -lt $deadline)) {
+      $resultEnvelopeJson = Get-OptionalRegistryValue -Path $resultRegistryPath -Name $resultRegistryName
       Start-Sleep -Seconds 1
     }
-    if ($null -eq $resultJson) {
+    if ($null -eq $resultEnvelopeJson) {
       throw "Production frontend updater did not publish its protected registry result. launcher_exit=$frontendExitCode stderr=$stderr"
     }
 
-    $result = $resultJson | ConvertFrom-Json
+    $pendingRequestId = Get-OptionalRegistryValue -Path $requestRegistryPath -Name $requestRegistryName
+    $resultEnvelope = $resultEnvelopeJson | ConvertFrom-Json
+    if ([string]::IsNullOrWhiteSpace($pendingRequestId) -or
+        $resultEnvelope.request_id -ne $pendingRequestId) {
+      throw "Explicit launching-user hive result was not bound to its pending request."
+    }
+    $result = $resultEnvelope.result
     if ($result.status -ne "success") {
       throw "Production frontend updater reported failure: $($result | ConvertTo-Json -Compress)"
     }
@@ -504,14 +514,16 @@ function Invoke-ProductionFrontendUpdater {
 
     # A GUI process launched over SSH runs outside the logged-on desktop and
     # cannot reliably initialize WebView2. The Rust one-shot reader is covered
-    # by unit tests; here verify that the protected transport can be removed
-    # and cannot leave a stale success for the next updater run.
+    # by unit tests; here remove the explicit user-hive result and request
+    # after verifying their correlation.
     Remove-ItemProperty -LiteralPath $resultRegistryPath -Name $resultRegistryName -ErrorAction Stop
+    Remove-ItemProperty -LiteralPath $requestRegistryPath -Name $requestRegistryName -ErrorAction Stop
     $remainingResult = Get-OptionalRegistryValue -Path $resultRegistryPath -Name $resultRegistryName
-    if ($null -ne $remainingResult) {
-      throw "Protected updater result could not be removed after verification."
+    $remainingRequest = Get-OptionalRegistryValue -Path $requestRegistryPath -Name $requestRegistryName
+    if (($null -ne $remainingResult) -or ($null -ne $remainingRequest)) {
+      throw "Protected updater result/request could not be removed after verification."
     }
-    Write-Host "protected updater result was removed without leaving stale success state"
+    Write-Host "updater result was published to the explicit launching-user hive and removed without stale state"
   } finally {
     $env:AZOOKEY_UPDATE_RELEASE_API_URL = $previousReleaseApiUrl
     $env:AZOOKEY_UPDATE_CURRENT_VERSION = $previousCurrentVersion
@@ -533,10 +545,14 @@ function Assert-CopiedFrontendCannotElevateHelper {
   Set-Content -LiteralPath (Join-Path $copiedRoot ".azookey-updater-integration-test") -Encoding ASCII -Value "untrusted copied marker"
 
   $resultPath = Join-Path $env:APPDATA "Azookey\update-result.json"
-  $resultRegistryPath = "HKCU:\Software\Azookey"
+  $launchingUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $resultRegistryPath = "Registry::HKEY_USERS\$launchingUserSid\Software\Azookey"
   $resultRegistryName = "UpdateResultJson"
+  $requestRegistryPath = "HKCU:\Software\Azookey"
+  $requestRegistryName = "PendingUpdateRequestId"
   Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
   Remove-ItemProperty -LiteralPath $resultRegistryPath -Name $resultRegistryName -ErrorAction SilentlyContinue
+  Remove-ItemProperty -LiteralPath $requestRegistryPath -Name $requestRegistryName -ErrorAction SilentlyContinue
   $previousReleaseApiUrl = $env:AZOOKEY_UPDATE_RELEASE_API_URL
   $previousCurrentVersion = $env:AZOOKEY_UPDATE_CURRENT_VERSION
   try {
@@ -567,7 +583,8 @@ function Assert-CopiedFrontendCannotElevateHelper {
       throw "Copied frontend failed for an unexpected reason: exit=$($frontend.ExitCode) stderr=$stderr"
     }
     if ((Test-Path -LiteralPath $resultPath) -or
-        ($null -ne (Get-OptionalRegistryValue -Path $resultRegistryPath -Name $resultRegistryName))) {
+        ($null -ne (Get-OptionalRegistryValue -Path $resultRegistryPath -Name $resultRegistryName)) -or
+        ($null -ne (Get-OptionalRegistryValue -Path $requestRegistryPath -Name $requestRegistryName))) {
       throw "Copied frontend unexpectedly launched the elevated updater helper."
     }
     Write-Host "copied frontend cannot elevate a helper outside Program Files"

@@ -27,6 +27,7 @@ const PROTECTED_UPDATE_STAGING_DIRECTORY_NAME: &str = ".azookey-updater-staging"
 const UPDATE_RESULT_FILENAME: &str = "update-result.json";
 const UPDATE_RESULT_REGISTRY_KEY: &str = r"Software\Azookey";
 const UPDATE_RESULT_REGISTRY_VALUE: &str = "UpdateResultJson";
+const PENDING_UPDATE_REQUEST_REGISTRY_VALUE: &str = "PendingUpdateRequestId";
 const APP_VERSION_JSON: &str = include_str!("../../../app-version.json");
 
 #[cfg(windows)]
@@ -141,6 +142,18 @@ pub struct UpdateInstallResult {
     pub install_log_path: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+struct ProtectedUpdateResult {
+    request_id: String,
+    result: UpdateInstallResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpdateResultTarget {
+    user_sid: String,
+    request_id: String,
+}
+
 #[derive(Debug)]
 struct ReleaseAssets {
     installer_url: String,
@@ -200,15 +213,19 @@ async fn download_and_launch_update_impl(silent_installer: bool) -> Result<Updat
     let launch_result = (|| -> Result<(PathBuf, PathBuf)> {
         let result_path = update_result_path()?;
         let install_log_path = staging_dir.join("azookey-update-install.log");
-        delete_protected_update_result()?;
         delete_legacy_update_result(&result_path)?;
-        launch_installer_helper(
+        let result_target = prepare_update_result_target()?;
+        if let Err(error) = launch_installer_helper(
             &installer_path,
             &expected_hash,
             &result_path,
             &install_log_path,
             silent_installer,
-        )?;
+            &result_target,
+        ) {
+            let _ = clear_protected_update_result();
+            return Err(error);
+        }
         Ok((result_path, install_log_path))
     })();
     let (result_path, install_log_path) = match launch_result {
@@ -230,9 +247,10 @@ async fn download_and_launch_update_impl(silent_installer: bool) -> Result<Updat
 
 pub fn take_update_install_result() -> Result<Option<UpdateInstallResult>> {
     let path = update_result_path()?;
-    // The elevated helper writes the current result to HKCU. Prefer it over the
-    // pre-#129 AppData file so a stale or malformed legacy file cannot shadow a
-    // completed update forever.
+    // The elevated helper writes the current result to the launching user's
+    // explicit HKEY_USERS hive, rather than its own HKCU. The request id stored
+    // by that user before elevation prevents a stale helper from publishing to
+    // a newer update request. Prefer it over the pre-#129 AppData file.
     let Some((data, from_legacy_file)) =
         select_update_result_data(read_protected_update_result()?, &path)?
     else {
@@ -244,7 +262,7 @@ pub fn take_update_install_result() -> Result<Option<UpdateInstallResult>> {
     if from_legacy_file {
         delete_legacy_update_result(&path)?;
     } else {
-        delete_protected_update_result()?;
+        clear_protected_update_result()?;
         // Best-effort cleanup of a stale pre-#129 result. It must never prevent
         // consuming the authenticated current result from the registry.
         let _ = delete_legacy_update_result(&path);
@@ -524,6 +542,116 @@ fn update_result_path() -> Result<PathBuf> {
     Ok(dir.join(UPDATE_RESULT_FILENAME))
 }
 
+fn new_update_request_id() -> Result<String> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before UNIX epoch")?
+        .as_nanos();
+    Ok(format!("{:x}-{:x}", std::process::id(), nonce))
+}
+
+fn is_supported_user_sid(value: &str) -> bool {
+    let Some(rest) = value
+        .strip_prefix("S-1-5-21-")
+        .or_else(|| value.strip_prefix("S-1-12-1-"))
+    else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-')
+        && rest.split('-').all(|part| !part.is_empty())
+}
+
+fn is_update_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 96
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+}
+
+#[cfg(windows)]
+fn current_user_sid_string() -> Result<String> {
+    use windows::{
+        core::PWSTR,
+        Win32::{
+            Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL},
+            Security::{
+                Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser, TOKEN_QUERY,
+                TOKEN_USER,
+            },
+            System::Threading::{GetCurrentProcess, OpenProcessToken},
+        },
+    };
+
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+            .context("failed to open updater process token")?;
+        let result = (|| -> Result<String> {
+            let mut token_info_length = 0;
+            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut token_info_length);
+            if token_info_length == 0 {
+                return Err(anyhow!("failed to get updater user SID size"));
+            }
+
+            let mut token_info = vec![0_u8; token_info_length as usize];
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(token_info.as_mut_ptr().cast()),
+                token_info_length,
+                &mut token_info_length,
+            )
+            .context("failed to get updater user SID")?;
+            let token_user = &*(token_info.as_ptr() as *const TOKEN_USER);
+            let mut sid_string = PWSTR::null();
+            ConvertSidToStringSidW(token_user.User.Sid, &mut sid_string)
+                .context("failed to convert updater user SID")?;
+            let result = sid_string
+                .to_string()
+                .context("failed to decode updater user SID");
+            let _ = LocalFree(HLOCAL(sid_string.as_ptr().cast()));
+            result
+        })();
+        let _ = CloseHandle(token);
+        result
+    }
+}
+
+#[cfg(not(windows))]
+fn current_user_sid_string() -> Result<String> {
+    Ok("S-1-5-21-0".to_string())
+}
+
+#[cfg(windows)]
+fn prepare_update_result_target() -> Result<UpdateResultTarget> {
+    let user_sid = current_user_sid_string()?;
+    if !is_supported_user_sid(&user_sid) {
+        return Err(anyhow!("unsupported updater user SID: {user_sid}"));
+    }
+    let request_id = new_update_request_id()?;
+    let key = windows_registry::CURRENT_USER
+        .create(UPDATE_RESULT_REGISTRY_KEY)
+        .context("failed to create updater request registry key")?;
+    key.set_string(PENDING_UPDATE_REQUEST_REGISTRY_VALUE, &request_id)
+        .context("failed to write updater request id")?;
+    Ok(UpdateResultTarget {
+        user_sid,
+        request_id,
+    })
+}
+
+#[cfg(not(windows))]
+fn prepare_update_result_target() -> Result<UpdateResultTarget> {
+    Ok(UpdateResultTarget {
+        user_sid: current_user_sid_string()?,
+        request_id: new_update_request_id()?,
+    })
+}
+
 fn delete_legacy_update_result(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
@@ -569,6 +697,7 @@ fn launch_installer_helper(
     result_path: &Path,
     install_log_path: &Path,
     silent_installer: bool,
+    result_target: &UpdateResultTarget,
 ) -> Result<()> {
     use std::{ffi::OsStr, mem::size_of, os::windows::ffi::OsStrExt};
     use windows::{
@@ -601,11 +730,13 @@ fn launch_installer_helper(
         Ok(format!("\"{value}\""))
     };
     let mut parameters = format!(
-        "--azookey-apply-update --installer-path {} --expected-sha256 {} --result-path {} --install-log-path {}",
+        "--azookey-apply-update --installer-path {} --expected-sha256 {} --result-path {} --install-log-path {} --result-user-sid {} --result-request-id {}",
         quoted(installer_path.as_os_str())?,
         expected_hash,
         quoted(result_path.as_os_str())?,
-        quoted(install_log_path.as_os_str())?
+        quoted(install_log_path.as_os_str())?,
+        result_target.user_sid,
+        result_target.request_id,
     );
     if silent_installer {
         parameters.push_str(" --silent");
@@ -655,6 +786,7 @@ fn launch_installer_helper(
     result_path: &Path,
     install_log_path: &Path,
     silent_installer: bool,
+    result_target: &UpdateResultTarget,
 ) -> Result<()> {
     let executable = env::current_exe().context("failed to resolve updater executable")?;
     let install_dir = executable
@@ -671,7 +803,11 @@ fn launch_installer_helper(
         .arg("--result-path")
         .arg(result_path)
         .arg("--install-log-path")
-        .arg(install_log_path);
+        .arg(install_log_path)
+        .arg("--result-user-sid")
+        .arg(&result_target.user_sid)
+        .arg("--result-request-id")
+        .arg(&result_target.request_id);
     if silent_installer {
         command.arg("--silent");
     }
@@ -687,6 +823,7 @@ struct InstallerHelperArgs {
     expected_sha256: String,
     result_path: PathBuf,
     install_log_path: PathBuf,
+    result_target: UpdateResultTarget,
     silent: bool,
 }
 
@@ -703,6 +840,8 @@ fn parse_installer_helper_args(
     let mut expected_sha256 = None;
     let mut result_path = None;
     let mut install_log_path = None;
+    let mut result_user_sid = None;
+    let mut result_request_id = None;
     let mut silent = false;
 
     while let Some(option) = args.next() {
@@ -729,6 +868,20 @@ fn parse_installer_helper_args(
                     "--install-log-path",
                 )?));
             }
+            "--result-user-sid" => {
+                result_user_sid = Some(
+                    next_helper_arg(&mut args, "--result-user-sid")?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            "--result-request-id" => {
+                result_request_id = Some(
+                    next_helper_arg(&mut args, "--result-request-id")?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
             "--silent" => silent = true,
             unexpected => return Err(anyhow!("unexpected updater helper option: {unexpected}")),
         }
@@ -737,11 +890,21 @@ fn parse_installer_helper_args(
     let expected_sha256 = expected_sha256
         .filter(|value| is_sha256(value))
         .ok_or_else(|| anyhow!("missing or invalid expected installer SHA-256"))?;
+    let user_sid = result_user_sid
+        .filter(|value| is_supported_user_sid(value))
+        .ok_or_else(|| anyhow!("missing or invalid updater result user SID"))?;
+    let request_id = result_request_id
+        .filter(|value| is_update_request_id(value))
+        .ok_or_else(|| anyhow!("missing or invalid updater result request id"))?;
     Ok(InstallerHelperArgs {
         installer_path: installer_path.ok_or_else(|| anyhow!("missing installer path"))?,
         expected_sha256,
         result_path: result_path.ok_or_else(|| anyhow!("missing result path"))?,
         install_log_path: install_log_path.ok_or_else(|| anyhow!("missing install log path"))?,
+        result_target: UpdateResultTarget {
+            user_sid,
+            request_id,
+        },
         silent,
     })
 }
@@ -774,7 +937,11 @@ fn completed_at_string() -> String {
 }
 
 #[cfg(not(windows))]
-fn write_update_result(path: &Path, result: &UpdateInstallResult) -> Result<()> {
+fn write_update_result(
+    path: &Path,
+    result: &UpdateInstallResult,
+    _target: &UpdateResultTarget,
+) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("update result path has no parent"))?;
@@ -794,26 +961,48 @@ fn write_update_result(path: &Path, result: &UpdateInstallResult) -> Result<()> 
 }
 
 #[cfg(windows)]
-fn write_update_result(_path: &Path, result: &UpdateInstallResult) -> Result<()> {
-    let data = serde_json::to_string_pretty(result).context("failed to serialize update result")?;
-    let key = windows_registry::CURRENT_USER
-        .create(UPDATE_RESULT_REGISTRY_KEY)
-        .context("failed to create updater result registry key")?;
+fn write_update_result(
+    _path: &Path,
+    result: &UpdateInstallResult,
+    target: &UpdateResultTarget,
+) -> Result<()> {
+    let registry_path = user_update_result_registry_path(&target.user_sid)?;
+    let envelope = ProtectedUpdateResult {
+        request_id: target.request_id.clone(),
+        result: result.clone(),
+    };
+    let data = serde_json::to_string_pretty(&envelope)
+        .context("failed to serialize protected update result")?;
+    let key = windows_registry::USERS
+        .create(&registry_path)
+        .context("failed to open launching user updater result registry key")?;
+    let pending_request = key
+        .get_string(PENDING_UPDATE_REQUEST_REGISTRY_VALUE)
+        .context("launching user has no pending updater request")?;
+    if pending_request != target.request_id {
+        return Err(anyhow!(
+            "launching user's pending updater request does not match helper request"
+        ));
+    }
     key.set_string(UPDATE_RESULT_REGISTRY_VALUE, &data)
-        .context("failed to write updater result registry value")?;
+        .context("failed to write launching user updater result registry value")?;
     Ok(())
 }
 
 #[cfg(windows)]
 fn read_protected_update_result() -> Result<Option<String>> {
+    let Some(request_id) = read_pending_update_request()? else {
+        return Ok(None);
+    };
     let key = match windows_registry::CURRENT_USER.open(UPDATE_RESULT_REGISTRY_KEY) {
         Ok(key) => key,
         Err(_) => return Ok(None),
     };
-    match key.get_string(UPDATE_RESULT_REGISTRY_VALUE) {
-        Ok(value) => Ok(Some(value)),
-        Err(_) => Ok(None),
-    }
+    let data = match key.get_string(UPDATE_RESULT_REGISTRY_VALUE) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    select_protected_update_result(&data, &request_id)
 }
 
 #[cfg(not(windows))]
@@ -821,22 +1010,61 @@ fn read_protected_update_result() -> Result<Option<String>> {
     Ok(None)
 }
 
+fn select_protected_update_result(data: &str, request_id: &str) -> Result<Option<String>> {
+    let envelope: ProtectedUpdateResult = serde_json::from_str(data)
+        .context("failed to parse launching user updater result registry value")?;
+    if envelope.request_id != request_id {
+        return Ok(None);
+    }
+    serde_json::to_string(&envelope.result)
+        .map(Some)
+        .context("failed to serialize selected updater result")
+}
+
 #[cfg(windows)]
-fn delete_protected_update_result() -> Result<()> {
-    // `Key::open` is read-only. Use `create` to obtain KEY_WRITE as well, and
-    // verify absence so a stale success cannot be mistaken for the next run.
+fn read_pending_update_request() -> Result<Option<String>> {
+    let key = match windows_registry::CURRENT_USER.open(UPDATE_RESULT_REGISTRY_KEY) {
+        Ok(key) => key,
+        Err(_) => return Ok(None),
+    };
+    match key.get_string(PENDING_UPDATE_REQUEST_REGISTRY_VALUE) {
+        Ok(value) if is_update_request_id(&value) => Ok(Some(value)),
+        Ok(_) => Err(anyhow!("invalid pending updater request id")),
+        Err(_) => Ok(None),
+    }
+}
+
+#[cfg(not(windows))]
+fn read_pending_update_request() -> Result<Option<String>> {
+    Ok(None)
+}
+
+fn user_update_result_registry_path(user_sid: &str) -> Result<String> {
+    if !is_supported_user_sid(user_sid) {
+        return Err(anyhow!("unsupported updater result user SID: {user_sid}"));
+    }
+    Ok(format!("{user_sid}\\{UPDATE_RESULT_REGISTRY_KEY}"))
+}
+
+#[cfg(windows)]
+fn clear_protected_update_result() -> Result<()> {
     let key = windows_registry::CURRENT_USER
         .create(UPDATE_RESULT_REGISTRY_KEY)
-        .context("failed to open updater result registry key for deletion")?;
+        .context("failed to open updater request registry key for deletion")?;
+    let _ = key.remove_value(PENDING_UPDATE_REQUEST_REGISTRY_VALUE);
     let _ = key.remove_value(UPDATE_RESULT_REGISTRY_VALUE);
-    if key.get_string(UPDATE_RESULT_REGISTRY_VALUE).is_ok() {
-        return Err(anyhow!("failed to remove updater result registry value"));
+    if key
+        .get_string(PENDING_UPDATE_REQUEST_REGISTRY_VALUE)
+        .is_ok()
+        || key.get_string(UPDATE_RESULT_REGISTRY_VALUE).is_ok()
+    {
+        return Err(anyhow!("failed to remove updater result/request values"));
     }
     Ok(())
 }
 
 #[cfg(not(windows))]
-fn delete_protected_update_result() -> Result<()> {
+fn clear_protected_update_result() -> Result<()> {
     Ok(())
 }
 
@@ -1122,7 +1350,7 @@ pub fn run_installer_helper_cli(args: impl IntoIterator<Item = OsString>) -> Res
 
     let args = parse_installer_helper_args(args)?;
     let result = helper_result(&args);
-    write_update_result(&args.result_path, &result)?;
+    write_update_result(&args.result_path, &result, &args.result_target)?;
     if result.status == "success" {
         Ok(())
     } else {
@@ -1372,6 +1600,10 @@ mod tests {
                 r"C:\User Data\update-result.json",
                 "--install-log-path",
                 r"C:\User Data\install.log",
+                "--result-user-sid",
+                "S-1-5-21-100-200-300-400",
+                "--result-request-id",
+                "abc123-def456",
             ]
             .into_iter()
             .map(OsString::from),
@@ -1383,6 +1615,8 @@ mod tests {
             PathBuf::from(r"C:\User Data\azookey-setup.exe")
         );
         assert_eq!(args.expected_sha256, expected_hash);
+        assert_eq!(args.result_target.user_sid, "S-1-5-21-100-200-300-400");
+        assert_eq!(args.result_target.request_id, "abc123-def456");
         assert!(!args.silent);
         assert_eq!(
             args.result_path,
@@ -1403,6 +1637,10 @@ mod tests {
                 "result.json",
                 "--install-log-path",
                 "install.log",
+                "--result-user-sid",
+                "S-1-12-1-100-200-300-400",
+                "--result-request-id",
+                "123abc-456def",
                 "--silent",
             ]
             .into_iter()
@@ -1425,6 +1663,10 @@ mod tests {
                 "result.json",
                 "--install-log-path",
                 "install.log",
+                "--result-user-sid",
+                "S-1-5-21-100-200-300-400",
+                "--result-request-id",
+                "abc123-def456",
             ]
             .into_iter()
             .map(OsString::from),
@@ -1432,6 +1674,45 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("SHA-256"));
+    }
+
+    #[test]
+    fn launching_user_result_path_accepts_only_user_sid_shapes() {
+        assert_eq!(
+            user_update_result_registry_path("S-1-5-21-100-200-300-400").unwrap(),
+            r"S-1-5-21-100-200-300-400\Software\Azookey"
+        );
+        assert!(user_update_result_registry_path(r"S-1-5-21-100\..\Microsoft\Windows").is_err());
+        assert!(user_update_result_registry_path("S-1-5-32-544").is_err());
+    }
+
+    #[test]
+    fn protected_result_must_match_launching_user_request() {
+        let result = UpdateInstallResult {
+            status: "success".to_string(),
+            exit_code: Some(3010),
+            needs_restart: true,
+            message: "updated".to_string(),
+            completed_at: "unix:1".to_string(),
+            installer_path: None,
+            install_log_path: None,
+        };
+        let data = serde_json::to_string(&ProtectedUpdateResult {
+            request_id: "current-request".to_string(),
+            result: result.clone(),
+        })
+        .unwrap();
+
+        let selected = select_protected_update_result(&data, "current-request")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<UpdateInstallResult>(&selected).unwrap(),
+            result
+        );
+        assert!(select_protected_update_result(&data, "stale-request")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
