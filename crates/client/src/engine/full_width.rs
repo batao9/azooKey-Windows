@@ -215,6 +215,7 @@ pub fn to_fullwidth(s: &str, process_alphabet: bool) -> String {
         .collect()
 }
 
+#[cfg(test)]
 pub fn to_fullwidth_with_config(
     s: &str,
     process_alphabet: bool,
@@ -510,8 +511,10 @@ mod tests {
 
     #[test]
     fn basic_setting_applies_before_width_groups() {
-        let mut general = GeneralConfig::default();
-        general.punctuation_style = PunctuationStyle::FullwidthCommaFullwidthPeriod;
+        let general = GeneralConfig {
+            punctuation_style: PunctuationStyle::FullwidthCommaFullwidthPeriod,
+            ..GeneralConfig::default()
+        };
 
         let mut config = default_character_width();
         config.groups.comma_period = WidthMode::Full;
@@ -534,8 +537,10 @@ mod tests {
         let mut config = default_character_width();
         config.groups.comma_period = WidthMode::Half;
 
-        let mut general = GeneralConfig::default();
-        general.punctuation_style = PunctuationStyle::FullwidthCommaFullwidthPeriod;
+        let mut general = GeneralConfig {
+            punctuation_style: PunctuationStyle::FullwidthCommaFullwidthPeriod,
+            ..GeneralConfig::default()
+        };
         assert_eq!(convert_kana_symbol(",.", &general, &config, &[]), ",.");
 
         general.punctuation_style = PunctuationStyle::ToutenFullwidthPeriod;
@@ -547,8 +552,10 @@ mod tests {
 
     #[test]
     fn symbol_style_switches_brackets_and_middle_dot() {
-        let mut general = GeneralConfig::default();
-        general.symbol_style = SymbolStyle::SquareBracketBackslash;
+        let general = GeneralConfig {
+            symbol_style: SymbolStyle::SquareBracketBackslash,
+            ..GeneralConfig::default()
+        };
 
         let output = convert_kana_symbol("[]\\", &general, &default_character_width(), &[]);
         assert_eq!(output, "［］\\");
@@ -556,8 +563,10 @@ mod tests {
 
     #[test]
     fn slash_style_uses_fullwidth_solidus() {
-        let mut general = GeneralConfig::default();
-        general.symbol_style = SymbolStyle::SquareBracketBackslash;
+        let general = GeneralConfig {
+            symbol_style: SymbolStyle::SquareBracketBackslash,
+            ..GeneralConfig::default()
+        };
 
         let output = convert_kana_symbol("/", &general, &default_character_width(), &[]);
         assert_eq!(output, "／");
@@ -565,8 +574,7 @@ mod tests {
 
     #[test]
     fn slash_to_middle_dot_follows_math_symbol_width_group() {
-        let mut general = GeneralConfig::default();
-        general.symbol_style = SymbolStyle::CornerBracketMiddleDot;
+        let general = GeneralConfig::default();
 
         let mut config = default_character_width();
         config.groups.middle_dot_corner_bracket = WidthMode::Half;
@@ -595,8 +603,7 @@ mod tests {
 
     #[test]
     fn backslash_is_not_forced_to_middle_dot_by_basic_setting() {
-        let mut general = GeneralConfig::default();
-        general.symbol_style = SymbolStyle::CornerBracketMiddleDot;
+        let general = GeneralConfig::default();
 
         let mut config = default_character_width();
         config.groups.hash_group = WidthMode::Half;

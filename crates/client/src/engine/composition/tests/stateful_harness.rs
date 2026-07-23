@@ -282,6 +282,7 @@ pub(super) fn baseline_spec_state() -> SimSpecState {
     }
 }
 
+#[allow(dead_code)]
 fn single_clause_spec_state() -> SimSpecState {
     SimSpecState {
         committed_clauses: Vec::new(),
@@ -1229,6 +1230,7 @@ impl ScenarioBackend {
         self.spec.current_index = 0;
     }
 
+    #[allow(dead_code)]
     fn step_spec_selection(&mut self, delta: i32) {
         let Some(current) = self.spec.clauses.get_mut(self.spec.current_index) else {
             return;

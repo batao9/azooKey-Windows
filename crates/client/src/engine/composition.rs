@@ -435,7 +435,7 @@ impl TextServiceFactory {
             return None;
         }
 
-        let mut buffer = vec![0u16; (byte_len as usize + 1) / 2];
+        let mut buffer = vec![0u16; (byte_len as usize).div_ceil(2)];
         let result = unsafe {
             RegGetValueW(
                 root,
@@ -1026,6 +1026,7 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn build_clause_snapshot(
         preview: &str,
         suffix: &str,
@@ -1055,6 +1056,7 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn build_future_clause_snapshot(
         preview: &str,
         suffix: &str,
@@ -1311,10 +1313,7 @@ impl TextServiceFactory {
 
     #[inline]
     fn sanitize_log_field(value: &str) -> String {
-        value
-            .replace('\t', " ")
-            .replace('\r', " ")
-            .replace('\n', " ")
+        value.replace(['\t', '\r', '\n'], " ")
     }
 
     #[inline]
@@ -1441,6 +1440,7 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn log_clause_action_state(
         phase: &str,
         action: &ClientAction,
@@ -1586,6 +1586,7 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn sync_clause_action_ui(
         &self,
         preview: &str,
@@ -1672,6 +1673,7 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn sync_candidate_window_update(
         &self,
         ipc_service: &mut IPCService,
@@ -2036,6 +2038,7 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn push_current_future_clause_snapshot(
         future_clause_snapshots: &mut Vec<FutureClauseSnapshot>,
         preview: &str,
@@ -2565,6 +2568,7 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn restore_future_clause_snapshot(
         preview: &mut String,
         suffix: &mut String,
@@ -4622,7 +4626,7 @@ impl TextServiceFactory {
             let mut raw_input = composition.raw_input.clone();
             let mut raw_hiragana = composition.raw_hiragana.clone();
             let mut fixed_prefix = composition.fixed_prefix.clone();
-            let mut corresponding_count = composition.corresponding_count.clone();
+            let mut corresponding_count = composition.corresponding_count;
             let mut candidates = composition.candidates.clone();
             let mut clause_snapshots = composition.clause_snapshots.clone();
             let mut future_clause_snapshots = composition.future_clause_snapshots.clone();

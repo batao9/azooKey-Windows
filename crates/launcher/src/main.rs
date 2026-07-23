@@ -352,10 +352,8 @@ fn spawn_process(mut command: Command, exe: &str, prefix: &str) -> anyhow::Resul
         let stdout_reader = BufReader::new(stdout);
         let prefix_stdout = prefix.to_string();
         thread::spawn(move || {
-            for line in stdout_reader.lines() {
-                if let Ok(line) = line {
-                    println!("{}: {}", prefix_stdout, line);
-                }
+            for line in stdout_reader.lines().map_while(Result::ok) {
+                println!("{}: {}", prefix_stdout, line);
             }
         });
     }
@@ -364,10 +362,8 @@ fn spawn_process(mut command: Command, exe: &str, prefix: &str) -> anyhow::Resul
         let stderr_reader = BufReader::new(stderr);
         let prefix_stderr = prefix.to_string();
         thread::spawn(move || {
-            for line in stderr_reader.lines() {
-                if let Ok(line) = line {
-                    eprintln!("{}: {}", prefix_stderr, line);
-                }
+            for line in stderr_reader.lines().map_while(Result::ok) {
+                eprintln!("{}: {}", prefix_stderr, line);
             }
         });
     }

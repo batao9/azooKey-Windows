@@ -286,43 +286,48 @@ pub enum WidthMode {
     Full,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PunctuationStyle {
+    #[default]
     ToutenKuten,
     FullwidthCommaFullwidthPeriod,
     ToutenFullwidthPeriod,
     FullwidthCommaKuten,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SymbolStyle {
+    #[default]
     CornerBracketMiddleDot,
     SquareBracketBackslash,
     CornerBracketBackslash,
     SquareBracketMiddleDot,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SpaceInputMode {
+    #[default]
     AlwaysHalf,
     #[serde(alias = "always_full")]
     FollowInputMode,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NumpadInputMode {
+    #[default]
     DirectInput,
     AlwaysHalf,
     FollowInputMode,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LearningMode {
+    #[default]
     Enabled,
     ReadOnly,
     Disabled,
@@ -757,8 +762,10 @@ mod tests {
         let config_root = temp.path().join("Azookey");
         fs::create_dir_all(&config_root).unwrap();
         let config_path = config_root.join(SETTINGS_FILENAME);
-        let mut legacy = AppConfig::default();
-        legacy.version = "0.1.1".to_string();
+        let mut legacy = AppConfig {
+            version: "0.1.1".to_string(),
+            ..AppConfig::default()
+        };
         legacy.general.numpad_input = NumpadInputMode::AlwaysHalf;
         fs::write(&config_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
 
@@ -990,36 +997,6 @@ impl Default for CharacterWidthConfig {
             symbol_fullwidth: default_symbol_fullwidth_map(),
             groups: CharacterWidthGroups::default(),
         }
-    }
-}
-
-impl Default for PunctuationStyle {
-    fn default() -> Self {
-        Self::ToutenKuten
-    }
-}
-
-impl Default for SymbolStyle {
-    fn default() -> Self {
-        Self::CornerBracketMiddleDot
-    }
-}
-
-impl Default for SpaceInputMode {
-    fn default() -> Self {
-        Self::AlwaysHalf
-    }
-}
-
-impl Default for NumpadInputMode {
-    fn default() -> Self {
-        Self::DirectInput
-    }
-}
-
-impl Default for LearningMode {
-    fn default() -> Self {
-        Self::Enabled
     }
 }
 
@@ -1370,5 +1347,5 @@ fn replace_config_file(temp_path: &Path, config_path: &Path) -> io::Result<()> {
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     }
-    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))
+    .map_err(|error| io::Error::other(error.to_string()))
 }

@@ -1094,6 +1094,7 @@ fn ffi_text_result(scope: &str, result: *mut c_char) -> Result<String, String> {
     Ok(result.to_string_lossy())
 }
 
+#[allow(clippy::result_large_err)]
 fn i8_offset_from_i32(scope: &str, raw: i32) -> Result<i8, Status> {
     i8::try_from(raw).map_err(|_| {
         log_event(
@@ -1716,8 +1717,7 @@ impl AzookeyService for MyAzookeyService {
         let context = request.context;
         let trimmed_context = context
             .split('\r')
-            .filter(|s| !s.is_empty())
-            .last()
+            .rfind(|s| !s.is_empty())
             .unwrap_or_default();
         let original_len = context.chars().count();
         let trimmed_len = trimmed_context.chars().count();

@@ -1749,7 +1749,7 @@ impl IPCService {
     pub fn show_window(&mut self) -> anyhow::Result<()> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let result: anyhow::Result<()> = (|| {
+        let result: anyhow::Result<()> = {
             let mut request = tonic::Request::new(shared::proto::EmptyResponse {});
             request.set_timeout(UI_RPC_DEADLINE);
             self.with_window_client("ui_show_window", |runtime, window_client| {
@@ -1760,7 +1760,7 @@ impl IPCService {
                 )?;
                 Ok(())
             })
-        })();
+        };
         self.log_client_performance_from_start(
             performance_start,
             request_id,
@@ -1778,7 +1778,7 @@ impl IPCService {
     pub fn hide_window(&mut self) -> anyhow::Result<()> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let result: anyhow::Result<()> = (|| {
+        let result: anyhow::Result<()> = {
             let mut request = tonic::Request::new(shared::proto::EmptyResponse {});
             request.set_timeout(UI_RPC_DEADLINE);
             self.with_window_client("ui_hide_window", |runtime, window_client| {
@@ -1789,7 +1789,7 @@ impl IPCService {
                 )?;
                 Ok(())
             })
-        })();
+        };
         self.log_client_performance_from_start(
             performance_start,
             request_id,
@@ -1813,7 +1813,7 @@ impl IPCService {
     ) -> anyhow::Result<()> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let result: anyhow::Result<()> = (|| {
+        let result: anyhow::Result<()> = {
             let mut request = tonic::Request::new(shared::proto::SetPositionRequest {
                 position: Some(shared::proto::WindowPosition {
                     top,
@@ -1831,7 +1831,7 @@ impl IPCService {
                 )?;
                 Ok(())
             })
-        })();
+        };
         self.log_client_performance_from_start(
             performance_start,
             request_id,
@@ -1854,7 +1854,7 @@ impl IPCService {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
         let candidate_count = performance_start.map(|_| candidates.len());
-        let result: anyhow::Result<()> = (|| {
+        let result: anyhow::Result<()> = {
             let mut request =
                 tonic::Request::new(shared::proto::SetCandidateRequest { candidates });
             request.set_timeout(UI_RPC_DEADLINE);
@@ -1866,7 +1866,7 @@ impl IPCService {
                 )?;
                 Ok(())
             })
-        })();
+        };
         self.log_client_performance_from_start(
             performance_start,
             request_id,
@@ -1889,7 +1889,7 @@ impl IPCService {
     pub fn set_selection(&mut self, index: i32) -> anyhow::Result<()> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let result: anyhow::Result<()> = (|| {
+        let result: anyhow::Result<()> = {
             let mut request = tonic::Request::new(shared::proto::SetSelectionRequest { index });
             request.set_timeout(UI_RPC_DEADLINE);
             self.with_window_client("ui_set_selection", |runtime, window_client| {
@@ -1900,7 +1900,7 @@ impl IPCService {
                 )?;
                 Ok(())
             })
-        })();
+        };
         self.log_client_performance_from_start(
             performance_start,
             request_id,
@@ -1918,7 +1918,7 @@ impl IPCService {
     pub fn set_input_mode(&mut self, mode: &str) -> anyhow::Result<()> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let result: anyhow::Result<()> = (|| {
+        let result: anyhow::Result<()> = {
             let mut request = tonic::Request::new(shared::proto::SetInputModeRequest {
                 mode: mode.to_string(),
             });
@@ -1931,7 +1931,7 @@ impl IPCService {
                 )?;
                 Ok(())
             })
-        })();
+        };
         self.log_client_performance_from_start(
             performance_start,
             request_id,
@@ -1967,6 +1967,7 @@ impl IPCService {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(candidates))]
     pub(crate) fn update_candidate_window_with_reading(
         &mut self,
@@ -1986,7 +1987,7 @@ impl IPCService {
         let input_mode_present = performance_start.map(|_| input_mode.is_some());
         let reading_present =
             performance_start.map(|_| reading.is_some_and(|value| !value.is_empty()));
-        let result: anyhow::Result<WindowRpcDelivery> = (|| {
+        let result: anyhow::Result<WindowRpcDelivery> = {
             let mut request = tonic::Request::new(shared::proto::UpdateCandidateWindowRequest {
                 visible,
                 position,
@@ -2010,7 +2011,7 @@ impl IPCService {
                     Ok(())
                 },
             )
-        })();
+        };
         self.log_client_performance_from_start(
             performance_start,
             request_id,

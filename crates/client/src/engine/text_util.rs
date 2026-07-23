@@ -119,9 +119,9 @@ static KANA_MAP: LazyLock<HashMap<&'static str, (&'static str, &'static str)>> =
 
 pub fn to_katakana(s: &str) -> String {
     let mut result = String::new();
-    let mut iter = s.chars().peekable();
+    let iter = s.chars().peekable();
 
-    while let Some(c) = iter.next() {
+    for c in iter {
         if let Some(&(katakana, _)) = KANA_MAP.get(&c.to_string().as_str()) {
             result.push_str(katakana);
         } else {
@@ -134,9 +134,9 @@ pub fn to_katakana(s: &str) -> String {
 
 pub fn to_half_katakana(s: &str) -> String {
     let mut result = String::new();
-    let mut iter = s.chars().peekable();
+    let iter = s.chars().peekable();
 
-    while let Some(c) = iter.next() {
+    for c in iter {
         let c = to_halfwidth(&c.to_string()).chars().next().unwrap();
 
         if let Some(&(_, hankaku_katakana)) = KANA_MAP.get(&c.to_string().as_str()) {

@@ -61,43 +61,6 @@ fn is_ctrl_pressed() -> bool {
     VK_CONTROL.is_pressed() || VK_LCONTROL.is_pressed() || VK_RCONTROL.is_pressed()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{Function, UserAction};
-
-    #[test]
-    fn ctrl_shortcut_keys_map_to_conversion_functions() {
-        assert_eq!(
-            Function::from_ctrl_shortcut_key_code(0x55),
-            Some(Function::Six)
-        );
-        assert_eq!(
-            Function::from_ctrl_shortcut_key_code(0x49),
-            Some(Function::Seven)
-        );
-        assert_eq!(
-            Function::from_ctrl_shortcut_key_code(0x4F),
-            Some(Function::Eight)
-        );
-        assert_eq!(
-            Function::from_ctrl_shortcut_key_code(0x50),
-            Some(Function::Nine)
-        );
-        assert_eq!(
-            Function::from_ctrl_shortcut_key_code(0x54),
-            Some(Function::Ten)
-        );
-        assert_eq!(Function::from_ctrl_shortcut_key_code(0x41), None);
-    }
-
-    #[test]
-    fn delete_key_maps_to_delete_action() {
-        let action = UserAction::try_from(0x2E).expect("VK_DELETE should map");
-
-        assert!(matches!(action, UserAction::Delete));
-    }
-}
-
 fn clear_dead_key_state(key_state: &[u8; 256]) {
     let mut unicode = [0u16; 8];
     // Use VK_SPACE to clear dead-key state left by ToUnicode.
@@ -255,5 +218,42 @@ impl TryFrom<usize> for UserAction {
         };
 
         Ok(action)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Function, UserAction};
+
+    #[test]
+    fn ctrl_shortcut_keys_map_to_conversion_functions() {
+        assert_eq!(
+            Function::from_ctrl_shortcut_key_code(0x55),
+            Some(Function::Six)
+        );
+        assert_eq!(
+            Function::from_ctrl_shortcut_key_code(0x49),
+            Some(Function::Seven)
+        );
+        assert_eq!(
+            Function::from_ctrl_shortcut_key_code(0x4F),
+            Some(Function::Eight)
+        );
+        assert_eq!(
+            Function::from_ctrl_shortcut_key_code(0x50),
+            Some(Function::Nine)
+        );
+        assert_eq!(
+            Function::from_ctrl_shortcut_key_code(0x54),
+            Some(Function::Ten)
+        );
+        assert_eq!(Function::from_ctrl_shortcut_key_code(0x41), None);
+    }
+
+    #[test]
+    fn delete_key_maps_to_delete_action() {
+        let action = UserAction::try_from(0x2E).expect("VK_DELETE should map");
+
+        assert!(matches!(action, UserAction::Delete));
     }
 }

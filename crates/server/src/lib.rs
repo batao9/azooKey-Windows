@@ -60,9 +60,7 @@ pub struct TonicNamedPipeServer {
 impl Connected for TonicNamedPipeServer {
     type ConnectInfo = ();
 
-    fn connect_info(&self) -> Self::ConnectInfo {
-        ()
-    }
+    fn connect_info(&self) -> Self::ConnectInfo {}
 }
 
 impl AsyncRead for TonicNamedPipeServer {
@@ -254,27 +252,25 @@ mod tests {
     use windows::{
         core::w,
         Win32::{
-            Foundation::{CloseHandle, LocalFree, BOOL, ERROR_ACCESS_DENIED, HLOCAL},
+            Foundation::{LocalFree, BOOL, ERROR_ACCESS_DENIED, HANDLE, HLOCAL},
             Security::{
                 Authorization::ConvertStringSidToSidW, CheckTokenMembership, PSID,
-                SECURITY_ATTRIBUTES, TOKEN_QUERY,
+                SECURITY_ATTRIBUTES,
             },
-            System::Threading::{GetCurrentProcess, OpenProcessToken},
         },
     };
 
     fn current_token_has_network_sid() -> bool {
         unsafe {
-            let mut token = Default::default();
-            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).unwrap();
-
             let mut network_sid = PSID::default();
             ConvertStringSidToSidW(w!("S-1-5-2"), &mut network_sid).unwrap();
             let mut is_member = BOOL::default();
-            let membership_result = CheckTokenMembership(token, network_sid, &mut is_member);
+            // A null token handle makes Windows evaluate the calling thread's
+            // effective token, duplicating its primary token when necessary.
+            let membership_result =
+                CheckTokenMembership(HANDLE::default(), network_sid, &mut is_member);
 
             let _ = LocalFree(HLOCAL(network_sid.0));
-            let _ = CloseHandle(token);
             membership_result.unwrap();
             is_member.as_bool()
         }
