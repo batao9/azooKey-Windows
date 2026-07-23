@@ -11,7 +11,6 @@ use tracing_subscriber::{
 
 use serde_json::Value as JsonValue;
 use std::{
-    fmt::Write as _,
     fs::File,
     io::{Seek, Write},
     marker::PhantomData,
@@ -128,16 +127,7 @@ where
         self
     }
 
-    /// Supply an arbitrary writer to which to write trace contents.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use tracing_chrome::ChromeLayerBuilder;
-    /// # use tracing_subscriber::prelude::*;
-    /// let (layer, guard) = ChromeLayerBuilder::new().writer(std::io::sink()).build();
-    /// # tracing_subscriber::registry().with(layer).init();
-    /// ```
+    // Supply an arbitrary writer to which to write trace contents.
     // pub fn writer<W: Write + Send + 'static>(mut self, writer: W) -> Self {
     //     self.out_writer = Some();
     //     self
@@ -270,7 +260,7 @@ where
         self.trace.add_entry(entry);
 
         let mut writer = self.writer.lock().unwrap();
-        self.trace.write_entries(&mut *writer)?;
+        self.trace.write_entries(&mut writer)?;
 
         Ok(())
     }
@@ -317,7 +307,7 @@ where
         self.trace.add_entry(entry);
 
         let mut writer = self.writer.lock().unwrap();
-        self.trace.write_entries(&mut *writer)?;
+        self.trace.write_entries(&mut writer)?;
 
         Ok(())
     }
@@ -376,7 +366,7 @@ where
             let mut args = Object::new();
             attrs.record(&mut JsonVisitor { object: &mut args });
             if let Some(span) = ctx.span(id) {
-                let _result = span.extensions_mut().insert(ArgsWrapper {
+                span.extensions_mut().insert(ArgsWrapper {
                     args: Arc::new(args),
                 });
             }
@@ -399,19 +389,6 @@ impl<'a> Visit for JsonVisitor<'a> {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         self.object
             .insert(field.name().to_owned(), format!("{value:?}").into());
-    }
-}
-
-pub struct StringVisitor<'a> {
-    string: &'a mut String,
-}
-
-impl<'a> Visit for StringVisitor<'a> {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        // do nothing
-        if field.name() == "message" {
-            write!(self.string, "{:?}", value).unwrap();
-        }
     }
 }
 

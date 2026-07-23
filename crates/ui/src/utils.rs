@@ -77,8 +77,10 @@ pub fn get_candidate_window_position(
         )
     };
 
-    let mut monitor_info = MONITORINFO::default();
-    monitor_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    let mut monitor_info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..MONITORINFO::default()
+    };
 
     unsafe {
         let _ = GetMonitorInfoW(monitor, &mut monitor_info);
@@ -115,8 +117,10 @@ pub fn get_candidate_window_position_with_ruby_clearance(
         )
     };
 
-    let mut monitor_info = MONITORINFO::default();
-    monitor_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    let mut monitor_info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..MONITORINFO::default()
+    };
 
     unsafe {
         let _ = GetMonitorInfoW(monitor, &mut monitor_info);
@@ -162,8 +166,10 @@ pub fn get_ruby_window_position(
         )
     };
 
-    let mut monitor_info = MONITORINFO::default();
-    monitor_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    let mut monitor_info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..MONITORINFO::default()
+    };
 
     unsafe {
         let _ = GetMonitorInfoW(monitor, &mut monitor_info);
@@ -195,8 +201,10 @@ pub fn get_ruby_window_size_for_rect(
         )
     };
 
-    let mut monitor_info = MONITORINFO::default();
-    monitor_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    let mut monitor_info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..MONITORINFO::default()
+    };
 
     unsafe {
         let _ = GetMonitorInfoW(monitor, &mut monitor_info);

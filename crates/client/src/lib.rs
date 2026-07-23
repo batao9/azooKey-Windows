@@ -15,7 +15,7 @@ use tsf::factory::TextServiceFactory;
 use windows::{
     core::{IUnknown, Interface as _, GUID, HRESULT},
     Win32::{
-        Foundation::{CLASS_E_CLASSNOTAVAILABLE, E_FAIL, E_UNEXPECTED, HMODULE, S_FALSE, S_OK},
+        Foundation::{CLASS_E_CLASSNOTAVAILABLE, E_UNEXPECTED, HMODULE, S_FALSE},
         System::{
             Com::IClassFactory,
             Ole::SELFREG_E_CLASS,
@@ -66,7 +66,7 @@ pub extern "system" fn DllMain(
 
         check_err!(result, true, false)
     } else {
-        return true;
+        true
     }
 }
 

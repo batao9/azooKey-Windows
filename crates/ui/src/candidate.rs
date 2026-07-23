@@ -25,7 +25,7 @@ pub fn create_candidate_window(event_loop: &EventLoop<UserEvent>) -> Result<Wind
         .with_visible(false)
         .with_undecorated_shadow(false)
         .with_transparent(true)
-        .build(&event_loop)
+        .build(event_loop)
         .context("Failed to create window")?;
 
     let hwnd = window.hwnd() as *mut std::ffi::c_void;

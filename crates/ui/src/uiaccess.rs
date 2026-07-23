@@ -223,7 +223,7 @@ pub fn prepare_uiaccess_token() -> Result<()> {
             PROCESS_CREATION_FLAGS::default(),
             None,
             None,
-            &mut startup_info,
+            &startup_info,
             &mut process_info,
         )?;
 

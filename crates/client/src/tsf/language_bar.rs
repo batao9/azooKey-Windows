@@ -733,7 +733,7 @@ fn read_registry_string(
         return Ok(Some(String::new()));
     }
 
-    let mut data = vec![0u16; ((data_size + 1) / 2) as usize];
+    let mut data = vec![0u16; data_size.div_ceil(2) as usize];
     let status = unsafe {
         RegGetValueW(
             hkey,
@@ -849,7 +849,7 @@ mod tests {
         ];
 
         let selected = select_existing_settings_app_path(candidates, |path| {
-            path == PathBuf::from("C:/Users/test/AppData/Local/Azookey/frontend.exe")
+            path == "C:/Users/test/AppData/Local/Azookey/frontend.exe"
         })
         .expect("existing fallback should be selected");
 

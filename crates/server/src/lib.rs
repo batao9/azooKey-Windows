@@ -27,9 +27,7 @@ pub struct TonicNamedPipeServer {
 impl Connected for TonicNamedPipeServer {
     type ConnectInfo = ();
 
-    fn connect_info(&self) -> Self::ConnectInfo {
-        ()
-    }
+    fn connect_info(&self) -> Self::ConnectInfo {}
 }
 
 impl AsyncRead for TonicNamedPipeServer {

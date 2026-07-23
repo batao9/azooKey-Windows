@@ -162,11 +162,11 @@ impl TextService {
         Ok(context.cast()?)
     }
 
-    pub fn borrow_composition(&self) -> Result<Ref<Composition>> {
+    pub fn borrow_composition(&self) -> Result<Ref<'_, Composition>> {
         Ok(self.composition.try_borrow()?)
     }
 
-    pub fn borrow_mut_composition(&self) -> Result<RefMut<Composition>> {
+    pub fn borrow_mut_composition(&self) -> Result<RefMut<'_, Composition>> {
         Ok(self.composition.try_borrow_mut()?)
     }
 }

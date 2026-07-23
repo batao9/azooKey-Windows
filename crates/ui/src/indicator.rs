@@ -24,7 +24,7 @@ pub fn create_indicator_window(event_loop: &EventLoop<UserEvent>) -> Result<Wind
         // .with_visible(false)
         .with_undecorated_shadow(false)
         .with_transparent(true)
-        .build(&event_loop)
+        .build(event_loop)
         .context("Failed to create window")?;
 
     window.set_inner_size(PhysicalSize::new(90.0, 90.0));
