@@ -150,8 +150,8 @@ jobs:
       shell: pwsh
       run: Copy-Item "llama_cpu\llama.lib" -Destination "server-swift\" -Force
 
-    - name: Run all Swift tests serially
-      run: swift test --package-path server-swift -c release --no-parallel --verbose -Xcc -D_CRT_USE_C_COMPLEX_H -Xcxx -D_CRT_USE_C_COMPLEX_H
+    - name: Run all Swift tests in parallel
+      run: swift test --package-path server-swift -c release --verbose -Xcc -D_CRT_USE_C_COMPLEX_H -Xcxx -D_CRT_USE_C_COMPLEX_H
 
     - name: Prepare Rust linker input
       shell: pwsh

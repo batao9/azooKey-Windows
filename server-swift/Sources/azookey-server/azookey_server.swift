@@ -1585,29 +1585,6 @@ private func sanitizeDiagnosticField(_ value: String, maxLength: Int = 80) -> St
     return makeWarmupComposingText(input: zenzaiWarmupRomanInput, inputStyle: .roman2kana)
 }
 
-private enum WarmupInputStyleSnapshot: Sendable {
-    case roman2kana
-    case direct
-
-    var inputStyle: InputStyle {
-        switch self {
-        case .roman2kana:
-            return .roman2kana
-        case .direct:
-            return .direct
-        }
-    }
-
-    var label: String {
-        switch self {
-        case .roman2kana:
-            return "roman2kana"
-        case .direct:
-            return "direct"
-        }
-    }
-}
-
 private struct WarmupExecutionSnapshot: Sendable {
     let requestId: UInt64
     let dictionaryURL: URL
@@ -1618,7 +1595,6 @@ private struct WarmupExecutionSnapshot: Sendable {
     let profile: String
     let context: String
     let input: String
-    let inputStyle: WarmupInputStyleSnapshot
     let useZenzai: Bool
     let diagnosticDetails: String
 }
@@ -1659,7 +1635,7 @@ private final class BackgroundWarmupRunner: @unchecked Sendable {
         var warmupComposingText = ComposingText()
         warmupComposingText.insertAtCursorPosition(
             snapshot.input,
-            inputStyle: snapshot.inputStyle.inputStyle
+            inputStyle: .direct
         )
         let options = makeConvertRequestOptions(
             context: snapshot.context,
@@ -1739,21 +1715,25 @@ private final class BackgroundWarmupRunner: @unchecked Sendable {
 
 private let backgroundWarmupRunner = BackgroundWarmupRunner()
 
+// InputStyleManager stores custom tables in an unsynchronized process-wide
+// dictionary. Background work must use direct input so it never reads that
+// registry concurrently with a foreground config reload.
+@MainActor func makeBackgroundWarmupComposingText(
+    zenzaiRuntimeEnabled: Bool
+) -> ComposingText {
+    makeWarmupComposingText(
+        input: zenzaiRuntimeEnabled ? "にほんご" : "あ",
+        inputStyle: .direct
+    )
+}
+
 @MainActor private func makeBackgroundWarmupSnapshot() -> WarmupExecutionSnapshot {
     let contextString = (config["context"] as? String) ?? ""
     let diagnosticSnapshot = zenzaiDiagnosticSnapshot()
-    let inputStyle: WarmupInputStyleSnapshot = if diagnosticSnapshot.runtimeEnabled {
-        .roman2kana
-    } else if currentInputStyle == .direct {
-        .direct
-    } else {
-        .roman2kana
-    }
-    let input = diagnosticSnapshot.runtimeEnabled ? zenzaiWarmupRomanInput : "a"
-    let warmupComposingText = makeWarmupComposingText(
-        input: input,
-        inputStyle: inputStyle.inputStyle
+    let warmupComposingText = makeBackgroundWarmupComposingText(
+        zenzaiRuntimeEnabled: diagnosticSnapshot.runtimeEnabled
     )
+    let input = warmupComposingText.convertTarget
     let useZenzai = effectiveZenzaiEnabledForCandidates(
         isConfigured: diagnosticSnapshot.runtimeEnabled,
         inputCount: warmupComposingText.input.count,
@@ -1766,7 +1746,7 @@ private let backgroundWarmupRunner = BackgroundWarmupRunner()
         inputCount: warmupComposingText.input.count,
         hiraganaLength: warmupComposingText.convertTarget.count,
         useZenzai: useZenzai
-    ) + ";warmup_input_style=\(inputStyle.label);background=true"
+    ) + ";warmup_input_style=direct;background=true"
 
     return WarmupExecutionSnapshot(
         requestId: currentRequestId,
@@ -1780,7 +1760,6 @@ private let backgroundWarmupRunner = BackgroundWarmupRunner()
         profile: (config["profile"] as? String) ?? "",
         context: contextString,
         input: input,
-        inputStyle: inputStyle,
         useZenzai: useZenzai,
         diagnosticDetails: diagnosticDetails
     )

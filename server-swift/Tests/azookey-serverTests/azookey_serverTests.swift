@@ -8,7 +8,9 @@ private func row(_ input: String, _ output: String, _ next: String = "") -> Roma
     RomajiTableRow(input: input, output: output, next_input: next)
 }
 
-private func makeTemporaryCustomInputStyle(_ rows: [RomajiTableRow]) throws -> InputStyle {
+// InputStyleManager uses a process-wide unsynchronized dictionary. Keep test
+// registrations on the same actor as every ComposingText lookup.
+@MainActor private func makeTemporaryCustomInputStyle(_ rows: [RomajiTableRow]) throws -> InputStyle {
     let fileURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("azookey-romaji-test-\(UUID().uuidString).tsv")
     let content = try #require(buildCustomRomajiTableContent(rows: rows))
@@ -1025,9 +1027,8 @@ private func testCandidate(
         row("nya", "にゃ"),
         row("-", "ー"),
     ]
-    let inputStyle = try makeTemporaryCustomInputStyle(rows)
-
-    let result = await MainActor.run {
+    let result = try await MainActor.run {
+        let inputStyle = try makeTemporaryCustomInputStyle(rows)
         var source = ComposingText()
         source.insertAtCursorPosition("kagen", inputStyle: inputStyle)
         let preview = makeCandidatePreviewComposingText(from: source)
@@ -1048,9 +1049,8 @@ private func testCandidate(
         row("nya", "にゃ"),
         row("ta", "た"),
     ]
-    let inputStyle = try makeTemporaryCustomInputStyle(rows)
-
-    let convertTarget = await MainActor.run {
+    let convertTarget = try await MainActor.run {
+        let inputStyle = try makeTemporaryCustomInputStyle(rows)
         var source = ComposingText()
         source.insertAtCursorPosition("nta", inputStyle: inputStyle)
         return source.convertTarget
@@ -1180,9 +1180,8 @@ private func testCandidate(
         row("q", "く"),
         row("qa", "くぁ"),
     ]
-    let inputStyle = try makeTemporaryCustomInputStyle(rows)
-
-    let preview = await MainActor.run {
+    let preview = try await MainActor.run {
+        let inputStyle = try makeTemporaryCustomInputStyle(rows)
         var source = ComposingText()
         source.insertAtCursorPosition("q", inputStyle: inputStyle)
         return makeCandidatePreviewComposingText(from: source)
@@ -1190,6 +1189,35 @@ private func testCandidate(
 
     #expect(preview.syntheticEndOfText == false)
     #expect(preview.composingText.convertTarget == "q")
+}
+
+@Test func backgroundWarmupAvoidsSharedInputStyleRegistry() async {
+    let metrics = await MainActor.run {
+        let disabled = makeBackgroundWarmupComposingText(zenzaiRuntimeEnabled: false)
+        let enabled = makeBackgroundWarmupComposingText(zenzaiRuntimeEnabled: true)
+        return (disabled: disabled, enabled: enabled)
+    }
+
+    #expect(metrics.disabled.convertTarget == "あ")
+    #expect(metrics.enabled.convertTarget == "にほんご")
+    #expect(metrics.disabled.input.count == 1)
+    #expect(metrics.enabled.input.count == 4)
+    #expect(metrics.disabled.input.allSatisfy { $0.inputStyle == .direct })
+    #expect(metrics.enabled.input.allSatisfy { $0.inputStyle == .direct })
+    #expect(
+        effectiveZenzaiEnabledForCandidates(
+            isConfigured: true,
+            inputCount: metrics.disabled.input.count,
+            hiraganaCount: metrics.disabled.convertTarget.count
+        ) == false
+    )
+    #expect(
+        effectiveZenzaiEnabledForCandidates(
+            isConfigured: true,
+            inputCount: metrics.enabled.input.count,
+            hiraganaCount: metrics.enabled.convertTarget.count
+        )
+    )
 }
 
 @Test func cursorPrefixCandidatesSupplementFirstClauseWithMainResultsForSameBoundary() async throws {

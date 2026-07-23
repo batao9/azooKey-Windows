@@ -35,12 +35,17 @@ fi
 TARGET_BRANCH="$1"
 CARGO_TEST_FILTER="${2:-composition}"
 SWIFT_TEST_FILTER="${3:-}"
+SWIFT_TEST_ITERATIONS="${SWIFT_TEST_ITERATIONS:-1}"
 
 if [[ "$CARGO_TEST_FILTER" == "-" ]]; then
   CARGO_TEST_FILTER="skip"
 fi
 if [[ "$SWIFT_TEST_FILTER" == "-" ]]; then
   SWIFT_TEST_FILTER="skip"
+fi
+if [[ ! "$SWIFT_TEST_ITERATIONS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SWIFT_TEST_ITERATIONS must be a positive integer"
+  exit 1
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -411,6 +416,7 @@ param(
   [Parameter(Mandatory = $true)][string]$HostTimestampUtc,
   [Parameter(Mandatory = $false)][string]$CargoTestFilter = "composition",
   [Parameter(Mandatory = $false)][string]$SwiftTestFilter = "",
+  [Parameter(Mandatory = $false)][int]$SwiftTestIterations = 1,
   [Parameter(Mandatory = $false)][string]$SwiftVendorTarPath = ""
 )
 
@@ -642,7 +648,8 @@ function Initialize-SwiftTestEnvironment {
 function Invoke-SwiftPackageTests {
   param(
     [Parameter(Mandatory = $true)][string]$SwiftSourceDir,
-    [Parameter(Mandatory = $false)][string]$TestFilter = "all"
+    [Parameter(Mandatory = $false)][string]$TestFilter = "all",
+    [Parameter(Mandatory = $false)][int]$Iterations = 1
   )
 
   $releaseDir = Join-Path $SwiftSourceDir ".build\x86_64-unknown-windows-msvc\release"
@@ -702,16 +709,18 @@ function Invoke-SwiftPackageTests {
     $runArgs += @("--filter", $TestFilter)
   }
 
-  Write-Host "running swift test runner $runnerExe $($runArgs -join ' ')"
-  Push-Location $releaseDir
-  try {
-    & $runnerExe @runArgs
-  } finally {
-    Pop-Location
-  }
+  for ($iteration = 1; $iteration -le $Iterations; $iteration++) {
+    Write-Host "running swift test runner iteration $iteration/$Iterations $runnerExe $($runArgs -join ' ')"
+    Push-Location $releaseDir
+    try {
+      & $runnerExe @runArgs
+    } finally {
+      Pop-Location
+    }
 
-  if ($LASTEXITCODE -ne 0) {
-    throw "swift test runner failed with exit code $LASTEXITCODE"
+    if ($LASTEXITCODE -ne 0) {
+      throw "swift test runner iteration $iteration/$Iterations failed with exit code $LASTEXITCODE"
+    }
   }
 }
 
@@ -772,9 +781,20 @@ if (![string]::IsNullOrWhiteSpace($SwiftTestFilter) -and $SwiftTestFilter -ne "s
   }
   if ($LASTEXITCODE -eq 0) {
     Write-Host "swift test completed without Windows runner workaround"
+    for ($iteration = 2; $iteration -le $SwiftTestIterations; $iteration++) {
+      Write-Host "running swift test iteration $iteration/$SwiftTestIterations with --skip-build"
+      if ($SwiftTestFilter -eq "all") {
+        swift test -c release --skip-build --verbose -Xcc -D_CRT_USE_C_COMPLEX_H
+      } else {
+        swift test -c release --skip-build --verbose -Xcc -D_CRT_USE_C_COMPLEX_H --filter $SwiftTestFilter
+      }
+      if ($LASTEXITCODE -ne 0) {
+        throw "swift test iteration $iteration/$SwiftTestIterations failed with exit code $LASTEXITCODE"
+      }
+    }
   } else {
     Write-Host "swift test returned exit code $LASTEXITCODE; retrying with Windows runner workaround"
-    Invoke-SwiftPackageTests -SwiftSourceDir $swiftSourceDir -TestFilter $SwiftTestFilter
+    Invoke-SwiftPackageTests -SwiftSourceDir $swiftSourceDir -TestFilter $SwiftTestFilter -Iterations $SwiftTestIterations
   }
 } else {
   Write-Host "skipping swift test"
@@ -847,7 +867,7 @@ main() {
   fi
 
   log "VM 上で test を実行します"
-  ssh_run_test "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -SourceTarPath \"$REMOTE_TAR_WIN\" -SourceDir \"$REMOTE_SRC_WIN\" -HostTimestampUtc \"$HOST_TIMESTAMP_UTC\" -CargoTestFilter \"$CARGO_TEST_FILTER\" -SwiftTestFilter \"$SWIFT_TEST_FILTER\"$swift_vendor_arg"
+  ssh_run_test "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -SourceTarPath \"$REMOTE_TAR_WIN\" -SourceDir \"$REMOTE_SRC_WIN\" -HostTimestampUtc \"$HOST_TIMESTAMP_UTC\" -CargoTestFilter \"$CARGO_TEST_FILTER\" -SwiftTestFilter \"$SWIFT_TEST_FILTER\" -SwiftTestIterations \"$SWIFT_TEST_ITERATIONS\"$swift_vendor_arg"
 
   log "VM を停止します"
   vbox controlvm "$VM_NAME" acpipowerbutton >/dev/null || true
