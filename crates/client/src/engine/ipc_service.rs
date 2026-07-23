@@ -155,6 +155,18 @@ pub(crate) fn is_ipc_deadline(error: &anyhow::Error) -> bool {
 }
 
 pub(crate) fn is_non_destructive_ipc_error(error: &anyhow::Error) -> bool {
+    requires_ipc_recovery(error)
+        || error.downcast_ref::<tonic::Status>().is_some_and(|status| {
+            matches!(
+                status.code(),
+                tonic::Code::InvalidArgument
+                    | tonic::Code::OutOfRange
+                    | tonic::Code::FailedPrecondition
+            )
+        })
+}
+
+pub(crate) fn requires_ipc_recovery(error: &anyhow::Error) -> bool {
     is_ipc_deadline(error) || error.downcast_ref::<IpcRecoveryPending>().is_some()
 }
 
@@ -258,6 +270,25 @@ pub struct Candidates {
     pub hiragana: String,
     pub corresponding_count: Vec<i32>,
     pub candidate_ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClauseSnapshotOperation {
+    Clear,
+    Push,
+    Pop,
+}
+
+impl ClauseSnapshotOperation {
+    fn proto_value(self) -> i32 {
+        use shared::proto::CompositionSnapshotOperation;
+
+        match self {
+            Self::Clear => CompositionSnapshotOperation::Clear as i32,
+            Self::Push => CompositionSnapshotOperation::Push as i32,
+            Self::Pop => CompositionSnapshotOperation::Pop as i32,
+        }
+    }
 }
 
 impl Candidates {
@@ -656,7 +687,7 @@ impl IPCService {
     }
 
     fn record_successful_move(&self, offset: i32) {
-        if offset == 0 || offset.abs() >= 125 {
+        if offset == 0 {
             return;
         }
         if let Ok(mut ledger) = self.recovery.input_ledger.lock() {
@@ -1052,6 +1083,28 @@ impl IPCService {
         self.observe_server_session("move_cursor", response.server_session_id);
         self.record_successful_move(offset);
         Self::candidates_from_composing_text(response.composing_text)
+    }
+
+    fn send_update_composition_snapshot(
+        &mut self,
+        operation: ClauseSnapshotOperation,
+        request_id: u64,
+    ) -> anyhow::Result<()> {
+        let mut request = tonic::Request::new(shared::proto::UpdateCompositionSnapshotRequest {
+            operation: operation.proto_value(),
+            request_id,
+        });
+        request.set_timeout(INPUT_RPC_DEADLINE);
+        let response = Self::block_on_server_rpc(
+            self.runtime.as_ref(),
+            &self.recovery,
+            "update_composition_snapshot",
+            INPUT_RPC_DEADLINE,
+            self.azookey_client.update_composition_snapshot(request),
+        )?;
+        let response = response.into_inner();
+        self.observe_server_session("update_composition_snapshot", response.server_session_id);
+        Ok(())
     }
 
     fn send_set_context(&mut self, context: &str, request_id: u64) -> anyhow::Result<()> {
@@ -1621,6 +1674,61 @@ impl IPCService {
         Ok(candidates)
     }
 
+    #[tracing::instrument(skip(self, previous_candidates))]
+    pub(crate) fn update_composition_snapshot(
+        &mut self,
+        operation: ClauseSnapshotOperation,
+        previous_candidates: &Candidates,
+    ) -> anyhow::Result<()> {
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
+        let first_attempt = self.send_update_composition_snapshot(operation, request_id);
+        let result: anyhow::Result<NonIdempotentEditRecovery> =
+            (|| match Self::classify_non_idempotent_edit_attempt(
+                "update_composition_snapshot",
+                first_attempt,
+            )? {
+                NonIdempotentEditAttempt::Completed(()) => Ok(NonIdempotentEditRecovery::None),
+                NonIdempotentEditAttempt::ReconnectAndRefresh(first_error) => {
+                    self.reconnect().map_err(|reconnect_error| {
+                        tracing::error!(
+                            ?first_error,
+                            ?reconnect_error,
+                            "composition snapshot reconnect failed"
+                        );
+                        reconnect_error
+                    })?;
+
+                    let refreshed_candidates = self.send_move_cursor(0, request_id)?;
+                    if Self::should_retry_non_idempotent_edit_after_refresh(
+                        Some(previous_candidates),
+                        &refreshed_candidates,
+                    ) {
+                        self.send_update_composition_snapshot(operation, request_id)?;
+                        Ok(NonIdempotentEditRecovery::RetriedAfterUnchangedRefresh)
+                    } else {
+                        Ok(NonIdempotentEditRecovery::RefreshedAfterReconnect)
+                    }
+                }
+            })();
+        self.log_client_performance_from_start(
+            performance_start,
+            request_id,
+            "update_composition_snapshot",
+            "rpc_total",
+            || match &result {
+                Ok(recovery) => format!(
+                    "status=success;operation={operation:?};recovery={}",
+                    recovery.log_value()
+                ),
+                Err(error) => {
+                    format!("status=error;operation={operation:?};error={error:?}")
+                }
+            },
+        );
+        result.map(|_| ())
+    }
+
     pub fn set_context(&mut self, context: String) -> anyhow::Result<()> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
@@ -2043,9 +2151,9 @@ mod tests {
         append_input_segment, await_rpc_with_deadline, fallback_input_ledger,
         is_non_destructive_ipc_error, mark_input_ledger_incomplete, move_input_cursor,
         pop_input_segment_character, preserve_recovery_error, recovery_generation_is_current,
-        restart_generation_ready, restart_request_needed, Candidates, CompositionOperation,
-        IPCService, InputLedger, IpcDeadlineExceeded, NonIdempotentEditAttempt, INPUT_STYLE_DIRECT,
-        INPUT_STYLE_ROMAN2KANA,
+        requires_ipc_recovery, restart_generation_ready, restart_request_needed, Candidates,
+        ClauseSnapshotOperation, CompositionOperation, IPCService, InputLedger,
+        IpcDeadlineExceeded, NonIdempotentEditAttempt, INPUT_STYLE_DIRECT, INPUT_STYLE_ROMAN2KANA,
     };
     use std::{
         future::Future,
@@ -2199,6 +2307,48 @@ mod tests {
                 },
                 CompositionOperation::Remove,
             ]
+        );
+    }
+
+    #[test]
+    fn input_ledger_preserves_full_i32_cursor_offsets() {
+        let mut ledger = InputLedger {
+            complete: true,
+            ..InputLedger::default()
+        };
+
+        for offset in [125, 126, 127, 128, 129, 1024, -125, i32::MIN] {
+            move_input_cursor(&mut ledger, offset);
+        }
+
+        assert_eq!(
+            ledger.operations,
+            vec![
+                CompositionOperation::MoveCursor(125),
+                CompositionOperation::MoveCursor(126),
+                CompositionOperation::MoveCursor(127),
+                CompositionOperation::MoveCursor(128),
+                CompositionOperation::MoveCursor(129),
+                CompositionOperation::MoveCursor(1024),
+                CompositionOperation::MoveCursor(-125),
+                CompositionOperation::MoveCursor(i32::MIN),
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_operations_have_distinct_proto_values() {
+        assert_eq!(
+            ClauseSnapshotOperation::Clear.proto_value(),
+            shared::proto::CompositionSnapshotOperation::Clear as i32
+        );
+        assert_eq!(
+            ClauseSnapshotOperation::Push.proto_value(),
+            shared::proto::CompositionSnapshotOperation::Push as i32
+        );
+        assert_eq!(
+            ClauseSnapshotOperation::Pop.proto_value(),
+            shared::proto::CompositionSnapshotOperation::Pop as i32
         );
     }
 
@@ -2442,6 +2592,8 @@ mod tests {
         let error = anyhow::Error::new(tonic::Status::invalid_argument("offset out of range"));
 
         assert!(!IPCService::should_reconnect_rpc_error(&error));
+        assert!(is_non_destructive_ipc_error(&error));
+        assert!(!requires_ipc_recovery(&error));
     }
 
     #[test]

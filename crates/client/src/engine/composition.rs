@@ -20,8 +20,8 @@ use super::{
     input_mode::InputMode,
     ipc_service::{
         client_performance_log_enabled, current_input_trace_request_id,
-        is_non_destructive_ipc_error, Candidates, ClientInputTraceGuard, IPCService,
-        WindowRpcDelivery,
+        is_non_destructive_ipc_error, requires_ipc_recovery, Candidates, ClauseSnapshotOperation,
+        ClientInputTraceGuard, IPCService, WindowRpcDelivery,
     },
     romaji_lookup::RomajiLookup,
     state::{keyboard_disabled_from_context, AppConfigSnapshot, IMEState},
@@ -256,9 +256,6 @@ impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
 }
 
 impl TextServiceFactory {
-    const MOVE_CURSOR_CLEAR_CLAUSE_SNAPSHOTS: i32 = 125;
-    const MOVE_CURSOR_PUSH_CLAUSE_SNAPSHOT: i32 = 126;
-    const MOVE_CURSOR_POP_CLAUSE_SNAPSHOT: i32 = 127;
     const MOVE_CLAUSE_TO_LAST: i32 = i32::MAX;
 
     fn log_client_performance(
@@ -1507,9 +1504,7 @@ impl TextServiceFactory {
         }
 
         clause_snapshots.clear();
-        let _ = ipc_service
-            .move_cursor_with_context(Self::MOVE_CURSOR_CLEAR_CLAUSE_SNAPSHOTS, candidates)?;
-        Ok(())
+        ipc_service.update_composition_snapshot(ClauseSnapshotOperation::Clear, candidates)
     }
 
     #[inline]
@@ -2554,10 +2549,8 @@ impl TextServiceFactory {
 
         for _ in 0..temp_clause_snapshots.len() {
             let previous_candidates = temp_candidates.clone();
-            let _ = backend.move_cursor_with_context(
-                Self::MOVE_CURSOR_POP_CLAUSE_SNAPSHOT,
-                &previous_candidates,
-            )?;
+            backend
+                .update_composition_snapshot(ClauseSnapshotOperation::Pop, &previous_candidates)?;
         }
 
         state.future_clause_snapshots.clear();
@@ -4313,7 +4306,7 @@ impl TextServiceFactory {
             Err(error) if is_non_destructive_ipc_error(&error) => {
                 tracing::warn!(
                     ?error,
-                    "IPC deadline exceeded; preserving the current composition for recovery"
+                    "IPC operation failed without mutating server state; preserving composition"
                 );
                 Ok(true)
             }
@@ -4380,7 +4373,7 @@ impl TextServiceFactory {
             Err(error) if is_non_destructive_ipc_error(&error) => {
                 tracing::warn!(
                     ?error,
-                    "IPC deadline exceeded on key-up; preserving current composition"
+                    "IPC key-up operation failed without mutation; preserving composition"
                 );
                 Ok(true)
             }
@@ -4481,7 +4474,7 @@ impl TextServiceFactory {
             Err(error) if is_non_destructive_ipc_error(&error) => {
                 tracing::warn!(
                     ?error,
-                    "IPC deadline exceeded during preserved shortcut; preserving composition"
+                    "IPC shortcut operation failed without mutation; preserving composition"
                 );
                 Ok(true)
             }
@@ -5493,9 +5486,18 @@ impl TextServiceFactory {
                                 deferred_clause_navigation_ready_ui_sync.take(),
                                 effect,
                             );
-                        if effect.server_reset {
+                        if effect.server_reset
+                            || (ipc_service.take_server_reset_recovered()
+                                && Self::has_client_composition_state(
+                                    &raw_input,
+                                    &preview,
+                                    &suffix,
+                                    &fixed_prefix,
+                                    &candidates,
+                                ))
+                        {
                             reset_after_empty_server_composition!(
-                                "move_clause returned empty composition"
+                                "move_clause detected server reset"
                             );
                         } else if effect.applied {
                             self.sync_clause_action_ui(
@@ -6252,7 +6254,7 @@ impl TextServiceFactory {
             Ok(())
         })();
 
-        if result.as_ref().is_err_and(is_non_destructive_ipc_error) {
+        if result.as_ref().is_err_and(requires_ipc_recovery) {
             if let Some(actions) = retry_actions.as_ref() {
                 let deferred = deferred_action_suffix(actions, failed_action_index);
                 if let Ok(text_service) = self.borrow() {

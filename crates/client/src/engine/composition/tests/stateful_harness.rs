@@ -1273,22 +1273,6 @@ impl ScenarioBackend {
 impl ClauseActionBackend for ScenarioBackend {
     fn move_cursor(&mut self, offset: i32) -> anyhow::Result<Candidates> {
         match offset {
-            value if value == TextServiceFactory::MOVE_CURSOR_CLEAR_CLAUSE_SNAPSHOTS => {
-                self.server_snapshots.clear();
-                self.blocked_boundary = false;
-                Ok(self.current_candidates())
-            }
-            value if value == TextServiceFactory::MOVE_CURSOR_PUSH_CLAUSE_SNAPSHOT => {
-                self.server_snapshots.push(self.server.clone());
-                Ok(self.current_candidates())
-            }
-            value if value == TextServiceFactory::MOVE_CURSOR_POP_CLAUSE_SNAPSHOT => {
-                if let Some(restored) = self.server_snapshots.pop() {
-                    self.server = restored;
-                }
-                self.blocked_boundary = false;
-                Ok(self.current_candidates())
-            }
             0 => {
                 if self.blocked_boundary {
                     Ok(Candidates::default())
@@ -1332,6 +1316,29 @@ impl ClauseActionBackend for ScenarioBackend {
         }
         self.blocked_boundary = false;
         Ok(self.current_candidates())
+    }
+
+    fn update_composition_snapshot(
+        &mut self,
+        operation: ClauseSnapshotOperation,
+        _previous_candidates: &Candidates,
+    ) -> anyhow::Result<()> {
+        match operation {
+            ClauseSnapshotOperation::Clear => {
+                self.server_snapshots.clear();
+                self.blocked_boundary = false;
+            }
+            ClauseSnapshotOperation::Push => {
+                self.server_snapshots.push(self.server.clone());
+            }
+            ClauseSnapshotOperation::Pop => {
+                if let Some(restored) = self.server_snapshots.pop() {
+                    self.server = restored;
+                }
+                self.blocked_boundary = false;
+            }
+        }
+        Ok(())
     }
 }
 

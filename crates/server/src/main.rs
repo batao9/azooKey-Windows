@@ -8,9 +8,10 @@ use windows::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass, HIG
 use shared::proto::azookey_service_server::{AzookeyService, AzookeyServiceServer};
 use shared::proto::{
     AppendTextRequest, AppendTextResponse, ClearTextRequest, ClearTextResponse, ComposingText,
-    CompositionOperationKind, MoveCursorRequest, MoveCursorResponse, PerformanceLogRequest,
-    PerformanceLogResponse, RemoveTextRequest, RemoveTextResponse, ReplaceCompositionRequest,
-    ReplaceCompositionResponse, ShrinkTextRequest, ShrinkTextResponse, Suggestion,
+    CompositionOperationKind, CompositionSnapshotOperation, MoveCursorRequest, MoveCursorResponse,
+    PerformanceLogRequest, PerformanceLogResponse, RemoveTextRequest, RemoveTextResponse,
+    ReplaceCompositionRequest, ReplaceCompositionResponse, ShrinkTextRequest, ShrinkTextResponse,
+    Suggestion, UpdateCompositionSnapshotRequest, UpdateCompositionSnapshotResponse,
 };
 use shared::{AppConfig, SERVER_PIPE_PATH};
 
@@ -381,7 +382,7 @@ macro_rules! performance_event_lazy {
 
 struct RawComposingText {
     text: String,
-    cursor: i8,
+    cursor: i32,
 }
 
 struct ComposedText {
@@ -406,6 +407,9 @@ unsafe extern "C" {
     fn AppendTextDirect(input: *const c_char, cursorPtr: *mut c_int) -> *mut c_char;
     fn RemoveText(cursorPtr: *mut c_int) -> *mut c_char;
     fn MoveCursor(offset: c_int, cursorPtr: *mut c_int) -> *mut c_char;
+    fn ClearComposingTextSnapshots();
+    fn PushComposingTextSnapshot();
+    fn PopComposingTextSnapshot();
     fn ShrinkText(offset: c_int) -> *mut c_char;
     fn ClearText();
     fn Warmup() -> bool;
@@ -1094,34 +1098,20 @@ fn ffi_text_result(scope: &str, result: *mut c_char) -> Result<String, String> {
     Ok(result.to_string_lossy())
 }
 
-#[allow(clippy::result_large_err)]
-fn i8_offset_from_i32(scope: &str, raw: i32) -> Result<i8, Status> {
-    i8::try_from(raw).map_err(|_| {
-        log_event(
-            ServerLogLevel::Warn,
-            &format!("[{scope}] offset out of range: {raw}"),
-        );
-        Status::invalid_argument("offset out of range")
-    })
-}
-
-fn cursor_from_c_int(scope: &str, cursor: c_int) -> i8 {
-    match i8::try_from(cursor) {
-        Ok(value) => value,
-        Err(_) => {
-            let clamped = cursor.clamp(i8::MIN as c_int, i8::MAX as c_int) as i8;
-            log_event(
-                ServerLogLevel::Warn,
-                &format!("[{scope}] cursor out of range: {cursor}, clamped to {clamped}"),
-            );
-            clamped
-        }
-    }
-}
-
 fn status_from_error(scope: &str, error: String) -> Status {
     log_event(ServerLogLevel::Error, &error);
     Status::internal(format!("{scope} failed"))
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_shrink_offset(offset: i32) -> Result<i32, Status> {
+    if offset < 0 {
+        Err(Status::invalid_argument(
+            "shrink_text offset must be non-negative",
+        ))
+    } else {
+        Ok(offset)
+    }
 }
 
 fn initialize(path: &str) -> Result<(), String> {
@@ -1140,10 +1130,7 @@ fn add_text(input: &str) -> Result<RawComposingText, String> {
         let result = AppendText(input.as_ptr(), &mut cursor);
         let text = ffi_text_result("AppendText", result)?;
 
-        Ok(RawComposingText {
-            text,
-            cursor: cursor_from_c_int("AppendText", cursor),
-        })
+        Ok(RawComposingText { text, cursor })
     }
 }
 
@@ -1155,24 +1142,17 @@ fn add_text_direct(input: &str) -> Result<RawComposingText, String> {
         let result = AppendTextDirect(input.as_ptr(), &mut cursor);
         let text = ffi_text_result("AppendTextDirect", result)?;
 
-        Ok(RawComposingText {
-            text,
-            cursor: cursor_from_c_int("AppendTextDirect", cursor),
-        })
+        Ok(RawComposingText { text, cursor })
     }
 }
 
-fn move_cursor(offset: i8) -> Result<RawComposingText, String> {
+fn move_cursor(offset: i32) -> Result<RawComposingText, String> {
     unsafe {
-        let offset = c_int::from(offset);
         let mut cursor: c_int = 0;
         let result = MoveCursor(offset, &mut cursor);
         let text = ffi_text_result("MoveCursor", result)?;
 
-        Ok(RawComposingText {
-            text,
-            cursor: cursor_from_c_int("MoveCursor", cursor),
-        })
+        Ok(RawComposingText { text, cursor })
     }
 }
 
@@ -1182,10 +1162,7 @@ fn remove_text() -> Result<RawComposingText, String> {
         let result = RemoveText(&mut cursor);
         let text = ffi_text_result("RemoveText", result)?;
 
-        Ok(RawComposingText {
-            text,
-            cursor: cursor_from_c_int("RemoveText", cursor),
-        })
+        Ok(RawComposingText { text, cursor })
     }
 }
 
@@ -1346,9 +1323,8 @@ fn get_composed_text(use_cursor_prefix: bool, request_id: u64) -> Result<Compose
     })
 }
 
-fn shrink_text(offset: i8) -> Result<RawComposingText, String> {
+fn shrink_text(offset: i32) -> Result<RawComposingText, String> {
     unsafe {
-        let offset = c_int::from(offset);
         let result = ShrinkText(offset);
         let text = ffi_text_result("ShrinkText", result)?;
 
@@ -1464,14 +1440,8 @@ impl AzookeyService for MyAzookeyService {
                         .map_err(|error| status_from_error("replace_composition", error))?;
                 }
                 CompositionOperationKind::MoveCursor => {
-                    let mut remaining_offset = operation.cursor_offset;
-                    while remaining_offset != 0 {
-                        let chunk = remaining_offset.clamp(-124, 124);
-                        let offset = i8_offset_from_i32("replace_composition", chunk)?;
-                        composing_text = move_cursor(offset)
-                            .map_err(|error| status_from_error("replace_composition", error))?;
-                        remaining_offset -= chunk;
-                    }
+                    composing_text = move_cursor(operation.cursor_offset)
+                        .map_err(|error| status_from_error("replace_composition", error))?;
                 }
             }
         }
@@ -1572,11 +1542,10 @@ impl AzookeyService for MyAzookeyService {
         let handler_start = Instant::now();
         let raw_offset = request.offset;
 
-        let offset = i8_offset_from_i32("move_cursor", raw_offset)?;
-        let use_cursor_prefix = offset == 0;
+        let use_cursor_prefix = raw_offset == 0;
         let move_start = Instant::now();
         let composing_text =
-            move_cursor(offset).map_err(|error| status_from_error("move_cursor", error))?;
+            move_cursor(raw_offset).map_err(|error| status_from_error("move_cursor", error))?;
         performance_event_lazy!(
             request_id,
             "move_cursor",
@@ -1602,7 +1571,7 @@ impl AzookeyService for MyAzookeyService {
             "move_cursor",
             "total",
             elapsed_ms(handler_start),
-            "status=success;cursor={};hiragana_len={};suggestions={};use_cursor_prefix={use_cursor_prefix}",
+            "status=success;offset={raw_offset};cursor={};hiragana_len={};suggestions={};use_cursor_prefix={use_cursor_prefix}",
             composing_text.cursor,
             composing_text.text.chars().count(),
             composed_text.suggestions.len()
@@ -1613,6 +1582,44 @@ impl AzookeyService for MyAzookeyService {
                 hiragana: composed_text.hiragana.unwrap_or(composing_text.text),
                 suggestions: composed_text.suggestions,
             }),
+            server_session_id: server_session_id(),
+        }))
+    }
+
+    async fn update_composition_snapshot(
+        &self,
+        request: Request<UpdateCompositionSnapshotRequest>,
+    ) -> Result<Response<UpdateCompositionSnapshotResponse>, Status> {
+        let _mutation_guard = self.mutation_lock.lock().await;
+        let request = request.into_inner();
+        let _request_guard = ServerRequestGuard::begin(true);
+        let request_id = request_id_or_next(request.request_id);
+        set_request_id(request_id);
+        let handler_start = Instant::now();
+        let operation = CompositionSnapshotOperation::try_from(request.operation)
+            .map_err(|_| Status::invalid_argument("unknown composition snapshot operation"))?;
+
+        unsafe {
+            match operation {
+                CompositionSnapshotOperation::Unspecified => {
+                    return Err(Status::invalid_argument(
+                        "composition snapshot operation is required",
+                    ));
+                }
+                CompositionSnapshotOperation::Clear => ClearComposingTextSnapshots(),
+                CompositionSnapshotOperation::Push => PushComposingTextSnapshot(),
+                CompositionSnapshotOperation::Pop => PopComposingTextSnapshot(),
+            }
+        }
+        performance_event_lazy!(
+            request_id,
+            "update_composition_snapshot",
+            "total",
+            elapsed_ms(handler_start),
+            "status=success;operation={operation:?}"
+        );
+
+        Ok(Response::new(UpdateCompositionSnapshotResponse {
             server_session_id: server_session_id(),
         }))
     }
@@ -1659,12 +1666,11 @@ impl AzookeyService for MyAzookeyService {
         let request_id = request_id_or_next(request.request_id);
         set_request_id(request_id);
         let handler_start = Instant::now();
-        let raw_offset = request.offset;
+        let raw_offset = validate_shrink_offset(request.offset)?;
 
-        let offset = i8_offset_from_i32("shrink_text", raw_offset)?;
         let shrink_start = Instant::now();
         let composing_text =
-            shrink_text(offset).map_err(|error| status_from_error("shrink_text", error))?;
+            shrink_text(raw_offset).map_err(|error| status_from_error("shrink_text", error))?;
         performance_event_lazy!(
             request_id,
             "shrink_text",
@@ -2031,7 +2037,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod path_tests {
-    use super::{resolve_log_path_from_roots, MyAzookeyService};
+    use super::{resolve_log_path_from_roots, validate_shrink_offset, MyAzookeyService};
     use std::{ffi::OsStr, path::Path};
 
     #[tokio::test]
@@ -2053,6 +2059,22 @@ mod path_tests {
         )
         .await
         .expect("lock should become available");
+    }
+
+    #[test]
+    fn shrink_offset_accepts_long_compositions_without_narrowing() {
+        for offset in [127, 128, 129, 1024, i32::MAX] {
+            assert_eq!(
+                validate_shrink_offset(offset).expect("non-negative offset"),
+                offset
+            );
+        }
+    }
+
+    #[test]
+    fn shrink_offset_rejects_negative_values_before_swift_ffi() {
+        let status = validate_shrink_offset(-1).expect_err("negative offset must fail");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
     }
 
     #[test]

@@ -70,10 +70,25 @@ message RemoveTextResponse {
   uint64 server_session_id = 2; // Identifies the current server process session.
 }
 
-// Request message for MoveCursor.
 message MoveCursorRequest {
-  int32 offset = 1; // The new cursor position.
+  int32 offset = 1; // Relative cursor movement in input units.
   uint64 request_id = 2;
+}
+
+enum CompositionSnapshotOperation {
+  COMPOSITION_SNAPSHOT_OPERATION_UNSPECIFIED = 0;
+  COMPOSITION_SNAPSHOT_OPERATION_CLEAR = 1;
+  COMPOSITION_SNAPSHOT_OPERATION_PUSH = 2;
+  COMPOSITION_SNAPSHOT_OPERATION_POP = 3;
+}
+
+message UpdateCompositionSnapshotRequest {
+  CompositionSnapshotOperation operation = 1;
+  uint64 request_id = 2;
+}
+
+message UpdateCompositionSnapshotResponse {
+  uint64 server_session_id = 1;
 }
 
 // Request message for ShrinkText.
@@ -164,6 +179,7 @@ service AzookeyService {
   rpc RemoveText (RemoveTextRequest) returns (RemoveTextResponse);
   rpc ShrinkText (ShrinkTextRequest) returns (ShrinkTextResponse);
   rpc MoveCursor (MoveCursorRequest) returns (MoveCursorResponse);
+  rpc UpdateCompositionSnapshot (UpdateCompositionSnapshotRequest) returns (UpdateCompositionSnapshotResponse);
   rpc ClearText (ClearTextRequest) returns (ClearTextResponse);
   rpc SetContext (SetContextRequest) returns (SetContextResponse);
   rpc UpdateConfig (UpdateConfigRequest) returns (UpdateConfigResponse);
