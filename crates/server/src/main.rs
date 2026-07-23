@@ -12,7 +12,7 @@ use shared::proto::{
     PerformanceLogResponse, RemoveTextRequest, RemoveTextResponse, ReplaceCompositionRequest,
     ReplaceCompositionResponse, ShrinkTextRequest, ShrinkTextResponse, Suggestion,
 };
-use shared::AppConfig;
+use shared::{AppConfig, SERVER_PIPE_PATH};
 
 use std::{
     backtrace::Backtrace,
@@ -1991,14 +1991,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_v1()
         .map_err(std::io::Error::other)?;
 
-    let incoming = TonicNamedPipeServer::new_with_first_pipe_callback("azookey_server", || {
+    let incoming = TonicNamedPipeServer::new_with_first_pipe_callback(SERVER_PIPE_PATH, || {
         log_event_lazy!(ServerLogLevel::Info, "AzookeyServer listening");
         write_server_crash_trace(
             "rust",
             "server_startup",
             "listening",
             "completed",
-            "pipe=azookey_server",
+            "pipe=LOCAL\\azookey_server",
         );
         write_crash_trace_file(
             LAUNCHER_CRASH_TRACE_FILE_NAME,
@@ -2006,9 +2006,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "server_startup",
             "server_listening",
             "completed",
-            &format!("server_pid={};pipe=azookey_server", std::process::id()),
+            &format!(
+                "server_pid={};pipe=LOCAL\\azookey_server",
+                std::process::id()
+            ),
         );
-    });
+    })?;
 
     Server::builder()
         .add_service(AzookeyServiceServer::new(service))

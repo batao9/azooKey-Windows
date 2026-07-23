@@ -187,7 +187,6 @@ impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
 
     #[macros::anyhow]
     fn GetIcon(&self) -> Result<HICON> {
-        let dll_module = DllModule::get()?;
         let keyboard_disabled = IMEState::keyboard_disabled()?;
         let input_mode = if keyboard_disabled {
             InputMode::Latin
@@ -215,7 +214,7 @@ impl ITfLangBarItemButton_Impl for TextServiceFactory_Impl {
 
         unsafe {
             let handle = LoadImageW(
-                dll_module.hinst.context("Dll instance not found")?,
+                DllModule::module_handle()?,
                 PCWSTR(icon_id as *mut u16),
                 IMAGE_ICON,
                 0,
@@ -315,8 +314,7 @@ unsafe extern "system" fn menu_owner_window_proc(
 }
 
 fn create_menu_owner_window() -> Result<MenuOwnerWindow> {
-    let dll_module = DllModule::get()?;
-    let hmodule = dll_module.hinst.context("Dll instance not found")?;
+    let hmodule = DllModule::module_handle()?;
     let hinstance = HINSTANCE(hmodule.0);
 
     unsafe {

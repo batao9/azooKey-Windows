@@ -2,18 +2,23 @@ use anyhow::Result;
 use hyper_util::rt::TokioIo;
 use shared::proto::azookey_service_client::AzookeyServiceClient;
 use std::{
+    os::windows::io::IntoRawHandle,
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{net::windows::named_pipe::ClientOptions, time};
+use tokio::{net::windows::named_pipe::NamedPipeClient, time};
 use tonic::transport::Endpoint;
 use tower::service_fn;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY};
 
-const SERVER_PIPE_PATH: &str = r"\\.\pipe\azookey_server";
 const IPC_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const IPC_CONNECT_DEADLINE: Duration = Duration::from_secs(2);
 const SETTINGS_RPC_DEADLINE: Duration = Duration::from_secs(5);
+
+fn open_named_pipe_client(pipe_name: &str) -> std::io::Result<NamedPipeClient> {
+    let handle = shared::open_named_pipe_client_handle(pipe_name)?;
+    unsafe { NamedPipeClient::from_raw_handle(handle.into_raw_handle()) }
+}
 
 // connect to kkc server
 #[derive(Debug, Clone)]
@@ -55,7 +60,7 @@ impl IPCService {
         let connect = endpoint.connect_with_connector(service_fn(move |_| async move {
             let started_at = Instant::now();
             let client = loop {
-                match ClientOptions::new().open(SERVER_PIPE_PATH) {
+                match open_named_pipe_client(shared::SERVER_PIPE_PATH) {
                     Ok(client) => break client,
                     Err(e)
                         if should_retry_pipe_connect_error(

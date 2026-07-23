@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use tracing::field::{Field, Visit};
 use tracing_core::LevelFilter;
 use tracing_subscriber::filter::Targets;
@@ -7,8 +8,9 @@ use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt};
 use windows::{core::PCWSTR, Win32::System::Diagnostics::Debug::OutputDebugStringW};
 
 use crate::extension::StringExt as _;
-use crate::globals::DllModule;
 use crate::tracing_chrome::{ChromeLayerBuilder, EventOrSpan};
+
+static LOGGER_INIT_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
 
 pub struct StringVisitor<'a> {
     string: &'a mut String,
@@ -37,7 +39,24 @@ fn resolve_trace_log_folder() -> PathBuf {
         .join("logs")
 }
 
-pub fn setup_logger() -> anyhow::Result<()> {
+pub fn initialize_logger() {
+    if let Err(error) =
+        LOGGER_INIT_RESULT.get_or_init(|| contain_logger_initialization(setup_logger))
+    {
+        diagnostic_log(format!("logger initialization disabled: {error}"));
+    }
+}
+
+fn contain_logger_initialization(
+    initializer: impl FnOnce() -> anyhow::Result<()>,
+) -> Result<(), String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(initializer)) {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(_) => Err("logger initialization panicked".to_string()),
+    }
+}
+
+fn setup_logger() -> anyhow::Result<()> {
     diagnostic_log("setup_logger called");
     #[cfg(not(debug_assertions))]
     {
@@ -88,9 +107,7 @@ pub fn setup_logger() -> anyhow::Result<()> {
             EventOrSpan::Span(span) => span.metadata().name().to_string(),
         }));
 
-    let (chrome_layer, sender) = builder.build();
-
-    DllModule::get()?.sender = Some(sender);
+    let chrome_layer = builder.build();
 
     // ignore traces from other crates
     let filter = Targets::new()
@@ -100,7 +117,27 @@ pub fn setup_logger() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(filter)
         .with(chrome_layer)
-        .init();
+        .try_init()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contain_logger_initialization;
+
+    #[test]
+    fn logger_initialization_error_is_contained() {
+        let result = contain_logger_initialization(|| anyhow::bail!("expected failure"));
+
+        assert_eq!(result, Err("expected failure".to_string()));
+    }
+
+    #[test]
+    fn logger_initialization_panic_is_contained() {
+        let result = contain_logger_initialization(|| panic!("expected panic"));
+
+        assert_eq!(result, Err("logger initialization panicked".to_string()));
+    }
 }

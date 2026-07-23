@@ -15,6 +15,8 @@ futures-core = "0.3.31"
 [dependencies.windows]
 version = "0.58.0"
 features = [
+    "Win32_Foundation",
+    "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_System_Threading",
 ]
