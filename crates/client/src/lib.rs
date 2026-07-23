@@ -7,19 +7,18 @@ mod trace;
 mod tracing_chrome;
 mod tsf;
 
-use std::{ffi::c_void, sync::Mutex};
+use std::ffi::c_void;
 
-use globals::{DllModule, DLL_INSTANCE, GUID_TEXT_SERVICE};
+use globals::{DllModule, GUID_TEXT_SERVICE};
 use register::{CLSIDMgr, CategoryMgr, ProfileMgr};
 use tsf::factory::TextServiceFactory;
 use windows::{
     core::{IUnknown, Interface as _, GUID, HRESULT},
     Win32::{
-        Foundation::{CLASS_E_CLASSNOTAVAILABLE, E_FAIL, E_UNEXPECTED, HMODULE, S_FALSE, S_OK},
+        Foundation::{CLASS_E_CLASSNOTAVAILABLE, E_UNEXPECTED, HMODULE, S_FALSE},
         System::{
-            Com::IClassFactory,
-            Ole::SELFREG_E_CLASS,
-            SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH},
+            Com::IClassFactory, LibraryLoader::DisableThreadLibraryCalls, Ole::SELFREG_E_CLASS,
+            SystemServices::DLL_PROCESS_ATTACH,
         },
     },
 };
@@ -33,41 +32,16 @@ pub extern "system" fn DllMain(
     _lpv_reserved: *mut c_void,
 ) -> bool {
     if fdw_reason == DLL_PROCESS_ATTACH {
-        let result: anyhow::Result<()> = (|| {
-            let mut dll_instance = DllModule::new();
-            dll_instance.hinst = Some(hinst);
-            DLL_INSTANCE
-                .set(Mutex::new(dll_instance))
-                .map_err(|e| anyhow::anyhow!(format!("{:?}", e)))?;
-            Ok(())
-        })();
-
-        // use unwrap only in this function
-        std::thread::spawn(|| {
-            trace::setup_logger().unwrap();
-        });
-
-        tracing::debug!("DllMain");
-
-        check_err!(result, true, false)
-    } else if fdw_reason == DLL_PROCESS_DETACH {
-        tracing::debug!("DLL_PROCESS_DETACH");
-
-        let result: anyhow::Result<()> = (|| {
-            let mut dll_instance = DllModule::get()?;
-            dll_instance.hinst = None;
-            // send a signal to the tracing writer thread to exit
-            if let Some(sender) = dll_instance.sender.take() {
-                sender.send(true).unwrap();
-            }
-
-            Ok(())
-        })();
-
-        check_err!(result, true, false)
-    } else {
-        return true;
+        DllModule::set_module_handle(hinst);
+        // This may fail when static TLS is active. Thread notifications are
+        // already no-ops, so failure does not affect correctness.
+        let _ = unsafe { DisableThreadLibraryCalls(hinst) };
     }
+
+    // Process detach is deliberately a no-op. Cleanup that can lock, allocate,
+    // or panic must never run while the loader lock is held.
+
+    true
 }
 
 #[no_mangle]
@@ -85,6 +59,7 @@ pub unsafe extern "system" fn DllGetClassObject(
     tracing::debug!("DllGetClassObject");
 
     let result: anyhow::Result<()> = (|| {
+        DllModule::initialize()?;
         let rclsid = unsafe { *rclsid };
         let riid = unsafe { *riid };
         let ppv = unsafe { &mut *ppv };
