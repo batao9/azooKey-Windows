@@ -9,13 +9,14 @@ use shared::{
 };
 use std::{
     cell::Cell,
+    os::windows::io::IntoRawHandle,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant},
 };
-use tokio::{net::windows::named_pipe::ClientOptions, time};
+use tokio::{net::windows::named_pipe::NamedPipeClient, time};
 use tonic::transport::{channel::Channel, Endpoint};
 use tower::service_fn;
 use windows::Win32::Foundation::ERROR_PIPE_BUSY;
@@ -33,6 +34,11 @@ static CLIENT_LOG_CONFIG_CACHE: OnceLock<Mutex<ClientLogConfigCache>> = OnceLock
 
 thread_local! {
     static CLIENT_INPUT_TRACE_REQUEST_ID: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+fn open_named_pipe_client(pipe_name: &str) -> std::io::Result<NamedPipeClient> {
+    let handle = shared::open_named_pipe_client_handle(pipe_name)?;
+    unsafe { NamedPipeClient::from_raw_handle(handle.into_raw_handle()) }
 }
 
 #[derive(Debug, Default)]
@@ -209,13 +215,13 @@ impl IPCService {
         let server_channel = Self::connect_named_pipe_channel(
             &runtime,
             "http://[::]:50051",
-            r"\\.\pipe\azookey_server",
+            shared::SERVER_PIPE_PATH,
             SERVER_PIPE_BUSY_TIMEOUT,
         )?;
         let window_client = match Self::connect_named_pipe_channel(
             &runtime,
             "http://[::]:50052",
-            r"\\.\pipe\azookey_ui",
+            shared::UI_PIPE_PATH,
             UI_PIPE_BUSY_TIMEOUT,
         ) {
             Ok(ui_channel) => Some(WindowServiceClient::new(ui_channel)),
@@ -265,7 +271,7 @@ impl IPCService {
             service_fn(move |_| async move {
                 let busy_started_at = Instant::now();
                 let client = loop {
-                    match ClientOptions::new().open(pipe_name) {
+                    match open_named_pipe_client(pipe_name) {
                         Ok(client) => break client,
                         Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => {
                             if busy_started_at.elapsed() >= busy_timeout {
@@ -1089,7 +1095,7 @@ impl IPCService {
             match Self::connect_named_pipe_channel(
                 self.runtime.as_ref(),
                 "http://[::]:50052",
-                r"\\.\pipe\azookey_ui",
+                shared::UI_PIPE_PATH,
                 UI_PIPE_BUSY_TIMEOUT,
             ) {
                 Ok(ui_channel) => {
