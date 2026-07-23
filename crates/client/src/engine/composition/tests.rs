@@ -9,7 +9,7 @@ use crate::engine::{
         ClientAction, LearningCommitKind, LearningCommitScope, SetSelectionType, SetTextType,
     },
     input_mode::InputMode,
-    ipc_service::WindowRpcDelivery,
+    ipc_service::{ClauseSnapshotOperation, WindowRpcDelivery},
     user_action::{Function, Navigation, UserAction},
 };
 use shared::{get_default_romaji_rows, AppConfig, PunctuationStyle, RomajiRule, WidthMode};
@@ -1769,18 +1769,7 @@ impl InitialSplitSingleNBoundaryBackend {
 }
 
 impl ClauseActionBackend for InitialSplitSingleNBoundaryBackend {
-    fn move_cursor(&mut self, offset: i32) -> anyhow::Result<Candidates> {
-        match offset {
-            value if value == TextServiceFactory::MOVE_CURSOR_PUSH_CLAUSE_SNAPSHOT => {
-                self.snapshots.push(self.server);
-            }
-            value if value == TextServiceFactory::MOVE_CURSOR_POP_CLAUSE_SNAPSHOT => {
-                if let Some(restored) = self.snapshots.pop() {
-                    self.server = restored;
-                }
-            }
-            _ => {}
-        }
+    fn move_cursor(&mut self, _offset: i32) -> anyhow::Result<Candidates> {
         Ok(self.current_candidates())
     }
 
@@ -1788,6 +1777,25 @@ impl ClauseActionBackend for InitialSplitSingleNBoundaryBackend {
         assert_eq!(offset, 7);
         self.server = SingleNBoundaryServerState::BadSuffix;
         Ok(self.current_candidates())
+    }
+
+    fn update_composition_snapshot(
+        &mut self,
+        operation: ClauseSnapshotOperation,
+        _previous_candidates: &Candidates,
+    ) -> anyhow::Result<()> {
+        match operation {
+            ClauseSnapshotOperation::Push => {
+                self.snapshots.push(self.server);
+            }
+            ClauseSnapshotOperation::Pop => {
+                if let Some(restored) = self.snapshots.pop() {
+                    self.server = restored;
+                }
+            }
+            ClauseSnapshotOperation::Clear => self.snapshots.clear(),
+        }
+        Ok(())
     }
 }
 

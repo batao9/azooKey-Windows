@@ -386,6 +386,96 @@ private func testCandidate(
     free_c_string(text)
 }
 
+@Test func cursorOffsetsUseFullInt32RangeWithoutSnapshotCollisions() async {
+    await MainActor.run {
+        let previousComposingText = composingText
+        let previousComposingTextSnapshots = composingTextSnapshots
+        defer {
+            composingText = previousComposingText
+            composingTextSnapshots = previousComposingTextSnapshots
+        }
+
+        let inputLength = 2048
+        let input = String(repeating: "あ", count: inputLength)
+        for offset in [125, 126, 127, 128, 129, 1024] {
+            composingText = ComposingText()
+            composingText.insertAtCursorPosition(input, inputStyle: .direct)
+            composingTextSnapshots.removeAll()
+
+            var cursor: CInt = 0
+            free_c_string(move_cursor(offset: -CInt(inputLength), cursorPtr: &cursor))
+            #expect(cursor == -CInt(inputLength))
+            #expect(composingText.convertTargetCursorPosition == 0)
+            free_c_string(move_cursor(offset: CInt(offset), cursorPtr: &cursor))
+            #expect(cursor == CInt(offset))
+            #expect(composingText.convertTargetCursorPosition == offset)
+            #expect(composingTextSnapshots.isEmpty)
+        }
+
+        composingText = ComposingText()
+        composingText.insertAtCursorPosition(input, inputStyle: .direct)
+        var extremeCursor: CInt = 0
+        free_c_string(move_cursor(offset: CInt.min, cursorPtr: &extremeCursor))
+        #expect(extremeCursor == -CInt(inputLength))
+        #expect(composingText.convertTargetCursorPosition == 0)
+        free_c_string(move_cursor(offset: CInt.max, cursorPtr: &extremeCursor))
+        #expect(extremeCursor == CInt(inputLength))
+        #expect(composingText.convertTargetCursorPosition == inputLength)
+
+        composingText = ComposingText()
+        composingText.insertAtCursorPosition(input, inputStyle: .direct)
+        composingTextSnapshots.removeAll()
+        push_composing_text_snapshot()
+        #expect(composingTextSnapshots.count == 1)
+
+        var cursor: CInt = 0
+        free_c_string(move_cursor(offset: -1024, cursorPtr: &cursor))
+        free_c_string(move_cursor(offset: 125, cursorPtr: &cursor))
+        #expect(cursor == 125)
+        #expect(composingText.convertTargetCursorPosition == 1149)
+        #expect(composingTextSnapshots.count == 1)
+
+        pop_composing_text_snapshot()
+        #expect(composingText.convertTargetCursorPosition == inputLength)
+        #expect(composingTextSnapshots.isEmpty)
+
+        push_composing_text_snapshot()
+        clear_composing_text_snapshots()
+        #expect(composingTextSnapshots.isEmpty)
+    }
+}
+
+@Test func shrinkTextSupportsLongOffsetsAndClampsDirectFfiInput() async {
+    await MainActor.run {
+        let previousComposingText = composingText
+        defer {
+            composingText = previousComposingText
+        }
+
+        let inputLength = 1100
+        let input = String(repeating: "あ", count: inputLength)
+        for offset in [127, 128, 129, 1024] {
+            composingText = ComposingText()
+            composingText.insertAtCursorPosition(input, inputStyle: .direct)
+
+            let result = shrink_text(offset: CInt(offset))
+            let remaining = String(cString: result)
+            free_c_string(result)
+
+            #expect(remaining.count == inputLength - offset)
+            #expect(composingText.input.count == inputLength - offset)
+        }
+
+        composingText = ComposingText()
+        composingText.insertAtCursorPosition(input, inputStyle: .direct)
+        let negativeResult = shrink_text(offset: -1)
+        let unchanged = String(cString: negativeResult)
+        free_c_string(negativeResult)
+        #expect(unchanged.count == inputLength)
+        #expect(composingText.input.count == inputLength)
+    }
+}
+
 @Test func ffiFreeCandidateListAcceptsNullEmptyAndPopulatedLists() async throws {
     free_candidate_list(nil, 0)
 

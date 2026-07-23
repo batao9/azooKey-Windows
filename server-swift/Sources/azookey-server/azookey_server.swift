@@ -2190,35 +2190,38 @@ func cursorPrefixBoundaryFirstClauseResults(
     cursorPtr: UnsafeMutablePointer<CInt>
 ) -> UnsafeMutablePointer<CChar> {
     serverLog("DEBUG", "MoveCursor: start offset=\(offset)")
-    if offset == 125 {
-        composingTextSnapshots.removeAll()
-        cursorPtr.pointee = CInt(composingText.convertTargetCursorPosition)
-        serverLog("DEBUG", "MoveCursor: clear snapshots")
-        return _strdup(composingText.convertTarget)!
-    }
-
-    if offset == 126 {
-        composingTextSnapshots.append(composingText)
-        cursorPtr.pointee = CInt(composingText.convertTargetCursorPosition)
-        serverLog("DEBUG", "MoveCursor: push snapshot count=\(composingTextSnapshots.count)")
-        return _strdup(composingText.convertTarget)!
-    }
-
-    if offset == 127 {
-        if let restored = composingTextSnapshots.popLast() {
-            composingText = restored
-        }
-        cursorPtr.pointee = CInt(composingText.convertTargetCursorPosition)
-        serverLog("DEBUG", "MoveCursor: pop snapshot remaining=\(composingTextSnapshots.count)")
-        return _strdup(composingText.convertTarget)!
-    }
-
     let cursor = composingText.moveCursorFromCursorPosition(count: Int(offset))
     serverLog("DEBUG", "MoveCursor: offset=\(offset) cursor=\(cursor)")
 
     cursorPtr.pointee = CInt(cursor)
     serverLog("DEBUG", "MoveCursor: completed cursor=\(cursor)")
     return _strdup(composingText.convertTarget)!
+}
+
+@_silgen_name("ClearComposingTextSnapshots")
+@MainActor public func clear_composing_text_snapshots() {
+    composingTextSnapshots.removeAll()
+    serverLog("DEBUG", "ClearComposingTextSnapshots: completed")
+}
+
+@_silgen_name("PushComposingTextSnapshot")
+@MainActor public func push_composing_text_snapshot() {
+    composingTextSnapshots.append(composingText)
+    serverLog(
+        "DEBUG",
+        "PushComposingTextSnapshot: completed count=\(composingTextSnapshots.count)"
+    )
+}
+
+@_silgen_name("PopComposingTextSnapshot")
+@MainActor public func pop_composing_text_snapshot() {
+    if let restored = composingTextSnapshots.popLast() {
+        composingText = restored
+    }
+    serverLog(
+        "DEBUG",
+        "PopComposingTextSnapshot: completed remaining=\(composingTextSnapshots.count)"
+    )
 }
 
 @_silgen_name("ClearText")
@@ -2866,7 +2869,8 @@ public func free_candidate_list(
 ) -> UnsafeMutablePointer<CChar>  {
     serverLog("DEBUG", "ShrinkText: start offset=\(offset)")
     var afterComposingText = composingText
-    afterComposingText.prefixComplete(composingCount: .inputCount(Int(offset)))
+    let boundedOffset = min(max(Int(offset), 0), afterComposingText.input.count)
+    afterComposingText.prefixComplete(composingCount: .inputCount(boundedOffset))
     composingText = afterComposingText
 
     serverLog("DEBUG", "ShrinkText: completed hiraganaLength=\(composingText.convertTarget.count) inputCount=\(composingText.input.count)")

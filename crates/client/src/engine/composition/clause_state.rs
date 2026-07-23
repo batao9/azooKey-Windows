@@ -7,7 +7,7 @@ use std::{
 use super::{ClauseSnapshot, Composition, FutureClauseSnapshot, TextServiceFactory};
 use crate::engine::{
     client_action::SetSelectionType,
-    ipc_service::{Candidates, IPCService},
+    ipc_service::{Candidates, ClauseSnapshotOperation, IPCService},
 };
 
 #[derive(Debug, Clone)]
@@ -39,6 +39,14 @@ pub(crate) trait ClauseActionBackend {
     ) -> Result<Candidates> {
         self.shrink_text(offset)
     }
+
+    fn update_composition_snapshot(
+        &mut self,
+        _operation: ClauseSnapshotOperation,
+        _previous_candidates: &Candidates,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl ClauseActionBackend for IPCService {
@@ -64,6 +72,14 @@ impl ClauseActionBackend for IPCService {
         previous_candidates: &Candidates,
     ) -> Result<Candidates> {
         IPCService::shrink_text_with_context(self, offset, previous_candidates)
+    }
+
+    fn update_composition_snapshot(
+        &mut self,
+        operation: ClauseSnapshotOperation,
+        previous_candidates: &Candidates,
+    ) -> Result<()> {
+        IPCService::update_composition_snapshot(self, operation, previous_candidates)
     }
 }
 
@@ -467,10 +483,8 @@ impl ClauseState {
             let current_corresponding_count = *state.corresponding_count;
             let previous_candidates = state.candidates.clone();
 
-            let _ = backend.move_cursor_with_context(
-                TextServiceFactory::MOVE_CURSOR_PUSH_CLAUSE_SNAPSHOT,
-                &previous_candidates,
-            )?;
+            backend
+                .update_composition_snapshot(ClauseSnapshotOperation::Push, &previous_candidates)?;
             state.clause_snapshots.push(snapshot);
 
             *state.candidates = backend
@@ -550,8 +564,8 @@ impl ClauseState {
                     TextServiceFactory::select_candidate(state.candidates, *state.selection_index)
                 else {
                     let previous_candidates = state.candidates.clone();
-                    let _ = backend.move_cursor_with_context(
-                        TextServiceFactory::MOVE_CURSOR_POP_CLAUSE_SNAPSHOT,
+                    backend.update_composition_snapshot(
+                        ClauseSnapshotOperation::Pop,
                         &previous_candidates,
                     )?;
                     if let Some(restored) = state.clause_snapshots.pop() {
@@ -614,8 +628,8 @@ impl ClauseState {
                     state.candidates,
                 );
                 let previous_candidates = state.candidates.clone();
-                let _ = backend.move_cursor_with_context(
-                    TextServiceFactory::MOVE_CURSOR_POP_CLAUSE_SNAPSHOT,
+                backend.update_composition_snapshot(
+                    ClauseSnapshotOperation::Pop,
                     &previous_candidates,
                 )?;
 
