@@ -93,6 +93,29 @@ function Assert-InstallPayload {
     }
 }
 
+function Wait-AzookeyUninstalled {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$InstallLocation
+    )
+
+    $payloadPaths = @("frontend.exe", "azookey.dll", "azookey32.dll", "launcher.exe") |
+        ForEach-Object { Join-Path $InstallLocation $_ }
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        $taskRemains = $null -ne (Get-ScheduledTask -TaskName "Azookey Startup" -ErrorAction SilentlyContinue)
+        $remainingPayload = @($payloadPaths | Where-Object { Test-Path -LiteralPath $_ })
+        if (-not $taskRemains -and $remainingPayload.Count -eq 0) {
+            return
+        }
+        Start-Sleep -Seconds 1
+    }
+
+    $taskRemains = $null -ne (Get-ScheduledTask -TaskName "Azookey Startup" -ErrorAction SilentlyContinue)
+    $remainingPayload = @($payloadPaths | Where-Object { Test-Path -LiteralPath $_ })
+    throw "Uninstall cleanup timed out. task_remains=$taskRemains remaining_payload=$($remainingPayload -join ',')"
+}
+
 $resolvedInstaller = (Resolve-Path -LiteralPath $InstallerPath).Path
 $installer = Get-Item -LiteralPath $resolvedInstaller
 if ($installer.Length -le 0) {
@@ -147,8 +170,9 @@ if (-not $SilentInstall) {
 }
 
 New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
-$installLog = Join-Path $LogDirectory "azookey-install.log"
-$uninstallLog = Join-Path $LogDirectory "azookey-uninstall.log"
+$resolvedLogDirectory = (Resolve-Path -LiteralPath $LogDirectory).Path
+$installLog = Join-Path $resolvedLogDirectory "azookey-install.log"
+$uninstallLog = Join-Path $resolvedLogDirectory "azookey-uninstall.log"
 $installed = $false
 
 try {
@@ -157,7 +181,7 @@ try {
         "/SUPPRESSMSGBOXES",
         "/NORESTART",
         "/SP-",
-        "/LOG=$installLog"
+        "/LOG=`"$installLog`""
     )
     $installProcess = Start-Process -FilePath $resolvedInstaller -ArgumentList $installArguments -PassThru
     Wait-CheckedProcess -Process $installProcess -Description "Silent installer"
@@ -181,21 +205,12 @@ try {
         "/VERYSILENT",
         "/SUPPRESSMSGBOXES",
         "/NORESTART",
-        "/LOG=$uninstallLog"
+        "/LOG=`"$uninstallLog`""
     )
     $uninstallProcess = Start-Process -FilePath $uninstaller.FullName -ArgumentList $uninstallArguments -PassThru
     Wait-CheckedProcess -Process $uninstallProcess -Description "Silent uninstaller"
     $installed = $false
-
-    if (Get-ScheduledTask -TaskName "Azookey Startup" -ErrorAction SilentlyContinue) {
-        throw "Azookey Startup task remains after uninstall"
-    }
-    foreach ($relativePath in @("frontend.exe", "azookey.dll", "azookey32.dll", "launcher.exe")) {
-        $path = Join-Path $installLocation $relativePath
-        if (Test-Path -LiteralPath $path) {
-            throw "Install payload remains after uninstall: $path"
-        }
-    }
+    Wait-AzookeyUninstalled -InstallLocation $installLocation
 
     Write-Host "Silent install and uninstall verification passed"
 } finally {
