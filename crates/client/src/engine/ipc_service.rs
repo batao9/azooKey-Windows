@@ -217,6 +217,11 @@ fn move_input_cursor(ledger: &mut InputLedger, offset: i32) {
     }
 }
 
+fn mark_input_ledger_incomplete(ledger: &mut InputLedger) {
+    ledger.operations.clear();
+    ledger.complete = false;
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Candidates {
     pub texts: Vec<String>,
@@ -643,8 +648,7 @@ impl IPCService {
 
     fn invalidate_input_ledger(&self) {
         if let Ok(mut ledger) = self.recovery.input_ledger.lock() {
-            ledger.operations.clear();
-            ledger.complete = false;
+            mark_input_ledger_incomplete(&mut ledger);
         }
     }
 
@@ -858,6 +862,12 @@ impl IPCService {
                             ));
                         }
 
+                        // The edit may have completed before the connection failed, but
+                        // refresh alone cannot safely reproduce that mutation in the local
+                        // recovery ledger. Discard it so a later deadline recovery cannot
+                        // rebuild the pre-edit composition and resurrect removed text or an
+                        // old cursor position.
+                        self.invalidate_input_ledger();
                         Ok((
                             refreshed_candidates,
                             NonIdempotentEditRecovery::RefreshedAfterReconnect,
@@ -2015,10 +2025,10 @@ impl IPCService {
 mod tests {
     use super::{
         append_input_segment, await_rpc_with_deadline, is_non_destructive_ipc_error,
-        move_input_cursor, pop_input_segment_character, preserve_recovery_error,
-        recovery_generation_is_current, restart_generation_ready, restart_request_needed,
-        Candidates, CompositionOperation, IPCService, InputLedger, IpcDeadlineExceeded,
-        NonIdempotentEditAttempt, INPUT_STYLE_DIRECT, INPUT_STYLE_ROMAN2KANA,
+        mark_input_ledger_incomplete, move_input_cursor, pop_input_segment_character,
+        preserve_recovery_error, recovery_generation_is_current, restart_generation_ready,
+        restart_request_needed, Candidates, CompositionOperation, IPCService, InputLedger,
+        IpcDeadlineExceeded, NonIdempotentEditAttempt, INPUT_STYLE_DIRECT, INPUT_STYLE_ROMAN2KANA,
     };
     use std::{
         future::Future,
@@ -2472,5 +2482,24 @@ mod tests {
         );
 
         assert!(attempt.is_err());
+    }
+
+    #[test]
+    fn ambiguous_non_idempotent_refresh_invalidates_input_ledger() {
+        let mut ledger = InputLedger {
+            operations: vec![
+                CompositionOperation::Append {
+                    text: "かな".to_string(),
+                    input_style: 0,
+                },
+                CompositionOperation::MoveCursor(-1),
+            ],
+            complete: true,
+        };
+
+        mark_input_ledger_incomplete(&mut ledger);
+
+        assert!(ledger.operations.is_empty());
+        assert!(!ledger.complete);
     }
 }
