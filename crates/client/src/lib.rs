@@ -1,6 +1,7 @@
 mod engine;
 mod extension;
 mod globals;
+mod launcher_control;
 mod macros;
 mod register;
 mod trace;

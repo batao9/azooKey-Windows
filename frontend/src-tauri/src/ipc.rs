@@ -12,6 +12,8 @@ use tower::service_fn;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY};
 
 const IPC_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const IPC_CONNECT_DEADLINE: Duration = Duration::from_secs(2);
+const SETTINGS_RPC_DEADLINE: Duration = Duration::from_secs(5);
 
 fn open_named_pipe_client(pipe_name: &str) -> std::io::Result<NamedPipeClient> {
     let handle = shared::open_named_pipe_client_handle(pipe_name)?;
@@ -52,30 +54,34 @@ impl IPCService {
 
     fn new_inner(timeout: Option<Duration>) -> Result<Self> {
         let runtime = tokio::runtime::Runtime::new()?;
+        let connect_deadline = connect_deadline(timeout);
 
-        let server_channel = runtime.block_on(
-            Endpoint::try_from("http://[::]:50051")?.connect_with_connector(service_fn(
-                move |_| async move {
-                    let started_at = Instant::now();
-                    let client = loop {
-                        match open_named_pipe_client(shared::SERVER_PIPE_PATH) {
-                            Ok(client) => break client,
-                            Err(e)
-                                if should_retry_pipe_connect_error(
-                                    e.raw_os_error(),
-                                    started_at,
-                                    timeout,
-                                ) => {}
-                            Err(e) => return Err(e),
-                        }
+        let endpoint = Endpoint::try_from("http://[::]:50051")?;
+        let connect = endpoint.connect_with_connector(service_fn(move |_| async move {
+            let started_at = Instant::now();
+            let client = loop {
+                match open_named_pipe_client(shared::SERVER_PIPE_PATH) {
+                    Ok(client) => break client,
+                    Err(e)
+                        if should_retry_pipe_connect_error(
+                            e.raw_os_error(),
+                            started_at,
+                            timeout,
+                        ) => {}
+                    Err(e) => return Err(e),
+                }
 
-                        time::sleep(IPC_RETRY_INTERVAL).await;
-                    };
+                time::sleep(IPC_RETRY_INTERVAL).await;
+            };
 
-                    Ok::<_, std::io::Error>(TokioIo::new(client))
-                },
-            )),
-        )?;
+            Ok::<_, std::io::Error>(TokioIo::new(client))
+        }));
+        let server_channel: tonic::transport::Channel = runtime.block_on(async {
+            match time::timeout(connect_deadline, connect).await {
+                Ok(result) => result.map_err(anyhow::Error::from),
+                Err(_) => Err(anyhow::anyhow!("settings IPC connect deadline exceeded")),
+            }
+        })?;
 
         let azookey_client = AzookeyServiceClient::new(server_channel);
 
@@ -84,6 +90,10 @@ impl IPCService {
             runtime: Arc::new(runtime),
         })
     }
+}
+
+fn connect_deadline(timeout: Option<Duration>) -> Duration {
+    timeout.unwrap_or(IPC_CONNECT_DEADLINE)
 }
 
 fn should_retry_pipe_connect_error(
@@ -105,21 +115,41 @@ fn should_retry_pipe_connect_error(
 // implement methods to interact with kkc server
 impl IPCService {
     pub fn update_config(&mut self) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::UpdateConfigRequest { request_id: 0 });
-        self.runtime
-            .clone()
-            .block_on(self.azookey_client.update_config(request))?;
+        let mut request = tonic::Request::new(shared::proto::UpdateConfigRequest { request_id: 0 });
+        request.set_timeout(SETTINGS_RPC_DEADLINE);
+        self.runtime.clone().block_on(async {
+            time::timeout(
+                SETTINGS_RPC_DEADLINE,
+                self.azookey_client.update_config(request),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("update_config IPC deadline exceeded"))??;
+            anyhow::Ok(())
+        })?;
 
         Ok(())
     }
 
     pub fn reset_learning_memory(&mut self) -> anyhow::Result<bool> {
-        let request =
+        let mut request =
             tonic::Request::new(shared::proto::ResetLearningMemoryRequest { request_id: 0 });
+        request.set_timeout(SETTINGS_RPC_DEADLINE);
         let response = self
             .runtime
             .clone()
-            .block_on(self.azookey_client.reset_learning_memory(request))?
+            .block_on(async {
+                match time::timeout(
+                    SETTINGS_RPC_DEADLINE,
+                    self.azookey_client.reset_learning_memory(request),
+                )
+                .await
+                {
+                    Ok(result) => result.map_err(anyhow::Error::from),
+                    Err(_) => Err(anyhow::anyhow!(
+                        "reset_learning_memory IPC deadline exceeded"
+                    )),
+                }
+            })?
             .into_inner();
 
         Ok(response.reset)
@@ -129,10 +159,18 @@ impl IPCService {
 #[cfg(test)]
 mod tests {
     use super::{
-        should_retry_pipe_connect_error, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
-        ERROR_PIPE_BUSY,
+        connect_deadline, should_retry_pipe_connect_error, ERROR_FILE_NOT_FOUND,
+        ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY, IPC_CONNECT_DEADLINE,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn explicit_reconnect_timeout_controls_outer_deadline() {
+        let reconnect_timeout = Duration::from_secs(10);
+
+        assert_eq!(connect_deadline(Some(reconnect_timeout)), reconnect_timeout);
+        assert_eq!(connect_deadline(None), IPC_CONNECT_DEADLINE);
+    }
 
     #[test]
     fn retries_missing_and_busy_pipe_errors_before_timeout() {

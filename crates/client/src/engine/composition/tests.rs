@@ -1,7 +1,8 @@
 use super::{
-    Candidates, CapsLockKeyboardLayout, ClauseActionBackend, ClauseActionEffect,
-    ClauseActionStateMut, ClauseNavigationReadyUiSync, ClauseSnapshot, ClauseState, Composition,
-    CompositionReducer, CompositionState, FutureClauseSnapshot, TextServiceFactory,
+    deferred_action_suffix, Candidates, CapsLockKeyboardLayout, ClauseActionBackend,
+    ClauseActionEffect, ClauseActionStateMut, ClauseNavigationReadyUiSync, ClauseSnapshot,
+    ClauseState, Composition, CompositionReducer, CompositionState, DeferredClientAction,
+    DeferredProjection, DeferredUserAction, FutureClauseSnapshot, TextServiceFactory,
 };
 use crate::engine::{
     client_action::{
@@ -13,6 +14,265 @@ use crate::engine::{
 };
 use shared::{get_default_romaji_rows, AppConfig, PunctuationStyle, RomajiRule, WidthMode};
 use windows::Win32::Foundation::LPARAM;
+
+#[test]
+fn deadline_recovery_defers_all_actions_from_failure_point() {
+    let actions = vec![
+        DeferredClientAction {
+            action: ClientAction::AppendText("a".to_string()),
+            transition: CompositionState::Composing,
+        },
+        DeferredClientAction {
+            action: ClientAction::RemoveText,
+            transition: CompositionState::Composing,
+        },
+        DeferredClientAction {
+            action: ClientAction::MoveCursor(-1),
+            transition: CompositionState::Selecting,
+        },
+        DeferredClientAction {
+            action: ClientAction::ShrinkText("k".to_string()),
+            transition: CompositionState::Composing,
+        },
+        DeferredClientAction {
+            action: ClientAction::EndComposition,
+            transition: CompositionState::None,
+        },
+    ];
+
+    let deferred = deferred_action_suffix(&actions, 1);
+    assert_eq!(deferred, actions[1..]);
+    assert_eq!(deferred[1].transition, CompositionState::Selecting);
+    assert_eq!(deferred[3].transition, CompositionState::None);
+}
+
+#[test]
+fn deferred_backspace_is_replanned_against_recovered_input() {
+    let app_config = AppConfig::default();
+    let romaji_lookup = super::RomajiLookup::from_rows(&app_config.romaji_table.rows);
+    let composition = Composition {
+        state: CompositionState::Composing,
+        raw_input: "ka".to_string(),
+        ..Composition::default()
+    };
+    let deferred = DeferredUserAction {
+        action: UserAction::Backspace,
+        is_shift_pressed: false,
+        is_shift_key: false,
+        shift_alphabet_shortcut: false,
+    };
+
+    let (transition, actions) = TextServiceFactory::plan_deferred_user_action(
+        &composition,
+        &deferred,
+        &InputMode::Kana,
+        &app_config,
+        &romaji_lookup,
+    )
+    .expect("backspace should remain handled after recovery");
+
+    assert_eq!(transition, CompositionState::Composing);
+    assert_eq!(actions, vec![ClientAction::RemoveText]);
+}
+
+#[test]
+fn deferred_projection_decides_handledness_after_queued_mode_change() {
+    let app_config = AppConfig::default();
+    let romaji_lookup = super::RomajiLookup::from_rows(&app_config.romaji_table.rows);
+    let composition = Composition::default();
+    let input = DeferredUserAction {
+        action: UserAction::Input('a'),
+        is_shift_pressed: false,
+        is_shift_key: false,
+        shift_alphabet_shortcut: false,
+    };
+    let mut projection = DeferredProjection {
+        mode: InputMode::Kana,
+        state: CompositionState::None,
+        raw_input: String::new(),
+        temporary_latin: false,
+        temporary_latin_shift_pending: false,
+        reliable: true,
+    };
+    TextServiceFactory::apply_actions_to_deferred_projection(
+        &mut projection,
+        &[DeferredClientAction {
+            action: ClientAction::SetIMEMode(InputMode::Latin),
+            transition: CompositionState::None,
+        }],
+    );
+
+    assert!(TextServiceFactory::plan_deferred_user_action(
+        &composition,
+        &input,
+        &projection.mode,
+        &app_config,
+        &romaji_lookup,
+    )
+    .is_none());
+
+    TextServiceFactory::apply_actions_to_deferred_projection(
+        &mut projection,
+        &[DeferredClientAction {
+            action: ClientAction::SetIMEMode(InputMode::Kana),
+            transition: CompositionState::None,
+        }],
+    );
+    assert!(TextServiceFactory::plan_deferred_user_action(
+        &composition,
+        &input,
+        &projection.mode,
+        &app_config,
+        &romaji_lookup,
+    )
+    .is_some());
+}
+
+#[test]
+fn deferred_projection_preserves_shift_transition_order() {
+    let mut projection = DeferredProjection {
+        mode: InputMode::Kana,
+        state: CompositionState::Composing,
+        raw_input: String::new(),
+        temporary_latin: true,
+        temporary_latin_shift_pending: false,
+        reliable: true,
+    };
+    TextServiceFactory::apply_actions_to_deferred_projection(
+        &mut projection,
+        &[
+            DeferredClientAction {
+                action: ClientAction::SetTemporaryLatinShiftPending(true),
+                transition: CompositionState::Composing,
+            },
+            DeferredClientAction {
+                action: ClientAction::SetTemporaryLatin(false),
+                transition: CompositionState::Composing,
+            },
+            DeferredClientAction {
+                action: ClientAction::SetTemporaryLatinShiftPending(false),
+                transition: CompositionState::Composing,
+            },
+        ],
+    );
+
+    assert!(!projection.temporary_latin);
+    assert!(!projection.temporary_latin_shift_pending);
+}
+
+#[test]
+fn deferred_projection_tracks_raw_input_before_navigation() {
+    let app_config = AppConfig::default();
+    let romaji_lookup = super::RomajiLookup::from_rows(&app_config.romaji_table.rows);
+    let mut projection = DeferredProjection {
+        mode: InputMode::Kana,
+        state: CompositionState::Composing,
+        raw_input: String::new(),
+        temporary_latin: false,
+        temporary_latin_shift_pending: false,
+        reliable: true,
+    };
+    TextServiceFactory::apply_actions_to_deferred_projection(
+        &mut projection,
+        &[
+            DeferredClientAction {
+                action: ClientAction::AppendText("a".to_string()),
+                transition: CompositionState::Composing,
+            },
+            DeferredClientAction {
+                action: ClientAction::AppendText("b".to_string()),
+                transition: CompositionState::Composing,
+            },
+            DeferredClientAction {
+                action: ClientAction::RemoveText,
+                transition: CompositionState::Composing,
+            },
+        ],
+    );
+    let projected_composition = Composition {
+        state: projection.state.clone(),
+        raw_input: projection.raw_input.clone(),
+        ..Composition::default()
+    };
+    let left = DeferredUserAction {
+        action: UserAction::Navigation(Navigation::Left),
+        is_shift_pressed: false,
+        is_shift_key: false,
+        shift_alphabet_shortcut: false,
+    };
+
+    assert_eq!(projection.raw_input, "a");
+    assert!(TextServiceFactory::plan_deferred_user_action(
+        &projected_composition,
+        &left,
+        &projection.mode,
+        &app_config,
+        &romaji_lookup,
+    )
+    .is_some());
+}
+
+#[test]
+fn deferred_projection_marks_backend_dependent_transitions_unreliable() {
+    let mut projection = DeferredProjection {
+        mode: InputMode::Kana,
+        state: CompositionState::Composing,
+        raw_input: "kana".to_string(),
+        temporary_latin: false,
+        temporary_latin_shift_pending: false,
+        reliable: true,
+    };
+
+    TextServiceFactory::apply_actions_to_deferred_projection(
+        &mut projection,
+        &[DeferredClientAction {
+            action: ClientAction::ShrinkText(String::new()),
+            transition: CompositionState::Composing,
+        }],
+    );
+
+    assert!(!projection.reliable);
+
+    TextServiceFactory::apply_actions_to_deferred_projection(
+        &mut projection,
+        &[
+            DeferredClientAction {
+                action: ClientAction::EndComposition,
+                transition: CompositionState::None,
+            },
+            DeferredClientAction {
+                action: ClientAction::SetIMEMode(InputMode::Latin),
+                transition: CompositionState::None,
+            },
+        ],
+    );
+    assert!(projection.reliable);
+    assert_eq!(projection.state, CompositionState::None);
+    assert_eq!(projection.mode, InputMode::Latin);
+
+    let app_config = AppConfig::default();
+    let romaji_lookup = super::RomajiLookup::from_rows(&app_config.romaji_table.rows);
+    let reset_composition = Composition::default();
+    for action in [
+        UserAction::Navigation(Navigation::Left),
+        UserAction::Input('a'),
+    ] {
+        let input = DeferredUserAction {
+            action,
+            is_shift_pressed: false,
+            is_shift_key: false,
+            shift_alphabet_shortcut: false,
+        };
+        assert!(TextServiceFactory::plan_deferred_user_action(
+            &reset_composition,
+            &input,
+            &projection.mode,
+            &app_config,
+            &romaji_lookup,
+        )
+        .is_none());
+    }
+}
 
 pub(super) fn row(input: &str, output: &str, next_input: &str) -> RomajiRule {
     RomajiRule {

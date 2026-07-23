@@ -9,9 +9,12 @@ use shared::{
 };
 use std::{
     cell::Cell,
+    error::Error as StdError,
+    fmt,
+    future::Future,
     os::windows::io::IntoRawHandle,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant},
@@ -19,14 +22,20 @@ use std::{
 use tokio::{net::windows::named_pipe::NamedPipeClient, time};
 use tonic::transport::{channel::Channel, Endpoint};
 use tower::service_fn;
-use windows::Win32::Foundation::ERROR_PIPE_BUSY;
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY};
 
 const INPUT_STYLE_ROMAN2KANA: i32 = 0;
 const INPUT_STYLE_DIRECT: i32 = 1;
 const CLIENT_LOG_CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const PIPE_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-const SERVER_PIPE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+const SERVER_PIPE_BUSY_TIMEOUT: Duration = Duration::from_millis(750);
 const UI_PIPE_BUSY_TIMEOUT: Duration = Duration::ZERO;
+const IPC_CONNECT_DEADLINE: Duration = Duration::from_secs(1);
+const INPUT_RPC_DEADLINE: Duration = Duration::from_secs(2);
+const STATE_RPC_DEADLINE: Duration = Duration::from_secs(1);
+const LEARNING_RPC_DEADLINE: Duration = Duration::from_secs(1);
+const UI_RPC_DEADLINE: Duration = Duration::from_millis(250);
+const PERFORMANCE_RPC_DEADLINE: Duration = Duration::from_millis(100);
 
 static CLIENT_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static IPC_CONNECTION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -56,9 +65,190 @@ pub struct IPCService {
     // candidate window server client
     window_client: Option<WindowServiceClient<Channel>>,
     runtime: Arc<tokio::runtime::Runtime>,
-    performance_log_tx: tokio::sync::mpsc::UnboundedSender<PerformanceLogRequest>,
+    performance_log_tx: tokio::sync::mpsc::Sender<PerformanceLogRequest>,
     server_session_id: Option<u64>,
     server_reset_recovered: bool,
+    recovery: Arc<ServerRecoveryState>,
+}
+
+#[derive(Debug)]
+struct ServerRecoveryState {
+    pending: AtomicBool,
+    generation: AtomicU64,
+    restart_completed_generation: AtomicU64,
+    restart_request_in_flight: AtomicBool,
+    input_ledger: Mutex<InputLedger>,
+}
+
+impl Default for ServerRecoveryState {
+    fn default() -> Self {
+        Self {
+            pending: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            restart_completed_generation: AtomicU64::new(0),
+            restart_request_in_flight: AtomicBool::new(false),
+            input_ledger: Mutex::new(InputLedger {
+                operations: Vec::new(),
+                complete: true,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct InputLedger {
+    operations: Vec<CompositionOperation>,
+    complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompositionOperation {
+    Append { text: String, input_style: i32 },
+    Remove,
+    MoveCursor(i32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveredComposition {
+    pub(crate) candidates: Candidates,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InputLedgerSnapshot(InputLedger);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IpcDeadlineExceeded {
+    operation: &'static str,
+    deadline: Duration,
+}
+
+impl fmt::Display for IpcDeadlineExceeded {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} exceeded IPC deadline of {:?}",
+            self.operation, self.deadline
+        )
+    }
+}
+
+impl StdError for IpcDeadlineExceeded {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IpcRecoveryPending {
+    details: String,
+}
+
+impl fmt::Display for IpcRecoveryPending {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "IPC recovery is still pending: {}", self.details)
+    }
+}
+
+impl StdError for IpcRecoveryPending {}
+
+pub(crate) fn is_ipc_deadline(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<IpcDeadlineExceeded>().is_some()
+        || error
+            .downcast_ref::<tonic::Status>()
+            .is_some_and(|status| status.code() == tonic::Code::DeadlineExceeded)
+}
+
+pub(crate) fn is_non_destructive_ipc_error(error: &anyhow::Error) -> bool {
+    is_ipc_deadline(error) || error.downcast_ref::<IpcRecoveryPending>().is_some()
+}
+
+fn preserve_recovery_error(error: anyhow::Error) -> anyhow::Error {
+    if is_ipc_deadline(&error) {
+        error
+    } else {
+        IpcRecoveryPending {
+            details: format!("{error:#}"),
+        }
+        .into()
+    }
+}
+
+async fn await_rpc_with_deadline<T, F>(
+    operation: &'static str,
+    deadline: Duration,
+    future: F,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = Result<T, tonic::Status>>,
+{
+    match time::timeout(deadline, future).await {
+        Ok(result) => result.map_err(Into::into),
+        Err(_) => Err(IpcDeadlineExceeded {
+            operation,
+            deadline,
+        }
+        .into()),
+    }
+}
+
+fn recovery_generation_is_current(expected: u64, current: u64) -> bool {
+    expected == current
+}
+
+fn restart_generation_ready(required: u64, completed: u64) -> bool {
+    required != 0 && completed >= required
+}
+
+fn restart_request_needed(pending: bool, ready: bool, in_flight: bool) -> bool {
+    pending && !ready && !in_flight
+}
+
+fn append_input_segment(ledger: &mut InputLedger, text: &str, input_style: i32) {
+    if !ledger.complete || text.is_empty() {
+        return;
+    }
+    ledger.operations.push(CompositionOperation::Append {
+        text: text.to_string(),
+        input_style,
+    });
+}
+
+fn pop_input_segment_character(ledger: &mut InputLedger) {
+    if ledger.complete {
+        ledger.operations.push(CompositionOperation::Remove);
+    }
+}
+
+fn move_input_cursor(ledger: &mut InputLedger, offset: i32) {
+    if ledger.complete && offset != 0 {
+        ledger
+            .operations
+            .push(CompositionOperation::MoveCursor(offset));
+    }
+}
+
+fn mark_input_ledger_incomplete(ledger: &mut InputLedger) {
+    ledger.operations.clear();
+    ledger.complete = false;
+}
+
+fn fallback_input_ledger(raw_input: &str, raw_hiragana: &str) -> InputLedger {
+    let (text, input_style) = if raw_input.is_empty() {
+        (raw_hiragana, INPUT_STYLE_DIRECT)
+    } else {
+        // raw_hiragana may still contain an incomplete roman2kana sequence such as
+        // `k`. Replaying raw_input preserves that converter buffer, while kana in
+        // raw_input is also accepted by the roman2kana input path.
+        (raw_input, INPUT_STYLE_ROMAN2KANA)
+    };
+
+    InputLedger {
+        operations: if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![CompositionOperation::Append {
+                text: text.to_string(),
+                input_style,
+            }]
+        },
+        complete: true,
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -236,13 +426,18 @@ impl IPCService {
 
         let azookey_client = AzookeyServiceClient::new(server_channel);
         let (performance_log_tx, mut performance_log_rx) =
-            tokio::sync::mpsc::unbounded_channel::<PerformanceLogRequest>();
+            tokio::sync::mpsc::channel::<PerformanceLogRequest>(64);
         let mut performance_log_client = azookey_client.clone();
         runtime.spawn(async move {
             while let Some(request) = performance_log_rx.recv().await {
-                if let Err(error) = performance_log_client
-                    .log_performance(tonic::Request::new(request))
-                    .await
+                let mut request = tonic::Request::new(request);
+                request.set_timeout(PERFORMANCE_RPC_DEADLINE);
+                if let Err(error) = await_rpc_with_deadline(
+                    "log_performance",
+                    PERFORMANCE_RPC_DEADLINE,
+                    performance_log_client.log_performance(request),
+                )
+                .await
                 {
                     tracing::debug!("failed to write client performance log: {error:?}");
                 }
@@ -258,6 +453,7 @@ impl IPCService {
             performance_log_tx,
             server_session_id: None,
             server_reset_recovered: false,
+            recovery: Arc::new(ServerRecoveryState::default()),
         })
     }
 
@@ -267,31 +463,47 @@ impl IPCService {
         pipe_name: &'static str,
         busy_timeout: Duration,
     ) -> Result<Channel> {
-        let channel = runtime.block_on(Endpoint::try_from(endpoint)?.connect_with_connector(
-            service_fn(move |_| async move {
-                let busy_started_at = Instant::now();
-                let client = loop {
-                    match open_named_pipe_client(pipe_name) {
-                        Ok(client) => break client,
-                        Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => {
-                            if busy_started_at.elapsed() >= busy_timeout {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::TimedOut,
-                                    format!(
-                                        "{pipe_name} remained busy for at least {busy_timeout:?}"
-                                    ),
-                                ));
-                            }
+        let endpoint = Endpoint::try_from(endpoint)?;
+        let connect = endpoint.connect_with_connector(service_fn(move |_| async move {
+            let busy_started_at = Instant::now();
+            let client = loop {
+                match open_named_pipe_client(pipe_name) {
+                    Ok(client) => break client,
+                    Err(e)
+                        if matches!(
+                            e.raw_os_error(),
+                            Some(code)
+                                if code == ERROR_PIPE_BUSY.0 as i32
+                                    || code == ERROR_FILE_NOT_FOUND.0 as i32
+                                    || code == ERROR_PATH_NOT_FOUND.0 as i32
+                        ) =>
+                    {
+                        if busy_started_at.elapsed() >= busy_timeout {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!(
+                                    "{pipe_name} remained unavailable for at least {busy_timeout:?}"
+                                ),
+                            ));
                         }
-                        Err(e) => return Err(e),
                     }
+                    Err(e) => return Err(e),
+                }
 
-                    time::sleep(PIPE_BUSY_RETRY_INTERVAL).await;
-                };
+                time::sleep(PIPE_BUSY_RETRY_INTERVAL).await;
+            };
 
-                Ok::<_, std::io::Error>(TokioIo::new(client))
-            }),
-        ))?;
+            Ok::<_, std::io::Error>(TokioIo::new(client))
+        }));
+        let channel = runtime.block_on(async {
+            time::timeout(IPC_CONNECT_DEADLINE, connect)
+                .await
+                .map_err(|_| IpcDeadlineExceeded {
+                    operation: "connect_named_pipe",
+                    deadline: IPC_CONNECT_DEADLINE,
+                })?
+                .map_err(anyhow::Error::from)
+        })?;
 
         Ok(channel)
     }
@@ -339,6 +551,192 @@ impl IPCService {
         self.runtime = refreshed.runtime;
         self.performance_log_tx = refreshed.performance_log_tx;
         Ok(())
+    }
+
+    fn mark_server_timeout(recovery: &Arc<ServerRecoveryState>, operation: &'static str) {
+        recovery.generation.fetch_add(1, Ordering::AcqRel);
+        recovery.pending.store(true, Ordering::Release);
+        Self::request_server_restart(recovery, operation);
+    }
+
+    fn request_server_restart(recovery: &Arc<ServerRecoveryState>, operation: &'static str) {
+        if recovery
+            .restart_request_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let generation = recovery.generation.load(Ordering::Acquire);
+        let recovery = recovery.clone();
+        std::thread::spawn(move || {
+            match crate::launcher_control::request_restart() {
+                Ok(()) => {
+                    recovery
+                        .restart_completed_generation
+                        .fetch_max(generation, Ordering::AcqRel);
+                    tracing::warn!(
+                        operation,
+                        generation,
+                        "Launcher completed azookey server restart"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        operation,
+                        generation,
+                        "Failed to request azookey server restart; next input will retry"
+                    );
+                }
+            }
+            recovery
+                .restart_request_in_flight
+                .store(false, Ordering::Release);
+        });
+    }
+
+    pub(crate) fn recovery_pending(&self) -> bool {
+        self.recovery.pending.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn ensure_server_restart_requested(&self) {
+        if restart_request_needed(
+            self.recovery_pending(),
+            self.recovery_restart_ready(),
+            self.recovery
+                .restart_request_in_flight
+                .load(Ordering::Acquire),
+        ) {
+            Self::request_server_restart(&self.recovery, "recovery_retry");
+        }
+    }
+
+    pub(crate) fn recovery_restart_ready(&self) -> bool {
+        let generation = self.recovery.generation.load(Ordering::Acquire);
+        restart_generation_ready(
+            generation,
+            self.recovery
+                .restart_completed_generation
+                .load(Ordering::Acquire),
+        )
+    }
+
+    pub(crate) fn wait_for_recovery_restart(&self) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < INPUT_RPC_DEADLINE {
+            self.ensure_server_restart_requested();
+            if self.recovery_restart_ready() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.recovery_restart_ready()
+    }
+
+    pub(crate) fn recovery_pending_error(&self) -> anyhow::Error {
+        IpcRecoveryPending {
+            details: "waiting for launcher to complete server restart".to_string(),
+        }
+        .into()
+    }
+
+    fn record_successful_append(&self, text: &str, input_style: i32) {
+        let Ok(mut ledger) = self.recovery.input_ledger.lock() else {
+            return;
+        };
+        append_input_segment(&mut ledger, text, input_style);
+    }
+
+    fn record_successful_remove(&self) {
+        let Ok(mut ledger) = self.recovery.input_ledger.lock() else {
+            return;
+        };
+        pop_input_segment_character(&mut ledger);
+    }
+
+    fn record_successful_move(&self, offset: i32) {
+        if offset == 0 || offset.abs() >= 125 {
+            return;
+        }
+        if let Ok(mut ledger) = self.recovery.input_ledger.lock() {
+            move_input_cursor(&mut ledger, offset);
+        }
+    }
+
+    fn clear_input_ledger(&self) {
+        if let Ok(mut ledger) = self.recovery.input_ledger.lock() {
+            ledger.operations.clear();
+            ledger.complete = true;
+        }
+    }
+
+    pub(crate) fn discard_input_ledger(&self) {
+        self.clear_input_ledger();
+    }
+
+    fn invalidate_input_ledger(&self) {
+        if let Ok(mut ledger) = self.recovery.input_ledger.lock() {
+            mark_input_ledger_incomplete(&mut ledger);
+        }
+    }
+
+    pub(crate) fn input_ledger_snapshot(&self) -> InputLedgerSnapshot {
+        let ledger = self
+            .recovery
+            .input_ledger
+            .lock()
+            .map(|ledger| ledger.clone())
+            .unwrap_or_default();
+        InputLedgerSnapshot(ledger)
+    }
+
+    pub(crate) fn restore_input_ledger(&self, snapshot: InputLedgerSnapshot) {
+        if let Ok(mut ledger) = self.recovery.input_ledger.lock() {
+            *ledger = snapshot.0;
+        }
+    }
+
+    pub(crate) fn replace_input_ledger_direct(&self, text: &str) {
+        if let Ok(mut ledger) = self.recovery.input_ledger.lock() {
+            ledger.operations = if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![CompositionOperation::Append {
+                    text: text.to_string(),
+                    input_style: INPUT_STYLE_DIRECT,
+                }]
+            };
+            ledger.complete = true;
+        }
+    }
+
+    fn block_on_server_rpc<T, F>(
+        runtime: &tokio::runtime::Runtime,
+        recovery: &Arc<ServerRecoveryState>,
+        operation: &'static str,
+        deadline: Duration,
+        future: F,
+    ) -> anyhow::Result<T>
+    where
+        F: Future<Output = Result<T, tonic::Status>>,
+    {
+        let result = runtime.block_on(await_rpc_with_deadline(operation, deadline, future));
+        if result.as_ref().is_err_and(is_ipc_deadline) {
+            Self::mark_server_timeout(recovery, operation);
+        }
+        result
+    }
+
+    fn block_on_window_rpc<T, F>(
+        runtime: &tokio::runtime::Runtime,
+        operation: &'static str,
+        future: F,
+    ) -> anyhow::Result<T>
+    where
+        F: Future<Output = Result<T, tonic::Status>>,
+    {
+        runtime.block_on(await_rpc_with_deadline(operation, UI_RPC_DEADLINE, future))
     }
 
     fn observe_server_session(&mut self, operation: &str, server_session_id: u64) {
@@ -493,6 +891,12 @@ impl IPCService {
                             ));
                         }
 
+                        // The edit may have completed before the connection failed, but
+                        // refresh alone cannot safely reproduce that mutation in the local
+                        // recovery ledger. Discard it so a later deadline recovery cannot
+                        // rebuild the pre-edit composition and resurrect removed text or an
+                        // old cursor position.
+                        self.invalidate_input_ledger();
                         Ok((
                             refreshed_candidates,
                             NonIdempotentEditRecovery::RefreshedAfterReconnect,
@@ -510,6 +914,11 @@ impl IPCService {
     }
 
     fn should_reconnect_rpc_error(error: &anyhow::Error) -> bool {
+        if is_ipc_deadline(error) {
+            // A local timeout means the server may still apply the operation.
+            // Replaying before absolute-state reconstruction is unsafe.
+            return false;
+        }
         let Some(status) = error.downcast_ref::<tonic::Status>() else {
             return true;
         };
@@ -519,7 +928,6 @@ impl IPCService {
             tonic::Code::Aborted
                 | tonic::Code::Cancelled
                 | tonic::Code::DataLoss
-                | tonic::Code::DeadlineExceeded
                 | tonic::Code::Internal
                 | tonic::Code::Unavailable
                 | tonic::Code::Unknown
@@ -532,40 +940,59 @@ impl IPCService {
         input_style: i32,
         request_id: u64,
     ) -> anyhow::Result<shared::proto::AppendTextResponse> {
-        let request = tonic::Request::new(shared::proto::AppendTextRequest {
+        let mut request = tonic::Request::new(shared::proto::AppendTextRequest {
             text_to_append: text.to_string(),
             input_style,
             request_id,
         });
+        request.set_timeout(INPUT_RPC_DEADLINE);
 
-        let response = self
-            .runtime
-            .clone()
-            .block_on(self.azookey_client.append_text(request))?;
+        let response = Self::block_on_server_rpc(
+            self.runtime.as_ref(),
+            &self.recovery,
+            "append_text",
+            INPUT_RPC_DEADLINE,
+            self.azookey_client.append_text(request),
+        );
+        if response.is_err() && !response.as_ref().is_err_and(is_ipc_deadline) {
+            self.invalidate_input_ledger();
+        }
+        let response = response?;
         let response = response.into_inner();
         self.observe_server_session("append_text", response.server_session_id);
+        self.record_successful_append(text, input_style);
         Ok(response)
     }
 
     fn send_remove_text(&mut self, request_id: u64) -> anyhow::Result<Candidates> {
-        let request = tonic::Request::new(shared::proto::RemoveTextRequest { request_id });
-        let response = self
-            .runtime
-            .clone()
-            .block_on(self.azookey_client.remove_text(request))?;
+        let mut request = tonic::Request::new(shared::proto::RemoveTextRequest { request_id });
+        request.set_timeout(INPUT_RPC_DEADLINE);
+        let response = Self::block_on_server_rpc(
+            self.runtime.as_ref(),
+            &self.recovery,
+            "remove_text",
+            INPUT_RPC_DEADLINE,
+            self.azookey_client.remove_text(request),
+        )?;
         let response = response.into_inner();
         self.observe_server_session("remove_text", response.server_session_id);
+        self.record_successful_remove();
         Self::candidates_from_composing_text(response.composing_text)
     }
 
     fn send_clear_text(&mut self, request_id: u64) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::ClearTextRequest { request_id });
-        let response = self
-            .runtime
-            .clone()
-            .block_on(self.azookey_client.clear_text(request))?;
+        let mut request = tonic::Request::new(shared::proto::ClearTextRequest { request_id });
+        request.set_timeout(STATE_RPC_DEADLINE);
+        let response = Self::block_on_server_rpc(
+            self.runtime.as_ref(),
+            &self.recovery,
+            "clear_text",
+            STATE_RPC_DEADLINE,
+            self.azookey_client.clear_text(request),
+        )?;
         let response = response.into_inner();
         self.observe_server_session("clear_text", response.server_session_id);
+        self.clear_input_ledger();
         Ok(())
     }
 
@@ -575,54 +1002,171 @@ impl IPCService {
         commit_kind: i32,
         request_id: u64,
     ) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::CommitLearningCandidateRequest {
+        let mut request = tonic::Request::new(shared::proto::CommitLearningCandidateRequest {
             candidate_id,
             commit_kind,
             request_id,
         });
-        let response = self
-            .runtime
-            .clone()
-            .block_on(self.azookey_client.commit_learning_candidate(request))?;
+        request.set_timeout(LEARNING_RPC_DEADLINE);
+        let response = Self::block_on_server_rpc(
+            self.runtime.as_ref(),
+            &self.recovery,
+            "commit_learning_candidate",
+            LEARNING_RPC_DEADLINE,
+            self.azookey_client.commit_learning_candidate(request),
+        )?;
         let response = response.into_inner();
         self.observe_server_session("commit_learning_candidate", response.server_session_id);
         Ok(())
     }
 
     fn send_shrink_text(&mut self, offset: i32, request_id: u64) -> anyhow::Result<Candidates> {
-        let request = tonic::Request::new(shared::proto::ShrinkTextRequest { offset, request_id });
-        let response = self
-            .runtime
-            .clone()
-            .block_on(self.azookey_client.shrink_text(request))?;
+        let mut request =
+            tonic::Request::new(shared::proto::ShrinkTextRequest { offset, request_id });
+        request.set_timeout(INPUT_RPC_DEADLINE);
+        let response = Self::block_on_server_rpc(
+            self.runtime.as_ref(),
+            &self.recovery,
+            "shrink_text",
+            INPUT_RPC_DEADLINE,
+            self.azookey_client.shrink_text(request),
+        )?;
         let response = response.into_inner();
         self.observe_server_session("shrink_text", response.server_session_id);
+        self.invalidate_input_ledger();
         Self::candidates_from_composing_text(response.composing_text)
     }
 
     fn send_move_cursor(&mut self, offset: i32, request_id: u64) -> anyhow::Result<Candidates> {
-        let request = tonic::Request::new(shared::proto::MoveCursorRequest { offset, request_id });
-        let response = self
-            .runtime
-            .clone()
-            .block_on(self.azookey_client.move_cursor(request))?;
+        let mut request =
+            tonic::Request::new(shared::proto::MoveCursorRequest { offset, request_id });
+        request.set_timeout(INPUT_RPC_DEADLINE);
+        let response = Self::block_on_server_rpc(
+            self.runtime.as_ref(),
+            &self.recovery,
+            "move_cursor",
+            INPUT_RPC_DEADLINE,
+            self.azookey_client.move_cursor(request),
+        )?;
         let response = response.into_inner();
         self.observe_server_session("move_cursor", response.server_session_id);
+        self.record_successful_move(offset);
         Self::candidates_from_composing_text(response.composing_text)
     }
 
     fn send_set_context(&mut self, context: &str, request_id: u64) -> anyhow::Result<()> {
-        let request = tonic::Request::new(shared::proto::SetContextRequest {
+        let mut request = tonic::Request::new(shared::proto::SetContextRequest {
             context: context.to_string(),
             request_id,
         });
-        let response = self
-            .runtime
-            .clone()
-            .block_on(self.azookey_client.set_context(request))?;
+        request.set_timeout(STATE_RPC_DEADLINE);
+        let response = Self::block_on_server_rpc(
+            self.runtime.as_ref(),
+            &self.recovery,
+            "set_context",
+            STATE_RPC_DEADLINE,
+            self.azookey_client.set_context(request),
+        )?;
         let response = response.into_inner();
         self.observe_server_session("set_context", response.server_session_id);
         Ok(())
+    }
+
+    fn send_replace_composition(
+        &mut self,
+        input_ledger: &InputLedger,
+        request_id: u64,
+    ) -> anyhow::Result<Candidates> {
+        let operations = input_ledger
+            .operations
+            .iter()
+            .map(|operation| match operation {
+                CompositionOperation::Append { text, input_style } => {
+                    shared::proto::CompositionOperation {
+                        kind: shared::proto::CompositionOperationKind::Append as i32,
+                        text: text.clone(),
+                        input_style: *input_style,
+                        cursor_offset: 0,
+                    }
+                }
+                CompositionOperation::Remove => shared::proto::CompositionOperation {
+                    kind: shared::proto::CompositionOperationKind::Remove as i32,
+                    text: String::new(),
+                    input_style: INPUT_STYLE_ROMAN2KANA,
+                    cursor_offset: 0,
+                },
+                CompositionOperation::MoveCursor(cursor_offset) => {
+                    shared::proto::CompositionOperation {
+                        kind: shared::proto::CompositionOperationKind::MoveCursor as i32,
+                        text: String::new(),
+                        input_style: INPUT_STYLE_ROMAN2KANA,
+                        cursor_offset: *cursor_offset,
+                    }
+                }
+            })
+            .collect();
+        let mut request = tonic::Request::new(shared::proto::ReplaceCompositionRequest {
+            operations,
+            request_id,
+        });
+        request.set_timeout(INPUT_RPC_DEADLINE);
+        let response = Self::block_on_server_rpc(
+            self.runtime.as_ref(),
+            &self.recovery,
+            "replace_composition",
+            INPUT_RPC_DEADLINE,
+            self.azookey_client.replace_composition(request),
+        )?
+        .into_inner();
+        self.observe_server_session("replace_composition", response.server_session_id);
+        if let Ok(mut ledger) = self.recovery.input_ledger.lock() {
+            *ledger = input_ledger.clone();
+        }
+        Self::candidates_from_composing_text(response.composing_text)
+    }
+
+    pub(crate) fn recover_composition_if_needed(
+        &mut self,
+        raw_input: &str,
+        raw_hiragana: &str,
+    ) -> anyhow::Result<Option<RecoveredComposition>> {
+        if !self.recovery.pending.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if !self.recovery_restart_ready() {
+            return Err(self.recovery_pending_error());
+        }
+
+        let recovery_generation = self.recovery.generation.load(Ordering::Acquire);
+        let input_ledger = self
+            .recovery
+            .input_ledger
+            .lock()
+            .ok()
+            .filter(|ledger| ledger.complete)
+            .map(|ledger| ledger.clone())
+            .unwrap_or_else(|| fallback_input_ledger(raw_input, raw_hiragana));
+
+        self.reconnect().map_err(preserve_recovery_error)?;
+        let candidates = self
+            .send_replace_composition(&input_ledger, current_or_next_request_id())
+            .map_err(preserve_recovery_error)?;
+
+        if !self.recovery_restart_ready() {
+            return Err(self.recovery_pending_error());
+        }
+
+        // A second timeout may have started while this reconstruction was in
+        // progress. Only the generation that we rebuilt is allowed to clear the
+        // recovery flag; late results from an older generation are ignored.
+        if recovery_generation_is_current(
+            recovery_generation,
+            self.recovery.generation.load(Ordering::Acquire),
+        ) {
+            self.recovery.pending.store(false, Ordering::Release);
+        }
+        self.server_reset_recovered = false;
+        Ok(Some(RecoveredComposition { candidates }))
     }
 
     pub(crate) fn connection_id(&self) -> u64 {
@@ -646,8 +1190,8 @@ impl IPCService {
             details,
         };
 
-        if let Err(error) = self.performance_log_tx.send(request) {
-            tracing::debug!("failed to enqueue client performance log: {error:?}");
+        if let Err(error) = self.performance_log_tx.try_send(request) {
+            tracing::debug!("dropped client performance log without blocking input: {error:?}");
         }
     }
 
@@ -760,6 +1304,13 @@ impl IPCService {
         let response = match send(self) {
             Ok(response) => response,
             Err(first_error) => {
+                if !Self::should_reconnect_rpc_error(&first_error) {
+                    tracing::warn!(
+                        "append_text failed without immediate replay (style={input_style}, text_len={}): {first_error:?}",
+                        text.chars().count()
+                    );
+                    return Err(first_error);
+                }
                 tracing::warn!(
                     "append_text first attempt failed (style={input_style}, text_len={}), reconnecting IPC: {first_error:?}",
                     text.chars().count()
@@ -933,7 +1484,21 @@ impl IPCService {
                 Err(error) => format!("status=error;error={error:?}"),
             },
         );
-        result.map(|((), _)| ())
+        match result {
+            Ok(((), _)) => Ok(()),
+            Err(error) if is_ipc_deadline(&error) => {
+                // Clear is an absolute, idempotent desired state. The timeout
+                // already requested a server restart, whose fresh process is
+                // empty, so let the client finish clearing its own preedit.
+                tracing::warn!(
+                    ?error,
+                    "Treating timed-out clear_text as best-effort success"
+                );
+                self.clear_input_ledger();
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     #[tracing::instrument]
@@ -944,18 +1509,18 @@ impl IPCService {
     ) -> anyhow::Result<()> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let result = self.run_rpc_with_reconnect("commit_learning_candidate", |this| {
-            this.send_commit_learning_candidate(candidate_id, commit_kind, request_id)
-        });
+        // Learning is an external side effect and the server has no dedupe
+        // ledger. Never replay it after an ambiguous failure.
+        let result = self.send_commit_learning_candidate(candidate_id, commit_kind, request_id);
         self.log_client_performance_from_start(
             performance_start,
             request_id,
             "commit_learning_candidate",
             "rpc_total",
             || match &result {
-                Ok(((), retried)) => {
+                Ok(()) => {
                     format!(
-                        "status=success;retry={retried};candidate_id={candidate_id};commit_kind={commit_kind}"
+                        "status=success;retry=false;candidate_id={candidate_id};commit_kind={commit_kind}"
                     )
                 }
                 Err(error) => {
@@ -965,7 +1530,7 @@ impl IPCService {
                 }
             },
         );
-        result.map(|((), _)| ())
+        result
     }
 
     #[tracing::instrument]
@@ -1185,9 +1750,14 @@ impl IPCService {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
         let result: anyhow::Result<()> = (|| {
-            let request = tonic::Request::new(shared::proto::EmptyResponse {});
+            let mut request = tonic::Request::new(shared::proto::EmptyResponse {});
+            request.set_timeout(UI_RPC_DEADLINE);
             self.with_window_client("ui_show_window", |runtime, window_client| {
-                runtime.block_on(window_client.show_window(request))?;
+                Self::block_on_window_rpc(
+                    runtime,
+                    "ui_show_window",
+                    window_client.show_window(request),
+                )?;
                 Ok(())
             })
         })();
@@ -1209,9 +1779,14 @@ impl IPCService {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
         let result: anyhow::Result<()> = (|| {
-            let request = tonic::Request::new(shared::proto::EmptyResponse {});
+            let mut request = tonic::Request::new(shared::proto::EmptyResponse {});
+            request.set_timeout(UI_RPC_DEADLINE);
             self.with_window_client("ui_hide_window", |runtime, window_client| {
-                runtime.block_on(window_client.hide_window(request))?;
+                Self::block_on_window_rpc(
+                    runtime,
+                    "ui_hide_window",
+                    window_client.hide_window(request),
+                )?;
                 Ok(())
             })
         })();
@@ -1239,7 +1814,7 @@ impl IPCService {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
         let result: anyhow::Result<()> = (|| {
-            let request = tonic::Request::new(shared::proto::SetPositionRequest {
+            let mut request = tonic::Request::new(shared::proto::SetPositionRequest {
                 position: Some(shared::proto::WindowPosition {
                     top,
                     left,
@@ -1247,8 +1822,13 @@ impl IPCService {
                     right,
                 }),
             });
+            request.set_timeout(UI_RPC_DEADLINE);
             self.with_window_client("ui_set_window_position", |runtime, window_client| {
-                runtime.block_on(window_client.set_window_position(request))?;
+                Self::block_on_window_rpc(
+                    runtime,
+                    "ui_set_window_position",
+                    window_client.set_window_position(request),
+                )?;
                 Ok(())
             })
         })();
@@ -1275,9 +1855,15 @@ impl IPCService {
         let performance_start = client_performance_start();
         let candidate_count = performance_start.map(|_| candidates.len());
         let result: anyhow::Result<()> = (|| {
-            let request = tonic::Request::new(shared::proto::SetCandidateRequest { candidates });
+            let mut request =
+                tonic::Request::new(shared::proto::SetCandidateRequest { candidates });
+            request.set_timeout(UI_RPC_DEADLINE);
             self.with_window_client("ui_set_candidates", |runtime, window_client| {
-                runtime.block_on(window_client.set_candidate(request))?;
+                Self::block_on_window_rpc(
+                    runtime,
+                    "ui_set_candidates",
+                    window_client.set_candidate(request),
+                )?;
                 Ok(())
             })
         })();
@@ -1304,9 +1890,14 @@ impl IPCService {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
         let result: anyhow::Result<()> = (|| {
-            let request = tonic::Request::new(shared::proto::SetSelectionRequest { index });
+            let mut request = tonic::Request::new(shared::proto::SetSelectionRequest { index });
+            request.set_timeout(UI_RPC_DEADLINE);
             self.with_window_client("ui_set_selection", |runtime, window_client| {
-                runtime.block_on(window_client.set_selection(request))?;
+                Self::block_on_window_rpc(
+                    runtime,
+                    "ui_set_selection",
+                    window_client.set_selection(request),
+                )?;
                 Ok(())
             })
         })();
@@ -1328,11 +1919,16 @@ impl IPCService {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
         let result: anyhow::Result<()> = (|| {
-            let request = tonic::Request::new(shared::proto::SetInputModeRequest {
+            let mut request = tonic::Request::new(shared::proto::SetInputModeRequest {
                 mode: mode.to_string(),
             });
+            request.set_timeout(UI_RPC_DEADLINE);
             self.with_window_client("ui_set_input_mode", |runtime, window_client| {
-                runtime.block_on(window_client.set_input_mode(request))?;
+                Self::block_on_window_rpc(
+                    runtime,
+                    "ui_set_input_mode",
+                    window_client.set_input_mode(request),
+                )?;
                 Ok(())
             })
         })();
@@ -1391,7 +1987,7 @@ impl IPCService {
         let reading_present =
             performance_start.map(|_| reading.is_some_and(|value| !value.is_empty()));
         let result: anyhow::Result<WindowRpcDelivery> = (|| {
-            let request = tonic::Request::new(shared::proto::UpdateCandidateWindowRequest {
+            let mut request = tonic::Request::new(shared::proto::UpdateCandidateWindowRequest {
                 visible,
                 position,
                 candidates: candidates
@@ -1402,10 +1998,15 @@ impl IPCService {
                 candidate_list_visible,
                 reading_vertical_adjustment,
             });
+            request.set_timeout(UI_RPC_DEADLINE);
             self.with_window_client_delivery(
                 "ui_update_candidate_window",
                 |runtime, window_client| {
-                    runtime.block_on(window_client.update_candidate_window(request))?;
+                    Self::block_on_window_rpc(
+                        runtime,
+                        "ui_update_candidate_window",
+                        window_client.update_candidate_window(request),
+                    )?;
                     Ok(())
                 },
             )
@@ -1437,7 +2038,196 @@ impl IPCService {
 
 #[cfg(test)]
 mod tests {
-    use super::{Candidates, IPCService, NonIdempotentEditAttempt};
+    use super::{
+        append_input_segment, await_rpc_with_deadline, fallback_input_ledger,
+        is_non_destructive_ipc_error, mark_input_ledger_incomplete, move_input_cursor,
+        pop_input_segment_character, preserve_recovery_error, recovery_generation_is_current,
+        restart_generation_ready, restart_request_needed, Candidates, CompositionOperation,
+        IPCService, InputLedger, IpcDeadlineExceeded, NonIdempotentEditAttempt, INPUT_STYLE_DIRECT,
+        INPUT_STYLE_ROMAN2KANA,
+    };
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    struct NeverResponds {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Future for NeverResponds {
+        type Output = Result<(), tonic::Status>;
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for NeverResponds {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn timeout_cancels_and_drops_inflight_rpc_future() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should initialize");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let error = runtime
+            .block_on(await_rpc_with_deadline(
+                "fault_never_responds",
+                Duration::from_millis(5),
+                NeverResponds {
+                    dropped: dropped.clone(),
+                },
+            ))
+            .expect_err("hung RPC should hit its deadline");
+
+        assert!(error.downcast_ref::<IpcDeadlineExceeded>().is_some());
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn response_arriving_after_cancel_cannot_complete_old_request() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should initialize");
+        let late_delivery_failed = runtime.block_on(async {
+            let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+            let late_sender = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                sender.send(()).is_err()
+            });
+
+            let result = await_rpc_with_deadline(
+                "fault_late_response",
+                Duration::from_millis(5),
+                async move {
+                    receiver
+                        .await
+                        .map_err(|_| tonic::Status::cancelled("receiver dropped"))
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            // The response receiver was part of the cancelled RPC future.
+            // A late response has no route back into client state.
+            late_sender.await.expect("late sender task should finish")
+        });
+
+        assert!(late_delivery_failed);
+    }
+
+    #[test]
+    fn server_restart_recovery_ignores_stale_generation_completion() {
+        assert!(recovery_generation_is_current(7, 7));
+        assert!(!recovery_generation_is_current(7, 8));
+    }
+
+    #[test]
+    fn recovery_waits_for_the_requested_restart_generation() {
+        assert!(!restart_generation_ready(0, 0));
+        assert!(!restart_generation_ready(8, 7));
+        assert!(restart_generation_ready(8, 8));
+        assert!(restart_generation_ready(8, 9));
+    }
+
+    #[test]
+    fn failed_launcher_request_is_retried_on_later_input() {
+        assert!(restart_request_needed(true, false, false));
+        assert!(!restart_request_needed(true, false, true));
+        assert!(!restart_request_needed(true, true, false));
+        assert!(!restart_request_needed(false, false, false));
+    }
+
+    #[test]
+    fn mixed_input_ledger_preserves_order_and_style() {
+        let mut ledger = InputLedger {
+            complete: true,
+            ..InputLedger::default()
+        };
+        append_input_segment(&mut ledger, "k", INPUT_STYLE_ROMAN2KANA);
+        append_input_segment(&mut ledger, "あ", INPUT_STYLE_DIRECT);
+        append_input_segment(&mut ledger, "a", INPUT_STYLE_ROMAN2KANA);
+
+        assert_eq!(
+            ledger.operations,
+            vec![
+                CompositionOperation::Append {
+                    text: "k".to_string(),
+                    input_style: INPUT_STYLE_ROMAN2KANA,
+                },
+                CompositionOperation::Append {
+                    text: "あ".to_string(),
+                    input_style: INPUT_STYLE_DIRECT,
+                },
+                CompositionOperation::Append {
+                    text: "a".to_string(),
+                    input_style: INPUT_STYLE_ROMAN2KANA,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn input_ledger_records_successful_mutations_in_order() {
+        let mut ledger = InputLedger {
+            complete: true,
+            ..InputLedger::default()
+        };
+        append_input_segment(&mut ledger, "ka", INPUT_STYLE_ROMAN2KANA);
+        move_input_cursor(&mut ledger, -1);
+        append_input_segment(&mut ledger, "あ", INPUT_STYLE_DIRECT);
+        pop_input_segment_character(&mut ledger);
+
+        assert_eq!(
+            ledger.operations,
+            vec![
+                CompositionOperation::Append {
+                    text: "ka".to_string(),
+                    input_style: INPUT_STYLE_ROMAN2KANA,
+                },
+                CompositionOperation::MoveCursor(-1),
+                CompositionOperation::Append {
+                    text: "あ".to_string(),
+                    input_style: INPUT_STYLE_DIRECT,
+                },
+                CompositionOperation::Remove,
+            ]
+        );
+    }
+
+    #[test]
+    fn server_restart_connection_gap_preserves_client_composition() {
+        let error = preserve_recovery_error(anyhow::anyhow!(
+            "named pipe is briefly absent while launcher restarts server"
+        ));
+
+        assert!(is_non_destructive_ipc_error(&error));
+        assert!(error.to_string().contains("recovery is still pending"));
+    }
+
+    #[test]
+    fn deadline_never_uses_immediate_retry_policy() {
+        let error = anyhow::Error::new(IpcDeadlineExceeded {
+            operation: "append_text",
+            deadline: Duration::from_secs(2),
+        });
+
+        assert!(!IPCService::should_reconnect_rpc_error(&error));
+    }
+
+    #[test]
+    fn grpc_deadline_status_never_replays_non_idempotent_rpc() {
+        let error = anyhow::Error::new(tonic::Status::deadline_exceeded("server timed out"));
+
+        assert!(is_non_destructive_ipc_error(&error));
+        assert!(!IPCService::should_reconnect_rpc_error(&error));
+    }
 
     #[test]
     fn append_retry_is_enabled_when_server_state_is_unchanged() {
@@ -1708,5 +2498,52 @@ mod tests {
         );
 
         assert!(attempt.is_err());
+    }
+
+    #[test]
+    fn ambiguous_non_idempotent_refresh_invalidates_input_ledger() {
+        let mut ledger = InputLedger {
+            operations: vec![
+                CompositionOperation::Append {
+                    text: "かな".to_string(),
+                    input_style: 0,
+                },
+                CompositionOperation::MoveCursor(-1),
+            ],
+            complete: true,
+        };
+
+        mark_input_ledger_incomplete(&mut ledger);
+
+        assert!(ledger.operations.is_empty());
+        assert!(!ledger.complete);
+    }
+
+    #[test]
+    fn fallback_input_ledger_preserves_pending_romaji_state() {
+        let ledger = fallback_input_ledger("k", "k");
+
+        assert_eq!(
+            ledger.operations,
+            vec![CompositionOperation::Append {
+                text: "k".to_string(),
+                input_style: INPUT_STYLE_ROMAN2KANA,
+            }]
+        );
+        assert!(ledger.complete);
+    }
+
+    #[test]
+    fn fallback_input_ledger_uses_direct_reading_without_raw_input() {
+        let ledger = fallback_input_ledger("", "かな");
+
+        assert_eq!(
+            ledger.operations,
+            vec![CompositionOperation::Append {
+                text: "かな".to_string(),
+                input_style: INPUT_STYLE_DIRECT,
+            }]
+        );
+        assert!(ledger.complete);
     }
 }

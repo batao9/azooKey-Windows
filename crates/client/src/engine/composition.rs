@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -19,8 +19,9 @@ use super::{
     full_width::{convert_kana_symbol, to_fullwidth, to_halfwidth},
     input_mode::InputMode,
     ipc_service::{
-        client_performance_log_enabled, current_input_trace_request_id, Candidates,
-        ClientInputTraceGuard, IPCService, WindowRpcDelivery,
+        client_performance_log_enabled, current_input_trace_request_id,
+        is_non_destructive_ipc_error, Candidates, ClientInputTraceGuard, IPCService,
+        WindowRpcDelivery,
     },
     romaji_lookup::RomajiLookup,
     state::{keyboard_disabled_from_context, AppConfigSnapshot, IMEState},
@@ -59,6 +60,27 @@ const VK_TRANSLATED_CAPSLOCK_KEY_CODE: usize = 0xF0;
 const CAPSLOCK_SCAN_CODE: isize = 0x3A;
 const KEYBOARD_TYPE_ENHANCED_101_OR_102: i32 = 0x4;
 const KEYBOARD_TYPE_JAPANESE: i32 = 0x7;
+
+fn deferred_action_suffix(
+    actions: &[DeferredClientAction],
+    failed_index: usize,
+) -> Vec<DeferredClientAction> {
+    actions.get(failed_index..).unwrap_or_default().to_vec()
+}
+
+fn has_same_com_identity(left: &ITfComposition, right: &ITfComposition) -> bool {
+    match (left.cast::<IUnknown>(), right.cast::<IUnknown>()) {
+        (Ok(left), Ok(right)) => left.as_raw() == right.as_raw(),
+        (Err(left_error), Err(right_error)) => {
+            tracing::warn!(?left_error, ?right_error, "Failed to query COM identities");
+            false
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            tracing::warn!(?error, "Failed to query COM identity");
+            false
+        }
+    }
+}
 
 mod clause_state;
 pub(super) use clause_state::{
@@ -127,6 +149,42 @@ pub struct Composition {
     pub temporary_latin: bool,
     pub temporary_latin_shift_pending: bool,
     pub tip_composition: Option<ITfComposition>,
+    deferred_actions: Vec<DeferredClientAction>,
+    deferred_inputs: VecDeque<DeferredInputEvent>,
+    deferred_projection: Option<DeferredProjection>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DeferredClientAction {
+    action: ClientAction,
+    transition: CompositionState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DeferredUserAction {
+    action: UserAction,
+    is_shift_pressed: bool,
+    is_shift_key: bool,
+    shift_alphabet_shortcut: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum DeferredInputEvent {
+    User {
+        input: DeferredUserAction,
+        fallback: Vec<DeferredClientAction>,
+    },
+    Actions(Vec<DeferredClientAction>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DeferredProjection {
+    mode: InputMode,
+    state: CompositionState,
+    raw_input: String,
+    temporary_latin: bool,
+    temporary_latin_shift_pending: bool,
+    reliable: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -186,13 +244,12 @@ impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
     fn OnCompositionTerminated(
         &self,
         _ecwrite: u32,
-        _pcomposition: Option<&ITfComposition>,
+        pcomposition: Option<&ITfComposition>,
     ) -> Result<()> {
         // if user clicked outside the composition, the composition will be terminated
         tracing::debug!("OnCompositionTerminated");
 
-        let actions = vec![ClientAction::EndComposition];
-        self.handle_action(&actions, CompositionState::None)?;
+        self.handle_external_composition_terminated(pcomposition);
 
         Ok(())
     }
@@ -3627,6 +3684,202 @@ impl TextServiceFactory {
         result
     }
 
+    fn plan_deferred_user_action(
+        composition: &Composition,
+        deferred: &DeferredUserAction,
+        mode: &InputMode,
+        app_config: &AppConfig,
+        romaji_lookup: &RomajiLookup,
+    ) -> Option<(CompositionState, Vec<ClientAction>)> {
+        let start_temporary_latin = !composition.temporary_latin
+            && *mode == InputMode::Kana
+            && deferred.shift_alphabet_shortcut;
+        let (transition, mut actions) = Self::plan_actions_for_user_action_with_lookup(
+            composition,
+            &deferred.action,
+            mode,
+            deferred.is_shift_pressed,
+            app_config,
+            romaji_lookup,
+            start_temporary_latin,
+        )?;
+
+        if composition.temporary_latin {
+            let should_reset_on_confirm = matches!(
+                deferred.action,
+                UserAction::Enter | UserAction::CommitAndNextClause | UserAction::CommitFirstClause
+            );
+            let should_reset_on_end = transition == CompositionState::None
+                || actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        ClientAction::EndComposition | ClientAction::SetIMEMode(_)
+                    )
+                });
+
+            if (should_reset_on_confirm || should_reset_on_end)
+                && !actions
+                    .iter()
+                    .any(|action| matches!(action, ClientAction::SetTemporaryLatin(false)))
+            {
+                actions.insert(0, ClientAction::SetTemporaryLatin(false));
+            }
+        }
+
+        if composition.temporary_latin_shift_pending
+            && !deferred.is_shift_key
+            && !actions
+                .iter()
+                .any(|action| matches!(action, ClientAction::SetTemporaryLatinShiftPending(_)))
+        {
+            actions.insert(0, ClientAction::SetTemporaryLatinShiftPending(false));
+        }
+
+        Some((transition, actions))
+    }
+
+    fn apply_actions_to_deferred_projection(
+        projection: &mut DeferredProjection,
+        actions: &[DeferredClientAction],
+    ) {
+        for deferred in actions {
+            projection.state = deferred.transition.clone();
+            match &deferred.action {
+                ClientAction::AppendText(text)
+                | ClientAction::AppendTextRaw(text)
+                | ClientAction::AppendTextDirect(text) => projection.raw_input.push_str(text),
+                ClientAction::RemoveText => {
+                    projection.raw_input.pop();
+                }
+                ClientAction::ShrinkText(text)
+                | ClientAction::ShrinkTextRaw(text)
+                | ClientAction::ShrinkTextDirect(text) => {
+                    projection.raw_input = text.clone();
+                    projection.reliable = false;
+                }
+                ClientAction::EnsureClauseNavigationReady
+                | ClientAction::MoveClause(_)
+                | ClientAction::AdjustBoundary(_)
+                | ClientAction::SetSelection(_)
+                | ClientAction::SetTextWithType(_) => projection.reliable = false,
+                ClientAction::SetIMEMode(mode) => {
+                    projection.mode = mode.clone();
+                    if projection.state == CompositionState::None {
+                        projection.raw_input.clear();
+                        projection.reliable = true;
+                    }
+                }
+                ClientAction::SetTemporaryLatin(value) => projection.temporary_latin = *value,
+                ClientAction::SetTemporaryLatinShiftPending(value) => {
+                    projection.temporary_latin_shift_pending = *value;
+                }
+                ClientAction::EndComposition => {
+                    projection.raw_input.clear();
+                    projection.temporary_latin = false;
+                    projection.temporary_latin_shift_pending = false;
+                    projection.reliable = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn deferred_projection(composition: &Composition, mode: InputMode) -> DeferredProjection {
+        if let Some(projection) = composition.deferred_projection.clone() {
+            return projection;
+        }
+        let mut projection = DeferredProjection {
+            mode,
+            state: composition.state.clone(),
+            raw_input: composition.raw_input.clone(),
+            temporary_latin: composition.temporary_latin,
+            temporary_latin_shift_pending: composition.temporary_latin_shift_pending,
+            reliable: true,
+        };
+        Self::apply_actions_to_deferred_projection(&mut projection, &composition.deferred_actions);
+        projection
+    }
+
+    fn enqueue_deferred_user_action(
+        &self,
+        composition: &Composition,
+        input: DeferredUserAction,
+        config_snapshot: &AppConfigSnapshot,
+    ) -> Result<bool> {
+        let mut projection = Self::deferred_projection(composition, IMEState::input_mode()?);
+        let mut projected_composition = composition.clone();
+        projected_composition.state = projection.state.clone();
+        projected_composition.raw_input = projection.raw_input.clone();
+        projected_composition.temporary_latin = projection.temporary_latin;
+        projected_composition.temporary_latin_shift_pending =
+            projection.temporary_latin_shift_pending;
+        projected_composition.deferred_actions.clear();
+        projected_composition.deferred_inputs.clear();
+        projected_composition.deferred_projection = None;
+
+        let mut planned = Self::plan_deferred_user_action(
+            &projected_composition,
+            &input,
+            &projection.mode,
+            config_snapshot.app_config(),
+            config_snapshot.romaji_lookup(),
+        );
+        if planned.is_none() && !projection.reliable {
+            for state in [
+                CompositionState::Composing,
+                CompositionState::Previewing,
+                CompositionState::None,
+            ] {
+                projected_composition.state = state;
+                if let Some(alternative) = Self::plan_deferred_user_action(
+                    &projected_composition,
+                    &input,
+                    &projection.mode,
+                    config_snapshot.app_config(),
+                    config_snapshot.romaji_lookup(),
+                ) {
+                    planned = Some(alternative);
+                    break;
+                }
+            }
+        }
+        let Some((transition, actions)) = planned else {
+            return Ok(false);
+        };
+        let fallback = actions
+            .into_iter()
+            .map(|action| DeferredClientAction {
+                action,
+                transition: transition.clone(),
+            })
+            .collect::<Vec<_>>();
+        Self::apply_actions_to_deferred_projection(&mut projection, &fallback);
+
+        let text_service = self.borrow()?;
+        let mut persisted = text_service.borrow_mut_composition()?;
+        persisted
+            .deferred_inputs
+            .push_back(DeferredInputEvent::User { input, fallback });
+        persisted.deferred_projection = Some(projection);
+        Ok(true)
+    }
+
+    fn enqueue_deferred_actions(
+        &self,
+        composition: &Composition,
+        actions: Vec<DeferredClientAction>,
+    ) -> Result<()> {
+        let mut projection = Self::deferred_projection(composition, IMEState::input_mode()?);
+        Self::apply_actions_to_deferred_projection(&mut projection, &actions);
+        let text_service = self.borrow()?;
+        let mut persisted = text_service.borrow_mut_composition()?;
+        persisted
+            .deferred_inputs
+            .push_back(DeferredInputEvent::Actions(actions));
+        persisted.deferred_projection = Some(projection);
+        Ok(())
+    }
+
     #[tracing::instrument]
     pub fn process_key(
         &self,
@@ -3748,17 +4001,53 @@ impl TextServiceFactory {
             }
 
             #[allow(clippy::let_and_return)]
-            let (composition, mode) = {
+            let (mut composition, mut mode) = {
                 let text_service = self.borrow()?;
                 let composition = text_service.borrow_composition()?.clone();
                 let mode = IMEState::input_mode()?;
                 (composition, mode)
             };
-            let start_temporary_latin = !composition.temporary_latin
-                && mode == InputMode::Kana
-                && Self::is_shift_alphabet_shortcut(wparam, is_shift_pressed);
-
-            if composition.temporary_latin && is_shift_key && !is_shift_left && !is_shift_right {
+            let mut has_deferred_input =
+                !composition.deferred_actions.is_empty() || !composition.deferred_inputs.is_empty();
+            if has_deferred_input {
+                let restart_ready = IMEState::ipc_service()?
+                    .is_some_and(|ipc_service| ipc_service.wait_for_recovery_restart());
+                if restart_ready {
+                    if let Err(error) = self.flush_deferred_user_actions() {
+                        tracing::warn!(
+                            ?error,
+                            "Deferred recovery was not ready before planning the next key"
+                        );
+                    } else {
+                        let text_service = self.borrow()?;
+                        composition = text_service.borrow_composition()?.clone();
+                        mode = IMEState::input_mode()?;
+                        has_deferred_input = !composition.deferred_actions.is_empty()
+                            || !composition.deferred_inputs.is_empty();
+                    }
+                }
+            }
+            let projected =
+                has_deferred_input.then(|| Self::deferred_projection(&composition, mode.clone()));
+            let temporary_latin = projected
+                .as_ref()
+                .map(|projection| projection.temporary_latin)
+                .unwrap_or(composition.temporary_latin);
+            if temporary_latin && is_shift_key && !is_shift_left && !is_shift_right {
+                if let Some(projection) = projected {
+                    self.enqueue_deferred_actions(
+                        &composition,
+                        vec![DeferredClientAction {
+                            action: ClientAction::SetTemporaryLatinShiftPending(true),
+                            transition: projection.state,
+                        }],
+                    )?;
+                    return Ok(Some((
+                        Vec::new(),
+                        composition.state.clone(),
+                        config_snapshot,
+                    )));
+                }
                 return Ok(Some((
                     vec![ClientAction::SetTemporaryLatinShiftPending(true)],
                     composition.state.clone(),
@@ -3785,53 +4074,39 @@ impl TextServiceFactory {
                 UserAction::try_from(wparam.0)?
             };
 
-            let Some((transition, mut actions)) = Self::plan_actions_for_user_action_with_lookup(
-                &composition,
-                &action,
-                &mode,
+            let deferred_user_action = DeferredUserAction {
+                action,
                 is_shift_pressed,
+                is_shift_key,
+                shift_alphabet_shortcut: Self::is_shift_alphabet_shortcut(wparam, is_shift_pressed),
+            };
+
+            if has_deferred_input {
+                if !self.enqueue_deferred_user_action(
+                    &composition,
+                    deferred_user_action,
+                    &config_snapshot,
+                )? {
+                    self.clear_temporary_latin_shift_pending_if_needed(should_clear_shift_pending)?;
+                    return Ok(None);
+                }
+                return Ok(Some((
+                    Vec::new(),
+                    composition.state.clone(),
+                    config_snapshot,
+                )));
+            }
+
+            let Some((transition, actions)) = Self::plan_deferred_user_action(
+                &composition,
+                &deferred_user_action,
+                &mode,
                 app_config,
                 romaji_lookup,
-                start_temporary_latin,
             ) else {
                 self.clear_temporary_latin_shift_pending_if_needed(should_clear_shift_pending)?;
                 return Ok(None);
             };
-
-            if composition.temporary_latin {
-                let should_reset_on_confirm = matches!(
-                    action,
-                    UserAction::Enter
-                        | UserAction::CommitAndNextClause
-                        | UserAction::CommitFirstClause
-                );
-                let should_reset_on_end = transition == CompositionState::None
-                    || actions.iter().any(|current_action| {
-                        matches!(
-                            current_action,
-                            ClientAction::EndComposition | ClientAction::SetIMEMode(_)
-                        )
-                    });
-
-                if (should_reset_on_confirm || should_reset_on_end)
-                    && !actions.iter().any(|current_action| {
-                        matches!(current_action, ClientAction::SetTemporaryLatin(false))
-                    })
-                {
-                    actions.insert(0, ClientAction::SetTemporaryLatin(false));
-                }
-            }
-
-            if should_clear_shift_pending
-                && !actions.iter().any(|current_action| {
-                    matches!(
-                        current_action,
-                        ClientAction::SetTemporaryLatinShiftPending(_)
-                    )
-                })
-            {
-                actions.insert(0, ClientAction::SetTemporaryLatinShiftPending(false));
-            }
 
             if !Self::ensure_ipc_service_for_key_event("process_key") {
                 return Ok(None);
@@ -3889,6 +4164,28 @@ impl TextServiceFactory {
             composition
         };
 
+        if !composition.deferred_actions.is_empty() || !composition.deferred_inputs.is_empty() {
+            let projection = Self::deferred_projection(&composition, IMEState::input_mode()?);
+            if !projection.temporary_latin_shift_pending {
+                return Ok(None);
+            }
+            let mut actions = vec![ClientAction::SetTemporaryLatinShiftPending(false)];
+            if projection.temporary_latin {
+                actions.insert(0, ClientAction::SetTemporaryLatin(false));
+            }
+            self.enqueue_deferred_actions(
+                &composition,
+                actions
+                    .into_iter()
+                    .map(|action| DeferredClientAction {
+                        action,
+                        transition: projection.state.clone(),
+                    })
+                    .collect(),
+            )?;
+            return Ok(Some((Vec::new(), composition.state.clone())));
+        }
+
         if !composition.temporary_latin_shift_pending {
             return Ok(None);
         }
@@ -3903,6 +4200,56 @@ impl TextServiceFactory {
         }
 
         Ok(Some((actions, composition.state.clone())))
+    }
+
+    fn flush_deferred_user_actions(&self) -> Result<()> {
+        loop {
+            let composition = self.borrow()?.borrow_composition()?.clone();
+            if !composition.deferred_actions.is_empty() {
+                self.handle_action(&[], composition.state.clone())?;
+                continue;
+            }
+
+            let Some(event) = composition.deferred_inputs.front().cloned() else {
+                self.borrow()?.borrow_mut_composition()?.deferred_projection = None;
+                return Ok(());
+            };
+            self.borrow()?
+                .borrow_mut_composition()?
+                .deferred_inputs
+                .pop_front();
+
+            match event {
+                DeferredInputEvent::Actions(actions) => {
+                    self.borrow()?
+                        .borrow_mut_composition()?
+                        .deferred_actions
+                        .extend(actions);
+                }
+                DeferredInputEvent::User { input, fallback } => {
+                    let config_snapshot = IMEState::app_config_snapshot()?;
+                    let mode = IMEState::input_mode()?;
+                    if let Some((transition, actions)) = Self::plan_deferred_user_action(
+                        &composition,
+                        &input,
+                        &mode,
+                        config_snapshot.app_config(),
+                        config_snapshot.romaji_lookup(),
+                    ) {
+                        self.handle_action_with_config_snapshot(
+                            &actions,
+                            transition,
+                            config_snapshot,
+                        )?;
+                    } else {
+                        self.borrow()?
+                            .borrow_mut_composition()?
+                            .deferred_actions
+                            .extend(fallback);
+                    }
+                }
+            }
+        }
     }
 
     #[tracing::instrument]
@@ -3925,7 +4272,11 @@ impl TextServiceFactory {
             if let Some((actions, transition, config_snapshot)) =
                 self.process_key(context, wparam, lparam)?
             {
-                self.handle_action_with_config_snapshot(&actions, transition, config_snapshot)?;
+                if actions.is_empty() {
+                    self.flush_deferred_user_actions()?;
+                } else {
+                    self.handle_action_with_config_snapshot(&actions, transition, config_snapshot)?;
+                }
                 Ok(true)
             } else {
                 Ok(false)
@@ -3955,6 +4306,13 @@ impl TextServiceFactory {
 
         match result {
             Ok(handled) => Ok(handled),
+            Err(error) if is_non_destructive_ipc_error(&error) => {
+                tracing::warn!(
+                    ?error,
+                    "IPC deadline exceeded; preserving the current composition for recovery"
+                );
+                Ok(true)
+            }
             Err(error) => {
                 tracing::error!("handle_key failed: {error:?}");
                 self.recover_after_key_error();
@@ -3981,7 +4339,11 @@ impl TextServiceFactory {
             };
 
             if let Some((actions, transition)) = self.process_key_up(context, wparam, lparam)? {
-                self.handle_action(&actions, transition)?;
+                if actions.is_empty() {
+                    self.flush_deferred_user_actions()?;
+                } else {
+                    self.handle_action(&actions, transition)?;
+                }
                 return Ok(true);
             }
 
@@ -4011,6 +4373,13 @@ impl TextServiceFactory {
 
         match result {
             Ok(handled) => Ok(handled),
+            Err(error) if is_non_destructive_ipc_error(&error) => {
+                tracing::warn!(
+                    ?error,
+                    "IPC deadline exceeded on key-up; preserving current composition"
+                );
+                Ok(true)
+            }
             Err(error) => {
                 tracing::error!("handle_key_up failed: {error:?}");
                 self.recover_after_key_error();
@@ -4071,25 +4440,29 @@ impl TextServiceFactory {
                 (composition, mode)
             };
 
-            let Some((transition, mut actions)) = Self::plan_actions_for_user_action_with_lookup(
-                &composition,
-                &UserAction::ToggleInputMode,
-                &mode,
+            let deferred = DeferredUserAction {
+                action: UserAction::ToggleInputMode,
                 is_shift_pressed,
+                is_shift_key: false,
+                shift_alphabet_shortcut: false,
+            };
+            if !composition.deferred_actions.is_empty() || !composition.deferred_inputs.is_empty() {
+                if !self.enqueue_deferred_user_action(&composition, deferred, &config_snapshot)? {
+                    return Ok(false);
+                }
+                self.flush_deferred_user_actions()?;
+                return Ok(true);
+            }
+
+            let Some((transition, actions)) = Self::plan_deferred_user_action(
+                &composition,
+                &deferred,
+                &mode,
                 app_config,
                 config_snapshot.romaji_lookup(),
-                false,
             ) else {
                 return Ok(false);
             };
-
-            if composition.temporary_latin
-                && !actions
-                    .iter()
-                    .any(|action| matches!(action, ClientAction::SetTemporaryLatin(false)))
-            {
-                actions.insert(0, ClientAction::SetTemporaryLatin(false));
-            }
 
             if !Self::ensure_ipc_service_for_key_event("handle_preserved_eisu_shortcut") {
                 return Ok(false);
@@ -4101,6 +4474,13 @@ impl TextServiceFactory {
 
         match result {
             Ok(handled) => Ok(handled),
+            Err(error) if is_non_destructive_ipc_error(&error) => {
+                tracing::warn!(
+                    ?error,
+                    "IPC deadline exceeded during preserved shortcut; preserving composition"
+                );
+                Ok(true)
+            }
             Err(error) => {
                 tracing::error!("handle_preserved_eisu_shortcut failed: {error:?}");
                 self.recover_after_key_error();
@@ -4111,6 +4491,41 @@ impl TextServiceFactory {
 
     fn recover_after_key_error(&self) {
         self.cancel_composition_for_disabled_context();
+    }
+
+    fn handle_external_composition_terminated(&self, terminated: Option<&ITfComposition>) {
+        let is_current = self
+            .borrow()
+            .ok()
+            .and_then(|text_service| {
+                text_service
+                    .borrow_composition()
+                    .ok()
+                    .and_then(|composition| composition.tip_composition.clone())
+            })
+            .zip(terminated.cloned())
+            .is_some_and(|(current, terminated)| has_same_com_identity(&current, &terminated));
+        if !is_current {
+            tracing::debug!("Ignore termination callback for a stale TSF composition");
+            return;
+        }
+
+        if let Ok(text_service) = self.borrow() {
+            if let Ok(mut composition) = text_service.borrow_mut_composition() {
+                *composition = Composition::default();
+            }
+        }
+
+        if let Ok(Some(mut ipc_service)) = IMEState::ipc_service() {
+            ipc_service.discard_input_ledger();
+            if let Ok(delivery) =
+                ipc_service.update_candidate_window(Some(false), None, Some(vec![]), Some(0), None)
+            {
+                self.remember_candidate_window_visibility_if_sent(delivery, Some(false));
+            }
+            let _ = ipc_service.clear_text();
+            let _ = IMEState::set_ipc_service(ipc_service);
+        }
     }
 
     fn cancel_composition_for_disabled_context(&self) {
@@ -4177,6 +4592,9 @@ impl TextServiceFactory {
         let trace_request_id = current_input_trace_request_id();
         let total_start = trace_request_id.map(|_| Instant::now());
         let requested_transition = transition.clone();
+        let mut retry_actions = None;
+        let mut failed_action_index = 0usize;
+        let mut failed_ledger_snapshot = None;
         let result: Result<()> = (|| {
             #[allow(clippy::let_and_return)]
             let (composition, mode) = {
@@ -4187,6 +4605,17 @@ impl TextServiceFactory {
             };
             let app_config = config_snapshot.app_config();
             let romaji_lookup = config_snapshot.romaji_lookup();
+            let mut effective_actions = composition.deferred_actions.clone();
+            effective_actions.extend(actions.iter().cloned().map(|action| DeferredClientAction {
+                action,
+                transition: transition.clone(),
+            }));
+            retry_actions = Some(effective_actions.clone());
+            let actions = effective_actions.as_slice();
+            let action_values = effective_actions
+                .iter()
+                .map(|deferred| deferred.action.clone())
+                .collect::<Vec<_>>();
 
             let mut preview = composition.preview.clone();
             let mut suffix = composition.suffix.clone();
@@ -4213,10 +4642,37 @@ impl TextServiceFactory {
             let mut pending_learning_commits = Vec::new();
             let has_learning_action = actions
                 .iter()
-                .any(|action| matches!(action, ClientAction::CommitLearning { .. }));
+                .any(|deferred| matches!(deferred.action, ClientAction::CommitLearning { .. }));
             let learning_blocked = has_learning_action
                 && (IMEState::keyboard_disabled().unwrap_or(true)
                     || self.current_context_has_sensitive_input_scope());
+
+            macro_rules! persist_local_state {
+                () => {{
+                    let text_service = self.borrow()?;
+                    let mut persisted = text_service.borrow_mut_composition()?;
+                    persisted.preview = preview.clone();
+                    persisted.state = transition.clone();
+                    persisted.selection_index = selection_index;
+                    persisted.raw_input = raw_input.clone();
+                    persisted.raw_hiragana = raw_hiragana.clone();
+                    persisted.fixed_prefix = fixed_prefix.clone();
+                    persisted.candidates = candidates.clone();
+                    persisted.clause_snapshots = clause_snapshots.clone();
+                    persisted.future_clause_snapshots = future_clause_snapshots.clone();
+                    persisted.current_clause_is_split_derived = current_clause_is_split_derived;
+                    persisted.current_clause_is_direct_split_remainder =
+                        current_clause_is_direct_split_remainder;
+                    persisted.current_clause_has_split_left_neighbor =
+                        current_clause_has_split_left_neighbor;
+                    persisted.current_clause_split_group_id = current_clause_split_group_id;
+                    persisted.next_split_group_id = next_split_group_id;
+                    persisted.suffix = suffix.clone();
+                    persisted.corresponding_count = corresponding_count;
+                    persisted.temporary_latin = temporary_latin;
+                    persisted.temporary_latin_shift_pending = temporary_latin_shift_pending;
+                }};
+            }
 
             macro_rules! reset_after_empty_server_composition {
                 ($reason:expr) => {{
@@ -4287,8 +4743,53 @@ impl TextServiceFactory {
             }
 
             ipc_service = IMEState::ipc_service()?.context("ipc_service is None")?;
+            failed_ledger_snapshot = Some(ipc_service.input_ledger_snapshot());
 
-            for (action_index, action) in actions.iter().enumerate() {
+            if ipc_service.recovery_pending() {
+                ipc_service.ensure_server_restart_requested();
+                if !ipc_service.recovery_restart_ready() {
+                    return Err(ipc_service.recovery_pending_error());
+                }
+
+                let recovered = ipc_service
+                    .recover_composition_if_needed(&raw_input, &raw_hiragana)?
+                    .context("IPC recovery unexpectedly produced no composition")?;
+                tracing::warn!(
+                    raw_input_len = raw_input.chars().count(),
+                    "Rebuilt server composition after IPC deadline"
+                );
+                candidates = recovered.candidates;
+                clause_snapshots.clear();
+                future_clause_snapshots.clear();
+                current_clause_is_split_derived = false;
+                current_clause_is_direct_split_remainder = false;
+                current_clause_has_split_left_neighbor = false;
+                current_clause_split_group_id = None;
+                next_split_group_id = 0;
+                selection_index = 0;
+                if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
+                    corresponding_count = selected.corresponding_count;
+                    preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
+                    suffix = selected.sub_text.clone();
+                    raw_hiragana = selected.hiragana;
+                    if composition.tip_composition.is_some() {
+                        self.set_text(&preview, &suffix)?;
+                        self.sync_candidate_window_after_text_update(
+                            &mut ipc_service,
+                            &candidates,
+                            selection_index,
+                            app_config,
+                            &transition,
+                        )?;
+                    }
+                }
+            }
+
+            for (action_index, deferred) in actions.iter().enumerate() {
+                failed_action_index = action_index;
+                failed_ledger_snapshot = Some(ipc_service.input_ledger_snapshot());
+                transition = deferred.transition.clone();
+                let action = &deferred.action;
                 if Self::action_needs_context_update(action) {
                     IMEState::set_ipc_service(ipc_service.clone())?;
                     self.update_context(&preview)?;
@@ -4297,7 +4798,14 @@ impl TextServiceFactory {
 
                 match action {
                     ClientAction::StartComposition => {
-                        self.start_composition()?;
+                        let composition_started = self
+                            .borrow()?
+                            .borrow_composition()?
+                            .tip_composition
+                            .is_some();
+                        if !composition_started {
+                            self.start_composition()?;
+                        }
                         if app_config.general.show_candidate_window_after_space {
                             let delivery = ipc_service.update_candidate_window(
                                 Some(false),
@@ -4345,6 +4853,7 @@ impl TextServiceFactory {
                                 ?kind,
                                 "Skip conversion learning in disabled or sensitive context"
                             );
+                            persist_local_state!();
                             continue;
                         }
                         pending_learning_commits.extend(
@@ -4618,6 +5127,7 @@ impl TextServiceFactory {
                             reset_after_empty_server_composition!(
                                 "server session changed before remove_text"
                             );
+                            persist_local_state!();
                             continue;
                         }
                         raw_input.pop();
@@ -4634,6 +5144,7 @@ impl TextServiceFactory {
                             reset_after_empty_server_composition!(
                                 "remove_text detected server session change"
                             );
+                            persist_local_state!();
                             continue;
                         }
                         if let Some(selected) = Self::select_candidate(&candidates, selection_index)
@@ -4721,6 +5232,7 @@ impl TextServiceFactory {
                             reset_after_empty_server_composition!(
                                 "server session changed before move_cursor"
                             );
+                            persist_local_state!();
                             continue;
                         }
                         candidates = ipc_service.move_cursor_with_context(*offset, &candidates)?;
@@ -4736,6 +5248,7 @@ impl TextServiceFactory {
                             reset_after_empty_server_composition!(
                                 "move_cursor detected server session change"
                             );
+                            persist_local_state!();
                             continue;
                         }
                         if let Some(selected) = Self::select_candidate(&candidates, selection_index)
@@ -4785,6 +5298,7 @@ impl TextServiceFactory {
                             reset_after_empty_server_composition!(
                                 "server session changed before clause_navigation_ready"
                             );
+                            persist_local_state!();
                             continue;
                         }
                         Self::log_clause_action_state(
@@ -4836,7 +5350,7 @@ impl TextServiceFactory {
                             );
                         } else if effect.applied {
                             let defer_ui_sync = Self::should_defer_clause_navigation_ready_sync(
-                                actions,
+                                &action_values,
                                 action_index,
                             );
                             let ready_ui_sync = Self::clause_navigation_ready_ui_sync(effect);
@@ -4856,6 +5370,7 @@ impl TextServiceFactory {
                                     &clause_snapshots,
                                     &future_clause_snapshots,
                                 );
+                                persist_local_state!();
                                 continue;
                             }
 
@@ -4923,6 +5438,7 @@ impl TextServiceFactory {
                             reset_after_empty_server_composition!(
                                 "server session changed before move_clause"
                             );
+                            persist_local_state!();
                             continue;
                         }
                         Self::log_clause_action_state(
@@ -5077,6 +5593,7 @@ impl TextServiceFactory {
                             reset_after_empty_server_composition!(
                                 "server session changed before adjust_boundary"
                             );
+                            persist_local_state!();
                             continue;
                         }
                         Self::log_clause_action_state(
@@ -5704,34 +6221,22 @@ impl TextServiceFactory {
                         self.set_text(&preview, &suffix)?;
                     }
                 }
+                if matches!(
+                    action,
+                    ClientAction::ShrinkText(_)
+                        | ClientAction::ShrinkTextRaw(_)
+                        | ClientAction::ShrinkTextDirect(_)
+                ) {
+                    ipc_service.replace_input_ledger_direct(&raw_hiragana);
+                }
+                persist_local_state!();
             }
 
-            let text_service = self.borrow()?;
-            let mut composition = text_service.borrow_mut_composition()?;
-
-            composition.preview = preview.clone();
-            composition.state = transition;
-            composition.selection_index = selection_index;
-            composition.raw_input = raw_input.clone();
-            composition.raw_hiragana = raw_hiragana.clone();
-            composition.fixed_prefix = fixed_prefix.clone();
-            composition.candidates = candidates;
-            composition.clause_snapshots = clause_snapshots;
-            composition.future_clause_snapshots = future_clause_snapshots;
-            composition.current_clause_is_split_derived = current_clause_is_split_derived;
-            composition.current_clause_is_direct_split_remainder =
-                current_clause_is_direct_split_remainder;
-            composition.current_clause_has_split_left_neighbor =
-                current_clause_has_split_left_neighbor;
-            composition.current_clause_split_group_id = current_clause_split_group_id;
-            composition.next_split_group_id = next_split_group_id;
-            composition.suffix = suffix.clone();
-            composition.corresponding_count = corresponding_count;
-            composition.temporary_latin = temporary_latin;
-            composition.temporary_latin_shift_pending = temporary_latin_shift_pending;
-
-            drop(composition);
-            drop(text_service);
+            persist_local_state!();
+            self.borrow()?
+                .borrow_mut_composition()?
+                .deferred_actions
+                .clear();
 
             if let Err(error) = IMEState::set_ipc_service(ipc_service) {
                 tracing::warn!(
@@ -5742,6 +6247,25 @@ impl TextServiceFactory {
 
             Ok(())
         })();
+
+        if result.as_ref().is_err_and(is_non_destructive_ipc_error) {
+            if let Some(actions) = retry_actions.as_ref() {
+                let deferred = deferred_action_suffix(actions, failed_action_index);
+                if let Ok(text_service) = self.borrow() {
+                    if let Ok(mut composition) = text_service.borrow_mut_composition() {
+                        composition.deferred_actions = deferred;
+                    }
+                }
+            }
+
+            if let Ok(Some(ipc_service)) = IMEState::ipc_service() {
+                if let Some(snapshot) = failed_ledger_snapshot.take() {
+                    ipc_service.restore_input_ledger(snapshot);
+                }
+                ipc_service.ensure_server_restart_requested();
+                let _ = IMEState::set_ipc_service(ipc_service);
+            }
+        }
 
         if let (Some(request_id), Some(total_start)) = (trace_request_id, total_start) {
             let details = match &result {
