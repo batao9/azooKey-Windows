@@ -911,7 +911,7 @@ mod tests {
 
     #[test]
     fn candidate_window_width_uses_minimum_for_short_candidates() {
-        let candidates = vec!["候補".to_string(), "candidate".to_string()];
+        let candidates = vec!["候補".to_string(), "short".to_string()];
 
         assert_eq!(
             candidate_window_width(&candidates),
