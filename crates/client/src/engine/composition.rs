@@ -68,6 +68,20 @@ fn deferred_action_suffix(
     actions.get(failed_index..).unwrap_or_default().to_vec()
 }
 
+fn has_same_com_identity(left: &ITfComposition, right: &ITfComposition) -> bool {
+    match (left.cast::<IUnknown>(), right.cast::<IUnknown>()) {
+        (Ok(left), Ok(right)) => left.as_raw() == right.as_raw(),
+        (Err(left_error), Err(right_error)) => {
+            tracing::warn!(?left_error, ?right_error, "Failed to query COM identities");
+            false
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            tracing::warn!(?error, "Failed to query COM identity");
+            false
+        }
+    }
+}
+
 mod clause_state;
 pub(super) use clause_state::{
     CandidateSelection, ClauseActionBackend, ClauseActionEffect, ClauseActionStateMut,
@@ -4490,7 +4504,7 @@ impl TextServiceFactory {
                     .and_then(|composition| composition.tip_composition.clone())
             })
             .zip(terminated.cloned())
-            .is_some_and(|(current, terminated)| current.as_raw() == terminated.as_raw());
+            .is_some_and(|(current, terminated)| has_same_com_identity(&current, &terminated));
         if !is_current {
             tracing::debug!("Ignore termination callback for a stale TSF composition");
             return;
@@ -4738,14 +4752,7 @@ impl TextServiceFactory {
                 }
 
                 let recovered = ipc_service
-                    .recover_composition_if_needed(
-                        if raw_hiragana.is_empty() {
-                            &raw_input
-                        } else {
-                            &raw_hiragana
-                        },
-                        !raw_hiragana.is_empty(),
-                    )?
+                    .recover_composition_if_needed(&raw_input, &raw_hiragana)?
                     .context("IPC recovery unexpectedly produced no composition")?;
                 tracing::warn!(
                     raw_input_len = raw_input.chars().count(),

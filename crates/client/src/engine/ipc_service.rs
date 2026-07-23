@@ -222,6 +222,29 @@ fn mark_input_ledger_incomplete(ledger: &mut InputLedger) {
     ledger.complete = false;
 }
 
+fn fallback_input_ledger(raw_input: &str, raw_hiragana: &str) -> InputLedger {
+    let (text, input_style) = if raw_input.is_empty() {
+        (raw_hiragana, INPUT_STYLE_DIRECT)
+    } else {
+        // raw_hiragana may still contain an incomplete roman2kana sequence such as
+        // `k`. Replaying raw_input preserves that converter buffer, while kana in
+        // raw_input is also accepted by the roman2kana input path.
+        (raw_input, INPUT_STYLE_ROMAN2KANA)
+    };
+
+    InputLedger {
+        operations: if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![CompositionOperation::Append {
+                text: text.to_string(),
+                input_style,
+            }]
+        },
+        complete: true,
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Candidates {
     pub texts: Vec<String>,
@@ -1099,7 +1122,7 @@ impl IPCService {
     pub(crate) fn recover_composition_if_needed(
         &mut self,
         raw_input: &str,
-        direct_input: bool,
+        raw_hiragana: &str,
     ) -> anyhow::Result<Option<RecoveredComposition>> {
         if !self.recovery.pending.load(Ordering::Acquire) {
             return Ok(None);
@@ -1116,21 +1139,7 @@ impl IPCService {
             .ok()
             .filter(|ledger| ledger.complete)
             .map(|ledger| ledger.clone())
-            .unwrap_or_else(|| InputLedger {
-                operations: if raw_input.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![CompositionOperation::Append {
-                        text: raw_input.to_string(),
-                        input_style: if direct_input {
-                            INPUT_STYLE_DIRECT
-                        } else {
-                            INPUT_STYLE_ROMAN2KANA
-                        },
-                    }]
-                },
-                complete: true,
-            });
+            .unwrap_or_else(|| fallback_input_ledger(raw_input, raw_hiragana));
 
         self.reconnect().map_err(preserve_recovery_error)?;
         let candidates = self
@@ -2024,11 +2033,12 @@ impl IPCService {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_input_segment, await_rpc_with_deadline, is_non_destructive_ipc_error,
-        mark_input_ledger_incomplete, move_input_cursor, pop_input_segment_character,
-        preserve_recovery_error, recovery_generation_is_current, restart_generation_ready,
-        restart_request_needed, Candidates, CompositionOperation, IPCService, InputLedger,
-        IpcDeadlineExceeded, NonIdempotentEditAttempt, INPUT_STYLE_DIRECT, INPUT_STYLE_ROMAN2KANA,
+        append_input_segment, await_rpc_with_deadline, fallback_input_ledger,
+        is_non_destructive_ipc_error, mark_input_ledger_incomplete, move_input_cursor,
+        pop_input_segment_character, preserve_recovery_error, recovery_generation_is_current,
+        restart_generation_ready, restart_request_needed, Candidates, CompositionOperation,
+        IPCService, InputLedger, IpcDeadlineExceeded, NonIdempotentEditAttempt, INPUT_STYLE_DIRECT,
+        INPUT_STYLE_ROMAN2KANA,
     };
     use std::{
         future::Future,
@@ -2501,5 +2511,33 @@ mod tests {
 
         assert!(ledger.operations.is_empty());
         assert!(!ledger.complete);
+    }
+
+    #[test]
+    fn fallback_input_ledger_preserves_pending_romaji_state() {
+        let ledger = fallback_input_ledger("k", "k");
+
+        assert_eq!(
+            ledger.operations,
+            vec![CompositionOperation::Append {
+                text: "k".to_string(),
+                input_style: INPUT_STYLE_ROMAN2KANA,
+            }]
+        );
+        assert!(ledger.complete);
+    }
+
+    #[test]
+    fn fallback_input_ledger_uses_direct_reading_without_raw_input() {
+        let ledger = fallback_input_ledger("", "かな");
+
+        assert_eq!(
+            ledger.operations,
+            vec![CompositionOperation::Append {
+                text: "かな".to_string(),
+                input_style: INPUT_STYLE_DIRECT,
+            }]
+        );
+        assert!(ledger.complete);
     }
 }
