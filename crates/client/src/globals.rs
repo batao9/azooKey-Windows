@@ -1,10 +1,13 @@
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    mpsc::Sender,
-    Arc, Mutex, MutexGuard, OnceLock,
+use std::{
+    ffi::c_void,
+    ptr,
+    sync::{
+        atomic::{AtomicPtr, AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard, OnceLock,
+    },
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use windows::{
     core::GUID,
@@ -56,7 +59,8 @@ pub const DISPLAY_ATTRIBUTE: TF_DISPLAYATTRIBUTE = TF_DISPLAYATTRIBUTE {
 // You can use any value for this cookie.
 pub const TEXTSERVICE_LANGBARITEMSINK_COOKIE: u32 = 0;
 
-pub static DLL_INSTANCE: OnceLock<Mutex<DllModule>> = OnceLock::new();
+static DLL_MODULE_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static DLL_INSTANCE: OnceLock<Mutex<DllModule>> = OnceLock::new();
 
 unsafe impl Sync for DllModule {}
 unsafe impl Send for DllModule {}
@@ -64,20 +68,36 @@ unsafe impl Send for DllModule {}
 #[derive(Debug)]
 pub struct DllModule {
     pub ref_count: Arc<AtomicUsize>,
-    pub hinst: Option<HMODULE>,
-    pub sender: Option<Sender<bool>>,
 }
 
 impl DllModule {
     pub fn new() -> Self {
         Self {
             ref_count: Arc::new(AtomicUsize::new(0)),
-            hinst: None,
-            sender: None,
         }
     }
 
+    pub fn set_module_handle(hinst: HMODULE) {
+        DLL_MODULE_HANDLE.store(hinst.0, Ordering::Release);
+    }
+
+    pub fn module_handle() -> Result<HMODULE> {
+        let handle = DLL_MODULE_HANDLE.load(Ordering::Acquire);
+        if handle.is_null() {
+            Err(anyhow::anyhow!("Dll module handle is not initialized"))
+        } else {
+            Ok(HMODULE(handle))
+        }
+    }
+
+    pub fn initialize() -> Result<()> {
+        Self::module_handle()?;
+        DLL_INSTANCE.get_or_init(|| Mutex::new(DllModule::new()));
+        Ok(())
+    }
+
     pub fn get() -> Result<MutexGuard<'static, DllModule>> {
+        Self::initialize()?;
         DLL_INSTANCE
             .get()
             .ok_or_else(|| anyhow::anyhow!("DllModule is not initialized"))?
@@ -87,12 +107,8 @@ impl DllModule {
 
     pub fn get_path() -> anyhow::Result<String> {
         let path = {
-            let dll_instance = DllModule::get()?.hinst;
-
             let mut buffer: [u16; MAX_PATH as usize] = [0; MAX_PATH as usize];
-            let length = unsafe {
-                GetModuleFileNameW(dll_instance.context("Dll instance not found")?, &mut buffer)
-            };
+            let length = unsafe { GetModuleFileNameW(Self::module_handle()?, &mut buffer) };
 
             String::from_utf16_lossy(&buffer[..length as usize])
         };

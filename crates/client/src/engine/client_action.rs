@@ -1,6 +1,6 @@
 use super::input_mode::InputMode;
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ClientAction {
     StartComposition,
     EndComposition,
@@ -33,7 +33,7 @@ pub enum ClientAction {
     SetIMEMode(InputMode),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SetSelectionType {
     Up,
     Down,

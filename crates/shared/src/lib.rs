@@ -12,6 +12,60 @@ pub mod proto {
         tonic::include_file_descriptor_set!("azookey_service_descriptor");
 }
 
+// The LOCAL prefix gives packaged/AppContainer clients a logon-session-scoped
+// named-pipe namespace. Keep these paths centralized so every process uses the
+// same session-local endpoint.
+pub const SERVER_PIPE_PATH: &str = r"\\.\pipe\LOCAL\azookey_server";
+pub const UI_PIPE_PATH: &str = r"\\.\pipe\LOCAL\azookey_ui";
+
+#[cfg(windows)]
+pub fn open_named_pipe_client_handle(
+    pipe_path: &str,
+) -> io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows::{
+        core::PCWSTR,
+        Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{
+                CreateFileW, FILE_FLAG_OVERLAPPED, FILE_READ_DATA, FILE_SHARE_MODE,
+                FILE_WRITE_DATA, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+                SYNCHRONIZE,
+            },
+        },
+    };
+
+    let pipe_path_wide = pipe_path.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let desired_access = (FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE).0;
+    let flags = FILE_FLAG_OVERLAPPED | SECURITY_IDENTIFICATION | SECURITY_SQOS_PRESENT;
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(pipe_path_wide.as_ptr()),
+            desired_access,
+            FILE_SHARE_MODE(0),
+            None,
+            OPEN_EXISTING,
+            flags,
+            HANDLE::default(),
+        )
+    }
+    .map_err(|_| io::Error::last_os_error())?;
+
+    Ok(unsafe { OwnedHandle::from_raw_handle(handle.0) })
+}
+
+#[cfg(test)]
+mod pipe_path_tests {
+    use super::{SERVER_PIPE_PATH, UI_PIPE_PATH};
+
+    #[test]
+    fn ipc_pipe_paths_use_the_logon_session_local_namespace() {
+        assert_eq!(SERVER_PIPE_PATH, r"\\.\pipe\LOCAL\azookey_server");
+        assert_eq!(UI_PIPE_PATH, r"\\.\pipe\LOCAL\azookey_ui");
+        assert_ne!(SERVER_PIPE_PATH, UI_PIPE_PATH);
+    }
+}
+
 /// Enables RedirectionGuard before a privileged process reads or writes data
 /// below user-writable directories. The policy blocks traversal through
 /// junctions and symbolic links created by non-administrators.

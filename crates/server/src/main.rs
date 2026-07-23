@@ -8,10 +8,11 @@ use windows::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass, HIG
 use shared::proto::azookey_service_server::{AzookeyService, AzookeyServiceServer};
 use shared::proto::{
     AppendTextRequest, AppendTextResponse, ClearTextRequest, ClearTextResponse, ComposingText,
-    MoveCursorRequest, MoveCursorResponse, PerformanceLogRequest, PerformanceLogResponse,
-    RemoveTextRequest, RemoveTextResponse, ShrinkTextRequest, ShrinkTextResponse, Suggestion,
+    CompositionOperationKind, MoveCursorRequest, MoveCursorResponse, PerformanceLogRequest,
+    PerformanceLogResponse, RemoveTextRequest, RemoveTextResponse, ReplaceCompositionRequest,
+    ReplaceCompositionResponse, ShrinkTextRequest, ShrinkTextResponse, Suggestion,
 };
-use shared::AppConfig;
+use shared::{AppConfig, SERVER_PIPE_PATH};
 
 use std::{
     backtrace::Backtrace,
@@ -22,7 +23,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
-        mpsc, OnceLock,
+        mpsc, Arc, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -1355,8 +1356,10 @@ fn shrink_text(offset: i8) -> Result<RawComposingText, String> {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct MyAzookeyService;
+#[derive(Debug, Clone, Default)]
+pub struct MyAzookeyService {
+    mutation_lock: Arc<tokio::sync::Mutex<()>>,
+}
 
 #[tonic::async_trait]
 impl AzookeyService for MyAzookeyService {
@@ -1364,6 +1367,7 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<AppendTextRequest>,
     ) -> Result<Response<AppendTextResponse>, Status> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
@@ -1423,10 +1427,90 @@ impl AzookeyService for MyAzookeyService {
         }))
     }
 
+    async fn replace_composition(
+        &self,
+        request: Request<ReplaceCompositionRequest>,
+    ) -> Result<Response<ReplaceCompositionResponse>, Status> {
+        let _mutation_guard = self.mutation_lock.lock().await;
+        let request = request.into_inner();
+        let _request_guard = ServerRequestGuard::begin(true);
+        let request_id = request_id_or_next(request.request_id);
+        set_request_id(request_id);
+        let handler_start = Instant::now();
+
+        // This is an absolute-state operation: clear the old converter state and
+        // replay the complete client-observed mutation log. It is safe to repeat after a
+        // timeout whose server-side completion is unknown.
+        clear_text();
+        let mut composing_text = RawComposingText {
+            text: String::new(),
+            cursor: 0,
+        };
+        for operation in &request.operations {
+            match CompositionOperationKind::try_from(operation.kind)
+                .map_err(|_| Status::invalid_argument("unknown composition operation"))?
+            {
+                CompositionOperationKind::Append => {
+                    composing_text = if operation.input_style == INPUT_STYLE_DIRECT {
+                        add_text_direct(&operation.text)
+                            .map_err(|error| status_from_error("replace_composition", error))?
+                    } else {
+                        add_text(&operation.text)
+                            .map_err(|error| status_from_error("replace_composition", error))?
+                    };
+                }
+                CompositionOperationKind::Remove => {
+                    composing_text = remove_text()
+                        .map_err(|error| status_from_error("replace_composition", error))?;
+                }
+                CompositionOperationKind::MoveCursor => {
+                    let mut remaining_offset = operation.cursor_offset;
+                    while remaining_offset != 0 {
+                        let chunk = remaining_offset.clamp(-124, 124);
+                        let offset = i8_offset_from_i32("replace_composition", chunk)?;
+                        composing_text = move_cursor(offset)
+                            .map_err(|error| status_from_error("replace_composition", error))?;
+                        remaining_offset -= chunk;
+                    }
+                }
+            }
+        }
+
+        let composed_text = if composing_text.text.is_empty() {
+            ComposedText {
+                hiragana: Some(String::new()),
+                suggestions: Vec::new(),
+            }
+        } else {
+            get_composed_text(false, request_id)
+                .map_err(|error| status_from_error("replace_composition", error))?
+        };
+        update_active_composition_state(&composing_text.text);
+        performance_event_lazy!(
+            request_id,
+            "replace_composition",
+            "total",
+            elapsed_ms(handler_start),
+            "status=success;operations={};hiragana_len={};suggestions={}",
+            request.operations.len(),
+            composing_text.text.chars().count(),
+            composed_text.suggestions.len()
+        );
+
+        Ok(Response::new(ReplaceCompositionResponse {
+            composing_text: Some(ComposingText {
+                hiragana: composed_text.hiragana.unwrap_or(composing_text.text),
+                suggestions: composed_text.suggestions,
+            }),
+            server_session_id: server_session_id(),
+        }))
+    }
+
     async fn remove_text(
         &self,
         request: Request<RemoveTextRequest>,
     ) -> Result<Response<RemoveTextResponse>, Status> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
@@ -1480,6 +1564,7 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<MoveCursorRequest>,
     ) -> Result<Response<MoveCursorResponse>, Status> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
@@ -1536,6 +1621,7 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<ClearTextRequest>,
     ) -> Result<Response<ClearTextResponse>, Status> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
@@ -1567,6 +1653,7 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<ShrinkTextRequest>,
     ) -> Result<Response<ShrinkTextResponse>, Status> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
@@ -1621,6 +1708,7 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<shared::proto::SetContextRequest>,
     ) -> Result<Response<shared::proto::SetContextResponse>, Status> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(false);
         let request_id = request_id_or_next(request.request_id);
@@ -1662,6 +1750,7 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<shared::proto::UpdateConfigRequest>,
     ) -> Result<Response<shared::proto::UpdateConfigResponse>, Status> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(false);
         let request_id = request_id_or_next(request.request_id);
@@ -1695,6 +1784,7 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<shared::proto::CommitLearningCandidateRequest>,
     ) -> Result<Response<shared::proto::CommitLearningCandidateResponse>, Status> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
@@ -1739,6 +1829,7 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<shared::proto::ResetLearningMemoryRequest>,
     ) -> Result<Response<shared::proto::ResetLearningMemoryResponse>, Status> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(false);
         let request_id = request_id_or_next(request.request_id);
@@ -1837,7 +1928,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or_else(|| std::io::Error::other("executable path is not valid UTF-8"))?;
     initialize(parent_dir_str).map_err(std::io::Error::other)?;
 
-    let service = MyAzookeyService;
+    let service = MyAzookeyService::default();
 
     tokio::spawn(async {
         let mut interval =
@@ -1900,14 +1991,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_v1()
         .map_err(std::io::Error::other)?;
 
-    let incoming = TonicNamedPipeServer::new_with_first_pipe_callback("azookey_server", || {
+    let incoming = TonicNamedPipeServer::new_with_first_pipe_callback(SERVER_PIPE_PATH, || {
         log_event_lazy!(ServerLogLevel::Info, "AzookeyServer listening");
         write_server_crash_trace(
             "rust",
             "server_startup",
             "listening",
             "completed",
-            "pipe=azookey_server",
+            "pipe=LOCAL\\azookey_server",
         );
         write_crash_trace_file(
             LAUNCHER_CRASH_TRACE_FILE_NAME,
@@ -1915,9 +2006,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "server_startup",
             "server_listening",
             "completed",
-            &format!("server_pid={};pipe=azookey_server", std::process::id()),
+            &format!(
+                "server_pid={};pipe=LOCAL\\azookey_server",
+                std::process::id()
+            ),
         );
-    });
+    })?;
 
     Server::builder()
         .add_service(AzookeyServiceServer::new(service))
@@ -1937,8 +2031,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod path_tests {
-    use super::resolve_log_path_from_roots;
+    use super::{resolve_log_path_from_roots, MyAzookeyService};
     use std::{ffi::OsStr, path::Path};
+
+    #[tokio::test]
+    async fn mutation_lock_keeps_replace_transaction_exclusive() {
+        let service = MyAzookeyService::default();
+        let first = service.mutation_lock.lock().await;
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(5),
+            service.mutation_lock.lock(),
+        )
+        .await;
+        assert!(second.is_err(), "second mutation must wait for first");
+
+        drop(first);
+        let _second = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            service.mutation_lock.lock(),
+        )
+        .await
+        .expect("lock should become available");
+    }
 
     #[test]
     fn server_logs_use_app_data() {
