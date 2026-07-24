@@ -74,6 +74,10 @@ fn requires_action_recovery(error: &anyhow::Error) -> bool {
     requires_ipc_recovery(error) || is_edit_session_error(error)
 }
 
+fn requires_server_resynchronization(error: &anyhow::Error) -> bool {
+    is_edit_session_error(error)
+}
+
 fn mode_switch_request_is_current(
     requested_generation: u64,
     current_generation: u64,
@@ -6516,7 +6520,17 @@ impl TextServiceFactory {
                 if let Some(snapshot) = failed_ledger_snapshot.take() {
                     ipc_service.restore_input_ledger(snapshot);
                 }
-                ipc_service.ensure_server_restart_requested();
+                if result
+                    .as_ref()
+                    .is_err_and(requires_server_resynchronization)
+                {
+                    // A TSF callback can fail after the server-side action has already mutated
+                    // its composition. Restart before replaying the deferred action so both
+                    // sides are rebuilt from the restored client ledger.
+                    ipc_service.require_server_recovery("edit_session_action");
+                } else {
+                    ipc_service.ensure_server_restart_requested();
+                }
                 let _ = IMEState::set_ipc_service(ipc_service);
             }
         }

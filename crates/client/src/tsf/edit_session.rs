@@ -577,16 +577,6 @@ impl TextServiceFactory {
 
                     move |cookie| unsafe {
                         let composition_range = composition.GetRange()?;
-                        let new_start_range = composition_range.Clone()?;
-                        let mut shifted: i32 = 0;
-
-                        new_start_range.Collapse(cookie, TF_ANCHOR_START)?;
-                        new_start_range.ShiftStart(
-                            cookie,
-                            text_len,
-                            &mut shifted,
-                            std::ptr::null(),
-                        )?;
 
                         commit_shift_start_after_prepare(
                             || {
@@ -594,6 +584,7 @@ impl TextServiceFactory {
                                 prop.Clear(cookie, &composition_range)?;
 
                                 let suffix_range = composition_range.Clone()?;
+                                let mut shifted = 0;
                                 suffix_range.ShiftStart(
                                     cookie,
                                     text_len,
@@ -625,6 +616,17 @@ impl TextServiceFactory {
                             || {
                                 // Keep the non-idempotent boundary change last. If any preparation
                                 // fails, replaying the deferred action must not shift twice.
+                                // Reacquire the dynamic range after SetText so anchor gravity cannot
+                                // move a previously cloned boundary to a host-dependent position.
+                                let new_start_range = composition.GetRange()?;
+                                let mut shifted = 0;
+                                new_start_range.Collapse(cookie, TF_ANCHOR_START)?;
+                                new_start_range.ShiftStart(
+                                    cookie,
+                                    text_len,
+                                    &mut shifted,
+                                    std::ptr::null(),
+                                )?;
                                 composition.ShiftStart(cookie, &new_start_range)?;
                                 Ok(())
                             },

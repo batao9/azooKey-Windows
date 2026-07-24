@@ -1,10 +1,10 @@
 use super::{
     deferred_action_suffix, idle_mode_switch_request_is_current, mode_switch_request_is_current,
-    requires_action_recovery, Candidates, CapsLockKeyboardLayout, ClauseActionBackend,
-    ClauseActionEffect, ClauseActionStateMut, ClauseAdvance, ClauseNavigationReadyUiSync,
-    ClauseSnapshot, ClauseState, Composition, CompositionReducer, CompositionState,
-    DeferredClientAction, DeferredProjection, DeferredUserAction, FutureClauseSnapshot,
-    TextServiceFactory,
+    requires_action_recovery, requires_server_resynchronization, Candidates,
+    CapsLockKeyboardLayout, ClauseActionBackend, ClauseActionEffect, ClauseActionStateMut,
+    ClauseAdvance, ClauseNavigationReadyUiSync, ClauseSnapshot, ClauseState, Composition,
+    CompositionReducer, CompositionState, DeferredClientAction, DeferredProjection,
+    DeferredUserAction, FutureClauseSnapshot, TextServiceFactory,
 };
 use crate::engine::{
     client_action::{
@@ -65,6 +65,14 @@ fn edit_session_lock_failure_defers_mutated_action_for_server_resynchronization(
 
     assert!(requires_action_recovery(&error));
     assert_eq!(deferred_action_suffix(&actions, 0), actions);
+}
+
+#[test]
+fn edit_session_callback_failure_requires_server_resynchronization_before_replay() {
+    let error = anyhow::Error::new(EditSessionFailure::Callback(TF_E_LOCKED));
+
+    assert!(requires_action_recovery(&error));
+    assert!(requires_server_resynchronization(&error));
 }
 
 #[test]

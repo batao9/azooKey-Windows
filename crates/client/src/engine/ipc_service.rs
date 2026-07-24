@@ -647,6 +647,10 @@ impl IPCService {
         }
     }
 
+    pub(crate) fn require_server_recovery(&self, operation: &'static str) {
+        Self::mark_server_recovery_required(&self.recovery, operation);
+    }
+
     pub(crate) fn recovery_restart_ready(&self) -> bool {
         let generation = self.recovery.generation.load(Ordering::Acquire);
         restart_generation_ready(
