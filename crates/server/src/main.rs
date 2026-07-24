@@ -1819,19 +1819,22 @@ impl AzookeyService for MyAzookeyService {
         let mut snapshot_count = 0usize;
         let mut last_signature = None;
 
-        let result = (|| -> Result<(), Status> {
+        let result = (|| -> Result<(), Box<Status>> {
             for _ in 0..shared::MAX_PREPARED_CLAUSE_ADVANCES {
                 unsafe {
                     PushComposingTextSnapshot();
                 }
                 snapshot_count += 1;
 
-                let shrunk_text = shrink_text(offset)
-                    .map_err(|error| status_from_error("prepare_future_clauses", error))?;
-                let navigation_text = move_cursor(0)
-                    .map_err(|error| status_from_error("prepare_future_clauses", error))?;
-                let navigation_composed = get_composed_text(true, request_id)
-                    .map_err(|error| status_from_error("prepare_future_clauses", error))?;
+                let shrunk_text = shrink_text(offset).map_err(|error| {
+                    Box::new(status_from_error("prepare_future_clauses", error))
+                })?;
+                let navigation_text = move_cursor(0).map_err(|error| {
+                    Box::new(status_from_error("prepare_future_clauses", error))
+                })?;
+                let navigation_composed = get_composed_text(true, request_id).map_err(|error| {
+                    Box::new(status_from_error("prepare_future_clauses", error))
+                })?;
 
                 let Some(selected) = navigation_composed.suggestions.first() else {
                     break;
@@ -1850,7 +1853,7 @@ impl AzookeyService for MyAzookeyService {
                     break;
                 }
                 last_signature = Some(signature);
-                offset = validate_shrink_offset(selected.corresponding_count)?;
+                offset = validate_shrink_offset(selected.corresponding_count).map_err(Box::new)?;
                 let navigation_composing_text = ComposingText {
                     hiragana: navigation_composed.hiragana.unwrap_or(navigation_text.text),
                     suggestions: navigation_composed.suggestions,
@@ -1874,7 +1877,7 @@ impl AzookeyService for MyAzookeyService {
                 PopComposingTextSnapshot();
             }
         }
-        result?;
+        result.map_err(|status| *status)?;
 
         performance_event_lazy!(
             request_id,

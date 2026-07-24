@@ -55,8 +55,7 @@ pub(crate) trait ClauseActionBackend {
             .hiragana
             .chars()
             .count()
-            .max(1)
-            .min(shared::MAX_PREPARED_CLAUSE_ADVANCES);
+            .clamp(1, shared::MAX_PREPARED_CLAUSE_ADVANCES);
 
         for _ in 0..max_steps {
             let advance = self.advance_clause(offset, &previous)?;
