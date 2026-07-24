@@ -13,9 +13,16 @@ use windows::{
     },
 };
 
-use crate::engine::{ipc_service::current_input_trace_request_id, state::IMEState};
+use crate::{
+    engine::{ipc_service::current_input_trace_request_id, state::IMEState},
+    extension::utf16_code_unit_len,
+};
 
 use super::{edit_session::read_edit_session, factory::TextServiceFactory};
+
+fn preview_end_shift(preview: &str) -> anyhow::Result<i32> {
+    Ok(-utf16_code_unit_len(preview)?)
+}
 
 impl TextServiceFactory {
     fn log_update_context_performance(
@@ -134,12 +141,11 @@ impl TextServiceFactory {
             };
 
             let edit_session_start = trace_request_id.map(|_| Instant::now());
+            let preview_end_shift = preview_end_shift(preview)?;
             let preceding_text = read_edit_session::<String>(
                 tid,
                 parent_context.clone(),
                 Rc::new({
-                    let preview_count = preview.chars().count() as i32;
-
                     move |cookie| {
                         // 2. Get the selection from the parent context.
                         let mut pselection: [TF_SELECTION; 1] = [TF_SELECTION::default()];
@@ -179,7 +185,7 @@ impl TextServiceFactory {
 
                         preceding_range.ShiftEnd(
                             cookie,
-                            -preview_count,
+                            preview_end_shift,
                             &mut preceding_range_shifted,
                             &halt_cond,
                         )?;
@@ -267,5 +273,17 @@ impl TextServiceFactory {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preview_end_shift;
+
+    #[test]
+    fn utf16_tsf_boundary_surrounded_text_excludes_preview_by_code_units() {
+        assert_eq!(preview_end_shift("😀かな").unwrap(), -4);
+        assert_eq!(preview_end_shift("か😀な").unwrap(), -4);
+        assert_eq!(preview_end_shift("かな𠮷").unwrap(), -4);
     }
 }

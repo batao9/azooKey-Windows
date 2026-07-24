@@ -19,7 +19,7 @@ use anyhow::Result;
 
 use crate::{
     engine::{ipc_service::current_input_trace_request_id, state::IMEState},
-    extension::StringExt as _,
+    extension::{utf16_code_unit_len, StringExt as _},
     globals::GUID_DISPLAY_ATTRIBUTE,
 };
 use shared::proto::WindowPosition;
@@ -258,13 +258,8 @@ fn close_composition_callback(
         if discard_text {
             range.SetText(cookie, TF_ST_CORRECTION, &[])?;
         } else {
-            let mut text = vec![0; 1024];
-            let mut text_len = 1024;
-
             let range_new = range.Clone()?;
-            range_new.GetText(cookie, TF_TF_MOVESTART, &mut text, &mut text_len)?;
-
-            text = text[..text_len as usize].to_vec();
+            let text = read_all_range_text(cookie, &range_new)?;
             range.SetText(cookie, TF_ST_CORRECTION, &text)?;
         }
 
@@ -284,6 +279,44 @@ fn close_composition_callback(
         composition.EndComposition(cookie)?;
         Ok(())
     })
+}
+
+const RANGE_TEXT_CHUNK_CODE_UNITS: usize = 1024;
+
+fn collect_range_text(
+    mut read: impl FnMut(&mut [u16]) -> anyhow::Result<usize>,
+) -> anyhow::Result<Vec<u16>> {
+    let mut text = Vec::new();
+    loop {
+        let mut chunk = [0u16; RANGE_TEXT_CHUNK_CODE_UNITS];
+        let length = read(&mut chunk)?;
+        if length > chunk.len() {
+            anyhow::bail!(
+                "ITfRange::GetText returned {length} UTF-16 code units for a {}-unit buffer",
+                chunk.len()
+            );
+        }
+        if length == 0 {
+            return Ok(text);
+        }
+        text.extend_from_slice(&chunk[..length]);
+    }
+}
+
+fn read_all_range_text(cookie: u32, range: &ITfRange) -> anyhow::Result<Vec<u16>> {
+    collect_range_text(|chunk| unsafe {
+        let mut length = 0;
+        range.GetText(cookie, TF_TF_MOVESTART, chunk, &mut length)?;
+        usize::try_from(length)
+            .map_err(|_| anyhow::anyhow!("ITfRange::GetText returned a negative length"))
+    })
+}
+
+fn prepare_set_text(text: &str, subtext: &str) -> anyhow::Result<(i32, Vec<u16>)> {
+    Ok((
+        utf16_code_unit_len(text)?,
+        format!("{text}{subtext}").as_str().to_wide_16_unpadded(),
+    ))
 }
 
 fn has_same_com_identity<I: Interface>(left: &I, right: &I) -> bool {
@@ -547,10 +580,7 @@ impl TextServiceFactory {
                 text_service.tid,
                 text_service.context()?,
                 Rc::new({
-                    let text_len = text.chars().count() as i32;
-
-                    // unpadded is all you need!
-                    let text = format!("{text}{subtext}").as_str().to_wide_16_unpadded();
+                    let (text_len, text) = prepare_set_text(text, subtext)?;
                     let context = text_service.context::<ITfContext>()?;
                     let display_attribute_atom = text_service.display_attribute_atom.clone();
 
@@ -601,7 +631,7 @@ impl TextServiceFactory {
                 text_service.tid,
                 text_service.context()?,
                 Rc::new({
-                    let text_len = text.chars().count() as i32;
+                    let text_len = utf16_code_unit_len(text)?;
                     let subtext = subtext.to_wide_16_unpadded();
                     let context = text_service.context::<ITfContext>()?;
                     let display_attribute_atom = text_service.display_attribute_atom.clone();
@@ -1027,16 +1057,65 @@ impl TextServiceFactory {
 #[cfg(test)]
 mod tests {
     use super::{
-        caret_position_or_none, commit_shift_start_after_prepare,
+        caret_position_or_none, collect_range_text, commit_shift_start_after_prepare,
         complete_async_edit_session_request, complete_async_position_request,
-        complete_sync_edit_session, is_non_destructive_edit_session_error, AsyncEditSession,
-        EditSessionFailure,
+        complete_sync_edit_session, is_non_destructive_edit_session_error, prepare_set_text,
+        AsyncEditSession, EditSessionFailure,
     };
     use std::{cell::Cell, rc::Rc};
     use windows::{
         core::HRESULT,
         Win32::UI::TextServices::{TF_E_DISCONNECTED, TF_E_LOCKED, TF_S_ASYNC},
     };
+
+    fn collect_simulated_range_text(text: &[u16]) -> Vec<u16> {
+        let mut cursor = 0;
+        collect_range_text(|buffer| {
+            let length = (text.len() - cursor).min(buffer.len());
+            buffer[..length].copy_from_slice(&text[cursor..cursor + length]);
+            cursor += length;
+            Ok(length)
+        })
+        .expect("simulated range should be read completely")
+    }
+
+    #[test]
+    fn utf16_tsf_boundary_reads_1023_1024_and_1025_code_units_without_truncation() {
+        for length in [1023, 1024, 1025] {
+            let expected = "a".repeat(length).encode_utf16().collect::<Vec<_>>();
+            assert_eq!(collect_simulated_range_text(&expected), expected);
+        }
+    }
+
+    #[test]
+    fn utf16_tsf_boundary_preserves_surrogate_pair_split_across_chunks() {
+        let expected = format!("{}😀末尾", "a".repeat(1023))
+            .encode_utf16()
+            .collect::<Vec<_>>();
+
+        let actual = collect_simulated_range_text(&expected);
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            String::from_utf16(&actual).unwrap(),
+            format!("{}😀末尾", "a".repeat(1023))
+        );
+    }
+
+    #[test]
+    fn utf16_tsf_boundary_prepares_display_range_and_suffix_in_code_units() {
+        for text in ["😀かな", "か😀な", "かな𠮷"] {
+            let (display_length, combined) =
+                prepare_set_text(text, "😀後").expect("composition text should be prepared");
+
+            assert_eq!(display_length, 4);
+            assert_eq!(
+                String::from_utf16(&combined).unwrap(),
+                format!("{text}😀後")
+            );
+            assert_eq!(combined.len(), 7);
+        }
+    }
 
     #[test]
     fn sync_edit_session_returns_callback_value_after_both_results_succeed() {
