@@ -453,7 +453,7 @@ impl TextServiceFactory {
     pub fn start_composition(&self) -> Result<()> {
         tracing::debug!("start_composition");
 
-        let text_service = self.borrow_mut()?;
+        let mut text_service = self.borrow_mut()?;
         let context = text_service.context()?;
         let context_composition = text_service.context::<ITfContextComposition>()?;
         let sink = text_service.this::<ITfCompositionSink>()?;
@@ -465,6 +465,7 @@ impl TextServiceFactory {
         };
 
         if tip_exists {
+            drop(text_service);
             self.end_composition()?;
             return Ok(());
         }
@@ -485,6 +486,10 @@ impl TextServiceFactory {
 
         tracing::debug!("Composition started {composition:?}");
         text_service.borrow_mut_composition()?.tip_composition = Some(composition);
+        // An idle mode-switch request may still be waiting for its asynchronous caret read.
+        // Starting a composition makes that request stale even if this composition ends before
+        // the callback arrives.
+        text_service.advance_mode_switch_generation();
 
         Ok(())
     }

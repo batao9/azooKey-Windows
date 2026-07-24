@@ -171,12 +171,18 @@ impl TextService {
     pub fn borrow_mut_composition(&self) -> Result<RefMut<'_, Composition>> {
         Ok(self.composition.try_borrow_mut()?)
     }
+
+    pub(crate) fn advance_mode_switch_generation(&mut self) -> u64 {
+        self.mode_switch_generation = self.mode_switch_generation.wrapping_add(1);
+        self.mode_switch_generation
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         CandidateWindowPositionState, CandidateWindowVisibilityState, SurroundingTextContextState,
+        TextService,
     };
     use std::time::{Duration, Instant};
 
@@ -218,5 +224,13 @@ mod tests {
 
         state.apply_visibility_update(Some(false));
         assert!(!state.should_update_position(true, None));
+    }
+
+    #[test]
+    fn mode_switch_generation_advances_across_composition_lifecycle_changes() {
+        let mut text_service = TextService::default();
+
+        assert_eq!(text_service.advance_mode_switch_generation(), 1);
+        assert_eq!(text_service.advance_mode_switch_generation(), 2);
     }
 }

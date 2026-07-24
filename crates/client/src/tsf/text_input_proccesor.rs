@@ -137,13 +137,13 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         let mut dll_instance = DllModule::get()?;
         dll_instance.release();
 
+        // End composition before borrowing TextService for sink teardown. The event helper
+        // needs a mutable borrow to invalidate pending mode switches and clear local state.
+        self.end_composition_for_tsf_event();
+
         {
             let text_service = self.borrow()?;
             let thread_mgr = text_service.thread_mgr()?;
-
-            // End composition without blocking the remaining TSF cleanup if the
-            // document no longer grants a synchronous edit session.
-            self.end_composition_for_tsf_event();
 
             // remove key event sink
             tracing::debug!("UnadviseKeyEventSink");

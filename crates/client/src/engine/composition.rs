@@ -4626,8 +4626,7 @@ impl TextServiceFactory {
         self.end_composition_async_best_effort();
 
         if let Ok(mut text_service) = self.borrow_mut() {
-            text_service.mode_switch_generation =
-                text_service.mode_switch_generation.wrapping_add(1);
+            text_service.advance_mode_switch_generation();
             if let Ok(mut composition) = text_service.borrow_mut_composition() {
                 *composition = Composition::default();
             }
@@ -4742,9 +4741,7 @@ impl TextServiceFactory {
         let (this, context, tip_composition, generation) = {
             let mut text_service = self.borrow_mut()?;
             let tip_composition = text_service.borrow_composition()?.tip_composition.clone();
-            text_service.mode_switch_generation =
-                text_service.mode_switch_generation.wrapping_add(1);
-            let generation = text_service.mode_switch_generation;
+            let generation = text_service.advance_mode_switch_generation();
             (
                 text_service.this::<ITfTextInputProcessor>()?,
                 text_service.context::<ITfContext>()?,
