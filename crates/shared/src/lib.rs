@@ -443,7 +443,7 @@ fn legacy_groups_from_symbol_fullwidth(
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct GeneralConfig {
     #[serde(default)]
     pub punctuation_style: PunctuationStyle,
@@ -488,7 +488,7 @@ impl Default for GeneralConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct RomajiRule {
     pub input: String,
     pub output: String,
@@ -909,7 +909,7 @@ mod tests {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct RomajiTableConfig {
     #[serde(default = "default_romaji_rows")]
     pub rows: Vec<RomajiRule>,
@@ -923,14 +923,14 @@ impl Default for RomajiTableConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct ZenzaiConfig {
     pub enable: bool,
     pub profile: String,
     pub backend: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct ShortcutConfig {
     #[serde(default = "default_shortcut_enabled")]
     pub ctrl_space_toggle: bool,
@@ -940,7 +940,7 @@ pub struct ShortcutConfig {
     pub eisu_toggle: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct DebugConfig {
     #[serde(default)]
     pub server_log_enabled: bool,
@@ -960,7 +960,7 @@ impl Default for DebugConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct CharacterWidthConfig {
     #[serde(default = "default_symbol_fullwidth_map")]
     pub symbol_fullwidth: HashMap<String, bool>,
@@ -968,13 +968,13 @@ pub struct CharacterWidthConfig {
     pub groups: CharacterWidthGroups,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct UserDictionaryEntry {
     pub reading: String,
     pub word: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
 pub struct UserDictionaryConfig {
     #[serde(default)]
     pub entries: Vec<UserDictionaryEntry>,
@@ -1037,7 +1037,7 @@ impl Default for ShortcutConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct AppConfig {
     pub version: String,
     #[serde(default)]

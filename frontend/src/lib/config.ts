@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
+import { createSerialTaskQueue } from "@/lib/config-save-controller.js";
 
 type ConfigStartupNotice = {
     kind: string;
@@ -10,6 +11,8 @@ type ConfigStartupNotice = {
 type UpdateConfigResponse = {
     saved: boolean;
     server_applied: boolean;
+    changed: boolean;
+    config: any;
     message?: string | null;
 };
 
@@ -25,6 +28,10 @@ type UpdateInstallResult = {
 
 const SERVER_APPLY_WARNING =
     "設定を保存しましたが、IME への反映に失敗しました。再起動後に反映されます。";
+const enqueueConfigUpdate = createSerialTaskQueue();
+
+export const getConfigAfterPendingUpdates = async () =>
+    enqueueConfigUpdate(() => invoke<any>("get_config"));
 
 export const showConfigStartupNoticeOnce = async () => {
     try {
@@ -73,24 +80,27 @@ export const showUpdateInstallResultOnce = async () => {
 export const saveConfigWithToast = async (
     updater: (config: any) => void,
     failureMessage = "設定の更新に失敗しました",
-) => {
-    try {
-        const data = await invoke<any>("get_config");
-        updater(data);
-        const result = await invoke<UpdateConfigResponse>("update_config", {
-            newConfig: data,
-        });
-
-        if (result.saved && !result.server_applied) {
-            toast(SERVER_APPLY_WARNING, {
-                description: result.message ?? undefined,
-                duration: 10000,
+) =>
+    enqueueConfigUpdate(async () => {
+        try {
+            const baseConfig = await invoke<any>("get_config");
+            const data = structuredClone(baseConfig);
+            updater(data);
+            const result = await invoke<UpdateConfigResponse>("update_config", {
+                baseConfig,
+                newConfig: data,
             });
-        }
 
-        return data;
-    } catch (_error) {
-        toast(failureMessage);
-        return null;
-    }
-};
+            if (result.saved && !result.server_applied) {
+                toast(SERVER_APPLY_WARNING, {
+                    description: result.message ?? undefined,
+                    duration: 10000,
+                });
+            }
+
+            return result.config;
+        } catch (_error) {
+            toast(failureMessage);
+            return null;
+        }
+    });
