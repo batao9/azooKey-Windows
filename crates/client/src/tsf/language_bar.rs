@@ -105,6 +105,16 @@ impl TextServiceFactory_Impl {
             InputMode::Kana => InputMode::Latin,
         };
 
+        let composition_active = self
+            .borrow()?
+            .borrow_composition()?
+            .tip_composition
+            .is_some();
+        if composition_active {
+            self.request_input_mode_switch_after_composition(mode)?;
+            return Ok(());
+        }
+
         let actions = vec![ClientAction::SetIMEMode(mode)];
         self.handle_action(&actions, CompositionState::None)?;
 

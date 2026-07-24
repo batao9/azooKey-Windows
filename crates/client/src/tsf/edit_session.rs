@@ -335,6 +335,25 @@ impl TextServiceFactory {
         }
     }
 
+    pub(crate) fn end_composition_async_on_success(&self, on_success: Rc<dyn Fn()>) -> Result<()> {
+        let text_service = self.borrow()?;
+        let Some(composition) = text_service.borrow_composition()?.tip_composition.clone() else {
+            on_success();
+            return Ok(());
+        };
+        let context = text_service.context::<ITfContext>()?;
+        let close = close_composition_callback(composition, context.clone(), false);
+        request_async_write_edit_session(
+            text_service.tid,
+            context,
+            Rc::new(move |cookie| {
+                close(cookie)?;
+                on_success();
+                Ok(())
+            }),
+        )
+    }
+
     #[tracing::instrument]
     pub fn start_composition(&self) -> Result<()> {
         tracing::debug!("start_composition");

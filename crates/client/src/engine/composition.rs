@@ -35,7 +35,7 @@ use shared::{
     LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MAX,
     LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MIN,
 };
-use windows::core::{w, IUnknown, Interface as _, PCWSTR};
+use windows::core::{w, AsImpl as _, IUnknown, Interface as _, PCWSTR};
 use windows::Win32::{
     Foundation::{LPARAM, WPARAM},
     System::Com::CoTaskMemFree,
@@ -46,9 +46,9 @@ use windows::Win32::{
             VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
         },
         TextServices::{
-            ITfComposition, ITfCompositionSink_Impl, ITfContext, ITfInputScope, InputScope,
-            GUID_PROP_INPUTSCOPE, IS_NUMERIC_PASSWORD, IS_PASSWORD, IS_PRIVATE,
-            TF_DEFAULT_SELECTION, TF_SELECTION,
+            ITfComposition, ITfCompositionSink_Impl, ITfContext, ITfInputScope,
+            ITfTextInputProcessor, InputScope, GUID_PROP_INPUTSCOPE, IS_NUMERIC_PASSWORD,
+            IS_PASSWORD, IS_PRIVATE, TF_DEFAULT_SELECTION, TF_SELECTION,
         },
     },
 };
@@ -4598,6 +4598,63 @@ impl TextServiceFactory {
         }
     }
 
+    fn complete_input_mode_switch_best_effort(
+        &self,
+        mode: InputMode,
+        position: Option<shared::proto::WindowPosition>,
+    ) {
+        if let Ok(text_service) = self.borrow() {
+            if let Ok(mut composition) = text_service.borrow_mut_composition() {
+                *composition = Composition::default();
+            }
+        }
+
+        if let Err(error) = IMEState::set_input_mode(mode.clone()) {
+            tracing::warn!(?error, "Failed to apply deferred input mode switch");
+        }
+        if let Err(error) = self.update_lang_bar() {
+            tracing::warn!(?error, "Failed to update language bar after mode switch");
+        }
+
+        let mode_label = match mode {
+            InputMode::Latin => "A",
+            InputMode::Kana => "あ",
+        };
+        if let Ok(Some(mut ipc_service)) = IMEState::ipc_service() {
+            if let Err(error) = ipc_service.update_candidate_window_with_reading(
+                None,
+                position,
+                None,
+                None,
+                Some(mode_label),
+                Some(""),
+                Some(false),
+                None,
+            ) {
+                tracing::warn!(?error, "Failed to update candidate UI after mode switch");
+            }
+            ipc_service.discard_input_ledger();
+            if let Err(error) = ipc_service.clear_text() {
+                tracing::warn!(?error, "Failed to clear server text after mode switch");
+            }
+            if let Err(error) = IMEState::set_ipc_service(ipc_service) {
+                tracing::warn!(?error, "Failed to persist IPC state after mode switch");
+            }
+        }
+    }
+
+    pub(crate) fn request_input_mode_switch_after_composition(
+        &self,
+        mode: InputMode,
+    ) -> Result<()> {
+        let position = self.candidate_window_position()?;
+        let this = self.borrow()?.this::<ITfTextInputProcessor>()?;
+        self.end_composition_async_on_success(Rc::new(move || {
+            let factory = unsafe { this.as_impl() };
+            factory.complete_input_mode_switch_best_effort(mode.clone(), position);
+        }))
+    }
+
     #[tracing::instrument]
     pub fn handle_action(
         &self,
@@ -5762,7 +5819,7 @@ impl TextServiceFactory {
                     }
                     ClientAction::SetIMEMode(mode) => {
                         let position = self.candidate_window_position()?;
-                        self.end_composition_async_best_effort();
+                        self.end_composition()?;
 
                         IMEState::set_input_mode(mode.clone())?;
 
