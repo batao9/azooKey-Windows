@@ -141,6 +141,14 @@ fn complete_async_edit_session_request(
         .map_err(|_| anyhow::Error::new(EditSessionFailure::Session(session_result)))
 }
 
+fn commit_shift_start_after_prepare(
+    prepare_suffix: impl FnOnce() -> Result<()>,
+    shift_composition_start: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    prepare_suffix()?;
+    shift_composition_start()
+}
+
 fn sync_edit_session<T>(
     client_id: u32,
     context: ITfContext,
@@ -568,43 +576,59 @@ impl TextServiceFactory {
                     let display_attribute_atom = text_service.display_attribute_atom.clone();
 
                     move |cookie| unsafe {
-                        // first, shift the start of the composition
-                        let range = composition.GetRange()?;
+                        let composition_range = composition.GetRange()?;
+                        let new_start_range = composition_range.Clone()?;
                         let mut shifted: i32 = 0;
 
-                        // and clear the display attribute
-                        let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
-                        prop.Clear(cookie, &range)?;
+                        new_start_range.Collapse(cookie, TF_ANCHOR_START)?;
+                        new_start_range.ShiftStart(
+                            cookie,
+                            text_len,
+                            &mut shifted,
+                            std::ptr::null(),
+                        )?;
 
-                        range.Collapse(cookie, TF_ANCHOR_START)?;
-                        range.ShiftStart(cookie, text_len, &mut shifted, std::ptr::null())?;
+                        commit_shift_start_after_prepare(
+                            || {
+                                let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
+                                prop.Clear(cookie, &composition_range)?;
 
-                        composition.ShiftStart(cookie, &range)?;
+                                let suffix_range = composition_range.Clone()?;
+                                suffix_range.ShiftStart(
+                                    cookie,
+                                    text_len,
+                                    &mut shifted,
+                                    std::ptr::null(),
+                                )?;
+                                suffix_range.SetText(cookie, TF_ST_CORRECTION, &subtext)?;
 
-                        // then, set the display attribute
-                        let range = composition.GetRange()?;
+                                let display_attribute =
+                                    display_attribute_atom.get(&GUID_DISPLAY_ATTRIBUTE);
+                                if let Some(display_attribute) = display_attribute {
+                                    let pvar = VARIANT::from(*display_attribute as i32);
+                                    let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
+                                    prop.SetValue(cookie, &suffix_range, &pvar)?;
+                                }
 
-                        range.SetText(cookie, TF_ST_CORRECTION, &subtext)?;
+                                suffix_range.Collapse(cookie, TF_ANCHOR_END)?;
+                                let selection = TF_SELECTION {
+                                    range: ManuallyDrop::new(Some(suffix_range)),
+                                    style: TF_SELECTIONSTYLE {
+                                        ase: TF_AE_NONE,
+                                        fInterimChar: false.into(),
+                                    },
+                                };
 
-                        let display_attribute = display_attribute_atom.get(&GUID_DISPLAY_ATTRIBUTE);
-                        if let Some(display_attribute) = display_attribute {
-                            let pvar = VARIANT::from(*display_attribute as i32);
-                            let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
-                            prop.SetValue(cookie, &range, &pvar)?;
-                        }
-
-                        range.Collapse(cookie, TF_ANCHOR_END)?;
-                        let selection = TF_SELECTION {
-                            range: ManuallyDrop::new(Some(range)),
-                            style: TF_SELECTIONSTYLE {
-                                ase: TF_AE_NONE,
-                                fInterimChar: false.into(),
+                                context.SetSelection(cookie, &[selection])?;
+                                Ok(())
                             },
-                        };
-
-                        context.SetSelection(cookie, &[selection])?;
-
-                        Ok(())
+                            || {
+                                // Keep the non-idempotent boundary change last. If any preparation
+                                // fails, replaying the deferred action must not shift twice.
+                                composition.ShiftStart(cookie, &new_start_range)?;
+                                Ok(())
+                            },
+                        )
                     }
                 }),
             )?;
@@ -949,9 +973,9 @@ impl TextServiceFactory {
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_async_edit_session_request, complete_async_position_request,
-        complete_sync_edit_session, is_non_destructive_edit_session_error, AsyncEditSession,
-        EditSessionFailure,
+        commit_shift_start_after_prepare, complete_async_edit_session_request,
+        complete_async_position_request, complete_sync_edit_session,
+        is_non_destructive_edit_session_error, AsyncEditSession, EditSessionFailure,
     };
     use std::{cell::Cell, rc::Rc};
     use windows::{
@@ -1023,6 +1047,42 @@ mod tests {
             Some(&EditSessionFailure::Callback(TF_E_LOCKED))
         );
         assert!(!is_non_destructive_edit_session_error(&error));
+    }
+
+    #[test]
+    fn shift_start_does_not_move_composition_boundary_when_preparation_fails() {
+        let shift_count = Cell::new(0);
+        let error = commit_shift_start_after_prepare(
+            || anyhow::bail!("selection update failed"),
+            || {
+                shift_count.set(shift_count.get() + 1);
+                Ok(())
+            },
+        )
+        .expect_err("failed preparation must abort the boundary change");
+
+        assert_eq!(error.to_string(), "selection update failed");
+        assert_eq!(shift_count.get(), 0);
+    }
+
+    #[test]
+    fn shift_start_moves_composition_boundary_only_after_preparation() {
+        let operation_order = Cell::new(0);
+        commit_shift_start_after_prepare(
+            || {
+                assert_eq!(operation_order.get(), 0);
+                operation_order.set(1);
+                Ok(())
+            },
+            || {
+                assert_eq!(operation_order.get(), 1);
+                operation_order.set(2);
+                Ok(())
+            },
+        )
+        .expect("successful preparation should commit the boundary change");
+
+        assert_eq!(operation_order.get(), 2);
     }
 
     #[test]
