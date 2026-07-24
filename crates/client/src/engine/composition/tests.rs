@@ -1,9 +1,10 @@
 use super::{
-    deferred_action_suffix, mode_switch_request_is_current, requires_action_recovery, Candidates,
-    CapsLockKeyboardLayout, ClauseActionBackend, ClauseActionEffect, ClauseActionStateMut,
-    ClauseAdvance, ClauseNavigationReadyUiSync, ClauseSnapshot, ClauseState, Composition,
-    CompositionReducer, CompositionState, DeferredClientAction, DeferredProjection,
-    DeferredUserAction, FutureClauseSnapshot, TextServiceFactory,
+    deferred_action_suffix, idle_mode_switch_request_is_current, mode_switch_request_is_current,
+    requires_action_recovery, Candidates, CapsLockKeyboardLayout, ClauseActionBackend,
+    ClauseActionEffect, ClauseActionStateMut, ClauseAdvance, ClauseNavigationReadyUiSync,
+    ClauseSnapshot, ClauseState, Composition, CompositionReducer, CompositionState,
+    DeferredClientAction, DeferredProjection, DeferredUserAction, FutureClauseSnapshot,
+    TextServiceFactory,
 };
 use crate::engine::{
     client_action::{
@@ -72,6 +73,14 @@ fn deferred_mode_switch_rejects_focus_composition_and_generation_changes() {
     assert!(!mode_switch_request_is_current(7, 7, false, true));
     assert!(!mode_switch_request_is_current(7, 7, true, false));
     assert!(!mode_switch_request_is_current(7, 8, true, true));
+}
+
+#[test]
+fn idle_mode_switch_rejects_focus_new_composition_and_generation_changes() {
+    assert!(idle_mode_switch_request_is_current(7, 7, true, true));
+    assert!(!idle_mode_switch_request_is_current(7, 7, false, true));
+    assert!(!idle_mode_switch_request_is_current(7, 7, true, false));
+    assert!(!idle_mode_switch_request_is_current(7, 8, true, true));
 }
 
 #[test]

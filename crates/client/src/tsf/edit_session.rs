@@ -341,6 +341,16 @@ fn caret_window_position_for_cookie(
     }
 }
 
+fn complete_async_position_request(
+    callback_succeeded: bool,
+    position: Option<WindowPosition>,
+    on_complete: &dyn Fn(Option<WindowPosition>),
+) {
+    if callback_succeeded {
+        on_complete(position);
+    }
+}
+
 impl TextServiceFactory {
     fn log_candidate_window_position_performance(
         request_id: u64,
@@ -632,15 +642,24 @@ impl TextServiceFactory {
             (text_service.tid, text_service.context::<ITfContext>()?)
         };
         let position = Rc::new(Cell::new(None));
+        let callback_succeeded = Rc::new(Cell::new(false));
         let callback = Rc::new({
             let context = context.clone();
             let position = position.clone();
+            let callback_succeeded = callback_succeeded.clone();
             move |cookie| {
                 position.set(caret_window_position_for_cookie(&context, cookie)?);
+                callback_succeeded.set(true);
                 Ok(())
             }
         });
-        let completion = Rc::new(move || on_complete(position.get()));
+        let completion = Rc::new(move || {
+            complete_async_position_request(
+                callback_succeeded.get(),
+                position.get(),
+                on_complete.as_ref(),
+            );
+        });
         request_async_read_edit_session(tid, context, callback, completion)
     }
 
@@ -930,8 +949,9 @@ impl TextServiceFactory {
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_async_edit_session_request, complete_sync_edit_session,
-        is_non_destructive_edit_session_error, AsyncEditSession, EditSessionFailure,
+        complete_async_edit_session_request, complete_async_position_request,
+        complete_sync_edit_session, is_non_destructive_edit_session_error, AsyncEditSession,
+        EditSessionFailure,
     };
     use std::{cell::Cell, rc::Rc};
     use windows::{
@@ -1051,6 +1071,18 @@ mod tests {
         .into();
 
         drop(session);
+        assert_eq!(completion_count.get(), 1);
+    }
+
+    #[test]
+    fn async_position_completion_ignores_callback_failure_or_cancellation() {
+        let completion_count = Cell::new(0);
+        let on_complete = |_| completion_count.set(completion_count.get() + 1);
+
+        complete_async_position_request(false, None, &on_complete);
+        assert_eq!(completion_count.get(), 0);
+
+        complete_async_position_request(true, None, &on_complete);
         assert_eq!(completion_count.get(), 1);
     }
 

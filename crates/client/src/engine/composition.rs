@@ -83,6 +83,15 @@ fn mode_switch_request_is_current(
     requested_generation == current_generation && context_matches && composition_matches
 }
 
+fn idle_mode_switch_request_is_current(
+    requested_generation: u64,
+    current_generation: u64,
+    context_matches: bool,
+    composition_is_empty: bool,
+) -> bool {
+    requested_generation == current_generation && context_matches && composition_is_empty
+}
+
 fn has_same_com_identity<I: windows::core::Interface>(left: &I, right: &I) -> bool {
     match (left.cast::<IUnknown>(), right.cast::<IUnknown>()) {
         (Ok(left), Ok(right)) => left.as_raw() == right.as_raw(),
@@ -4612,7 +4621,9 @@ impl TextServiceFactory {
     pub(crate) fn end_composition_for_tsf_event(&self) {
         self.end_composition_async_best_effort();
 
-        if let Ok(text_service) = self.borrow() {
+        if let Ok(mut text_service) = self.borrow_mut() {
+            text_service.mode_switch_generation =
+                text_service.mode_switch_generation.wrapping_add(1);
             if let Ok(mut composition) = text_service.borrow_mut_composition() {
                 *composition = Composition::default();
             }
@@ -4701,6 +4712,25 @@ impl TextServiceFactory {
         )
     }
 
+    fn is_current_idle_mode_switch_request(&self, generation: u64, context: &ITfContext) -> bool {
+        let Ok(text_service) = self.borrow() else {
+            return false;
+        };
+        let context_matches = text_service
+            .context
+            .as_ref()
+            .is_some_and(|current| has_same_com_identity(current, context));
+        let composition_is_empty = text_service
+            .borrow_composition()
+            .is_ok_and(|composition| composition.tip_composition.is_none());
+        idle_mode_switch_request_is_current(
+            generation,
+            text_service.mode_switch_generation,
+            context_matches,
+            composition_is_empty,
+        )
+    }
+
     pub(crate) fn request_input_mode_switch_after_composition(
         &self,
         mode: InputMode,
@@ -4708,11 +4738,9 @@ impl TextServiceFactory {
         let (this, context, tip_composition, generation) = {
             let mut text_service = self.borrow_mut()?;
             let tip_composition = text_service.borrow_composition()?.tip_composition.clone();
-            let generation = tip_composition.as_ref().map(|_| {
-                text_service.mode_switch_generation =
-                    text_service.mode_switch_generation.wrapping_add(1);
-                text_service.mode_switch_generation
-            });
+            text_service.mode_switch_generation =
+                text_service.mode_switch_generation.wrapping_add(1);
+            let generation = text_service.mode_switch_generation;
             (
                 text_service.this::<ITfTextInputProcessor>()?,
                 text_service.context::<ITfContext>()?,
@@ -4722,9 +4750,16 @@ impl TextServiceFactory {
         };
 
         let Some(tip_composition) = tip_composition else {
-            let on_complete = Rc::new(move |position| {
-                let factory = unsafe { this.as_impl() };
-                factory.complete_input_mode_switch_best_effort(mode.clone(), position);
+            let on_complete = Rc::new({
+                let context = context.clone();
+                move |position| {
+                    let factory = unsafe { this.as_impl() };
+                    if factory.is_current_idle_mode_switch_request(generation, &context) {
+                        factory.complete_input_mode_switch_best_effort(mode.clone(), position);
+                    } else {
+                        tracing::debug!("Skip stale idle mode-switch completion");
+                    }
+                }
             });
             if let Err(error) = self.request_caret_window_position_async(on_complete) {
                 tracing::warn!(
@@ -4734,7 +4769,6 @@ impl TextServiceFactory {
             }
             return Ok(());
         };
-        let generation = generation.context("mode switch generation is missing")?;
         let position = self.candidate_window_position()?;
 
         let is_current = Rc::new({
