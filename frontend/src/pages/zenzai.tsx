@@ -8,7 +8,7 @@ import {
     SelectTrigger,
     SelectValue,
 } from "@/components/ui/select"
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner"
 import { invoke } from '@tauri-apps/api/core';
 import {
@@ -17,7 +17,23 @@ import {
     TooltipProvider,
     TooltipTrigger,
 } from "@/components/ui/tooltip"
-import { saveConfigWithToast } from "@/lib/config";
+import {
+    getConfigAfterPendingUpdates,
+    saveConfigWithToast,
+} from "@/lib/config";
+import {
+    createDebouncedSaver,
+    type ConfigSaveState,
+} from "@/lib/config-save-controller.js";
+
+const PROFILE_SAVE_DELAY_MS = 500;
+
+const PROFILE_SAVE_LABELS: Record<ConfigSaveState, string> = {
+    dirty: "未保存の変更があります",
+    saving: "保存中…",
+    saved: "保存済み",
+    error: "保存できませんでした。入力内容は画面に保持されています。",
+};
 
 const ToolTipSelectItem = ({
     name,
@@ -58,17 +74,35 @@ export const Zenzai = () => {
         cuda: false,
         vulkan: false,
     });
+    const [profileSaveState, setProfileSaveState] =
+        useState<ConfigSaveState>("saved");
+    const profileEdited = useRef(false);
+    const profileSaver = useMemo(
+        () =>
+            createDebouncedSaver<string, any>({
+                delayMs: PROFILE_SAVE_DELAY_MS,
+                onStateChange: setProfileSaveState,
+                save: (profile) =>
+                    saveConfigWithToast((config) => {
+                        config.zenzai.profile = profile;
+                    }),
+            }),
+        [],
+    );
 
     // Load config on component mount
     useEffect(() => {
-        invoke<any>("get_config")
+        profileSaver.resume();
+        getConfigAfterPendingUpdates()
             .then((data) => {
                 const zenzai = data.zenzai;
-                setValue({
+                setValue((previous) => ({
                     enable: zenzai.enable,
-                    profile: zenzai.profile,
+                    profile: profileEdited.current
+                        ? previous.profile
+                        : zenzai.profile,
                     backend: zenzai.backend,
-                });
+                }));
             })
             .catch(() => {
                 // Keep default values if config fetch fails
@@ -81,7 +115,11 @@ export const Zenzai = () => {
                 vulkan: capability["vulkan"],
             });
         })
-    }, []);
+
+        return () => {
+            void profileSaver.dispose();
+        };
+    }, [profileSaver]);
 
     const updateConfig = (updater: (config: any) => void) =>
         saveConfigWithToast(updater);
@@ -98,11 +136,9 @@ export const Zenzai = () => {
 
     const handleProfileChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
         const newProfile = event.target.value;
+        profileEdited.current = true;
         setValue((prev) => ({ ...prev, profile: newProfile }));
-        
-        updateConfig((data) => {
-            data.zenzai.profile = newProfile;
-        });
+        profileSaver.schedule(newProfile);
     };
 
     const handleBackendChange = async (backend: string) => {
@@ -151,7 +187,26 @@ export const Zenzai = () => {
                             </p>
                         </div>
                     </div>
-                    <Textarea placeholder="例）山田太郎、数学科の学生。" value={value.profile} disabled={!value.enable} onChange={handleProfileChange} />
+                    <Textarea
+                        placeholder="例）山田太郎、数学科の学生。"
+                        value={value.profile}
+                        disabled={!value.enable}
+                        aria-invalid={profileSaveState === "error"}
+                        onChange={handleProfileChange}
+                        onBlur={() => {
+                            void profileSaver.flush();
+                        }}
+                    />
+                    <p
+                        className={
+                            profileSaveState === "error"
+                                ? "text-xs text-destructive"
+                                : "text-xs text-muted-foreground"
+                        }
+                        aria-live="polite"
+                    >
+                        {PROFILE_SAVE_LABELS[profileSaveState]}
+                    </p>
                 </div>
                 <div className="flex items-center space-x-4 rounded-md border p-4">
                     <Cpu />

@@ -71,6 +71,10 @@ jobs:
       working-directory: frontend
       run: npm run typecheck
 
+    - name: Test frontend config saving
+      working-directory: frontend
+      run: npm test
+
     - name: Test candidate scroller
       run: node --test crates/ui/tests/candidate_scroller.test.cjs
 

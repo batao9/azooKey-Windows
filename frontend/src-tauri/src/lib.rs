@@ -3,8 +3,16 @@ mod server_process;
 mod updater;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use shared::{AppConfig, AppConfigLoadResult, ConfigError, ConfigRecovery, RomajiRule};
 use std::{path::PathBuf, sync::Mutex, time::Duration};
+use windows::{
+    core::w,
+    Win32::{
+        Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0},
+        System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject, INFINITE},
+    },
+};
 
 use anyhow::Context as _;
 
@@ -12,6 +20,8 @@ use anyhow::Context as _;
 pub struct AppState {
     settings: Mutex<AppConfig>,
     ipc: Mutex<Option<ipc::IPCService>>,
+    config_update_lock: Mutex<()>,
+    server_config_dirty: Mutex<bool>,
     startup_notice: Mutex<Option<ConfigStartupNotice>>,
 }
 
@@ -51,6 +61,8 @@ impl AppState {
         AppState {
             settings: Mutex::new(settings),
             ipc: Mutex::new(ipc),
+            config_update_lock: Mutex::new(()),
+            server_config_dirty: Mutex::new(false),
             startup_notice: Mutex::new(startup_notice),
         }
     }
@@ -67,7 +79,36 @@ struct ConfigStartupNotice {
 struct UpdateConfigResponse {
     saved: bool,
     server_applied: bool,
+    changed: bool,
+    config: AppConfig,
     message: Option<String>,
+}
+
+struct CrossProcessConfigGuard(HANDLE);
+
+impl CrossProcessConfigGuard {
+    fn acquire() -> Result<Self, String> {
+        let handle = unsafe { CreateMutexW(None, false, w!("Local\\AzookeyWindowsConfigUpdate")) }
+            .map_err(|error| format!("failed to create config update mutex: {error}"))?;
+
+        let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
+        if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+            Ok(Self(handle))
+        } else {
+            let _ = unsafe { CloseHandle(handle) };
+            Err(format!(
+                "failed to acquire config update mutex: wait={}",
+                wait.0
+            ))
+        }
+    }
+}
+
+impl Drop for CrossProcessConfigGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { ReleaseMutex(self.0) };
+        let _ = unsafe { CloseHandle(self.0) };
+    }
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -122,8 +163,21 @@ fn greet(name: &str) -> String {
 
 #[tauri::command]
 fn get_config(state: tauri::State<AppState>) -> AppConfig {
-    let config = state.settings.lock().unwrap();
-    config.clone()
+    get_config_impl(&state)
+}
+
+fn get_config_impl(state: &AppState) -> AppConfig {
+    let _update_guard = state.config_update_lock.lock().unwrap();
+    match AppConfig::read() {
+        Ok(config) => {
+            *state.settings.lock().unwrap() = config.clone();
+            config
+        }
+        Err(error) => {
+            eprintln!("Failed to refresh settings from disk: {error}");
+            state.settings.lock().unwrap().clone()
+        }
+    }
 }
 
 #[tauri::command]
@@ -134,19 +188,89 @@ fn take_config_startup_notice(state: tauri::State<AppState>) -> Option<ConfigSta
 #[tauri::command]
 fn update_config(
     state: tauri::State<AppState>,
+    base_config: AppConfig,
     new_config: AppConfig,
 ) -> Result<UpdateConfigResponse, String> {
-    update_config_impl(&state, new_config)
+    update_config_impl(&state, base_config, new_config)
+}
+
+fn apply_config_delta(current: &mut Value, base: &Value, updated: &Value) {
+    if base == updated {
+        return;
+    }
+
+    let (Some(current_object), Some(base_object), Some(updated_object)) = (
+        current.as_object_mut(),
+        base.as_object(),
+        updated.as_object(),
+    ) else {
+        *current = updated.clone();
+        return;
+    };
+
+    for (key, updated_value) in updated_object {
+        match base_object.get(key) {
+            Some(base_value) if base_value == updated_value => {}
+            Some(base_value) => {
+                if let Some(current_value) = current_object.get_mut(key) {
+                    apply_config_delta(current_value, base_value, updated_value);
+                } else {
+                    current_object.insert(key.clone(), updated_value.clone());
+                }
+            }
+            None => {
+                current_object.insert(key.clone(), updated_value.clone());
+            }
+        }
+    }
+
+    for key in base_object.keys() {
+        if !updated_object.contains_key(key) {
+            current_object.remove(key);
+        }
+    }
+}
+
+fn merge_config_update(
+    current_config: AppConfig,
+    base_config: AppConfig,
+    new_config: AppConfig,
+) -> Result<AppConfig, String> {
+    let mut current = serde_json::to_value(current_config).map_err(|error| error.to_string())?;
+    let base = serde_json::to_value(base_config).map_err(|error| error.to_string())?;
+    let updated = serde_json::to_value(new_config).map_err(|error| error.to_string())?;
+    apply_config_delta(&mut current, &base, &updated);
+    serde_json::from_value(current).map_err(|error| error.to_string())
 }
 
 fn update_config_impl(
     state: &AppState,
+    base_config: AppConfig,
     new_config: AppConfig,
 ) -> Result<UpdateConfigResponse, String> {
-    {
-        let mut config = state.settings.lock().unwrap();
+    let _update_guard = state.config_update_lock.lock().unwrap();
+    let _cross_process_guard = CrossProcessConfigGuard::acquire()?;
+    let current_config = AppConfig::read().unwrap_or_else(|error| {
+        eprintln!("Failed to read latest settings before update: {error}");
+        state.settings.lock().unwrap().clone()
+    });
+    let new_config = merge_config_update(current_config.clone(), base_config, new_config)?;
+    let changed = current_config != new_config;
+    if changed {
         new_config.write().map_err(|error| error.to_string())?;
-        *config = new_config;
+    }
+    *state.settings.lock().unwrap() = new_config.clone();
+
+    if changed {
+        *state.server_config_dirty.lock().unwrap() = true;
+    } else if !*state.server_config_dirty.lock().unwrap() {
+        return Ok(UpdateConfigResponse {
+            saved: true,
+            server_applied: true,
+            changed: false,
+            config: new_config,
+            message: None,
+        });
     }
 
     if let Some(ipc) = state.ipc.lock().unwrap().as_mut() {
@@ -155,6 +279,8 @@ fn update_config_impl(
             return Ok(UpdateConfigResponse {
                 saved: true,
                 server_applied: false,
+                changed,
+                config: new_config,
                 message: Some(error.to_string()),
             });
         }
@@ -162,13 +288,18 @@ fn update_config_impl(
         return Ok(UpdateConfigResponse {
             saved: true,
             server_applied: false,
+            changed,
+            config: new_config,
             message: Some("IPC service is not initialized".to_string()),
         });
     }
 
+    *state.server_config_dirty.lock().unwrap() = false;
     Ok(UpdateConfigResponse {
         saved: true,
         server_applied: true,
+        changed,
+        config: new_config,
         message: None,
     })
 }
@@ -221,13 +352,20 @@ fn restart_server(state: tauri::State<AppState>) -> Result<(), String> {
 }
 
 fn restart_server_impl(state: &AppState) -> Result<(), anyhow::Error> {
-    let config = state.settings.lock().unwrap().clone();
+    let _update_guard = state.config_update_lock.lock().unwrap();
+    let _cross_process_guard = CrossProcessConfigGuard::acquire().map_err(anyhow::Error::msg)?;
+    let config = AppConfig::read().unwrap_or_else(|error| {
+        eprintln!("Failed to refresh settings before server restart: {error}");
+        state.settings.lock().unwrap().clone()
+    });
+    *state.settings.lock().unwrap() = config.clone();
 
     server_process::restart_server(&config)?;
 
     let ipc = ipc::IPCService::new_with_timeout(Duration::from_secs(10))
         .context("Server restarted, but IPC reconnect failed")?;
     *state.ipc.lock().unwrap() = Some(ipc);
+    *state.server_config_dirty.lock().unwrap() = false;
 
     Ok(())
 }
@@ -422,6 +560,8 @@ mod tests {
         AppState {
             settings: Mutex::new(AppConfig::default()),
             ipc: Mutex::new(None),
+            config_update_lock: Mutex::new(()),
+            server_config_dirty: Mutex::new(false),
             startup_notice: Mutex::new(None),
         }
     }
@@ -434,25 +574,82 @@ mod tests {
         let mut config = AppConfig::default();
         config.zenzai.enable = true;
 
-        let result = update_config_impl(&state, config).unwrap();
+        let result = update_config_impl(&state, AppConfig::default(), config).unwrap();
 
         assert!(result.saved);
         assert!(!result.server_applied);
+        assert!(result.changed);
         assert!(result.message.is_some());
         assert!(temp.path().join("Azookey").join("settings.json").exists());
         assert!(state.settings.lock().unwrap().zenzai.enable);
     }
 
     #[test]
-    fn update_config_returns_error_when_save_fails() {
+    fn update_config_skips_disk_and_server_for_unchanged_settings() {
         let _appdata = AppDataGuard::unset();
         let state = test_state();
 
-        let error = update_config_impl(&state, AppConfig::default())
+        let config = AppConfig::default();
+        let result = update_config_impl(&state, config.clone(), config).unwrap();
+
+        assert!(result.saved);
+        assert!(result.server_applied);
+        assert!(!result.changed);
+        assert!(result.message.is_none());
+    }
+
+    #[test]
+    fn update_config_returns_error_when_save_fails() {
+        let _appdata = AppDataGuard::unset();
+        let state = test_state();
+        let mut config = AppConfig::default();
+        config.zenzai.enable = true;
+
+        let error = update_config_impl(&state, AppConfig::default(), config)
             .expect_err("save failure should be returned to the UI");
 
         assert!(error.contains("APPDATA"));
         assert!(!state.settings.lock().unwrap().zenzai.enable);
+    }
+
+    #[test]
+    fn unchanged_settings_remain_pending_after_server_apply_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let _appdata = AppDataGuard::set(temp.path());
+        let state = test_state();
+        let mut config = AppConfig::default();
+        config.zenzai.profile = "profile".to_string();
+
+        let first = update_config_impl(&state, AppConfig::default(), config.clone()).unwrap();
+        let retry = update_config_impl(&state, config.clone(), config).unwrap();
+
+        assert!(first.changed);
+        assert!(!first.server_applied);
+        assert!(!retry.changed);
+        assert!(!retry.server_applied);
+        assert!(*state.server_config_dirty.lock().unwrap());
+    }
+
+    #[test]
+    fn stale_full_config_update_preserves_newer_unrelated_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let _appdata = AppDataGuard::set(temp.path());
+        let state = test_state();
+        let base = AppConfig::default();
+        let mut current = base.clone();
+        current.zenzai.profile = "newer profile".to_string();
+        current.write().unwrap();
+        let mut stale_update = base.clone();
+        stale_update.shortcuts.eisu_toggle = true;
+
+        let result = update_config_impl(&state, base, stale_update).unwrap();
+
+        assert!(result.changed);
+        assert_eq!(result.config.zenzai.profile, "newer profile");
+        assert!(result.config.shortcuts.eisu_toggle);
+        let persisted = AppConfig::read().unwrap();
+        assert_eq!(persisted.zenzai.profile, "newer profile");
+        assert!(persisted.shortcuts.eisu_toggle);
     }
 
     #[test]
