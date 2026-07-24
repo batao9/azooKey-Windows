@@ -4773,7 +4773,7 @@ impl TextServiceFactory {
                     }
                 }
             });
-            let on_cancel = Rc::new({
+            let on_terminal = Rc::new({
                 let this = this.clone();
                 move || {
                     let factory = unsafe { this.as_impl() };
@@ -4782,7 +4782,7 @@ impl TextServiceFactory {
                     }
                 }
             });
-            if let Err(error) = self.request_caret_window_position_async(on_complete, on_cancel) {
+            if let Err(error) = self.request_caret_window_position_async(on_complete, on_terminal) {
                 tracing::warn!(
                     ?error,
                     "Failed to queue caret lookup for language-bar mode switch"

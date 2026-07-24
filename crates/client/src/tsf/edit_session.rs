@@ -349,13 +349,14 @@ fn complete_async_position_request(
     request_accepted: bool,
     position: Option<WindowPosition>,
     on_complete: &dyn Fn(Option<WindowPosition>),
-    on_cancel: &dyn Fn(),
+    on_terminal: &dyn Fn(),
 ) -> bool {
     if callback_succeeded {
         on_complete(position);
+        on_terminal();
         false
     } else if request_accepted {
-        on_cancel();
+        on_terminal();
         false
     } else {
         // RequestEditSession may release the COM object before returning its rejection.
@@ -692,7 +693,7 @@ impl TextServiceFactory {
     pub(crate) fn request_caret_window_position_async(
         &self,
         on_complete: Rc<dyn Fn(Option<WindowPosition>)>,
-        on_cancel: Rc<dyn Fn()>,
+        on_terminal: Rc<dyn Fn()>,
     ) -> Result<()> {
         let (tid, context) = {
             let text_service = self.borrow()?;
@@ -719,14 +720,14 @@ impl TextServiceFactory {
         let completion = Rc::new({
             let request_accepted = request_accepted.clone();
             let cancel_before_request_result = cancel_before_request_result.clone();
-            let on_cancel = on_cancel.clone();
+            let on_terminal = on_terminal.clone();
             move || {
                 cancel_before_request_result.set(complete_async_position_request(
                     callback_succeeded.get(),
                     request_accepted.get(),
                     position.get(),
                     on_complete.as_ref(),
-                    on_cancel.as_ref(),
+                    on_terminal.as_ref(),
                 ));
             }
         });
@@ -734,7 +735,7 @@ impl TextServiceFactory {
         if result.is_ok() {
             request_accepted.set(true);
             if cancel_before_request_result.replace(false) {
-                on_cancel();
+                on_terminal();
             }
         }
         result
@@ -1212,40 +1213,40 @@ mod tests {
     }
 
     #[test]
-    fn async_position_completion_routes_success_and_cancellation_separately() {
+    fn async_position_completion_runs_terminal_cleanup_after_success_or_cancellation() {
         let completion_count = Cell::new(0);
-        let cancellation_count = Cell::new(0);
+        let terminal_count = Cell::new(0);
         let on_complete = |_| completion_count.set(completion_count.get() + 1);
-        let on_cancel = || cancellation_count.set(cancellation_count.get() + 1);
+        let on_terminal = || terminal_count.set(terminal_count.get() + 1);
 
         assert!(complete_async_position_request(
             false,
             false,
             None,
             &on_complete,
-            &on_cancel,
+            &on_terminal,
         ));
         assert_eq!(completion_count.get(), 0);
-        assert_eq!(cancellation_count.get(), 0);
+        assert_eq!(terminal_count.get(), 0);
 
         assert!(!complete_async_position_request(
             false,
             true,
             None,
             &on_complete,
-            &on_cancel,
+            &on_terminal,
         ));
-        assert_eq!(cancellation_count.get(), 1);
+        assert_eq!(terminal_count.get(), 1);
 
         assert!(!complete_async_position_request(
             true,
             true,
             None,
             &on_complete,
-            &on_cancel,
+            &on_terminal,
         ));
         assert_eq!(completion_count.get(), 1);
-        assert_eq!(cancellation_count.get(), 1);
+        assert_eq!(terminal_count.get(), 2);
     }
 
     #[test]
