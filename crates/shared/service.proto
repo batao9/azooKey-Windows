@@ -102,6 +102,34 @@ message ShrinkTextResponse {
   uint64 server_session_id = 2; // Identifies the current server process session.
 }
 
+// Advances clause navigation as one server-side transaction. The snapshot is
+// pushed before shrinking so moving left can restore the previous clause.
+message AdvanceClauseRequest {
+  int32 offset = 1;
+  uint64 request_id = 2;
+}
+
+message AdvanceClauseResponse {
+  ComposingText shrunk_text = 1;
+  ComposingText navigation_text = 2;
+  uint64 server_session_id = 3;
+}
+
+message PreparedClauseAdvance {
+  ComposingText shrunk_text = 1;
+  ComposingText navigation_text = 2;
+}
+
+message PrepareFutureClausesRequest {
+  int32 initial_offset = 1;
+  uint64 request_id = 2;
+}
+
+message PrepareFutureClausesResponse {
+  repeated PreparedClauseAdvance advances = 1;
+  uint64 server_session_id = 2;
+}
+
 // Response message for MoveCursor.
 message MoveCursorResponse {
   ComposingText composing_text = 1; // The resulting text and suggestions.
@@ -178,6 +206,8 @@ service AzookeyService {
   rpc ReplaceComposition (ReplaceCompositionRequest) returns (ReplaceCompositionResponse);
   rpc RemoveText (RemoveTextRequest) returns (RemoveTextResponse);
   rpc ShrinkText (ShrinkTextRequest) returns (ShrinkTextResponse);
+  rpc AdvanceClause (AdvanceClauseRequest) returns (AdvanceClauseResponse);
+  rpc PrepareFutureClauses (PrepareFutureClausesRequest) returns (PrepareFutureClausesResponse);
   rpc MoveCursor (MoveCursorRequest) returns (MoveCursorResponse);
   rpc UpdateCompositionSnapshot (UpdateCompositionSnapshotRequest) returns (UpdateCompositionSnapshotResponse);
   rpc ClearText (ClearTextRequest) returns (ClearTextResponse);

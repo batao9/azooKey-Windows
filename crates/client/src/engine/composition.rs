@@ -85,8 +85,32 @@ fn has_same_com_identity(left: &ITfComposition, right: &ITfComposition) -> bool 
 mod clause_state;
 pub(super) use clause_state::{
     CandidateSelection, ClauseActionBackend, ClauseActionEffect, ClauseActionStateMut,
-    ClauseCommand, ClauseState, ClauseTransitionInput, MoveClauseProgressMarker,
+    ClauseAdvance, ClauseCommand, ClauseState, ClauseTransitionInput,
 };
+
+struct PreparedClauseBackend {
+    advances: VecDeque<ClauseAdvance>,
+}
+
+impl ClauseActionBackend for PreparedClauseBackend {
+    fn move_cursor(&mut self, _offset: i32) -> Result<Candidates> {
+        anyhow::bail!("prepared clause navigation unexpectedly requested move_cursor")
+    }
+
+    fn shrink_text(&mut self, _offset: i32) -> Result<Candidates> {
+        anyhow::bail!("prepared clause navigation unexpectedly requested shrink_text")
+    }
+
+    fn advance_clause(
+        &mut self,
+        _offset: i32,
+        _previous_candidates: &Candidates,
+    ) -> Result<ClauseAdvance> {
+        self.advances
+            .pop_front()
+            .context("prepared clause navigation response was exhausted")
+    }
+}
 
 #[cfg(test)]
 pub(crate) struct CompositionReducer;
@@ -2427,16 +2451,18 @@ impl TextServiceFactory {
         future_clause_snapshots.push(split_snapshot);
     }
 
-    #[inline]
-    fn rebuild_future_clause_snapshots_from_backend<B: ClauseActionBackend>(
+    fn rebuild_future_clause_snapshots_from_prepared(
         state: &mut ClauseActionStateMut<'_>,
-        backend: &mut B,
+        prepared: Vec<ClauseAdvance>,
     ) -> Result<()> {
         if state.suffix.is_empty() {
             state.future_clause_snapshots.clear();
             return Ok(());
         }
 
+        let mut backend = PreparedClauseBackend {
+            advances: prepared.into(),
+        };
         let mut temp_preview = state.preview.clone();
         let mut temp_suffix = state.suffix.clone();
         let mut temp_raw_input = state.raw_input.clone();
@@ -2460,7 +2486,7 @@ impl TextServiceFactory {
         let initial_raw_hiragana = state.raw_hiragana.clone();
         let mut collected = Vec::new();
 
-        loop {
+        while !backend.advances.is_empty() {
             let (effect, made_progress) = {
                 let mut temp_state = ClauseActionStateMut {
                     preview: &mut temp_preview,
@@ -2481,15 +2507,15 @@ impl TextServiceFactory {
                     current_clause_split_group_id: &mut temp_current_clause_split_group_id,
                     next_split_group_id: &mut temp_next_split_group_id,
                 };
-                let before = MoveClauseProgressMarker::from_state(&temp_state);
+                let before = clause_state::MoveClauseProgressMarker::from_state(&temp_state);
                 let effect = ClauseState::transition_with_backend(
                     &mut temp_state,
                     ClauseCommand::MoveRight,
                     ClauseTransitionInput::default(),
-                    backend,
+                    &mut backend,
                 )?
                 .effect;
-                let after = MoveClauseProgressMarker::from_state(&temp_state);
+                let after = clause_state::MoveClauseProgressMarker::from_state(&temp_state);
                 (effect, before != after)
             };
             if !effect.applied || !made_progress {
@@ -2527,9 +2553,6 @@ impl TextServiceFactory {
                             &raw_hiragana_suffix,
                             initial_raw_input_suffix.chars().count() as i32,
                         );
-                        repaired_snapshot.is_split_derived = true;
-                        repaired_snapshot.is_direct_split_remainder = true;
-                        repaired_snapshot.has_split_left_neighbor = true;
                         repaired_snapshot.split_group_id = *state.current_clause_split_group_id;
                         snapshot = repaired_snapshot;
                     }
@@ -2545,12 +2568,6 @@ impl TextServiceFactory {
             if temp_suffix.is_empty() {
                 break;
             }
-        }
-
-        for _ in 0..temp_clause_snapshots.len() {
-            let previous_candidates = temp_candidates.clone();
-            backend
-                .update_composition_snapshot(ClauseSnapshotOperation::Pop, &previous_candidates)?;
         }
 
         state.future_clause_snapshots.clear();
