@@ -35,8 +35,8 @@ impl ITfTextLayoutSink_Impl for TextServiceFactory_Impl {
             return Ok(());
         }
 
-        if let Err(error) = self.update_pos() {
-            tracing::warn!("Failed to update position from OnLayoutChange: {error:?}");
+        if let Err(error) = self.request_update_pos_async() {
+            tracing::warn!("Failed to request position update from OnLayoutChange: {error:?}");
         }
 
         Ok(())

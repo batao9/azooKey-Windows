@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::tsf::edit_session::edit_session;
+use crate::tsf::edit_session::{is_non_destructive_edit_session_error, read_edit_session};
 use crate::{
     engine::user_action::UserAction,
     extension::VKeyExt as _,
@@ -2936,7 +2936,7 @@ impl TextServiceFactory {
     }
 
     fn context_has_sensitive_input_scope(tid: u32, context: ITfContext) -> Result<bool> {
-        Ok(edit_session::<bool>(
+        read_edit_session::<bool>(
             tid,
             context.clone(),
             Rc::new({
@@ -2967,8 +2967,7 @@ impl TextServiceFactory {
                     Ok(Self::input_scope_list_contains_sensitive(&input_scope))
                 }
             }),
-        )?
-        .unwrap_or(false))
+        )
     }
 
     fn current_context_has_sensitive_input_scope(&self) -> bool {
@@ -4320,10 +4319,13 @@ impl TextServiceFactory {
 
         match result {
             Ok(handled) => Ok(handled),
-            Err(error) if is_non_destructive_ipc_error(&error) => {
+            Err(error)
+                if is_non_destructive_ipc_error(&error)
+                    || is_non_destructive_edit_session_error(&error) =>
+            {
                 tracing::warn!(
                     ?error,
-                    "IPC operation failed without mutating server state; preserving composition"
+                    "Operation failed without invalidating local composition; preserving it"
                 );
                 Ok(true)
             }
@@ -4387,10 +4389,13 @@ impl TextServiceFactory {
 
         match result {
             Ok(handled) => Ok(handled),
-            Err(error) if is_non_destructive_ipc_error(&error) => {
+            Err(error)
+                if is_non_destructive_ipc_error(&error)
+                    || is_non_destructive_edit_session_error(&error) =>
+            {
                 tracing::warn!(
                     ?error,
-                    "IPC key-up operation failed without mutation; preserving composition"
+                    "Key-up operation failed without invalidating local composition; preserving it"
                 );
                 Ok(true)
             }
@@ -4488,10 +4493,13 @@ impl TextServiceFactory {
 
         match result {
             Ok(handled) => Ok(handled),
-            Err(error) if is_non_destructive_ipc_error(&error) => {
+            Err(error)
+                if is_non_destructive_ipc_error(&error)
+                    || is_non_destructive_edit_session_error(&error) =>
+            {
                 tracing::warn!(
                     ?error,
-                    "IPC shortcut operation failed without mutation; preserving composition"
+                    "Shortcut operation failed without invalidating local composition; preserving it"
                 );
                 Ok(true)
             }

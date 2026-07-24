@@ -1,18 +1,19 @@
 use macros::anyhow;
 use windows::{
-    core::{implement, AsImpl, VARIANT},
+    core::{implement, AsImpl, HRESULT, VARIANT},
     Win32::{
         Foundation::RECT,
         UI::TextServices::{
             ITfComposition, ITfCompositionSink, ITfContext, ITfContextComposition, ITfEditSession,
-            ITfEditSession_Impl, ITfInsertAtSelection, ITfRange, GUID_PROP_ATTRIBUTE, TF_AE_NONE,
-            TF_ANCHOR_END, TF_ANCHOR_START, TF_ES_READWRITE, TF_IAS_QUERYONLY, TF_SELECTION,
-            TF_SELECTIONSTYLE, TF_ST_CORRECTION, TF_TF_MOVESTART,
+            ITfEditSession_Impl, ITfInsertAtSelection, ITfRange, ITfTextInputProcessor,
+            GUID_PROP_ATTRIBUTE, TF_AE_NONE, TF_ANCHOR_END, TF_ANCHOR_START, TF_ES_ASYNC,
+            TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_QUERYONLY, TF_SELECTION,
+            TF_SELECTIONSTYLE, TF_ST_CORRECTION, TF_S_ASYNC, TF_TF_MOVESTART,
         },
     },
 };
 
-use std::{cell::Cell, mem::ManuallyDrop, rc::Rc, time::Instant};
+use std::{cell::Cell, fmt, mem::ManuallyDrop, rc::Rc, time::Instant};
 
 use anyhow::Result;
 
@@ -38,12 +39,75 @@ struct EditSession<'a, T> {
     phantom: std::marker::PhantomData<&'a T>,
 }
 
-// edit action will be performed within this function
-pub fn edit_session<T>(
+#[implement(ITfEditSession)]
+struct AsyncEditSession {
+    callback: Rc<dyn Fn(u32) -> anyhow::Result<()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditSessionFailure {
+    Request(HRESULT),
+    Session(HRESULT),
+    UnexpectedAsync,
+    CallbackNotCompleted,
+}
+
+impl fmt::Display for EditSessionFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Request(hresult) => {
+                write!(formatter, "RequestEditSession failed: {hresult:?}")
+            }
+            Self::Session(hresult) => {
+                write!(formatter, "edit session was rejected: {hresult:?}")
+            }
+            Self::UnexpectedAsync => {
+                write!(formatter, "synchronous edit session was deferred")
+            }
+            Self::CallbackNotCompleted => {
+                write!(formatter, "edit session completed without callback result")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EditSessionFailure {}
+
+pub(crate) fn is_non_destructive_edit_session_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<EditSessionFailure>().is_some()
+}
+
+fn complete_sync_edit_session<T>(
+    request_result: std::result::Result<HRESULT, HRESULT>,
+    callback_result: Option<T>,
+) -> Result<T> {
+    let session_result = request_result
+        .map_err(|hresult| anyhow::Error::new(EditSessionFailure::Request(hresult)))?;
+    if session_result == TF_S_ASYNC {
+        return Err(anyhow::Error::new(EditSessionFailure::UnexpectedAsync));
+    }
+    session_result
+        .ok()
+        .map_err(|_| anyhow::Error::new(EditSessionFailure::Session(session_result)))?;
+    callback_result.ok_or_else(|| anyhow::Error::new(EditSessionFailure::CallbackNotCompleted))
+}
+
+fn complete_async_edit_session_request(
+    request_result: std::result::Result<HRESULT, HRESULT>,
+) -> Result<()> {
+    let session_result = request_result
+        .map_err(|hresult| anyhow::Error::new(EditSessionFailure::Request(hresult)))?;
+    session_result
+        .ok()
+        .map_err(|_| anyhow::Error::new(EditSessionFailure::Session(session_result)))
+}
+
+fn sync_edit_session<T>(
     client_id: u32,
     context: ITfContext,
+    access: windows::Win32::UI::TextServices::TF_CONTEXT_EDIT_CONTEXT_FLAGS,
     callback: Rc<dyn Fn(u32) -> anyhow::Result<T>>,
-) -> Result<Option<T>> {
+) -> Result<T> {
     let session: ITfEditSession = EditSession {
         callback,
         result: Cell::new(None),
@@ -51,15 +115,40 @@ pub fn edit_session<T>(
     }
     .into();
 
-    let result = unsafe { context.RequestEditSession(client_id, &session, TF_ES_READWRITE) };
+    let request_result =
+        unsafe { context.RequestEditSession(client_id, &session, access | TF_ES_SYNC) }
+            .map_err(|error| error.code());
+    let session: &EditSession<'_, T> =
+        unsafe { <ITfEditSession as AsImpl<EditSession<'_, T>>>::as_impl(&session) };
+    complete_sync_edit_session(request_result, session.result.take())
+}
 
-    match result {
-        Ok(_) => {
-            let session = unsafe { session.as_impl() };
-            Ok(session.result.take())
-        }
-        Err(e) => Err(anyhow::Error::new(e)),
-    }
+pub fn read_edit_session<T>(
+    client_id: u32,
+    context: ITfContext,
+    callback: Rc<dyn Fn(u32) -> anyhow::Result<T>>,
+) -> Result<T> {
+    sync_edit_session(client_id, context, TF_ES_READ, callback)
+}
+
+pub fn write_edit_session<T>(
+    client_id: u32,
+    context: ITfContext,
+    callback: Rc<dyn Fn(u32) -> anyhow::Result<T>>,
+) -> Result<T> {
+    sync_edit_session(client_id, context, TF_ES_READWRITE, callback)
+}
+
+fn request_async_read_edit_session(
+    client_id: u32,
+    context: ITfContext,
+    callback: Rc<dyn Fn(u32) -> anyhow::Result<()>>,
+) -> Result<()> {
+    let session: ITfEditSession = AsyncEditSession { callback }.into();
+    let request_result =
+        unsafe { context.RequestEditSession(client_id, &session, TF_ES_READ | TF_ES_ASYNC) }
+            .map_err(|error| error.code());
+    complete_async_edit_session_request(request_result)
 }
 
 impl<'a, T> ITfEditSession_Impl for EditSession_Impl<'a, T> {
@@ -68,6 +157,13 @@ impl<'a, T> ITfEditSession_Impl for EditSession_Impl<'a, T> {
         let result = (self.callback)(cookie)?;
         self.result.set(Some(result));
         Ok(())
+    }
+}
+
+impl ITfEditSession_Impl for AsyncEditSession_Impl {
+    #[anyhow]
+    fn DoEditSession(&self, cookie: u32) -> Result<()> {
+        (self.callback)(cookie)
     }
 }
 
@@ -93,7 +189,7 @@ impl TextServiceFactory {
         let text_service = self.borrow()?;
 
         if let Some(composition) = text_service.borrow_composition()?.tip_composition.clone() {
-            edit_session(
+            write_edit_session(
                 text_service.tid,
                 text_service.context()?,
                 Rc::new({
@@ -162,7 +258,7 @@ impl TextServiceFactory {
             return Ok(());
         }
 
-        let composition = edit_session::<ITfComposition>(
+        let composition = write_edit_session::<ITfComposition>(
             text_service.tid,
             context,
             Rc::new({
@@ -177,7 +273,7 @@ impl TextServiceFactory {
         )?;
 
         tracing::debug!("Composition started {composition:?}");
-        text_service.borrow_mut_composition()?.tip_composition = composition;
+        text_service.borrow_mut_composition()?.tip_composition = Some(composition);
 
         Ok(())
     }
@@ -205,7 +301,7 @@ impl TextServiceFactory {
         let text_service = self.borrow()?;
 
         if let Some(composition) = text_service.borrow_composition()?.tip_composition.clone() {
-            edit_session(
+            write_edit_session(
                 text_service.tid,
                 text_service.context()?,
                 Rc::new({
@@ -259,7 +355,7 @@ impl TextServiceFactory {
         let text_service = self.borrow()?;
 
         if let Some(composition) = text_service.borrow_composition()?.tip_composition.clone() {
-            edit_session(
+            write_edit_session(
                 text_service.tid,
                 text_service.context()?,
                 Rc::new({
@@ -388,7 +484,7 @@ impl TextServiceFactory {
             };
 
             if let Some(tip_composition) = tip_composition {
-                let position = edit_session(
+                let position = read_edit_session(
                     tid,
                     context.clone(),
                     Rc::new({
@@ -411,7 +507,7 @@ impl TextServiceFactory {
                         }
                     }),
                 )?;
-                Ok(position)
+                Ok(Some(position))
             } else {
                 Ok(None)
             }
@@ -457,6 +553,93 @@ impl TextServiceFactory {
         self.candidate_window_position_with_mode(CandidateWindowPositionMode::Throttled)
     }
 
+    fn finish_update_pos(&self) {
+        match self.borrow_mut() {
+            Ok(mut text_service) => {
+                text_service.update_pos_state.finish_update(Instant::now());
+            }
+            Err(error) => {
+                tracing::warn!("Failed to reset update_pos guard: {error:?}");
+            }
+        }
+    }
+
+    pub(crate) fn request_update_pos_async(&self) -> Result<()> {
+        let (tid, context, tip_composition, this) = {
+            let mut text_service = self.borrow_mut()?;
+            let tip_composition = text_service.borrow_composition()?.tip_composition.clone();
+            let Some(tip_composition) = tip_composition else {
+                return Ok(());
+            };
+            let tid = text_service.tid;
+            let context = text_service.context::<ITfContext>()?;
+            let this = text_service.this::<ITfTextInputProcessor>()?;
+
+            let now = Instant::now();
+            if text_service
+                .candidate_window_position_state
+                .should_throttle(now)
+            {
+                tracing::debug!("Skip throttled asynchronous candidate position update");
+                return Ok(());
+            }
+            if !text_service.update_pos_state.try_begin_update(now) {
+                tracing::debug!("Skip re-entrant asynchronous candidate position update");
+                return Ok(());
+            }
+            text_service
+                .candidate_window_position_state
+                .mark_attempt(now);
+
+            (tid, context, tip_composition, this)
+        };
+
+        let callback = Rc::new({
+            let context = context.clone();
+
+            move |cookie| {
+                let result: Result<()> = (|| unsafe {
+                    let view = context.GetActiveView()?;
+                    let range = tip_composition.GetRange()?;
+
+                    let mut rect = RECT::default();
+                    let mut clipped = false.into();
+                    view.GetTextExt(cookie, &range, &mut rect, &mut clipped)?;
+
+                    if let Some(mut ipc_service) = IMEState::ipc_service()? {
+                        let position = WindowPosition {
+                            top: rect.top,
+                            left: rect.left,
+                            bottom: rect.bottom,
+                            right: rect.right,
+                        };
+                        ipc_service.update_candidate_window(
+                            None,
+                            Some(position),
+                            None,
+                            None,
+                            None,
+                        )?;
+                        IMEState::set_ipc_service(ipc_service)?;
+                    }
+                    Ok(())
+                })();
+
+                let factory = unsafe { this.as_impl() };
+                factory.finish_update_pos();
+                result
+            }
+        });
+
+        match request_async_read_edit_session(tid, context, callback) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.finish_update_pos();
+                Err(error)
+            }
+        }
+    }
+
     #[tracing::instrument]
     pub fn update_pos(&self) -> Result<()> {
         if let Some(position) = self.candidate_window_position_for_update()? {
@@ -466,5 +649,118 @@ impl TextServiceFactory {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        complete_async_edit_session_request, complete_sync_edit_session,
+        is_non_destructive_edit_session_error, AsyncEditSession, EditSessionFailure,
+    };
+    use std::{cell::Cell, rc::Rc};
+    use windows::{
+        core::HRESULT,
+        Win32::UI::TextServices::{TF_E_DISCONNECTED, TF_E_LOCKED, TF_S_ASYNC},
+    };
+
+    #[test]
+    fn sync_edit_session_returns_callback_value_after_both_results_succeed() {
+        let value = complete_sync_edit_session(Ok(HRESULT(0)), Some("completed".to_string()))
+            .expect("completed callback result");
+
+        assert_eq!(value, "completed");
+    }
+
+    #[test]
+    fn sync_edit_session_keeps_lock_rejection_distinct_from_request_failure() {
+        let error = complete_sync_edit_session::<()>(Ok(TF_E_LOCKED), None)
+            .expect_err("lock rejection must fail the session");
+
+        assert_eq!(
+            error.downcast_ref::<EditSessionFailure>(),
+            Some(&EditSessionFailure::Session(TF_E_LOCKED))
+        );
+        assert!(is_non_destructive_edit_session_error(&error));
+    }
+
+    #[test]
+    fn sync_edit_session_rejects_unexpected_async_completion() {
+        let error = complete_sync_edit_session::<()>(Ok(TF_S_ASYNC), None)
+            .expect_err("synchronous contract must not read a deferred result");
+
+        assert_eq!(
+            error.downcast_ref::<EditSessionFailure>(),
+            Some(&EditSessionFailure::UnexpectedAsync)
+        );
+    }
+
+    #[test]
+    fn sync_edit_session_reports_context_destruction_as_request_failure() {
+        let error = complete_sync_edit_session::<()>(Err(TF_E_DISCONNECTED), None)
+            .expect_err("destroyed context must fail the outer request");
+
+        assert_eq!(
+            error.downcast_ref::<EditSessionFailure>(),
+            Some(&EditSessionFailure::Request(TF_E_DISCONNECTED))
+        );
+        assert!(is_non_destructive_edit_session_error(&error));
+    }
+
+    #[test]
+    fn sync_edit_session_requires_callback_completion() {
+        let error = complete_sync_edit_session::<()>(Ok(HRESULT(0)), None)
+            .expect_err("successful session without callback completion is invalid");
+
+        assert_eq!(
+            error.downcast_ref::<EditSessionFailure>(),
+            Some(&EditSessionFailure::CallbackNotCompleted)
+        );
+    }
+
+    #[test]
+    fn async_edit_session_runs_work_only_when_tsf_invokes_the_callback() {
+        let callback_invoked = Rc::new(Cell::new(false));
+        let session: windows::Win32::UI::TextServices::ITfEditSession = AsyncEditSession {
+            callback: Rc::new({
+                let callback_invoked = callback_invoked.clone();
+                move |_| {
+                    callback_invoked.set(true);
+                    Ok(())
+                }
+            }),
+        }
+        .into();
+
+        assert!(!callback_invoked.get());
+        unsafe {
+            session
+                .DoEditSession(0)
+                .expect("async callback should complete");
+        }
+        assert!(callback_invoked.get());
+    }
+
+    #[test]
+    fn async_edit_session_accepts_deferred_completion_without_reading_a_result() {
+        complete_async_edit_session_request(Ok(TF_S_ASYNC))
+            .expect("deferred async session is an accepted request");
+    }
+
+    #[test]
+    fn async_edit_session_reports_request_and_lock_failures_separately() {
+        let request_error = complete_async_edit_session_request(Err(TF_E_DISCONNECTED))
+            .expect_err("destroyed context must reject the outer request");
+        assert_eq!(
+            request_error.downcast_ref::<EditSessionFailure>(),
+            Some(&EditSessionFailure::Request(TF_E_DISCONNECTED))
+        );
+
+        let session_error = complete_async_edit_session_request(Ok(TF_E_LOCKED))
+            .expect_err("lock rejection must reject the async session");
+        assert_eq!(
+            session_error.downcast_ref::<EditSessionFailure>(),
+            Some(&EditSessionFailure::Session(TF_E_LOCKED))
+        );
     }
 }
