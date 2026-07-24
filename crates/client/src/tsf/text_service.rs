@@ -134,6 +134,7 @@ pub struct TextService {
     pub layout_sink_context: Option<ITfContext>,
     pub composition: RefCell<Composition>,
     pub update_pos_state: UpdatePosState,
+    pub update_pos_generation: u64,
     pub candidate_window_position_state: CandidateWindowPositionState,
     pub candidate_window_visibility_state: CandidateWindowVisibilityState,
     pub surrounding_text_context_state: SurroundingTextContextState,

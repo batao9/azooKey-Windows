@@ -16,7 +16,7 @@ impl ITfTextLayoutSink_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     fn OnLayoutChange(
         &self,
-        _pic: Option<&ITfContext>,
+        pic: Option<&ITfContext>,
         _lcode: TfLayoutCode,
         _pview: Option<&ITfContextView>,
     ) -> Result<()> {
@@ -35,7 +35,7 @@ impl ITfTextLayoutSink_Impl for TextServiceFactory_Impl {
             return Ok(());
         }
 
-        if let Err(error) = self.request_update_pos_async() {
+        if let Err(error) = self.request_update_pos_async(pic) {
             tracing::warn!("Failed to request position update from OnLayoutChange: {error:?}");
         }
 

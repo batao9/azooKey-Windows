@@ -141,8 +141,9 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
             let text_service = self.borrow()?;
             let thread_mgr = text_service.thread_mgr()?;
 
-            // end composition
-            self.end_composition()?;
+            // End composition without blocking the remaining TSF cleanup if the
+            // document no longer grants a synchronous edit session.
+            self.end_composition_for_tsf_event();
 
             // remove key event sink
             tracing::debug!("UnadviseKeyEventSink");

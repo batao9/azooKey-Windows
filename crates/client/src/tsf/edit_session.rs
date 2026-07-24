@@ -1,6 +1,6 @@
 use macros::anyhow;
 use windows::{
-    core::{implement, AsImpl, HRESULT, VARIANT},
+    core::{implement, AsImpl, IUnknown, Interface, HRESULT, VARIANT},
     Win32::{
         Foundation::RECT,
         UI::TextServices::{
@@ -42,10 +42,26 @@ struct EditSession<'a, T> {
 #[implement(ITfEditSession)]
 struct AsyncEditSession {
     callback: Rc<dyn Fn(u32) -> anyhow::Result<()>>,
+    completion: Rc<dyn Fn()>,
+    completed: Cell<bool>,
+}
+
+impl AsyncEditSession {
+    fn complete(&self) {
+        if !self.completed.replace(true) {
+            (self.completion)();
+        }
+    }
+}
+
+impl Drop for AsyncEditSession {
+    fn drop(&mut self) {
+        self.complete();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EditSessionFailure {
+pub(crate) enum EditSessionFailure {
     Request(HRESULT),
     Session(HRESULT),
     UnexpectedAsync,
@@ -139,16 +155,46 @@ pub fn write_edit_session<T>(
     sync_edit_session(client_id, context, TF_ES_READWRITE, callback)
 }
 
+fn request_async_edit_session(
+    client_id: u32,
+    context: ITfContext,
+    access: windows::Win32::UI::TextServices::TF_CONTEXT_EDIT_CONTEXT_FLAGS,
+    callback: Rc<dyn Fn(u32) -> anyhow::Result<()>>,
+    completion: Rc<dyn Fn()>,
+) -> Result<()> {
+    let session: ITfEditSession = AsyncEditSession {
+        callback,
+        completion,
+        completed: Cell::new(false),
+    }
+    .into();
+    let request_result =
+        unsafe { context.RequestEditSession(client_id, &session, access | TF_ES_ASYNC) }
+            .map_err(|error| error.code());
+    complete_async_edit_session_request(request_result)
+}
+
 fn request_async_read_edit_session(
     client_id: u32,
     context: ITfContext,
     callback: Rc<dyn Fn(u32) -> anyhow::Result<()>>,
+    completion: Rc<dyn Fn()>,
 ) -> Result<()> {
-    let session: ITfEditSession = AsyncEditSession { callback }.into();
-    let request_result =
-        unsafe { context.RequestEditSession(client_id, &session, TF_ES_READ | TF_ES_ASYNC) }
-            .map_err(|error| error.code());
-    complete_async_edit_session_request(request_result)
+    request_async_edit_session(client_id, context, TF_ES_READ, callback, completion)
+}
+
+fn request_async_write_edit_session(
+    client_id: u32,
+    context: ITfContext,
+    callback: Rc<dyn Fn(u32) -> anyhow::Result<()>>,
+) -> Result<()> {
+    request_async_edit_session(
+        client_id,
+        context,
+        TF_ES_READWRITE,
+        callback,
+        Rc::new(|| {}),
+    )
 }
 
 impl<'a, T> ITfEditSession_Impl for EditSession_Impl<'a, T> {
@@ -163,7 +209,62 @@ impl<'a, T> ITfEditSession_Impl for EditSession_Impl<'a, T> {
 impl ITfEditSession_Impl for AsyncEditSession_Impl {
     #[anyhow]
     fn DoEditSession(&self, cookie: u32) -> Result<()> {
-        (self.callback)(cookie)
+        let result = (self.callback)(cookie);
+        self.complete();
+        result
+    }
+}
+
+fn close_composition_callback(
+    composition: ITfComposition,
+    context: ITfContext,
+    discard_text: bool,
+) -> Rc<dyn Fn(u32) -> anyhow::Result<()>> {
+    Rc::new(move |cookie| unsafe {
+        let range: ITfRange = composition.GetRange()?;
+
+        if discard_text {
+            range.SetText(cookie, TF_ST_CORRECTION, &[])?;
+        } else {
+            let mut text = vec![0; 1024];
+            let mut text_len = 1024;
+
+            let range_new = range.Clone()?;
+            range_new.GetText(cookie, TF_TF_MOVESTART, &mut text, &mut text_len)?;
+
+            text = text[..text_len as usize].to_vec();
+            range.SetText(cookie, TF_ST_CORRECTION, &text)?;
+        }
+
+        let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
+        prop.Clear(cookie, &range)?;
+
+        range.Collapse(cookie, TF_ANCHOR_END)?;
+        let selection = TF_SELECTION {
+            range: ManuallyDrop::new(Some(range.clone())),
+            style: TF_SELECTIONSTYLE {
+                ase: TF_AE_NONE,
+                fInterimChar: false.into(),
+            },
+        };
+
+        context.SetSelection(cookie, &[selection])?;
+        composition.EndComposition(cookie)?;
+        Ok(())
+    })
+}
+
+fn has_same_com_identity<I: Interface>(left: &I, right: &I) -> bool {
+    match (left.cast::<IUnknown>(), right.cast::<IUnknown>()) {
+        (Ok(left), Ok(right)) => left.as_raw() == right.as_raw(),
+        (Err(left_error), Err(right_error)) => {
+            tracing::warn!(?left_error, ?right_error, "Failed to query COM identities");
+            false
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            tracing::warn!(?error, "Failed to query COM identity");
+            false
+        }
     }
 }
 
@@ -192,42 +293,11 @@ impl TextServiceFactory {
             write_edit_session(
                 text_service.tid,
                 text_service.context()?,
-                Rc::new({
-                    let context = text_service.context::<ITfContext>()?;
-
-                    move |cookie| unsafe {
-                        let range: ITfRange = composition.GetRange()?;
-
-                        if discard_text {
-                            range.SetText(cookie, TF_ST_CORRECTION, &[])?;
-                        } else {
-                            let mut text = vec![0; 1024];
-                            let mut text_len = 1024;
-
-                            let range_new = range.Clone()?;
-                            range_new.GetText(cookie, TF_TF_MOVESTART, &mut text, &mut text_len)?;
-
-                            text = text[..text_len as usize].to_vec();
-                            range.SetText(cookie, TF_ST_CORRECTION, &text)?;
-                        }
-
-                        let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
-                        prop.Clear(cookie, &range)?;
-
-                        range.Collapse(cookie, TF_ANCHOR_END)?;
-                        let selection = TF_SELECTION {
-                            range: ManuallyDrop::new(Some(range.clone())),
-                            style: TF_SELECTIONSTYLE {
-                                ase: TF_AE_NONE,
-                                fInterimChar: false.into(),
-                            },
-                        };
-
-                        context.SetSelection(cookie, &[selection])?;
-                        composition.EndComposition(cookie)?;
-                        Ok(())
-                    }
-                }),
+                close_composition_callback(
+                    composition,
+                    text_service.context::<ITfContext>()?,
+                    discard_text,
+                ),
             )?;
         } else {
             tracing::warn!("Composition is not started");
@@ -236,6 +306,33 @@ impl TextServiceFactory {
         text_service.borrow_mut_composition()?.tip_composition = None;
 
         Ok(())
+    }
+
+    pub(crate) fn end_composition_async_best_effort(&self) {
+        let request_result: Result<()> = (|| {
+            let text_service = self.borrow()?;
+            let Some(composition) = text_service.borrow_composition()?.tip_composition.clone()
+            else {
+                return Ok(());
+            };
+            let context = text_service.context::<ITfContext>()?;
+            let tid = text_service.tid;
+            request_async_write_edit_session(
+                tid,
+                context.clone(),
+                close_composition_callback(composition, context, false),
+            )
+        })();
+
+        if let Err(error) = request_result {
+            tracing::warn!(?error, "Failed to request best-effort composition end");
+        }
+
+        if let Ok(text_service) = self.borrow() {
+            if let Ok(mut composition) = text_service.borrow_mut_composition() {
+                composition.tip_composition = None;
+            }
+        }
     }
 
     #[tracing::instrument]
@@ -564,8 +661,36 @@ impl TextServiceFactory {
         }
     }
 
-    pub(crate) fn request_update_pos_async(&self) -> Result<()> {
-        let (tid, context, tip_composition, this) = {
+    fn is_current_update_pos_request(
+        &self,
+        generation: u64,
+        context: &ITfContext,
+        tip_composition: &ITfComposition,
+    ) -> bool {
+        let Ok(text_service) = self.borrow() else {
+            return false;
+        };
+        if text_service.update_pos_generation != generation {
+            return false;
+        }
+        let Some(current_context) = text_service.context.as_ref() else {
+            return false;
+        };
+        if !has_same_com_identity(current_context, context) {
+            return false;
+        }
+        text_service
+            .borrow_composition()
+            .ok()
+            .and_then(|composition| composition.tip_composition.clone())
+            .is_some_and(|current| has_same_com_identity(&current, tip_composition))
+    }
+
+    pub(crate) fn request_update_pos_async(
+        &self,
+        layout_context: Option<&ITfContext>,
+    ) -> Result<()> {
+        let (tid, context, tip_composition, this, generation) = {
             let mut text_service = self.borrow_mut()?;
             let tip_composition = text_service.borrow_composition()?.tip_composition.clone();
             let Some(tip_composition) = tip_composition else {
@@ -574,6 +699,12 @@ impl TextServiceFactory {
             let tid = text_service.tid;
             let context = text_service.context::<ITfContext>()?;
             let this = text_service.this::<ITfTextInputProcessor>()?;
+            if layout_context
+                .is_some_and(|layout_context| !has_same_com_identity(&context, layout_context))
+            {
+                tracing::debug!("Skip layout update for a stale TSF context");
+                return Ok(());
+            }
 
             let now = Instant::now();
             if text_service
@@ -590,14 +721,24 @@ impl TextServiceFactory {
             text_service
                 .candidate_window_position_state
                 .mark_attempt(now);
+            text_service.update_pos_generation = text_service.update_pos_generation.wrapping_add(1);
+            let generation = text_service.update_pos_generation;
 
-            (tid, context, tip_composition, this)
+            (tid, context, tip_composition, this, generation)
         };
 
         let callback = Rc::new({
             let context = context.clone();
+            let tip_composition = tip_composition.clone();
+            let this = this.clone();
 
             move |cookie| {
+                let factory = unsafe { this.as_impl() };
+                if !factory.is_current_update_pos_request(generation, &context, &tip_composition) {
+                    tracing::debug!("Skip stale asynchronous candidate position callback");
+                    return Ok(());
+                }
+
                 let result: Result<()> = (|| unsafe {
                     let view = context.GetActiveView()?;
                     let range = tip_composition.GetRange()?;
@@ -624,20 +765,19 @@ impl TextServiceFactory {
                     }
                     Ok(())
                 })();
-
-                let factory = unsafe { this.as_impl() };
-                factory.finish_update_pos();
                 result
             }
         });
 
-        match request_async_read_edit_session(tid, context, callback) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.finish_update_pos();
-                Err(error)
+        let completion = Rc::new({
+            let this = this.clone();
+            move || {
+                let factory = unsafe { this.as_impl() };
+                factory.finish_update_pos();
             }
-        }
+        });
+
+        request_async_read_edit_session(tid, context, callback, completion)
     }
 
     #[tracing::instrument]
@@ -721,6 +861,7 @@ mod tests {
     #[test]
     fn async_edit_session_runs_work_only_when_tsf_invokes_the_callback() {
         let callback_invoked = Rc::new(Cell::new(false));
+        let completion_count = Rc::new(Cell::new(0));
         let session: windows::Win32::UI::TextServices::ITfEditSession = AsyncEditSession {
             callback: Rc::new({
                 let callback_invoked = callback_invoked.clone();
@@ -729,6 +870,11 @@ mod tests {
                     Ok(())
                 }
             }),
+            completion: Rc::new({
+                let completion_count = completion_count.clone();
+                move || completion_count.set(completion_count.get() + 1)
+            }),
+            completed: Cell::new(false),
         }
         .into();
 
@@ -739,6 +885,26 @@ mod tests {
                 .expect("async callback should complete");
         }
         assert!(callback_invoked.get());
+        assert_eq!(completion_count.get(), 1);
+        drop(session);
+        assert_eq!(completion_count.get(), 1);
+    }
+
+    #[test]
+    fn async_edit_session_releases_completion_guard_when_callback_never_runs() {
+        let completion_count = Rc::new(Cell::new(0));
+        let session: windows::Win32::UI::TextServices::ITfEditSession = AsyncEditSession {
+            callback: Rc::new(|_| panic!("callback must not run")),
+            completion: Rc::new({
+                let completion_count = completion_count.clone();
+                move || completion_count.set(completion_count.get() + 1)
+            }),
+            completed: Cell::new(false),
+        }
+        .into();
+
+        drop(session);
+        assert_eq!(completion_count.get(), 1);
     }
 
     #[test]

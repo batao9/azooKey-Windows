@@ -68,6 +68,10 @@ fn deferred_action_suffix(
     actions.get(failed_index..).unwrap_or_default().to_vec()
 }
 
+fn requires_action_recovery(error: &anyhow::Error) -> bool {
+    requires_ipc_recovery(error) || is_non_destructive_edit_session_error(error)
+}
+
 fn has_same_com_identity(left: &ITfComposition, right: &ITfComposition) -> bool {
     match (left.cast::<IUnknown>(), right.cast::<IUnknown>()) {
         (Ok(left), Ok(right)) => left.as_raw() == right.as_raw(),
@@ -4573,6 +4577,27 @@ impl TextServiceFactory {
         }
     }
 
+    pub(crate) fn end_composition_for_tsf_event(&self) {
+        self.end_composition_async_best_effort();
+
+        if let Ok(text_service) = self.borrow() {
+            if let Ok(mut composition) = text_service.borrow_mut_composition() {
+                *composition = Composition::default();
+            }
+        }
+
+        if let Ok(Some(mut ipc_service)) = IMEState::ipc_service() {
+            ipc_service.discard_input_ledger();
+            if let Ok(delivery) =
+                ipc_service.update_candidate_window(Some(false), None, Some(vec![]), Some(0), None)
+            {
+                self.remember_candidate_window_visibility_if_sent(delivery, Some(false));
+            }
+            let _ = ipc_service.clear_text();
+            let _ = IMEState::set_ipc_service(ipc_service);
+        }
+    }
+
     #[tracing::instrument]
     pub fn handle_action(
         &self,
@@ -5736,9 +5761,8 @@ impl TextServiceFactory {
                         }
                     }
                     ClientAction::SetIMEMode(mode) => {
-                        self.start_composition()?;
                         let position = self.candidate_window_position()?;
-                        self.end_composition()?;
+                        self.end_composition_async_best_effort();
 
                         IMEState::set_input_mode(mode.clone())?;
 
@@ -6279,7 +6303,7 @@ impl TextServiceFactory {
             Ok(())
         })();
 
-        if result.as_ref().is_err_and(requires_ipc_recovery) {
+        if result.as_ref().is_err_and(requires_action_recovery) {
             if let Some(actions) = retry_actions.as_ref() {
                 let deferred = deferred_action_suffix(actions, failed_action_index);
                 if let Ok(text_service) = self.borrow() {

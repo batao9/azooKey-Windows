@@ -1,9 +1,9 @@
 use super::{
-    deferred_action_suffix, Candidates, CapsLockKeyboardLayout, ClauseActionBackend,
-    ClauseActionEffect, ClauseActionStateMut, ClauseAdvance, ClauseNavigationReadyUiSync,
-    ClauseSnapshot, ClauseState, Composition, CompositionReducer, CompositionState,
-    DeferredClientAction, DeferredProjection, DeferredUserAction, FutureClauseSnapshot,
-    TextServiceFactory,
+    deferred_action_suffix, requires_action_recovery, Candidates, CapsLockKeyboardLayout,
+    ClauseActionBackend, ClauseActionEffect, ClauseActionStateMut, ClauseAdvance,
+    ClauseNavigationReadyUiSync, ClauseSnapshot, ClauseState, Composition, CompositionReducer,
+    CompositionState, DeferredClientAction, DeferredProjection, DeferredUserAction,
+    FutureClauseSnapshot, TextServiceFactory,
 };
 use crate::engine::{
     client_action::{
@@ -13,8 +13,9 @@ use crate::engine::{
     ipc_service::{ClauseSnapshotOperation, WindowRpcDelivery},
     user_action::{Function, Navigation, UserAction},
 };
+use crate::tsf::edit_session::EditSessionFailure;
 use shared::{get_default_romaji_rows, AppConfig, PunctuationStyle, RomajiRule, WidthMode};
-use windows::Win32::Foundation::LPARAM;
+use windows::Win32::{Foundation::LPARAM, UI::TextServices::TF_E_LOCKED};
 
 #[test]
 fn deadline_recovery_defers_all_actions_from_failure_point() {
@@ -45,6 +46,24 @@ fn deadline_recovery_defers_all_actions_from_failure_point() {
     assert_eq!(deferred, actions[1..]);
     assert_eq!(deferred[1].transition, CompositionState::Selecting);
     assert_eq!(deferred[3].transition, CompositionState::None);
+}
+
+#[test]
+fn edit_session_lock_failure_defers_mutated_action_for_server_resynchronization() {
+    let actions = vec![
+        DeferredClientAction {
+            action: ClientAction::AppendText("a".to_string()),
+            transition: CompositionState::Composing,
+        },
+        DeferredClientAction {
+            action: ClientAction::AppendText("i".to_string()),
+            transition: CompositionState::Composing,
+        },
+    ];
+    let error = anyhow::Error::new(EditSessionFailure::Session(TF_E_LOCKED));
+
+    assert!(requires_action_recovery(&error));
+    assert_eq!(deferred_action_suffix(&actions, 0), actions);
 }
 
 #[test]
