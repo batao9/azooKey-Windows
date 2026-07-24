@@ -4,7 +4,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::tsf::edit_session::{is_non_destructive_edit_session_error, read_edit_session};
+use crate::tsf::edit_session::{
+    is_edit_session_error, is_non_destructive_edit_session_error, read_edit_session,
+};
 use crate::{
     engine::user_action::UserAction,
     extension::VKeyExt as _,
@@ -69,7 +71,7 @@ fn deferred_action_suffix(
 }
 
 fn requires_action_recovery(error: &anyhow::Error) -> bool {
-    requires_ipc_recovery(error) || is_non_destructive_edit_session_error(error)
+    requires_ipc_recovery(error) || is_edit_session_error(error)
 }
 
 fn mode_switch_request_is_current(
@@ -4342,6 +4344,13 @@ impl TextServiceFactory {
                 );
                 Ok(true)
             }
+            Err(error) if is_edit_session_error(&error) => {
+                tracing::warn!(
+                    ?error,
+                    "Edit-session callback failed after possible document mutation; preserving composition for recovery"
+                );
+                Ok(true)
+            }
             Err(error) => {
                 tracing::error!("handle_key failed: {error:?}");
                 self.recover_after_key_error();
@@ -4409,6 +4418,13 @@ impl TextServiceFactory {
                 tracing::warn!(
                     ?error,
                     "Key-up operation failed without invalidating local composition; preserving it"
+                );
+                Ok(true)
+            }
+            Err(error) if is_edit_session_error(&error) => {
+                tracing::warn!(
+                    ?error,
+                    "Key-up edit-session callback failed after possible mutation; preserving composition for recovery"
                 );
                 Ok(true)
             }
@@ -4513,6 +4529,13 @@ impl TextServiceFactory {
                 tracing::warn!(
                     ?error,
                     "Shortcut operation failed without invalidating local composition; preserving it"
+                );
+                Ok(true)
+            }
+            Err(error) if is_edit_session_error(&error) => {
+                tracing::warn!(
+                    ?error,
+                    "Shortcut edit-session callback failed after possible mutation; preserving composition for recovery"
                 );
                 Ok(true)
             }
@@ -4682,27 +4705,37 @@ impl TextServiceFactory {
         &self,
         mode: InputMode,
     ) -> Result<()> {
-        let position = self.candidate_window_position()?;
-        let request = {
+        let (this, context, tip_composition, generation) = {
             let mut text_service = self.borrow_mut()?;
             let tip_composition = text_service.borrow_composition()?.tip_composition.clone();
-            tip_composition.map(|tip_composition| {
+            let generation = tip_composition.as_ref().map(|_| {
                 text_service.mode_switch_generation =
                     text_service.mode_switch_generation.wrapping_add(1);
-                (
-                    text_service.this::<ITfTextInputProcessor>(),
-                    text_service.context::<ITfContext>(),
-                    tip_composition,
-                    text_service.mode_switch_generation,
-                )
-            })
+                text_service.mode_switch_generation
+            });
+            (
+                text_service.this::<ITfTextInputProcessor>()?,
+                text_service.context::<ITfContext>()?,
+                tip_composition,
+                generation,
+            )
         };
-        let Some((this, context, tip_composition, generation)) = request else {
-            self.complete_input_mode_switch_best_effort(mode, position);
+
+        let Some(tip_composition) = tip_composition else {
+            let on_complete = Rc::new(move |position| {
+                let factory = unsafe { this.as_impl() };
+                factory.complete_input_mode_switch_best_effort(mode.clone(), position);
+            });
+            if let Err(error) = self.request_caret_window_position_async(on_complete) {
+                tracing::warn!(
+                    ?error,
+                    "Failed to queue caret lookup for language-bar mode switch"
+                );
+            }
             return Ok(());
         };
-        let this = this?;
-        let context = context?;
+        let generation = generation.context("mode switch generation is missing")?;
+        let position = self.candidate_window_position()?;
 
         let is_current = Rc::new({
             let this = this.clone();
@@ -5883,8 +5916,18 @@ impl TextServiceFactory {
                         }
                     }
                     ClientAction::SetIMEMode(mode) => {
-                        let position = self.candidate_window_position()?;
-                        self.end_composition()?;
+                        let composition_active = self
+                            .borrow()?
+                            .borrow_composition()?
+                            .tip_composition
+                            .is_some();
+                        let position = if composition_active {
+                            let position = self.candidate_window_position()?;
+                            self.end_composition()?;
+                            position
+                        } else {
+                            self.caret_window_position()?
+                        };
 
                         IMEState::set_input_mode(mode.clone())?;
 

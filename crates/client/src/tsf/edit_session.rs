@@ -36,6 +36,7 @@ enum CandidateWindowPositionMode {
 struct EditSession<'a, T> {
     callback: Rc<dyn Fn(u32) -> anyhow::Result<T>>,
     pub result: Cell<Option<T>>,
+    callback_started: Cell<bool>,
     phantom: std::marker::PhantomData<&'a T>,
 }
 
@@ -64,6 +65,7 @@ impl Drop for AsyncEditSession {
 pub(crate) enum EditSessionFailure {
     Request(HRESULT),
     Session(HRESULT),
+    Callback(HRESULT),
     UnexpectedAsync,
     CallbackNotCompleted,
 }
@@ -76,6 +78,9 @@ impl fmt::Display for EditSessionFailure {
             }
             Self::Session(hresult) => {
                 write!(formatter, "edit session was rejected: {hresult:?}")
+            }
+            Self::Callback(hresult) => {
+                write!(formatter, "edit session callback failed: {hresult:?}")
             }
             Self::UnexpectedAsync => {
                 write!(formatter, "synchronous edit session was deferred")
@@ -90,11 +95,24 @@ impl fmt::Display for EditSessionFailure {
 impl std::error::Error for EditSessionFailure {}
 
 pub(crate) fn is_non_destructive_edit_session_error(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<EditSessionFailure>(),
+        Some(
+            EditSessionFailure::Request(_)
+                | EditSessionFailure::Session(_)
+                | EditSessionFailure::UnexpectedAsync
+                | EditSessionFailure::CallbackNotCompleted
+        )
+    )
+}
+
+pub(crate) fn is_edit_session_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<EditSessionFailure>().is_some()
 }
 
 fn complete_sync_edit_session<T>(
     request_result: std::result::Result<HRESULT, HRESULT>,
+    callback_started: bool,
     callback_result: Option<T>,
 ) -> Result<T> {
     let session_result = request_result
@@ -102,9 +120,14 @@ fn complete_sync_edit_session<T>(
     if session_result == TF_S_ASYNC {
         return Err(anyhow::Error::new(EditSessionFailure::UnexpectedAsync));
     }
-    session_result
-        .ok()
-        .map_err(|_| anyhow::Error::new(EditSessionFailure::Session(session_result)))?;
+    session_result.ok().map_err(|_| {
+        let failure = if callback_started {
+            EditSessionFailure::Callback(session_result)
+        } else {
+            EditSessionFailure::Session(session_result)
+        };
+        anyhow::Error::new(failure)
+    })?;
     callback_result.ok_or_else(|| anyhow::Error::new(EditSessionFailure::CallbackNotCompleted))
 }
 
@@ -127,6 +150,7 @@ fn sync_edit_session<T>(
     let session: ITfEditSession = EditSession {
         callback,
         result: Cell::new(None),
+        callback_started: Cell::new(false),
         phantom: std::marker::PhantomData,
     }
     .into();
@@ -136,7 +160,11 @@ fn sync_edit_session<T>(
             .map_err(|error| error.code());
     let session: &EditSession<'_, T> =
         unsafe { <ITfEditSession as AsImpl<EditSession<'_, T>>>::as_impl(&session) };
-    complete_sync_edit_session(request_result, session.result.take())
+    complete_sync_edit_session(
+        request_result,
+        session.callback_started.get(),
+        session.result.take(),
+    )
 }
 
 pub fn read_edit_session<T>(
@@ -200,6 +228,7 @@ fn request_async_write_edit_session(
 impl<'a, T> ITfEditSession_Impl for EditSession_Impl<'a, T> {
     #[anyhow]
     fn DoEditSession(&self, cookie: u32) -> Result<()> {
+        self.callback_started.set(true);
         let result = (self.callback)(cookie)?;
         self.result.set(Some(result));
         Ok(())
@@ -268,6 +297,50 @@ fn has_same_com_identity<I: Interface>(left: &I, right: &I) -> bool {
     }
 }
 
+fn window_position_for_range(
+    context: &ITfContext,
+    cookie: u32,
+    range: &ITfRange,
+) -> Result<WindowPosition> {
+    unsafe {
+        let view = context.GetActiveView()?;
+        let mut rect = RECT::default();
+        let mut clipped = false.into();
+        view.GetTextExt(cookie, range, &mut rect, &mut clipped)?;
+        Ok(WindowPosition {
+            top: rect.top,
+            left: rect.left,
+            bottom: rect.bottom,
+            right: rect.right,
+        })
+    }
+}
+
+fn caret_window_position_for_cookie(
+    context: &ITfContext,
+    cookie: u32,
+) -> Result<Option<WindowPosition>> {
+    unsafe {
+        let mut selection = [TF_SELECTION::default()];
+        let mut fetched = 0;
+        context.GetSelection(
+            cookie,
+            windows::Win32::UI::TextServices::TF_DEFAULT_SELECTION,
+            &mut selection,
+            &mut fetched,
+        )?;
+        if fetched == 0 {
+            return Ok(None);
+        }
+        let Some(range) = selection[0].range.as_ref() else {
+            return Ok(None);
+        };
+        let range = range.Clone()?;
+        range.Collapse(cookie, TF_ANCHOR_END)?;
+        window_position_for_range(context, cookie, &range).map(Some)
+    }
+}
+
 impl TextServiceFactory {
     fn log_candidate_window_position_performance(
         request_id: u64,
@@ -326,12 +399,6 @@ impl TextServiceFactory {
 
         if let Err(error) = request_result {
             tracing::warn!(?error, "Failed to request best-effort composition end");
-        }
-
-        if let Ok(text_service) = self.borrow() {
-            if let Ok(mut composition) = text_service.borrow_mut_composition() {
-                composition.tip_composition = None;
-            }
         }
     }
 
@@ -536,6 +603,45 @@ impl TextServiceFactory {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn caret_window_position(&self) -> Result<Option<WindowPosition>> {
+        let (tid, context) = {
+            let text_service = self.borrow()?;
+            (text_service.tid, text_service.context::<ITfContext>()?)
+        };
+        match read_edit_session(
+            tid,
+            context.clone(),
+            Rc::new(move |cookie| caret_window_position_for_cookie(&context, cookie)),
+        ) {
+            Ok(position) => Ok(position),
+            Err(error) => {
+                tracing::warn!("Failed to obtain caret window position: {error:?}");
+                Ok(None)
+            }
+        }
+    }
+
+    pub(crate) fn request_caret_window_position_async(
+        &self,
+        on_complete: Rc<dyn Fn(Option<WindowPosition>)>,
+    ) -> Result<()> {
+        let (tid, context) = {
+            let text_service = self.borrow()?;
+            (text_service.tid, text_service.context::<ITfContext>()?)
+        };
+        let position = Rc::new(Cell::new(None));
+        let callback = Rc::new({
+            let context = context.clone();
+            let position = position.clone();
+            move |cookie| {
+                position.set(caret_window_position_for_cookie(&context, cookie)?);
+                Ok(())
+            }
+        });
+        let completion = Rc::new(move || on_complete(position.get()));
+        request_async_read_edit_session(tid, context, callback, completion)
     }
 
     fn candidate_window_position_with_mode(
@@ -835,7 +941,7 @@ mod tests {
 
     #[test]
     fn sync_edit_session_returns_callback_value_after_both_results_succeed() {
-        let value = complete_sync_edit_session(Ok(HRESULT(0)), Some("completed".to_string()))
+        let value = complete_sync_edit_session(Ok(HRESULT(0)), true, Some("completed".to_string()))
             .expect("completed callback result");
 
         assert_eq!(value, "completed");
@@ -843,7 +949,7 @@ mod tests {
 
     #[test]
     fn sync_edit_session_keeps_lock_rejection_distinct_from_request_failure() {
-        let error = complete_sync_edit_session::<()>(Ok(TF_E_LOCKED), None)
+        let error = complete_sync_edit_session::<()>(Ok(TF_E_LOCKED), false, None)
             .expect_err("lock rejection must fail the session");
 
         assert_eq!(
@@ -855,7 +961,7 @@ mod tests {
 
     #[test]
     fn sync_edit_session_rejects_unexpected_async_completion() {
-        let error = complete_sync_edit_session::<()>(Ok(TF_S_ASYNC), None)
+        let error = complete_sync_edit_session::<()>(Ok(TF_S_ASYNC), false, None)
             .expect_err("synchronous contract must not read a deferred result");
 
         assert_eq!(
@@ -866,7 +972,7 @@ mod tests {
 
     #[test]
     fn sync_edit_session_reports_context_destruction_as_request_failure() {
-        let error = complete_sync_edit_session::<()>(Err(TF_E_DISCONNECTED), None)
+        let error = complete_sync_edit_session::<()>(Err(TF_E_DISCONNECTED), false, None)
             .expect_err("destroyed context must fail the outer request");
 
         assert_eq!(
@@ -878,13 +984,25 @@ mod tests {
 
     #[test]
     fn sync_edit_session_requires_callback_completion() {
-        let error = complete_sync_edit_session::<()>(Ok(HRESULT(0)), None)
+        let error = complete_sync_edit_session::<()>(Ok(HRESULT(0)), false, None)
             .expect_err("successful session without callback completion is invalid");
 
         assert_eq!(
             error.downcast_ref::<EditSessionFailure>(),
             Some(&EditSessionFailure::CallbackNotCompleted)
         );
+    }
+
+    #[test]
+    fn sync_edit_session_marks_callback_hresult_as_potentially_destructive() {
+        let error = complete_sync_edit_session::<()>(Ok(TF_E_LOCKED), true, None)
+            .expect_err("callback HRESULT must remain distinct from lock rejection");
+
+        assert_eq!(
+            error.downcast_ref::<EditSessionFailure>(),
+            Some(&EditSessionFailure::Callback(TF_E_LOCKED))
+        );
+        assert!(!is_non_destructive_edit_session_error(&error));
     }
 
     #[test]
