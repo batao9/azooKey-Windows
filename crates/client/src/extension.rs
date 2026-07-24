@@ -28,9 +28,9 @@ impl StringExt for &str {
     }
 
     fn to_wide(&self) -> Vec<u8> {
-        self.encode_utf16()
-            .flat_map(|c| c.to_le_bytes())
-            .chain(Some(0))
+        self.to_wide_16()
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
             .collect()
     }
 }
@@ -131,5 +131,25 @@ pub trait VKeyExt {
 impl VKeyExt for VIRTUAL_KEY {
     fn is_pressed(self) -> bool {
         unsafe { GetKeyState(self.0 as i32) as u16 & 0x8000 != 0 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StringExt as _;
+
+    #[test]
+    fn win32_wide_boundary_registry_string_is_even_length_and_nul_terminated() {
+        let value = "azooKey 日本語 😀 𠮷";
+        let bytes = value.to_wide();
+        let expected = value
+            .encode_utf16()
+            .chain(Some(0))
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        assert_eq!(bytes, expected);
+        assert_eq!(bytes.len() % 2, 0);
+        assert_eq!(bytes.last_chunk::<2>(), Some(&[0, 0]));
     }
 }
