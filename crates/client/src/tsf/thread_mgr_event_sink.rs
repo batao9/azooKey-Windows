@@ -4,11 +4,7 @@ use windows::Win32::UI::TextServices::{
 
 use anyhow::Result;
 
-use crate::engine::{
-    client_action::ClientAction,
-    composition::CompositionState,
-    state::{keyboard_disabled_from_context, IMEState},
-};
+use crate::engine::state::{keyboard_disabled_from_context, IMEState};
 
 use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
 
@@ -83,14 +79,7 @@ impl ITfThreadMgrEventSink_Impl for TextServiceFactory_Impl {
         self.set_keyboard_disabled_for_document_mgr(focus)?;
         ensure_ipc_service_for_tsf_event("OnSetFocus");
 
-        let actions = vec![ClientAction::EndComposition];
-        if IMEState::ipc_service()?.is_some() {
-            self.handle_action(&actions, CompositionState::None)?;
-        } else {
-            tracing::debug!(
-                "Skipping focus composition cleanup because IPC service is unavailable"
-            );
-        }
+        self.end_composition_for_tsf_event();
 
         if focus.is_none() {
             let mut text_service = self.borrow_mut()?;

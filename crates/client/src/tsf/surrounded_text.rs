@@ -15,7 +15,7 @@ use windows::{
 
 use crate::engine::{ipc_service::current_input_trace_request_id, state::IMEState};
 
-use super::{edit_session::edit_session, factory::TextServiceFactory};
+use super::{edit_session::read_edit_session, factory::TextServiceFactory};
 
 impl TextServiceFactory {
     fn log_update_context_performance(
@@ -134,7 +134,7 @@ impl TextServiceFactory {
             };
 
             let edit_session_start = trace_request_id.map(|_| Instant::now());
-            let preceding_text = edit_session::<String>(
+            let preceding_text = read_edit_session::<String>(
                 tid,
                 parent_context.clone(),
                 Rc::new({
@@ -205,16 +205,11 @@ impl TextServiceFactory {
                     "edit_session",
                     edit_session_start,
                     format!(
-                        "status=success;preview_len={};preceding_text_present={}",
-                        preview.chars().count(),
-                        preceding_text.is_some()
+                        "status=success;preview_len={};preceding_text_present=true",
+                        preview.chars().count()
                     ),
                 );
             }
-
-            let Some(preceding_text) = preceding_text else {
-                return Ok(());
-            };
 
             let Some(mut ipc_service) = IMEState::ipc_service()? else {
                 return Ok(());

@@ -4,7 +4,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::tsf::edit_session::edit_session;
+use crate::tsf::edit_session::{
+    is_edit_session_error, is_non_destructive_edit_session_error, read_edit_session,
+};
 use crate::{
     engine::user_action::UserAction,
     extension::VKeyExt as _,
@@ -35,7 +37,7 @@ use shared::{
     LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MAX,
     LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MIN,
 };
-use windows::core::{w, IUnknown, Interface as _, PCWSTR};
+use windows::core::{w, AsImpl as _, IUnknown, Interface as _, PCWSTR};
 use windows::Win32::{
     Foundation::{LPARAM, WPARAM},
     System::Com::CoTaskMemFree,
@@ -46,9 +48,9 @@ use windows::Win32::{
             VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
         },
         TextServices::{
-            ITfComposition, ITfCompositionSink_Impl, ITfContext, ITfInputScope, InputScope,
-            GUID_PROP_INPUTSCOPE, IS_NUMERIC_PASSWORD, IS_PASSWORD, IS_PRIVATE,
-            TF_DEFAULT_SELECTION, TF_SELECTION,
+            ITfComposition, ITfCompositionSink_Impl, ITfContext, ITfInputScope,
+            ITfTextInputProcessor, InputScope, GUID_PROP_INPUTSCOPE, IS_NUMERIC_PASSWORD,
+            IS_PASSWORD, IS_PRIVATE, TF_DEFAULT_SELECTION, TF_SELECTION,
         },
     },
 };
@@ -68,7 +70,51 @@ fn deferred_action_suffix(
     actions.get(failed_index..).unwrap_or_default().to_vec()
 }
 
-fn has_same_com_identity(left: &ITfComposition, right: &ITfComposition) -> bool {
+fn requires_action_recovery(error: &anyhow::Error) -> bool {
+    requires_ipc_recovery(error) || is_edit_session_error(error)
+}
+
+fn requires_server_resynchronization(error: &anyhow::Error) -> bool {
+    is_edit_session_error(error)
+}
+
+fn language_bar_toggle_requires_deferred_replay(composition: &Composition) -> bool {
+    !composition.deferred_actions.is_empty() || !composition.deferred_inputs.is_empty()
+}
+
+fn language_bar_deferred_action(
+    mode: &InputMode,
+    replaces_pending_mode_switch: bool,
+) -> UserAction {
+    if replaces_pending_mode_switch {
+        match mode {
+            InputMode::Kana => UserAction::InputModeOn,
+            InputMode::Latin => UserAction::InputModeOff,
+        }
+    } else {
+        UserAction::ToggleInputMode
+    }
+}
+
+fn mode_switch_request_is_current(
+    requested_generation: u64,
+    current_generation: u64,
+    context_matches: bool,
+    composition_matches: bool,
+) -> bool {
+    requested_generation == current_generation && context_matches && composition_matches
+}
+
+fn idle_mode_switch_request_is_current(
+    requested_generation: u64,
+    current_generation: u64,
+    context_matches: bool,
+    composition_is_empty: bool,
+) -> bool {
+    requested_generation == current_generation && context_matches && composition_is_empty
+}
+
+fn has_same_com_identity<I: windows::core::Interface>(left: &I, right: &I) -> bool {
     match (left.cast::<IUnknown>(), right.cast::<IUnknown>()) {
         (Ok(left), Ok(right)) => left.as_raw() == right.as_raw(),
         (Err(left_error), Err(right_error)) => {
@@ -2936,7 +2982,7 @@ impl TextServiceFactory {
     }
 
     fn context_has_sensitive_input_scope(tid: u32, context: ITfContext) -> Result<bool> {
-        Ok(edit_session::<bool>(
+        read_edit_session::<bool>(
             tid,
             context.clone(),
             Rc::new({
@@ -2967,8 +3013,7 @@ impl TextServiceFactory {
                     Ok(Self::input_scope_list_contains_sensitive(&input_scope))
                 }
             }),
-        )?
-        .unwrap_or(false))
+        )
     }
 
     fn current_context_has_sensitive_input_scope(&self) -> bool {
@@ -3819,6 +3864,7 @@ impl TextServiceFactory {
         composition: &Composition,
         input: DeferredUserAction,
         config_snapshot: &AppConfigSnapshot,
+        replace_pending_mode_switch: bool,
     ) -> Result<bool> {
         let mut projection = Self::deferred_projection(composition, IMEState::input_mode()?);
         let mut projected_composition = composition.clone();
@@ -3869,12 +3915,18 @@ impl TextServiceFactory {
             .collect::<Vec<_>>();
         Self::apply_actions_to_deferred_projection(&mut projection, &fallback);
 
-        let text_service = self.borrow()?;
+        let mut text_service = self.borrow_mut()?;
         let mut persisted = text_service.borrow_mut_composition()?;
         persisted
             .deferred_inputs
             .push_back(DeferredInputEvent::User { input, fallback });
         persisted.deferred_projection = Some(projection);
+        drop(persisted);
+        if replace_pending_mode_switch {
+            // Queueing and invalidating the superseded async request happen under the same
+            // TextService borrow. Any earlier error leaves the pending request untouched.
+            text_service.invalidate_mode_switch_requests();
+        }
         Ok(true)
     }
 
@@ -4100,6 +4152,7 @@ impl TextServiceFactory {
                     &composition,
                     deferred_user_action,
                     &config_snapshot,
+                    false,
                 )? {
                     self.clear_temporary_latin_shift_pending_if_needed(should_clear_shift_pending)?;
                     return Ok(None);
@@ -4228,28 +4281,32 @@ impl TextServiceFactory {
                 self.borrow()?.borrow_mut_composition()?.deferred_projection = None;
                 return Ok(());
             };
-            self.borrow()?
-                .borrow_mut_composition()?
-                .deferred_inputs
-                .pop_front();
 
             match event {
                 DeferredInputEvent::Actions(actions) => {
-                    self.borrow()?
-                        .borrow_mut_composition()?
-                        .deferred_actions
-                        .extend(actions);
+                    let text_service = self.borrow()?;
+                    let mut composition = text_service.borrow_mut_composition()?;
+                    composition.deferred_inputs.pop_front();
+                    composition.deferred_actions.extend(actions);
                 }
                 DeferredInputEvent::User { input, fallback } => {
+                    // Keep the user event queued until every fallible prerequisite for
+                    // replanning has succeeded. A transient configuration or mode lookup
+                    // failure must not discard the user's input.
                     let config_snapshot = IMEState::app_config_snapshot()?;
                     let mode = IMEState::input_mode()?;
-                    if let Some((transition, actions)) = Self::plan_deferred_user_action(
+                    let planned = Self::plan_deferred_user_action(
                         &composition,
                         &input,
                         &mode,
                         config_snapshot.app_config(),
                         config_snapshot.romaji_lookup(),
-                    ) {
+                    );
+                    self.borrow()?
+                        .borrow_mut_composition()?
+                        .deferred_inputs
+                        .pop_front();
+                    if let Some((transition, actions)) = planned {
                         self.handle_action_with_config_snapshot(
                             &actions,
                             transition,
@@ -4320,10 +4377,20 @@ impl TextServiceFactory {
 
         match result {
             Ok(handled) => Ok(handled),
-            Err(error) if is_non_destructive_ipc_error(&error) => {
+            Err(error)
+                if is_non_destructive_ipc_error(&error)
+                    || is_non_destructive_edit_session_error(&error) =>
+            {
                 tracing::warn!(
                     ?error,
-                    "IPC operation failed without mutating server state; preserving composition"
+                    "Operation failed without invalidating local composition; preserving it"
+                );
+                Ok(true)
+            }
+            Err(error) if is_edit_session_error(&error) => {
+                tracing::warn!(
+                    ?error,
+                    "Edit-session callback failed after possible document mutation; preserving composition for recovery"
                 );
                 Ok(true)
             }
@@ -4387,10 +4454,20 @@ impl TextServiceFactory {
 
         match result {
             Ok(handled) => Ok(handled),
-            Err(error) if is_non_destructive_ipc_error(&error) => {
+            Err(error)
+                if is_non_destructive_ipc_error(&error)
+                    || is_non_destructive_edit_session_error(&error) =>
+            {
                 tracing::warn!(
                     ?error,
-                    "IPC key-up operation failed without mutation; preserving composition"
+                    "Key-up operation failed without invalidating local composition; preserving it"
+                );
+                Ok(true)
+            }
+            Err(error) if is_edit_session_error(&error) => {
+                tracing::warn!(
+                    ?error,
+                    "Key-up edit-session callback failed after possible mutation; preserving composition for recovery"
                 );
                 Ok(true)
             }
@@ -4461,7 +4538,12 @@ impl TextServiceFactory {
                 shift_alphabet_shortcut: false,
             };
             if !composition.deferred_actions.is_empty() || !composition.deferred_inputs.is_empty() {
-                if !self.enqueue_deferred_user_action(&composition, deferred, &config_snapshot)? {
+                if !self.enqueue_deferred_user_action(
+                    &composition,
+                    deferred,
+                    &config_snapshot,
+                    false,
+                )? {
                     return Ok(false);
                 }
                 self.flush_deferred_user_actions()?;
@@ -4488,10 +4570,20 @@ impl TextServiceFactory {
 
         match result {
             Ok(handled) => Ok(handled),
-            Err(error) if is_non_destructive_ipc_error(&error) => {
+            Err(error)
+                if is_non_destructive_ipc_error(&error)
+                    || is_non_destructive_edit_session_error(&error) =>
+            {
                 tracing::warn!(
                     ?error,
-                    "IPC shortcut operation failed without mutation; preserving composition"
+                    "Shortcut operation failed without invalidating local composition; preserving it"
+                );
+                Ok(true)
+            }
+            Err(error) if is_edit_session_error(&error) => {
+                tracing::warn!(
+                    ?error,
+                    "Shortcut edit-session callback failed after possible mutation; preserving composition for recovery"
                 );
                 Ok(true)
             }
@@ -4563,6 +4655,252 @@ impl TextServiceFactory {
 
             let _ = IMEState::set_ipc_service(ipc_service);
         }
+    }
+
+    pub(crate) fn end_composition_for_tsf_event(&self) {
+        self.end_composition_async_best_effort();
+
+        if let Ok(mut text_service) = self.borrow_mut() {
+            text_service.invalidate_mode_switch_requests();
+            if let Ok(mut composition) = text_service.borrow_mut_composition() {
+                *composition = Composition::default();
+            }
+        }
+
+        if let Ok(Some(mut ipc_service)) = IMEState::ipc_service() {
+            ipc_service.discard_input_ledger();
+            if let Ok(delivery) =
+                ipc_service.update_candidate_window(Some(false), None, Some(vec![]), Some(0), None)
+            {
+                self.remember_candidate_window_visibility_if_sent(delivery, Some(false));
+            }
+            let _ = ipc_service.clear_text();
+            let _ = IMEState::set_ipc_service(ipc_service);
+        }
+    }
+
+    fn complete_input_mode_switch_best_effort(
+        &self,
+        generation: u64,
+        mode: InputMode,
+        position: Option<shared::proto::WindowPosition>,
+    ) {
+        let Ok(mut text_service) = self.borrow_mut() else {
+            tracing::warn!("Failed to complete deferred input mode switch due to borrow conflict");
+            return;
+        };
+        if !text_service.clear_pending_mode_switch(generation) {
+            tracing::debug!("Skip superseded deferred input mode switch");
+            return;
+        }
+        if let Ok(mut composition) = text_service.borrow_mut_composition() {
+            *composition = Composition::default();
+        }
+        drop(text_service);
+
+        if let Err(error) = IMEState::set_input_mode(mode.clone()) {
+            tracing::warn!(?error, "Failed to apply deferred input mode switch");
+        }
+        if let Err(error) = self.update_lang_bar() {
+            tracing::warn!(?error, "Failed to update language bar after mode switch");
+        }
+
+        let mode_label = match mode {
+            InputMode::Latin => "A",
+            InputMode::Kana => "あ",
+        };
+        if let Ok(Some(mut ipc_service)) = IMEState::ipc_service() {
+            if let Err(error) = ipc_service.update_candidate_window_with_reading(
+                None,
+                position,
+                None,
+                None,
+                Some(mode_label),
+                Some(""),
+                Some(false),
+                None,
+            ) {
+                tracing::warn!(?error, "Failed to update candidate UI after mode switch");
+            }
+            ipc_service.discard_input_ledger();
+            if let Err(error) = ipc_service.clear_text() {
+                tracing::warn!(?error, "Failed to clear server text after mode switch");
+            }
+            if let Err(error) = IMEState::set_ipc_service(ipc_service) {
+                tracing::warn!(?error, "Failed to persist IPC state after mode switch");
+            }
+        }
+    }
+
+    fn is_current_mode_switch_request(
+        &self,
+        generation: u64,
+        context: &ITfContext,
+        tip_composition: &ITfComposition,
+    ) -> bool {
+        let Ok(text_service) = self.borrow() else {
+            return false;
+        };
+        let context_matches = text_service
+            .context
+            .as_ref()
+            .is_some_and(|current| has_same_com_identity(current, context));
+        let composition_matches = text_service
+            .borrow_composition()
+            .ok()
+            .and_then(|composition| composition.tip_composition.clone())
+            .is_some_and(|current| has_same_com_identity(&current, tip_composition));
+        mode_switch_request_is_current(
+            generation,
+            text_service.mode_switch_generation,
+            context_matches,
+            composition_matches,
+        )
+    }
+
+    fn is_current_idle_mode_switch_request(&self, generation: u64, context: &ITfContext) -> bool {
+        let Ok(text_service) = self.borrow() else {
+            return false;
+        };
+        let context_matches = text_service
+            .context
+            .as_ref()
+            .is_some_and(|current| has_same_com_identity(current, context));
+        let composition_is_empty = text_service
+            .borrow_composition()
+            .is_ok_and(|composition| composition.tip_composition.is_none());
+        idle_mode_switch_request_is_current(
+            generation,
+            text_service.mode_switch_generation,
+            context_matches,
+            composition_is_empty,
+        )
+    }
+
+    pub(crate) fn request_input_mode_switch_after_composition(
+        &self,
+        mode: InputMode,
+    ) -> Result<()> {
+        let (this, context, tip_composition, generation) = {
+            let mut text_service = self.borrow_mut()?;
+            let tip_composition = text_service.borrow_composition()?.tip_composition.clone();
+            let this = text_service.this::<ITfTextInputProcessor>()?;
+            let context = text_service.context::<ITfContext>()?;
+            let generation = text_service.begin_mode_switch(mode.clone());
+            (this, context, tip_composition, generation)
+        };
+
+        let Some(tip_composition) = tip_composition else {
+            let on_complete = Rc::new({
+                let this = this.clone();
+                let context = context.clone();
+                let mode = mode.clone();
+                move |position| {
+                    let factory = unsafe { this.as_impl() };
+                    if factory.is_current_idle_mode_switch_request(generation, &context) {
+                        factory.complete_input_mode_switch_best_effort(
+                            generation,
+                            mode.clone(),
+                            position,
+                        );
+                    } else {
+                        tracing::debug!("Skip stale idle mode-switch completion");
+                    }
+                }
+            });
+            let on_terminal = Rc::new({
+                let this = this.clone();
+                move || {
+                    let factory = unsafe { this.as_impl() };
+                    if let Ok(mut text_service) = factory.borrow_mut() {
+                        text_service.clear_pending_mode_switch(generation);
+                    }
+                }
+            });
+            if let Err(error) = self.request_caret_window_position_async(on_complete, on_terminal) {
+                tracing::warn!(
+                    ?error,
+                    "Failed to queue caret lookup for language-bar mode switch"
+                );
+                let factory = unsafe { this.as_impl() };
+                if factory.is_current_idle_mode_switch_request(generation, &context) {
+                    factory.complete_input_mode_switch_best_effort(generation, mode, None);
+                }
+            }
+            return Ok(());
+        };
+        let position = match self.candidate_window_position() {
+            Ok(position) => position,
+            Err(error) => {
+                if let Ok(mut text_service) = self.borrow_mut() {
+                    text_service.clear_pending_mode_switch(generation);
+                }
+                return Err(error);
+            }
+        };
+
+        let is_current = Rc::new({
+            let this = this.clone();
+            let context = context.clone();
+            let tip_composition = tip_composition.clone();
+            move || {
+                let factory = unsafe { this.as_impl() };
+                factory.is_current_mode_switch_request(generation, &context, &tip_composition)
+            }
+        });
+        let on_success = Rc::new({
+            let this = this.clone();
+            move || {
+                let factory = unsafe { this.as_impl() };
+                factory.complete_input_mode_switch_best_effort(generation, mode.clone(), position);
+            }
+        });
+        let on_terminal = Rc::new(move || {
+            let factory = unsafe { this.as_impl() };
+            if let Ok(mut text_service) = factory.borrow_mut() {
+                text_service.clear_pending_mode_switch(generation);
+            }
+        });
+        let result = self.end_composition_async_on_success(is_current, on_success, on_terminal);
+        if result.is_err() {
+            if let Ok(mut text_service) = self.borrow_mut() {
+                text_service.clear_pending_mode_switch(generation);
+            }
+        }
+        result
+    }
+
+    pub(crate) fn request_language_bar_input_mode_toggle(&self, mode: InputMode) -> Result<()> {
+        let (composition, replaces_pending_mode_switch) = {
+            let text_service = self.borrow()?;
+            let composition = text_service.borrow_composition()?.clone();
+            let replaces_pending_mode_switch = text_service.pending_mode_switch().is_some();
+            (composition, replaces_pending_mode_switch)
+        };
+        if !language_bar_toggle_requires_deferred_replay(&composition) {
+            return self.request_input_mode_switch_after_composition(mode);
+        }
+
+        // A pending asynchronous language-bar request must not overtake queued recovery input.
+        // Preserve the absolute target computed from that pending request, and only invalidate
+        // the request after the replacement has been queued successfully.
+        let config_snapshot = IMEState::app_config_snapshot()?;
+        let deferred = DeferredUserAction {
+            action: language_bar_deferred_action(&mode, replaces_pending_mode_switch),
+            is_shift_pressed: false,
+            is_shift_key: false,
+            shift_alphabet_shortcut: false,
+        };
+        if !self.enqueue_deferred_user_action(
+            &composition,
+            deferred,
+            &config_snapshot,
+            replaces_pending_mode_switch,
+        )? {
+            tracing::warn!("Failed to plan deferred language-bar input mode toggle");
+            return Ok(());
+        }
+        self.flush_deferred_user_actions()
     }
 
     #[tracing::instrument]
@@ -5728,9 +6066,18 @@ impl TextServiceFactory {
                         }
                     }
                     ClientAction::SetIMEMode(mode) => {
-                        self.start_composition()?;
-                        let position = self.candidate_window_position()?;
-                        self.end_composition()?;
+                        let composition_active = self
+                            .borrow()?
+                            .borrow_composition()?
+                            .tip_composition
+                            .is_some();
+                        let position = if composition_active {
+                            let position = self.candidate_window_position()?;
+                            self.end_composition()?;
+                            position
+                        } else {
+                            self.caret_window_position()?
+                        };
 
                         IMEState::set_input_mode(mode.clone())?;
 
@@ -6271,7 +6618,7 @@ impl TextServiceFactory {
             Ok(())
         })();
 
-        if result.as_ref().is_err_and(requires_ipc_recovery) {
+        if result.as_ref().is_err_and(requires_action_recovery) {
             if let Some(actions) = retry_actions.as_ref() {
                 let deferred = deferred_action_suffix(actions, failed_action_index);
                 if let Ok(text_service) = self.borrow() {
@@ -6285,7 +6632,17 @@ impl TextServiceFactory {
                 if let Some(snapshot) = failed_ledger_snapshot.take() {
                     ipc_service.restore_input_ledger(snapshot);
                 }
-                ipc_service.ensure_server_restart_requested();
+                if result
+                    .as_ref()
+                    .is_err_and(requires_server_resynchronization)
+                {
+                    // A TSF callback can fail after the server-side action has already mutated
+                    // its composition. Restart before replaying the deferred action so both
+                    // sides are rebuilt from the restored client ledger.
+                    ipc_service.require_server_recovery("edit_session_action");
+                } else {
+                    ipc_service.ensure_server_restart_requested();
+                }
                 let _ = IMEState::set_ipc_service(ipc_service);
             }
         }

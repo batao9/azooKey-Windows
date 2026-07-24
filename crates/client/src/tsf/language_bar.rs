@@ -38,10 +38,7 @@ use windows::{
 };
 
 use crate::{
-    engine::{
-        client_action::ClientAction, composition::CompositionState, input_mode::InputMode,
-        state::IMEState, theme::get_theme,
-    },
+    engine::{input_mode::InputMode, state::IMEState, theme::get_theme},
     extension::StringExt as _,
     globals::{DllModule, GUID_TEXT_SERVICE, TEXTSERVICE_LANGBARITEMSINK_COOKIE},
     launcher_control,
@@ -73,6 +70,13 @@ const SETTINGS_APP_MAIN_BINARY_NAME_VALUE: PCWSTR = w!("MainBinaryName");
 
 static MENU_OWNER_WINDOW_CLASS_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
+fn toggled_input_mode(mode: InputMode) -> InputMode {
+    match mode {
+        InputMode::Latin => InputMode::Kana,
+        InputMode::Kana => InputMode::Latin,
+    }
+}
+
 // you need to implement these three interfaces to create a language bar item
 // if not, you will get E_FAIL error in ITfLangBarItemMgr::AddItem
 
@@ -100,15 +104,14 @@ impl TextServiceFactory_Impl {
             return Ok(());
         }
 
-        let mode = match IMEState::input_mode()? {
-            InputMode::Latin => InputMode::Kana,
-            InputMode::Kana => InputMode::Latin,
+        let pending_mode = { self.borrow()?.pending_mode_switch() };
+        let base_mode = match pending_mode {
+            Some(mode) => mode,
+            None => IMEState::input_mode()?,
         };
+        let mode = toggled_input_mode(base_mode);
 
-        let actions = vec![ClientAction::SetIMEMode(mode)];
-        self.handle_action(&actions, CompositionState::None)?;
-
-        Ok(())
+        self.request_language_bar_input_mode_toggle(mode)
     }
 
     fn handle_right_click(&self, pt: &POINT) -> Result<()> {
@@ -717,8 +720,9 @@ impl ITfSource_Impl for TextServiceFactory_Impl {
 mod tests {
     use super::{
         resolve_settings_app_path_from_install_location, select_existing_settings_app_path,
-        trim_registry_string, SettingsAppPath,
+        toggled_input_mode, trim_registry_string, SettingsAppPath,
     };
+    use crate::engine::input_mode::InputMode;
     use crate::launcher_control::parse_launcher_response;
     use std::path::PathBuf;
 
@@ -816,5 +820,13 @@ mod tests {
     fn parse_launcher_response_rejects_launcher_error() {
         let error = parse_launcher_response(b"error:denied\n").unwrap_err();
         assert!(error.to_string().contains("denied"));
+    }
+
+    #[test]
+    fn two_pending_language_bar_toggles_return_to_the_original_mode() {
+        let first_target = toggled_input_mode(InputMode::Latin);
+        let second_target = toggled_input_mode(first_target);
+
+        assert_eq!(second_target, InputMode::Latin);
     }
 }

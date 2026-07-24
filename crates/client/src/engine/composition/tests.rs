@@ -1,9 +1,11 @@
 use super::{
-    deferred_action_suffix, Candidates, CapsLockKeyboardLayout, ClauseActionBackend,
-    ClauseActionEffect, ClauseActionStateMut, ClauseAdvance, ClauseNavigationReadyUiSync,
-    ClauseSnapshot, ClauseState, Composition, CompositionReducer, CompositionState,
-    DeferredClientAction, DeferredProjection, DeferredUserAction, FutureClauseSnapshot,
-    TextServiceFactory,
+    deferred_action_suffix, idle_mode_switch_request_is_current, language_bar_deferred_action,
+    language_bar_toggle_requires_deferred_replay, mode_switch_request_is_current,
+    requires_action_recovery, requires_server_resynchronization, Candidates,
+    CapsLockKeyboardLayout, ClauseActionBackend, ClauseActionEffect, ClauseActionStateMut,
+    ClauseAdvance, ClauseNavigationReadyUiSync, ClauseSnapshot, ClauseState, Composition,
+    CompositionReducer, CompositionState, DeferredClientAction, DeferredInputEvent,
+    DeferredProjection, DeferredUserAction, FutureClauseSnapshot, TextServiceFactory,
 };
 use crate::engine::{
     client_action::{
@@ -13,8 +15,9 @@ use crate::engine::{
     ipc_service::{ClauseSnapshotOperation, WindowRpcDelivery},
     user_action::{Function, Navigation, UserAction},
 };
+use crate::tsf::edit_session::EditSessionFailure;
 use shared::{get_default_romaji_rows, AppConfig, PunctuationStyle, RomajiRule, WidthMode};
-use windows::Win32::Foundation::LPARAM;
+use windows::Win32::{Foundation::LPARAM, UI::TextServices::TF_E_LOCKED};
 
 #[test]
 fn deadline_recovery_defers_all_actions_from_failure_point() {
@@ -45,6 +48,142 @@ fn deadline_recovery_defers_all_actions_from_failure_point() {
     assert_eq!(deferred, actions[1..]);
     assert_eq!(deferred[1].transition, CompositionState::Selecting);
     assert_eq!(deferred[3].transition, CompositionState::None);
+}
+
+#[test]
+fn edit_session_lock_failure_defers_mutated_action_for_server_resynchronization() {
+    let actions = vec![
+        DeferredClientAction {
+            action: ClientAction::AppendText("a".to_string()),
+            transition: CompositionState::Composing,
+        },
+        DeferredClientAction {
+            action: ClientAction::AppendText("i".to_string()),
+            transition: CompositionState::Composing,
+        },
+    ];
+    let error = anyhow::Error::new(EditSessionFailure::Session(TF_E_LOCKED));
+
+    assert!(requires_action_recovery(&error));
+    assert_eq!(deferred_action_suffix(&actions, 0), actions);
+}
+
+#[test]
+fn edit_session_callback_failure_requires_server_resynchronization_before_replay() {
+    let error = anyhow::Error::new(EditSessionFailure::Callback(TF_E_LOCKED));
+
+    assert!(requires_action_recovery(&error));
+    assert!(requires_server_resynchronization(&error));
+}
+
+#[test]
+fn language_bar_toggle_joins_deferred_action_and_input_replay() {
+    let deferred_action = DeferredClientAction {
+        action: ClientAction::AppendText("a".to_string()),
+        transition: CompositionState::Composing,
+    };
+    let mut composition = Composition::default();
+    assert!(!language_bar_toggle_requires_deferred_replay(&composition));
+
+    composition.deferred_actions.push(deferred_action.clone());
+    assert!(language_bar_toggle_requires_deferred_replay(&composition));
+
+    composition.deferred_actions.clear();
+    composition
+        .deferred_inputs
+        .push_back(DeferredInputEvent::Actions(vec![deferred_action]));
+    assert!(language_bar_toggle_requires_deferred_replay(&composition));
+}
+
+#[test]
+fn second_language_bar_click_preserves_absolute_target_during_deferred_replay() {
+    // Actual mode is Latin, while the first click has a pending Kana request. The language-bar
+    // computes Latin for the second click. Replaying that click must therefore set Latin
+    // absolutely instead of toggling the still-actual Latin state to Kana again.
+    let target = InputMode::Latin;
+    assert_eq!(
+        language_bar_deferred_action(&target, true),
+        UserAction::InputModeOff
+    );
+
+    let app_config = AppConfig::default();
+    let romaji_lookup = super::RomajiLookup::from_rows(&app_config.romaji_table.rows);
+    let deferred = DeferredUserAction {
+        action: language_bar_deferred_action(&target, true),
+        is_shift_pressed: false,
+        is_shift_key: false,
+        shift_alphabet_shortcut: false,
+    };
+    let (_, actions) = TextServiceFactory::plan_deferred_user_action(
+        &Composition::default(),
+        &deferred,
+        &InputMode::Latin,
+        &app_config,
+        &romaji_lookup,
+    )
+    .expect("an absolute mode target must remain plannable");
+
+    assert_eq!(actions, vec![ClientAction::SetIMEMode(InputMode::Latin)]);
+}
+
+#[test]
+fn queued_language_bar_clicks_without_pending_request_preserve_toggle_parity() {
+    assert_eq!(
+        language_bar_deferred_action(&InputMode::Kana, false),
+        UserAction::ToggleInputMode
+    );
+
+    let app_config = AppConfig::default();
+    let romaji_lookup = super::RomajiLookup::from_rows(&app_config.romaji_table.rows);
+    let deferred = DeferredUserAction {
+        action: language_bar_deferred_action(&InputMode::Kana, false),
+        is_shift_pressed: false,
+        is_shift_key: false,
+        shift_alphabet_shortcut: false,
+    };
+    let mut projection = DeferredProjection {
+        // The first queued click already projected actual Latin to Kana.
+        mode: InputMode::Kana,
+        state: CompositionState::None,
+        raw_input: String::new(),
+        temporary_latin: false,
+        temporary_latin_shift_pending: false,
+        reliable: true,
+    };
+    let (_, actions) = TextServiceFactory::plan_deferred_user_action(
+        &Composition::default(),
+        &deferred,
+        &projection.mode,
+        &app_config,
+        &romaji_lookup,
+    )
+    .expect("the second queued click must remain plannable");
+    let deferred_actions = actions
+        .into_iter()
+        .map(|action| DeferredClientAction {
+            action,
+            transition: CompositionState::None,
+        })
+        .collect::<Vec<_>>();
+    TextServiceFactory::apply_actions_to_deferred_projection(&mut projection, &deferred_actions);
+
+    assert_eq!(projection.mode, InputMode::Latin);
+}
+
+#[test]
+fn deferred_mode_switch_rejects_focus_composition_and_generation_changes() {
+    assert!(mode_switch_request_is_current(7, 7, true, true));
+    assert!(!mode_switch_request_is_current(7, 7, false, true));
+    assert!(!mode_switch_request_is_current(7, 7, true, false));
+    assert!(!mode_switch_request_is_current(7, 8, true, true));
+}
+
+#[test]
+fn idle_mode_switch_rejects_focus_new_composition_and_generation_changes() {
+    assert!(idle_mode_switch_request_is_current(7, 7, true, true));
+    assert!(!idle_mode_switch_request_is_current(7, 7, false, true));
+    assert!(!idle_mode_switch_request_is_current(7, 7, true, false));
+    assert!(!idle_mode_switch_request_is_current(7, 8, true, true));
 }
 
 #[test]
