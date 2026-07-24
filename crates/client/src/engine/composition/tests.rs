@@ -102,14 +102,14 @@ fn second_language_bar_click_preserves_absolute_target_during_deferred_replay() 
     // absolutely instead of toggling the still-actual Latin state to Kana again.
     let target = InputMode::Latin;
     assert_eq!(
-        language_bar_deferred_action(&target),
+        language_bar_deferred_action(&target, true),
         UserAction::InputModeOff
     );
 
     let app_config = AppConfig::default();
     let romaji_lookup = super::RomajiLookup::from_rows(&app_config.romaji_table.rows);
     let deferred = DeferredUserAction {
-        action: language_bar_deferred_action(&target),
+        action: language_bar_deferred_action(&target, true),
         is_shift_pressed: false,
         is_shift_key: false,
         shift_alphabet_shortcut: false,
@@ -124,6 +124,50 @@ fn second_language_bar_click_preserves_absolute_target_during_deferred_replay() 
     .expect("an absolute mode target must remain plannable");
 
     assert_eq!(actions, vec![ClientAction::SetIMEMode(InputMode::Latin)]);
+}
+
+#[test]
+fn queued_language_bar_clicks_without_pending_request_preserve_toggle_parity() {
+    assert_eq!(
+        language_bar_deferred_action(&InputMode::Kana, false),
+        UserAction::ToggleInputMode
+    );
+
+    let app_config = AppConfig::default();
+    let romaji_lookup = super::RomajiLookup::from_rows(&app_config.romaji_table.rows);
+    let deferred = DeferredUserAction {
+        action: language_bar_deferred_action(&InputMode::Kana, false),
+        is_shift_pressed: false,
+        is_shift_key: false,
+        shift_alphabet_shortcut: false,
+    };
+    let mut projection = DeferredProjection {
+        // The first queued click already projected actual Latin to Kana.
+        mode: InputMode::Kana,
+        state: CompositionState::None,
+        raw_input: String::new(),
+        temporary_latin: false,
+        temporary_latin_shift_pending: false,
+        reliable: true,
+    };
+    let (_, actions) = TextServiceFactory::plan_deferred_user_action(
+        &Composition::default(),
+        &deferred,
+        &projection.mode,
+        &app_config,
+        &romaji_lookup,
+    )
+    .expect("the second queued click must remain plannable");
+    let deferred_actions = actions
+        .into_iter()
+        .map(|action| DeferredClientAction {
+            action,
+            transition: CompositionState::None,
+        })
+        .collect::<Vec<_>>();
+    TextServiceFactory::apply_actions_to_deferred_projection(&mut projection, &deferred_actions);
+
+    assert_eq!(projection.mode, InputMode::Latin);
 }
 
 #[test]

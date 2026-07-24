@@ -82,10 +82,17 @@ fn language_bar_toggle_requires_deferred_replay(composition: &Composition) -> bo
     !composition.deferred_actions.is_empty() || !composition.deferred_inputs.is_empty()
 }
 
-fn language_bar_deferred_action(mode: &InputMode) -> UserAction {
-    match mode {
-        InputMode::Kana => UserAction::InputModeOn,
-        InputMode::Latin => UserAction::InputModeOff,
+fn language_bar_deferred_action(
+    mode: &InputMode,
+    replaces_pending_mode_switch: bool,
+) -> UserAction {
+    if replaces_pending_mode_switch {
+        match mode {
+            InputMode::Kana => UserAction::InputModeOn,
+            InputMode::Latin => UserAction::InputModeOff,
+        }
+    } else {
+        UserAction::ToggleInputMode
     }
 }
 
@@ -4864,10 +4871,11 @@ impl TextServiceFactory {
     }
 
     pub(crate) fn request_language_bar_input_mode_toggle(&self, mode: InputMode) -> Result<()> {
-        let composition = {
+        let (composition, replaces_pending_mode_switch) = {
             let text_service = self.borrow()?;
             let composition = text_service.borrow_composition()?.clone();
-            composition
+            let replaces_pending_mode_switch = text_service.pending_mode_switch().is_some();
+            (composition, replaces_pending_mode_switch)
         };
         if !language_bar_toggle_requires_deferred_replay(&composition) {
             return self.request_input_mode_switch_after_composition(mode);
@@ -4878,12 +4886,17 @@ impl TextServiceFactory {
         // the request after the replacement has been queued successfully.
         let config_snapshot = IMEState::app_config_snapshot()?;
         let deferred = DeferredUserAction {
-            action: language_bar_deferred_action(&mode),
+            action: language_bar_deferred_action(&mode, replaces_pending_mode_switch),
             is_shift_pressed: false,
             is_shift_key: false,
             shift_alphabet_shortcut: false,
         };
-        if !self.enqueue_deferred_user_action(&composition, deferred, &config_snapshot, true)? {
+        if !self.enqueue_deferred_user_action(
+            &composition,
+            deferred,
+            &config_snapshot,
+            replaces_pending_mode_switch,
+        )? {
             tracing::warn!("Failed to plan deferred language-bar input mode toggle");
             return Ok(());
         }
