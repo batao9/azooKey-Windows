@@ -335,10 +335,16 @@ impl TextServiceFactory {
         }
     }
 
-    pub(crate) fn end_composition_async_on_success(&self, on_success: Rc<dyn Fn()>) -> Result<()> {
+    pub(crate) fn end_composition_async_on_success(
+        &self,
+        is_current: Rc<dyn Fn() -> bool>,
+        on_success: Rc<dyn Fn()>,
+    ) -> Result<()> {
         let text_service = self.borrow()?;
         let Some(composition) = text_service.borrow_composition()?.tip_composition.clone() else {
-            on_success();
+            if is_current() {
+                on_success();
+            }
             return Ok(());
         };
         let context = text_service.context::<ITfContext>()?;
@@ -347,6 +353,10 @@ impl TextServiceFactory {
             text_service.tid,
             context,
             Rc::new(move |cookie| {
+                if !is_current() {
+                    tracing::debug!("Skip stale asynchronous composition end callback");
+                    return Ok(());
+                }
                 close(cookie)?;
                 on_success();
                 Ok(())

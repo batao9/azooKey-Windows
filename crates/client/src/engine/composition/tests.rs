@@ -1,9 +1,9 @@
 use super::{
-    deferred_action_suffix, requires_action_recovery, Candidates, CapsLockKeyboardLayout,
-    ClauseActionBackend, ClauseActionEffect, ClauseActionStateMut, ClauseAdvance,
-    ClauseNavigationReadyUiSync, ClauseSnapshot, ClauseState, Composition, CompositionReducer,
-    CompositionState, DeferredClientAction, DeferredProjection, DeferredUserAction,
-    FutureClauseSnapshot, TextServiceFactory,
+    deferred_action_suffix, mode_switch_request_is_current, requires_action_recovery, Candidates,
+    CapsLockKeyboardLayout, ClauseActionBackend, ClauseActionEffect, ClauseActionStateMut,
+    ClauseAdvance, ClauseNavigationReadyUiSync, ClauseSnapshot, ClauseState, Composition,
+    CompositionReducer, CompositionState, DeferredClientAction, DeferredProjection,
+    DeferredUserAction, FutureClauseSnapshot, TextServiceFactory,
 };
 use crate::engine::{
     client_action::{
@@ -64,6 +64,14 @@ fn edit_session_lock_failure_defers_mutated_action_for_server_resynchronization(
 
     assert!(requires_action_recovery(&error));
     assert_eq!(deferred_action_suffix(&actions, 0), actions);
+}
+
+#[test]
+fn deferred_mode_switch_rejects_focus_composition_and_generation_changes() {
+    assert!(mode_switch_request_is_current(7, 7, true, true));
+    assert!(!mode_switch_request_is_current(7, 7, false, true));
+    assert!(!mode_switch_request_is_current(7, 7, true, false));
+    assert!(!mode_switch_request_is_current(7, 8, true, true));
 }
 
 #[test]

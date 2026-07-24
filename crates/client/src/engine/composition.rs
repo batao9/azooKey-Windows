@@ -72,7 +72,16 @@ fn requires_action_recovery(error: &anyhow::Error) -> bool {
     requires_ipc_recovery(error) || is_non_destructive_edit_session_error(error)
 }
 
-fn has_same_com_identity(left: &ITfComposition, right: &ITfComposition) -> bool {
+fn mode_switch_request_is_current(
+    requested_generation: u64,
+    current_generation: u64,
+    context_matches: bool,
+    composition_matches: bool,
+) -> bool {
+    requested_generation == current_generation && context_matches && composition_matches
+}
+
+fn has_same_com_identity<I: windows::core::Interface>(left: &I, right: &I) -> bool {
     match (left.cast::<IUnknown>(), right.cast::<IUnknown>()) {
         (Ok(left), Ok(right)) => left.as_raw() == right.as_raw(),
         (Err(left_error), Err(right_error)) => {
@@ -4643,16 +4652,72 @@ impl TextServiceFactory {
         }
     }
 
+    fn is_current_mode_switch_request(
+        &self,
+        generation: u64,
+        context: &ITfContext,
+        tip_composition: &ITfComposition,
+    ) -> bool {
+        let Ok(text_service) = self.borrow() else {
+            return false;
+        };
+        let context_matches = text_service
+            .context
+            .as_ref()
+            .is_some_and(|current| has_same_com_identity(current, context));
+        let composition_matches = text_service
+            .borrow_composition()
+            .ok()
+            .and_then(|composition| composition.tip_composition.clone())
+            .is_some_and(|current| has_same_com_identity(&current, tip_composition));
+        mode_switch_request_is_current(
+            generation,
+            text_service.mode_switch_generation,
+            context_matches,
+            composition_matches,
+        )
+    }
+
     pub(crate) fn request_input_mode_switch_after_composition(
         &self,
         mode: InputMode,
     ) -> Result<()> {
         let position = self.candidate_window_position()?;
-        let this = self.borrow()?.this::<ITfTextInputProcessor>()?;
-        self.end_composition_async_on_success(Rc::new(move || {
+        let request = {
+            let mut text_service = self.borrow_mut()?;
+            let tip_composition = text_service.borrow_composition()?.tip_composition.clone();
+            tip_composition.map(|tip_composition| {
+                text_service.mode_switch_generation =
+                    text_service.mode_switch_generation.wrapping_add(1);
+                (
+                    text_service.this::<ITfTextInputProcessor>(),
+                    text_service.context::<ITfContext>(),
+                    tip_composition,
+                    text_service.mode_switch_generation,
+                )
+            })
+        };
+        let Some((this, context, tip_composition, generation)) = request else {
+            self.complete_input_mode_switch_best_effort(mode, position);
+            return Ok(());
+        };
+        let this = this?;
+        let context = context?;
+
+        let is_current = Rc::new({
+            let this = this.clone();
+            let context = context.clone();
+            let tip_composition = tip_composition.clone();
+            move || {
+                let factory = unsafe { this.as_impl() };
+                factory.is_current_mode_switch_request(generation, &context, &tip_composition)
+            }
+        });
+        let on_success = Rc::new(move || {
             let factory = unsafe { this.as_impl() };
             factory.complete_input_mode_switch_best_effort(mode.clone(), position);
-        }))
+        });
+        self.end_composition_async_on_success(is_current, on_success)
     }
 
     #[tracing::instrument]
