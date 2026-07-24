@@ -11,6 +11,14 @@ use windows::{
 
 use crate::check_win32_err;
 
+pub fn utf16_code_unit_len(value: &str) -> anyhow::Result<i32> {
+    value
+        .encode_utf16()
+        .count()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("UTF-16 text length exceeds the TSF i32 offset range"))
+}
+
 // string extension
 pub trait StringExt {
     fn to_wide_16(&self) -> Vec<u16>;
@@ -136,7 +144,7 @@ impl VKeyExt for VIRTUAL_KEY {
 
 #[cfg(test)]
 mod tests {
-    use super::StringExt as _;
+    use super::{utf16_code_unit_len, StringExt as _};
 
     #[test]
     fn win32_wide_boundary_registry_string_is_even_length_and_nul_terminated() {
@@ -151,5 +159,12 @@ mod tests {
         assert_eq!(bytes, expected);
         assert_eq!(bytes.len() % 2, 0);
         assert_eq!(bytes.last_chunk::<2>(), Some(&[0, 0]));
+    }
+
+    #[test]
+    fn utf16_tsf_boundary_counts_supplementary_characters_as_surrogate_pairs() {
+        assert_eq!(utf16_code_unit_len("😀かな").unwrap(), 4);
+        assert_eq!(utf16_code_unit_len("か😀な").unwrap(), 4);
+        assert_eq!(utf16_code_unit_len("かな𠮷").unwrap(), 4);
     }
 }
