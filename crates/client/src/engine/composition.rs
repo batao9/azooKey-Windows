@@ -4626,7 +4626,7 @@ impl TextServiceFactory {
         self.end_composition_async_best_effort();
 
         if let Ok(mut text_service) = self.borrow_mut() {
-            text_service.advance_mode_switch_generation();
+            text_service.invalidate_mode_switch_requests();
             if let Ok(mut composition) = text_service.borrow_mut_composition() {
                 *composition = Composition::default();
             }
@@ -4646,14 +4646,22 @@ impl TextServiceFactory {
 
     fn complete_input_mode_switch_best_effort(
         &self,
+        generation: u64,
         mode: InputMode,
         position: Option<shared::proto::WindowPosition>,
     ) {
-        if let Ok(text_service) = self.borrow() {
-            if let Ok(mut composition) = text_service.borrow_mut_composition() {
-                *composition = Composition::default();
-            }
+        let Ok(mut text_service) = self.borrow_mut() else {
+            tracing::warn!("Failed to complete deferred input mode switch due to borrow conflict");
+            return;
+        };
+        if !text_service.clear_pending_mode_switch(generation) {
+            tracing::debug!("Skip superseded deferred input mode switch");
+            return;
         }
+        if let Ok(mut composition) = text_service.borrow_mut_composition() {
+            *composition = Composition::default();
+        }
+        drop(text_service);
 
         if let Err(error) = IMEState::set_input_mode(mode.clone()) {
             tracing::warn!(?error, "Failed to apply deferred input mode switch");
@@ -4741,22 +4749,25 @@ impl TextServiceFactory {
         let (this, context, tip_composition, generation) = {
             let mut text_service = self.borrow_mut()?;
             let tip_composition = text_service.borrow_composition()?.tip_composition.clone();
-            let generation = text_service.advance_mode_switch_generation();
-            (
-                text_service.this::<ITfTextInputProcessor>()?,
-                text_service.context::<ITfContext>()?,
-                tip_composition,
-                generation,
-            )
+            let this = text_service.this::<ITfTextInputProcessor>()?;
+            let context = text_service.context::<ITfContext>()?;
+            let generation = text_service.begin_mode_switch(mode.clone());
+            (this, context, tip_composition, generation)
         };
 
         let Some(tip_composition) = tip_composition else {
             let on_complete = Rc::new({
+                let this = this.clone();
                 let context = context.clone();
+                let mode = mode.clone();
                 move |position| {
                     let factory = unsafe { this.as_impl() };
                     if factory.is_current_idle_mode_switch_request(generation, &context) {
-                        factory.complete_input_mode_switch_best_effort(mode.clone(), position);
+                        factory.complete_input_mode_switch_best_effort(
+                            generation,
+                            mode.clone(),
+                            position,
+                        );
                     } else {
                         tracing::debug!("Skip stale idle mode-switch completion");
                     }
@@ -4767,10 +4778,22 @@ impl TextServiceFactory {
                     ?error,
                     "Failed to queue caret lookup for language-bar mode switch"
                 );
+                let factory = unsafe { this.as_impl() };
+                if factory.is_current_idle_mode_switch_request(generation, &context) {
+                    factory.complete_input_mode_switch_best_effort(generation, mode, None);
+                }
             }
             return Ok(());
         };
-        let position = self.candidate_window_position()?;
+        let position = match self.candidate_window_position() {
+            Ok(position) => position,
+            Err(error) => {
+                if let Ok(mut text_service) = self.borrow_mut() {
+                    text_service.clear_pending_mode_switch(generation);
+                }
+                return Err(error);
+            }
+        };
 
         let is_current = Rc::new({
             let this = this.clone();
@@ -4783,9 +4806,15 @@ impl TextServiceFactory {
         });
         let on_success = Rc::new(move || {
             let factory = unsafe { this.as_impl() };
-            factory.complete_input_mode_switch_best_effort(mode.clone(), position);
+            factory.complete_input_mode_switch_best_effort(generation, mode.clone(), position);
         });
-        self.end_composition_async_on_success(is_current, on_success)
+        let result = self.end_composition_async_on_success(is_current, on_success);
+        if result.is_err() {
+            if let Ok(mut text_service) = self.borrow_mut() {
+                text_service.clear_pending_mode_switch(generation);
+            }
+        }
+        result
     }
 
     #[tracing::instrument]

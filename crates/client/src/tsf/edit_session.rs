@@ -499,7 +499,7 @@ impl TextServiceFactory {
         // An idle mode-switch request may still be waiting for its asynchronous caret read.
         // Starting a composition makes that request stale even if this composition ends before
         // the callback arrives.
-        text_service.advance_mode_switch_generation();
+        text_service.invalidate_mode_switch_requests();
 
         Ok(())
     }

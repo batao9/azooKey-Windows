@@ -136,6 +136,7 @@ pub struct TextService {
     pub update_pos_state: UpdatePosState,
     pub update_pos_generation: u64,
     pub mode_switch_generation: u64,
+    pending_mode_switch: Option<InputMode>,
     pub candidate_window_position_state: CandidateWindowPositionState,
     pub candidate_window_visibility_state: CandidateWindowVisibilityState,
     pub surrounding_text_context_state: SurroundingTextContextState,
@@ -172,9 +173,32 @@ impl TextService {
         Ok(self.composition.try_borrow_mut()?)
     }
 
-    pub(crate) fn advance_mode_switch_generation(&mut self) -> u64 {
+    fn advance_mode_switch_generation(&mut self) -> u64 {
         self.mode_switch_generation = self.mode_switch_generation.wrapping_add(1);
         self.mode_switch_generation
+    }
+
+    pub(crate) fn begin_mode_switch(&mut self, mode: InputMode) -> u64 {
+        let generation = self.advance_mode_switch_generation();
+        self.pending_mode_switch = Some(mode);
+        generation
+    }
+
+    pub(crate) fn invalidate_mode_switch_requests(&mut self) {
+        self.advance_mode_switch_generation();
+        self.pending_mode_switch = None;
+    }
+
+    pub(crate) fn pending_mode_switch(&self) -> Option<InputMode> {
+        self.pending_mode_switch.clone()
+    }
+
+    pub(crate) fn clear_pending_mode_switch(&mut self, generation: u64) -> bool {
+        if self.mode_switch_generation != generation {
+            return false;
+        }
+        self.pending_mode_switch = None;
+        true
     }
 }
 
@@ -184,6 +208,7 @@ mod tests {
         CandidateWindowPositionState, CandidateWindowVisibilityState, SurroundingTextContextState,
         TextService,
     };
+    use crate::engine::input_mode::InputMode;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -227,10 +252,30 @@ mod tests {
     }
 
     #[test]
-    fn mode_switch_generation_advances_across_composition_lifecycle_changes() {
+    fn pending_mode_switch_tracks_the_latest_toggle_generation() {
         let mut text_service = TextService::default();
 
-        assert_eq!(text_service.advance_mode_switch_generation(), 1);
-        assert_eq!(text_service.advance_mode_switch_generation(), 2);
+        let first = text_service.begin_mode_switch(InputMode::Kana);
+        let second = text_service.begin_mode_switch(InputMode::Latin);
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
+        assert_eq!(text_service.pending_mode_switch(), Some(InputMode::Latin));
+        assert!(!text_service.clear_pending_mode_switch(first));
+        assert_eq!(text_service.pending_mode_switch(), Some(InputMode::Latin));
+        assert!(text_service.clear_pending_mode_switch(second));
+        assert_eq!(text_service.pending_mode_switch(), None);
+    }
+
+    #[test]
+    fn composition_lifecycle_invalidates_pending_mode_switches() {
+        let mut text_service = TextService::default();
+        let generation = text_service.begin_mode_switch(InputMode::Kana);
+
+        text_service.invalidate_mode_switch_requests();
+
+        assert_eq!(generation, 1);
+        assert_eq!(text_service.mode_switch_generation, 2);
+        assert_eq!(text_service.pending_mode_switch(), None);
     }
 }
