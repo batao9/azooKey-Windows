@@ -1,5 +1,5 @@
 use super::{
-    deferred_action_suffix, idle_mode_switch_request_is_current,
+    deferred_action_suffix, idle_mode_switch_request_is_current, language_bar_deferred_action,
     language_bar_toggle_requires_deferred_replay, mode_switch_request_is_current,
     requires_action_recovery, requires_server_resynchronization, Candidates,
     CapsLockKeyboardLayout, ClauseActionBackend, ClauseActionEffect, ClauseActionStateMut,
@@ -93,6 +93,37 @@ fn language_bar_toggle_joins_deferred_action_and_input_replay() {
         .deferred_inputs
         .push_back(DeferredInputEvent::Actions(vec![deferred_action]));
     assert!(language_bar_toggle_requires_deferred_replay(&composition));
+}
+
+#[test]
+fn second_language_bar_click_preserves_absolute_target_during_deferred_replay() {
+    // Actual mode is Latin, while the first click has a pending Kana request. The language-bar
+    // computes Latin for the second click. Replaying that click must therefore set Latin
+    // absolutely instead of toggling the still-actual Latin state to Kana again.
+    let target = InputMode::Latin;
+    assert_eq!(
+        language_bar_deferred_action(&target),
+        UserAction::InputModeOff
+    );
+
+    let app_config = AppConfig::default();
+    let romaji_lookup = super::RomajiLookup::from_rows(&app_config.romaji_table.rows);
+    let deferred = DeferredUserAction {
+        action: language_bar_deferred_action(&target),
+        is_shift_pressed: false,
+        is_shift_key: false,
+        shift_alphabet_shortcut: false,
+    };
+    let (_, actions) = TextServiceFactory::plan_deferred_user_action(
+        &Composition::default(),
+        &deferred,
+        &InputMode::Latin,
+        &app_config,
+        &romaji_lookup,
+    )
+    .expect("an absolute mode target must remain plannable");
+
+    assert_eq!(actions, vec![ClientAction::SetIMEMode(InputMode::Latin)]);
 }
 
 #[test]

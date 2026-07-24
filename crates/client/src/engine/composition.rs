@@ -82,6 +82,13 @@ fn language_bar_toggle_requires_deferred_replay(composition: &Composition) -> bo
     !composition.deferred_actions.is_empty() || !composition.deferred_inputs.is_empty()
 }
 
+fn language_bar_deferred_action(mode: &InputMode) -> UserAction {
+    match mode {
+        InputMode::Kana => UserAction::InputModeOn,
+        InputMode::Latin => UserAction::InputModeOff,
+    }
+}
+
 fn mode_switch_request_is_current(
     requested_generation: u64,
     current_generation: u64,
@@ -3850,6 +3857,7 @@ impl TextServiceFactory {
         composition: &Composition,
         input: DeferredUserAction,
         config_snapshot: &AppConfigSnapshot,
+        replace_pending_mode_switch: bool,
     ) -> Result<bool> {
         let mut projection = Self::deferred_projection(composition, IMEState::input_mode()?);
         let mut projected_composition = composition.clone();
@@ -3900,12 +3908,18 @@ impl TextServiceFactory {
             .collect::<Vec<_>>();
         Self::apply_actions_to_deferred_projection(&mut projection, &fallback);
 
-        let text_service = self.borrow()?;
+        let mut text_service = self.borrow_mut()?;
         let mut persisted = text_service.borrow_mut_composition()?;
         persisted
             .deferred_inputs
             .push_back(DeferredInputEvent::User { input, fallback });
         persisted.deferred_projection = Some(projection);
+        drop(persisted);
+        if replace_pending_mode_switch {
+            // Queueing and invalidating the superseded async request happen under the same
+            // TextService borrow. Any earlier error leaves the pending request untouched.
+            text_service.invalidate_mode_switch_requests();
+        }
         Ok(true)
     }
 
@@ -4131,6 +4145,7 @@ impl TextServiceFactory {
                     &composition,
                     deferred_user_action,
                     &config_snapshot,
+                    false,
                 )? {
                     self.clear_temporary_latin_shift_pending_if_needed(should_clear_shift_pending)?;
                     return Ok(None);
@@ -4259,28 +4274,32 @@ impl TextServiceFactory {
                 self.borrow()?.borrow_mut_composition()?.deferred_projection = None;
                 return Ok(());
             };
-            self.borrow()?
-                .borrow_mut_composition()?
-                .deferred_inputs
-                .pop_front();
 
             match event {
                 DeferredInputEvent::Actions(actions) => {
-                    self.borrow()?
-                        .borrow_mut_composition()?
-                        .deferred_actions
-                        .extend(actions);
+                    let text_service = self.borrow()?;
+                    let mut composition = text_service.borrow_mut_composition()?;
+                    composition.deferred_inputs.pop_front();
+                    composition.deferred_actions.extend(actions);
                 }
                 DeferredInputEvent::User { input, fallback } => {
+                    // Keep the user event queued until every fallible prerequisite for
+                    // replanning has succeeded. A transient configuration or mode lookup
+                    // failure must not discard the user's input.
                     let config_snapshot = IMEState::app_config_snapshot()?;
                     let mode = IMEState::input_mode()?;
-                    if let Some((transition, actions)) = Self::plan_deferred_user_action(
+                    let planned = Self::plan_deferred_user_action(
                         &composition,
                         &input,
                         &mode,
                         config_snapshot.app_config(),
                         config_snapshot.romaji_lookup(),
-                    ) {
+                    );
+                    self.borrow()?
+                        .borrow_mut_composition()?
+                        .deferred_inputs
+                        .pop_front();
+                    if let Some((transition, actions)) = planned {
                         self.handle_action_with_config_snapshot(
                             &actions,
                             transition,
@@ -4512,7 +4531,12 @@ impl TextServiceFactory {
                 shift_alphabet_shortcut: false,
             };
             if !composition.deferred_actions.is_empty() || !composition.deferred_inputs.is_empty() {
-                if !self.enqueue_deferred_user_action(&composition, deferred, &config_snapshot)? {
+                if !self.enqueue_deferred_user_action(
+                    &composition,
+                    deferred,
+                    &config_snapshot,
+                    false,
+                )? {
                     return Ok(false);
                 }
                 self.flush_deferred_user_actions()?;
@@ -4850,17 +4874,16 @@ impl TextServiceFactory {
         }
 
         // A pending asynchronous language-bar request must not overtake queued recovery input.
-        // Invalidate it, then enqueue this click behind the existing deferred actions so the
-        // normal handle_action path replays user input before applying SetIMEMode.
-        self.borrow_mut()?.invalidate_mode_switch_requests();
+        // Preserve the absolute target computed from that pending request, and only invalidate
+        // the request after the replacement has been queued successfully.
         let config_snapshot = IMEState::app_config_snapshot()?;
         let deferred = DeferredUserAction {
-            action: UserAction::ToggleInputMode,
+            action: language_bar_deferred_action(&mode),
             is_shift_pressed: false,
             is_shift_key: false,
             shift_alphabet_shortcut: false,
         };
-        if !self.enqueue_deferred_user_action(&composition, deferred, &config_snapshot)? {
+        if !self.enqueue_deferred_user_action(&composition, deferred, &config_snapshot, true)? {
             tracing::warn!("Failed to plan deferred language-bar input mode toggle");
             return Ok(());
         }
