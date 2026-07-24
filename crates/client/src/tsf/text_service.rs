@@ -194,7 +194,7 @@ impl TextService {
     }
 
     pub(crate) fn clear_pending_mode_switch(&mut self, generation: u64) -> bool {
-        if self.mode_switch_generation != generation {
+        if self.mode_switch_generation != generation || self.pending_mode_switch.is_none() {
             return false;
         }
         self.pending_mode_switch = None;
@@ -264,6 +264,7 @@ mod tests {
         assert!(!text_service.clear_pending_mode_switch(first));
         assert_eq!(text_service.pending_mode_switch(), Some(InputMode::Latin));
         assert!(text_service.clear_pending_mode_switch(second));
+        assert!(!text_service.clear_pending_mode_switch(second));
         assert_eq!(text_service.pending_mode_switch(), None);
     }
 

@@ -223,14 +223,9 @@ fn request_async_write_edit_session(
     client_id: u32,
     context: ITfContext,
     callback: Rc<dyn Fn(u32) -> anyhow::Result<()>>,
+    completion: Rc<dyn Fn()>,
 ) -> Result<()> {
-    request_async_edit_session(
-        client_id,
-        context,
-        TF_ES_READWRITE,
-        callback,
-        Rc::new(|| {}),
-    )
+    request_async_edit_session(client_id, context, TF_ES_READWRITE, callback, completion)
 }
 
 impl<'a, T> ITfEditSession_Impl for EditSession_Impl<'a, T> {
@@ -351,11 +346,21 @@ fn caret_window_position_for_cookie(
 
 fn complete_async_position_request(
     callback_succeeded: bool,
+    request_accepted: bool,
     position: Option<WindowPosition>,
     on_complete: &dyn Fn(Option<WindowPosition>),
-) {
+    on_cancel: &dyn Fn(),
+) -> bool {
     if callback_succeeded {
         on_complete(position);
+        false
+    } else if request_accepted {
+        on_cancel();
+        false
+    } else {
+        // RequestEditSession may release the COM object before returning its rejection.
+        // Let the caller handle that error; only route cancellation after acceptance.
+        true
     }
 }
 
@@ -422,6 +427,7 @@ impl TextServiceFactory {
                 tid,
                 context.clone(),
                 close_composition_callback(composition, context, false),
+                Rc::new(|| {}),
             )
         })();
 
@@ -434,18 +440,26 @@ impl TextServiceFactory {
         &self,
         is_current: Rc<dyn Fn() -> bool>,
         on_success: Rc<dyn Fn()>,
+        on_terminal: Rc<dyn Fn()>,
     ) -> Result<()> {
-        let text_service = self.borrow()?;
-        let Some(composition) = text_service.borrow_composition()?.tip_composition.clone() else {
+        let (tid, context, composition) = {
+            let text_service = self.borrow()?;
+            let tid = text_service.tid;
+            let context = text_service.context::<ITfContext>()?;
+            let composition = text_service.borrow_composition()?.tip_composition.clone();
+            (tid, context, composition)
+        };
+        let Some(composition) = composition else {
             if is_current() {
                 on_success();
+            } else {
+                on_terminal();
             }
             return Ok(());
         };
-        let context = text_service.context::<ITfContext>()?;
         let close = close_composition_callback(composition, context.clone(), false);
         request_async_write_edit_session(
-            text_service.tid,
+            tid,
             context,
             Rc::new(move |cookie| {
                 if !is_current() {
@@ -456,6 +470,7 @@ impl TextServiceFactory {
                 on_success();
                 Ok(())
             }),
+            on_terminal,
         )
     }
 
@@ -677,6 +692,7 @@ impl TextServiceFactory {
     pub(crate) fn request_caret_window_position_async(
         &self,
         on_complete: Rc<dyn Fn(Option<WindowPosition>)>,
+        on_cancel: Rc<dyn Fn()>,
     ) -> Result<()> {
         let (tid, context) = {
             let text_service = self.borrow()?;
@@ -684,6 +700,8 @@ impl TextServiceFactory {
         };
         let position = Rc::new(Cell::new(None));
         let callback_succeeded = Rc::new(Cell::new(false));
+        let request_accepted = Rc::new(Cell::new(false));
+        let cancel_before_request_result = Rc::new(Cell::new(false));
         let callback = Rc::new({
             let context = context.clone();
             let position = position.clone();
@@ -698,14 +716,28 @@ impl TextServiceFactory {
                 Ok(())
             }
         });
-        let completion = Rc::new(move || {
-            complete_async_position_request(
-                callback_succeeded.get(),
-                position.get(),
-                on_complete.as_ref(),
-            );
+        let completion = Rc::new({
+            let request_accepted = request_accepted.clone();
+            let cancel_before_request_result = cancel_before_request_result.clone();
+            let on_cancel = on_cancel.clone();
+            move || {
+                cancel_before_request_result.set(complete_async_position_request(
+                    callback_succeeded.get(),
+                    request_accepted.get(),
+                    position.get(),
+                    on_complete.as_ref(),
+                    on_cancel.as_ref(),
+                ));
+            }
         });
-        request_async_read_edit_session(tid, context, callback, completion)
+        let result = request_async_read_edit_session(tid, context, callback, completion);
+        if result.is_ok() {
+            request_accepted.set(true);
+            if cancel_before_request_result.replace(false) {
+                on_cancel();
+            }
+        }
+        result
     }
 
     fn candidate_window_position_with_mode(
@@ -1140,6 +1172,29 @@ mod tests {
     }
 
     #[test]
+    fn async_edit_session_runs_terminal_cleanup_when_callback_fails() {
+        let completion_count = Rc::new(Cell::new(0));
+        let session: windows::Win32::UI::TextServices::ITfEditSession = AsyncEditSession {
+            callback: Rc::new(|_| anyhow::bail!("composition close failed")),
+            completion: Rc::new({
+                let completion_count = completion_count.clone();
+                move || completion_count.set(completion_count.get() + 1)
+            }),
+            completed: Cell::new(false),
+        }
+        .into();
+
+        unsafe {
+            session
+                .DoEditSession(0)
+                .expect_err("callback failure must propagate");
+        }
+        assert_eq!(completion_count.get(), 1);
+        drop(session);
+        assert_eq!(completion_count.get(), 1);
+    }
+
+    #[test]
     fn async_edit_session_releases_completion_guard_when_callback_never_runs() {
         let completion_count = Rc::new(Cell::new(0));
         let session: windows::Win32::UI::TextServices::ITfEditSession = AsyncEditSession {
@@ -1157,15 +1212,40 @@ mod tests {
     }
 
     #[test]
-    fn async_position_completion_ignores_callback_failure_or_cancellation() {
+    fn async_position_completion_routes_success_and_cancellation_separately() {
         let completion_count = Cell::new(0);
+        let cancellation_count = Cell::new(0);
         let on_complete = |_| completion_count.set(completion_count.get() + 1);
+        let on_cancel = || cancellation_count.set(cancellation_count.get() + 1);
 
-        complete_async_position_request(false, None, &on_complete);
+        assert!(complete_async_position_request(
+            false,
+            false,
+            None,
+            &on_complete,
+            &on_cancel,
+        ));
         assert_eq!(completion_count.get(), 0);
+        assert_eq!(cancellation_count.get(), 0);
 
-        complete_async_position_request(true, None, &on_complete);
+        assert!(!complete_async_position_request(
+            false,
+            true,
+            None,
+            &on_complete,
+            &on_cancel,
+        ));
+        assert_eq!(cancellation_count.get(), 1);
+
+        assert!(!complete_async_position_request(
+            true,
+            true,
+            None,
+            &on_complete,
+            &on_cancel,
+        ));
         assert_eq!(completion_count.get(), 1);
+        assert_eq!(cancellation_count.get(), 1);
     }
 
     #[test]

@@ -4773,7 +4773,16 @@ impl TextServiceFactory {
                     }
                 }
             });
-            if let Err(error) = self.request_caret_window_position_async(on_complete) {
+            let on_cancel = Rc::new({
+                let this = this.clone();
+                move || {
+                    let factory = unsafe { this.as_impl() };
+                    if let Ok(mut text_service) = factory.borrow_mut() {
+                        text_service.clear_pending_mode_switch(generation);
+                    }
+                }
+            });
+            if let Err(error) = self.request_caret_window_position_async(on_complete, on_cancel) {
                 tracing::warn!(
                     ?error,
                     "Failed to queue caret lookup for language-bar mode switch"
@@ -4804,11 +4813,20 @@ impl TextServiceFactory {
                 factory.is_current_mode_switch_request(generation, &context, &tip_composition)
             }
         });
-        let on_success = Rc::new(move || {
-            let factory = unsafe { this.as_impl() };
-            factory.complete_input_mode_switch_best_effort(generation, mode.clone(), position);
+        let on_success = Rc::new({
+            let this = this.clone();
+            move || {
+                let factory = unsafe { this.as_impl() };
+                factory.complete_input_mode_switch_best_effort(generation, mode.clone(), position);
+            }
         });
-        let result = self.end_composition_async_on_success(is_current, on_success);
+        let on_terminal = Rc::new(move || {
+            let factory = unsafe { this.as_impl() };
+            if let Ok(mut text_service) = factory.borrow_mut() {
+                text_service.clear_pending_mode_switch(generation);
+            }
+        });
+        let result = self.end_composition_async_on_success(is_current, on_success, on_terminal);
         if result.is_err() {
             if let Ok(mut text_service) = self.borrow_mut() {
                 text_service.clear_pending_mode_switch(generation);
