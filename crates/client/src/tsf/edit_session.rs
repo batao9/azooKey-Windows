@@ -359,6 +359,16 @@ fn complete_async_position_request(
     }
 }
 
+fn caret_position_or_none(result: Result<Option<WindowPosition>>) -> Option<WindowPosition> {
+    match result {
+        Ok(position) => position,
+        Err(error) => {
+            tracing::warn!("Failed to obtain caret window position: {error:?}");
+            None
+        }
+    }
+}
+
 impl TextServiceFactory {
     fn log_candidate_window_position_performance(
         request_id: u64,
@@ -679,7 +689,11 @@ impl TextServiceFactory {
             let position = position.clone();
             let callback_succeeded = callback_succeeded.clone();
             move |cookie| {
-                position.set(caret_window_position_for_cookie(&context, cookie)?);
+                // Position is optional UI metadata. A host that cannot expose its caret must not
+                // cause the requested input-mode change itself to be dropped.
+                position.set(caret_position_or_none(caret_window_position_for_cookie(
+                    &context, cookie,
+                )));
                 callback_succeeded.set(true);
                 Ok(())
             }
@@ -980,9 +994,10 @@ impl TextServiceFactory {
 #[cfg(test)]
 mod tests {
     use super::{
-        commit_shift_start_after_prepare, complete_async_edit_session_request,
-        complete_async_position_request, complete_sync_edit_session,
-        is_non_destructive_edit_session_error, AsyncEditSession, EditSessionFailure,
+        caret_position_or_none, commit_shift_start_after_prepare,
+        complete_async_edit_session_request, complete_async_position_request,
+        complete_sync_edit_session, is_non_destructive_edit_session_error, AsyncEditSession,
+        EditSessionFailure,
     };
     use std::{cell::Cell, rc::Rc};
     use windows::{
@@ -1151,6 +1166,13 @@ mod tests {
 
         complete_async_position_request(true, None, &on_complete);
         assert_eq!(completion_count.get(), 1);
+    }
+
+    #[test]
+    fn async_caret_read_failure_falls_back_to_an_unpositioned_mode_switch() {
+        let position = caret_position_or_none(Err(anyhow::anyhow!("text extent unavailable")));
+
+        assert!(position.is_none());
     }
 
     #[test]
