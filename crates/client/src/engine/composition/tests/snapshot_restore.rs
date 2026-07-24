@@ -189,7 +189,7 @@ fn move_clause_right_prefers_rich_navigation_candidates_after_two_clause_shrink(
 }
 
 #[test]
-fn auto_split_future_snapshot_preserves_rich_candidates_for_exact_two_clause_suffix() {
+fn auto_split_prepared_snapshot_preserves_rich_candidates_for_exact_two_clause_suffix() {
     let mut preview = "いい加減".to_string();
     let mut suffix = "統一しろ".to_string();
     let mut raw_input = "iikagentouitusiro".to_string();
@@ -229,13 +229,15 @@ fn auto_split_future_snapshot_preserves_rich_candidates_for_exact_two_clause_suf
         "とういつしろ",
         &[10, 10, 10, 10],
     );
-    let mut backend = RichNavigationAfterShrinkBackend {
-        shrink_candidates: suffix_candidates.clone(),
-        navigation_candidates: suffix_candidates,
-    };
 
-    TextServiceFactory::rebuild_future_clause_snapshots_from_backend(&mut state, &mut backend)
-        .expect("future snapshots should rebuild");
+    TextServiceFactory::rebuild_future_clause_snapshots_from_prepared(
+        &mut state,
+        vec![ClauseAdvance {
+            shrunk: suffix_candidates.clone(),
+            navigation: suffix_candidates,
+        }],
+    )
+    .expect("future snapshots should rebuild from the batch response");
 
     let snapshot = state
         .future_clause_snapshots

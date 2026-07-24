@@ -20,9 +20,73 @@ pub(crate) struct CandidateSelection {
     pub(crate) candidate_id: u64,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ClauseAdvance {
+    pub(crate) shrunk: Candidates,
+    pub(crate) navigation: Candidates,
+}
+
 pub(crate) trait ClauseActionBackend {
     fn move_cursor(&mut self, offset: i32) -> Result<Candidates>;
     fn shrink_text(&mut self, offset: i32) -> Result<Candidates>;
+
+    fn advance_clause(
+        &mut self,
+        offset: i32,
+        previous_candidates: &Candidates,
+    ) -> Result<ClauseAdvance> {
+        self.update_composition_snapshot(ClauseSnapshotOperation::Push, previous_candidates)?;
+        let shrunk = self.shrink_text_with_context(offset, previous_candidates)?;
+        let navigation = self.move_cursor(0)?;
+        Ok(ClauseAdvance { shrunk, navigation })
+    }
+
+    fn prepare_future_clauses(
+        &mut self,
+        initial_offset: i32,
+        previous_candidates: &Candidates,
+    ) -> Result<Vec<ClauseAdvance>> {
+        let mut offset = initial_offset;
+        let mut previous = previous_candidates.clone();
+        let mut advances = Vec::new();
+        let mut last_signature = None;
+        let mut snapshot_count = 0;
+        let max_steps = previous
+            .hiragana
+            .chars()
+            .count()
+            .clamp(1, shared::MAX_PREPARED_CLAUSE_ADVANCES);
+
+        for _ in 0..max_steps {
+            let advance = self.advance_clause(offset, &previous)?;
+            snapshot_count += 1;
+            let Some(selected) = TextServiceFactory::select_candidate(&advance.navigation, 0)
+            else {
+                break;
+            };
+            let is_last = selected.sub_text.is_empty();
+            let signature = (
+                advance.navigation.hiragana.clone(),
+                selected.corresponding_count,
+                selected.sub_text.clone(),
+            );
+            if last_signature.as_ref() == Some(&signature) {
+                break;
+            }
+            advances.push(advance.clone());
+            last_signature = Some(signature);
+            offset = selected.corresponding_count;
+            previous = advance.navigation;
+            if is_last {
+                break;
+            }
+        }
+
+        for _ in 0..snapshot_count {
+            self.update_composition_snapshot(ClauseSnapshotOperation::Pop, &previous)?;
+        }
+        Ok(advances)
+    }
 
     fn move_cursor_with_context(
         &mut self,
@@ -56,6 +120,22 @@ impl ClauseActionBackend for IPCService {
 
     fn shrink_text(&mut self, offset: i32) -> Result<Candidates> {
         IPCService::shrink_text(self, offset)
+    }
+
+    fn advance_clause(
+        &mut self,
+        offset: i32,
+        previous_candidates: &Candidates,
+    ) -> Result<ClauseAdvance> {
+        IPCService::advance_clause(self, offset, previous_candidates)
+    }
+
+    fn prepare_future_clauses(
+        &mut self,
+        initial_offset: i32,
+        previous_candidates: &Candidates,
+    ) -> Result<Vec<ClauseAdvance>> {
+        IPCService::prepare_future_clauses(self, initial_offset, previous_candidates)
     }
 
     fn move_cursor_with_context(
@@ -380,7 +460,9 @@ impl ClauseState {
         *state.current_clause_is_direct_split_remainder = false;
         *state.current_clause_has_split_left_neighbor = false;
         *state.current_clause_split_group_id = None;
-        TextServiceFactory::rebuild_future_clause_snapshots_from_backend(state, backend)?;
+        let prepared =
+            backend.prepare_future_clauses(selected.corresponding_count, state.candidates)?;
+        TextServiceFactory::rebuild_future_clause_snapshots_from_prepared(state, prepared)?;
         if let Some(set_type) = display_override_set_type {
             let suffix_raw_input = state
                 .future_clause_snapshots
@@ -483,12 +565,12 @@ impl ClauseState {
             let current_corresponding_count = *state.corresponding_count;
             let previous_candidates = state.candidates.clone();
 
-            backend
-                .update_composition_snapshot(ClauseSnapshotOperation::Push, &previous_candidates)?;
-            state.clause_snapshots.push(snapshot);
+            state.clause_snapshots.push(snapshot.clone());
 
-            *state.candidates = backend
-                .shrink_text_with_context(current_corresponding_count, &previous_candidates)?;
+            let advance =
+                backend.advance_clause(current_corresponding_count, &previous_candidates)?;
+            let navigation_candidates = advance.navigation;
+            *state.candidates = advance.shrunk;
             if state.candidates.is_empty_composition() {
                 return Ok(ClauseActionEffect::server_reset());
             }
@@ -538,7 +620,6 @@ impl ClauseState {
                 }
 
                 if state.future_clause_snapshots.is_empty() {
-                    let navigation_candidates = backend.move_cursor(0)?;
                     if let Some(navigation_selected) = TextServiceFactory::select_candidate(
                         &navigation_candidates,
                         *state.selection_index,
@@ -554,9 +635,31 @@ impl ClauseState {
                             state.raw_input,
                         ) || navigation_has_richer_current_candidates
                         {
-                            *state.candidates = navigation_candidates;
+                            *state.candidates = navigation_candidates.clone();
                             *state.selection_index = navigation_selected.index;
                         }
+                    }
+
+                    if let Some(raw_hiragana_suffix) =
+                        TextServiceFactory::recover_single_n_raw_hiragana_suffix(
+                            &snapshot.raw_hiragana,
+                            &navigation_candidates.hiragana,
+                        )
+                    {
+                        let raw_input_suffix = TextServiceFactory::current_raw_input_suffix(
+                            &snapshot.raw_input,
+                            snapshot.corresponding_count,
+                        );
+                        let repaired =
+                            TextServiceFactory::build_conservative_future_clause_snapshot(
+                                &snapshot.suffix,
+                                "",
+                                &raw_input_suffix,
+                                &raw_hiragana_suffix,
+                                raw_input_suffix.chars().count() as i32,
+                            );
+                        *state.candidates = repaired.candidates;
+                        *state.selection_index = repaired.selection_index;
                     }
                 }
 

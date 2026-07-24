@@ -1,8 +1,9 @@
 use super::{
     deferred_action_suffix, Candidates, CapsLockKeyboardLayout, ClauseActionBackend,
-    ClauseActionEffect, ClauseActionStateMut, ClauseNavigationReadyUiSync, ClauseSnapshot,
-    ClauseState, Composition, CompositionReducer, CompositionState, DeferredClientAction,
-    DeferredProjection, DeferredUserAction, FutureClauseSnapshot, TextServiceFactory,
+    ClauseActionEffect, ClauseActionStateMut, ClauseAdvance, ClauseNavigationReadyUiSync,
+    ClauseSnapshot, ClauseState, Composition, CompositionReducer, CompositionState,
+    DeferredClientAction, DeferredProjection, DeferredUserAction, FutureClauseSnapshot,
+    TextServiceFactory,
 };
 use crate::engine::{
     client_action::{
@@ -1263,6 +1264,81 @@ fn move_clause_to_last_stops_when_right_move_makes_no_progress() {
 struct NonProgressEnsureBackend {
     move_cursor_zero_calls: usize,
     shrink_calls: usize,
+    prepare_calls: usize,
+}
+
+struct BatchedClauseAdvanceBackend {
+    advance_calls: usize,
+}
+
+impl ClauseActionBackend for BatchedClauseAdvanceBackend {
+    fn move_cursor(&mut self, _offset: i32) -> anyhow::Result<Candidates> {
+        panic!("move_cursor must be included in advance_clause")
+    }
+
+    fn shrink_text(&mut self, _offset: i32) -> anyhow::Result<Candidates> {
+        panic!("shrink_text must be included in advance_clause")
+    }
+
+    fn advance_clause(
+        &mut self,
+        offset: i32,
+        _previous_candidates: &Candidates,
+    ) -> anyhow::Result<ClauseAdvance> {
+        self.advance_calls += 1;
+        assert_eq!(offset, 7);
+        let next = candidates(&["統一"], &[""], "とういつ", &[6]);
+        Ok(ClauseAdvance {
+            shrunk: next.clone(),
+            navigation: next,
+        })
+    }
+}
+
+#[test]
+fn move_clause_right_uses_one_batched_backend_operation() {
+    let mut preview = "いい加減".to_string();
+    let mut suffix = "統一".to_string();
+    let mut raw_input = "iikagentouitu".to_string();
+    let mut raw_hiragana = "いいかげんとういつ".to_string();
+    let mut fixed_prefix = String::new();
+    let mut corresponding_count = 7;
+    let mut selection_index = 0;
+    let mut current_candidates = candidates(&["いい加減"], &["統一"], "いいかげんとういつ", &[7]);
+    let mut clause_snapshots = Vec::new();
+    let mut future_clause_snapshots = Vec::new();
+    let mut current_clause_is_split_derived = true;
+    let mut current_clause_is_direct_split_remainder = false;
+    let mut current_clause_has_split_left_neighbor = false;
+    let mut current_clause_split_group_id = None;
+    let mut next_split_group_id = 1;
+    let mut backend = BatchedClauseAdvanceBackend { advance_calls: 0 };
+
+    let mut state = ClauseActionStateMut {
+        preview: &mut preview,
+        suffix: &mut suffix,
+        raw_input: &mut raw_input,
+        raw_hiragana: &mut raw_hiragana,
+        fixed_prefix: &mut fixed_prefix,
+        corresponding_count: &mut corresponding_count,
+        selection_index: &mut selection_index,
+        candidates: &mut current_candidates,
+        clause_snapshots: &mut clause_snapshots,
+        future_clause_snapshots: &mut future_clause_snapshots,
+        current_clause_is_split_derived: &mut current_clause_is_split_derived,
+        current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+        current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+        current_clause_split_group_id: &mut current_clause_split_group_id,
+        next_split_group_id: &mut next_split_group_id,
+    };
+
+    let effect = TextServiceFactory::apply_move_clause(&mut state, &mut backend, 1)
+        .expect("right move should use the batched operation");
+
+    assert!(effect.applied);
+    assert_eq!(backend.advance_calls, 1);
+    assert_eq!(preview, "いい加減統一");
+    assert_eq!(suffix, "");
 }
 
 impl ClauseActionBackend for NonProgressEnsureBackend {
@@ -1283,16 +1359,77 @@ impl ClauseActionBackend for NonProgressEnsureBackend {
 
     fn shrink_text(&mut self, _offset: i32) -> anyhow::Result<Candidates> {
         self.shrink_calls += 1;
-        assert!(
-            self.shrink_calls <= 1,
-            "future snapshot rebuild retried a non-progressing right move"
-        );
         Ok(Candidates::default())
+    }
+
+    fn prepare_future_clauses(
+        &mut self,
+        initial_offset: i32,
+        _previous_candidates: &Candidates,
+    ) -> anyhow::Result<Vec<ClauseAdvance>> {
+        self.prepare_calls += 1;
+        assert_eq!(initial_offset, 7);
+        Ok(Vec::new())
+    }
+}
+
+#[derive(Default)]
+struct BoundedPrepareBackend {
+    navigation_calls: usize,
+    pushes: usize,
+    pops: usize,
+}
+
+impl ClauseActionBackend for BoundedPrepareBackend {
+    fn move_cursor(&mut self, _offset: i32) -> anyhow::Result<Candidates> {
+        self.navigation_calls += 1;
+        let remaining = 128usize.saturating_sub(self.navigation_calls);
+        Ok(candidates(
+            &["節"],
+            &["残り"],
+            &"あ".repeat(remaining.max(1)),
+            &[1],
+        ))
+    }
+
+    fn shrink_text(&mut self, _offset: i32) -> anyhow::Result<Candidates> {
+        Ok(candidates(&["節"], &["残り"], "あ", &[1]))
+    }
+
+    fn update_composition_snapshot(
+        &mut self,
+        operation: ClauseSnapshotOperation,
+        _previous_candidates: &Candidates,
+    ) -> anyhow::Result<()> {
+        match operation {
+            ClauseSnapshotOperation::Push => self.pushes += 1,
+            ClauseSnapshotOperation::Pop => self.pops += 1,
+            ClauseSnapshotOperation::Clear => {}
+        }
+        Ok(())
     }
 }
 
 #[test]
-fn ensure_clause_navigation_stops_rebuilding_future_on_non_progress_move() {
+fn prepare_future_clauses_bounds_suffix_clone_work() {
+    let previous = candidates(&["節"], &["残り"], &"あ".repeat(128), &[1]);
+    let mut backend = BoundedPrepareBackend::default();
+
+    let prepared = backend
+        .prepare_future_clauses(1, &previous)
+        .expect("bounded preparation should succeed");
+
+    assert_eq!(prepared.len(), shared::MAX_PREPARED_CLAUSE_ADVANCES);
+    assert_eq!(
+        backend.navigation_calls,
+        shared::MAX_PREPARED_CLAUSE_ADVANCES
+    );
+    assert_eq!(backend.pushes, shared::MAX_PREPARED_CLAUSE_ADVANCES);
+    assert_eq!(backend.pops, shared::MAX_PREPARED_CLAUSE_ADVANCES);
+}
+
+#[test]
+fn ensure_clause_navigation_uses_two_constant_backend_operations() {
     let mut preview = "いい加減統一".to_string();
     let mut suffix = String::new();
     let mut raw_input = "iikagentouitu".to_string();
@@ -1311,6 +1448,7 @@ fn ensure_clause_navigation_stops_rebuilding_future_on_non_progress_move() {
     let mut backend = NonProgressEnsureBackend {
         move_cursor_zero_calls: 0,
         shrink_calls: 0,
+        prepare_calls: 0,
     };
 
     let mut state = ClauseActionStateMut {
@@ -1335,7 +1473,9 @@ fn ensure_clause_navigation_stops_rebuilding_future_on_non_progress_move() {
         .expect("ensure clause navigation should return");
 
     assert!(effect.applied);
-    assert_eq!(backend.shrink_calls, 1);
+    assert_eq!(backend.move_cursor_zero_calls, 1);
+    assert_eq!(backend.prepare_calls, 1);
+    assert_eq!(backend.shrink_calls, 0);
     assert!(future_clause_snapshots.is_empty());
 }
 
@@ -1385,13 +1525,17 @@ struct FKeyDisplayEnsureBackend {
 
 impl ClauseActionBackend for FKeyDisplayEnsureBackend {
     fn move_cursor(&mut self, offset: i32) -> anyhow::Result<Candidates> {
-        if offset == 0 && !self.shrunk {
-            return Ok(candidates(
-                &["加減", "下限", "かげん"],
-                &["統一", "統一", "統一"],
-                "かげんとういつ",
-                &[5, 5, 5],
-            ));
+        if offset == 0 {
+            return Ok(if self.shrunk {
+                candidates(&["統一"], &[""], "とういつ", &[6])
+            } else {
+                candidates(
+                    &["加減", "下限", "かげん"],
+                    &["統一", "統一", "統一"],
+                    "かげんとういつ",
+                    &[5, 5, 5],
+                )
+            });
         }
         Ok(Candidates::default())
     }

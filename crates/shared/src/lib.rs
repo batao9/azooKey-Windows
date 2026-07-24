@@ -17,6 +17,9 @@ pub mod proto {
 // same session-local endpoint.
 pub const SERVER_PIPE_PATH: &str = r"\\.\pipe\LOCAL\azookey_server";
 pub const UI_PIPE_PATH: &str = r"\\.\pipe\LOCAL\azookey_ui";
+// Bounds the suffix-bearing candidate payload and snapshot cloning performed
+// when clause navigation starts. Longer compositions continue lazily.
+pub const MAX_PREPARED_CLAUSE_ADVANCES: usize = 16;
 
 #[cfg(windows)]
 pub fn open_named_pipe_client_handle(

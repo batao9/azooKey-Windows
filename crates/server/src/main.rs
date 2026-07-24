@@ -7,11 +7,13 @@ use windows::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass, HIG
 
 use shared::proto::azookey_service_server::{AzookeyService, AzookeyServiceServer};
 use shared::proto::{
-    AppendTextRequest, AppendTextResponse, ClearTextRequest, ClearTextResponse, ComposingText,
-    CompositionOperationKind, CompositionSnapshotOperation, MoveCursorRequest, MoveCursorResponse,
-    PerformanceLogRequest, PerformanceLogResponse, RemoveTextRequest, RemoveTextResponse,
-    ReplaceCompositionRequest, ReplaceCompositionResponse, ShrinkTextRequest, ShrinkTextResponse,
-    Suggestion, UpdateCompositionSnapshotRequest, UpdateCompositionSnapshotResponse,
+    AdvanceClauseRequest, AdvanceClauseResponse, AppendTextRequest, AppendTextResponse,
+    ClearTextRequest, ClearTextResponse, ComposingText, CompositionOperationKind,
+    CompositionSnapshotOperation, MoveCursorRequest, MoveCursorResponse, PerformanceLogRequest,
+    PerformanceLogResponse, PrepareFutureClausesRequest, PrepareFutureClausesResponse,
+    PreparedClauseAdvance, RemoveTextRequest, RemoveTextResponse, ReplaceCompositionRequest,
+    ReplaceCompositionResponse, ShrinkTextRequest, ShrinkTextResponse, Suggestion,
+    UpdateCompositionSnapshotRequest, UpdateCompositionSnapshotResponse,
 };
 use shared::{AppConfig, SERVER_PIPE_PATH};
 
@@ -1332,6 +1334,33 @@ fn shrink_text(offset: i32) -> Result<RawComposingText, String> {
     }
 }
 
+struct CompositionSnapshotRollback {
+    armed: bool,
+}
+
+impl CompositionSnapshotRollback {
+    fn push() -> Self {
+        unsafe {
+            PushComposingTextSnapshot();
+        }
+        Self { armed: true }
+    }
+
+    fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CompositionSnapshotRollback {
+    fn drop(&mut self) {
+        if self.armed {
+            unsafe {
+                PopComposingTextSnapshot();
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MyAzookeyService {
     mutation_lock: Arc<tokio::sync::Mutex<()>>,
@@ -1706,6 +1735,160 @@ impl AzookeyService for MyAzookeyService {
                 hiragana: composed_text.hiragana.unwrap_or(composing_text.text),
                 suggestions: composed_text.suggestions,
             }),
+            server_session_id: server_session_id(),
+        }))
+    }
+
+    async fn advance_clause(
+        &self,
+        request: Request<AdvanceClauseRequest>,
+    ) -> Result<Response<AdvanceClauseResponse>, Status> {
+        let _mutation_guard = self.mutation_lock.lock().await;
+        let request = request.into_inner();
+        let _request_guard = ServerRequestGuard::begin(true);
+        let request_id = request_id_or_next(request.request_id);
+        set_request_id(request_id);
+        let handler_start = Instant::now();
+        let raw_offset = validate_shrink_offset(request.offset)?;
+
+        let snapshot_rollback = CompositionSnapshotRollback::push();
+
+        let shrink_start = Instant::now();
+        let shrunk_text =
+            shrink_text(raw_offset).map_err(|error| status_from_error("advance_clause", error))?;
+        performance_event_lazy!(
+            request_id,
+            "advance_clause",
+            "swift_shrink_text",
+            elapsed_ms(shrink_start),
+            "offset={raw_offset};candidate_generation=deferred"
+        );
+
+        let move_start = Instant::now();
+        let navigation_text =
+            move_cursor(0).map_err(|error| status_from_error("advance_clause", error))?;
+        let navigation_composed = get_composed_text(true, request_id)
+            .map_err(|error| status_from_error("advance_clause", error))?;
+        performance_event_lazy!(
+            request_id,
+            "advance_clause",
+            "swift_move_cursor",
+            elapsed_ms(move_start),
+            "hiragana_len={};suggestions={}",
+            navigation_text.text.chars().count(),
+            navigation_composed.suggestions.len()
+        );
+
+        update_active_composition_state(&navigation_text.text);
+        performance_event_lazy!(
+            request_id,
+            "advance_clause",
+            "total",
+            elapsed_ms(handler_start),
+            "status=success;offset={raw_offset};navigation_suggestions={}",
+            navigation_composed.suggestions.len()
+        );
+
+        let navigation_composing_text = ComposingText {
+            hiragana: navigation_composed.hiragana.unwrap_or(navigation_text.text),
+            suggestions: navigation_composed.suggestions,
+        };
+        snapshot_rollback.commit();
+        Ok(Response::new(AdvanceClauseResponse {
+            shrunk_text: Some(ComposingText {
+                hiragana: shrunk_text.text,
+                suggestions: Vec::new(),
+            }),
+            navigation_text: Some(navigation_composing_text),
+            server_session_id: server_session_id(),
+        }))
+    }
+
+    async fn prepare_future_clauses(
+        &self,
+        request: Request<PrepareFutureClausesRequest>,
+    ) -> Result<Response<PrepareFutureClausesResponse>, Status> {
+        let _mutation_guard = self.mutation_lock.lock().await;
+        let request = request.into_inner();
+        let _request_guard = ServerRequestGuard::begin(true);
+        let request_id = request_id_or_next(request.request_id);
+        set_request_id(request_id);
+        let handler_start = Instant::now();
+        let mut offset = validate_shrink_offset(request.initial_offset)?;
+        let mut advances = Vec::new();
+        let mut snapshot_count = 0usize;
+        let mut last_signature = None;
+
+        let result = (|| -> Result<(), Box<Status>> {
+            for _ in 0..shared::MAX_PREPARED_CLAUSE_ADVANCES {
+                unsafe {
+                    PushComposingTextSnapshot();
+                }
+                snapshot_count += 1;
+
+                let shrunk_text = shrink_text(offset).map_err(|error| {
+                    Box::new(status_from_error("prepare_future_clauses", error))
+                })?;
+                let navigation_text = move_cursor(0).map_err(|error| {
+                    Box::new(status_from_error("prepare_future_clauses", error))
+                })?;
+                let navigation_composed = get_composed_text(true, request_id).map_err(|error| {
+                    Box::new(status_from_error("prepare_future_clauses", error))
+                })?;
+
+                let Some(selected) = navigation_composed.suggestions.first() else {
+                    break;
+                };
+                let is_last = selected.subtext.is_empty();
+                let signature = (
+                    navigation_composed
+                        .hiragana
+                        .as_deref()
+                        .unwrap_or(&navigation_text.text)
+                        .to_string(),
+                    selected.corresponding_count,
+                    selected.subtext.clone(),
+                );
+                if last_signature.as_ref() == Some(&signature) {
+                    break;
+                }
+                last_signature = Some(signature);
+                offset = validate_shrink_offset(selected.corresponding_count).map_err(Box::new)?;
+                let navigation_composing_text = ComposingText {
+                    hiragana: navigation_composed.hiragana.unwrap_or(navigation_text.text),
+                    suggestions: navigation_composed.suggestions,
+                };
+                advances.push(PreparedClauseAdvance {
+                    shrunk_text: Some(ComposingText {
+                        hiragana: shrunk_text.text,
+                        suggestions: Vec::new(),
+                    }),
+                    navigation_text: Some(navigation_composing_text),
+                });
+                if is_last {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+
+        for _ in 0..snapshot_count {
+            unsafe {
+                PopComposingTextSnapshot();
+            }
+        }
+        result.map_err(|status| *status)?;
+
+        performance_event_lazy!(
+            request_id,
+            "prepare_future_clauses",
+            "total",
+            elapsed_ms(handler_start),
+            "status=success;advance_count={}",
+            advances.len()
+        );
+        Ok(Response::new(PrepareFutureClausesResponse {
+            advances,
             server_session_id: server_session_id(),
         }))
     }

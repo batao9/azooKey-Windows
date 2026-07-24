@@ -584,10 +584,14 @@ impl IPCService {
         Ok(())
     }
 
-    fn mark_server_timeout(recovery: &Arc<ServerRecoveryState>, operation: &'static str) {
+    fn mark_server_recovery_required(recovery: &Arc<ServerRecoveryState>, operation: &'static str) {
+        Self::mark_recovery_pending(recovery);
+        Self::request_server_restart(recovery, operation);
+    }
+
+    fn mark_recovery_pending(recovery: &ServerRecoveryState) {
         recovery.generation.fetch_add(1, Ordering::AcqRel);
         recovery.pending.store(true, Ordering::Release);
-        Self::request_server_restart(recovery, operation);
     }
 
     fn request_server_restart(recovery: &Arc<ServerRecoveryState>, operation: &'static str) {
@@ -754,7 +758,7 @@ impl IPCService {
     {
         let result = runtime.block_on(await_rpc_with_deadline(operation, deadline, future));
         if result.as_ref().is_err_and(is_ipc_deadline) {
-            Self::mark_server_timeout(recovery, operation);
+            Self::mark_server_recovery_required(recovery, operation);
         }
         result
     }
@@ -875,6 +879,15 @@ impl IPCService {
             previous.has_same_composition(refreshed_candidates)
                 && !refreshed_candidates.is_empty_composition()
         })
+    }
+
+    #[inline]
+    fn prepare_future_clauses_reconnect_state_is_valid(
+        previous_candidates: &Candidates,
+        refreshed_candidates: &Candidates,
+    ) -> bool {
+        !refreshed_candidates.is_empty_composition()
+            && previous_candidates.has_same_composition(refreshed_candidates)
     }
 
     fn run_non_idempotent_edit_with_reconnect(
@@ -1066,6 +1079,61 @@ impl IPCService {
         self.observe_server_session("shrink_text", response.server_session_id);
         self.invalidate_input_ledger();
         Self::candidates_from_composing_text(response.composing_text)
+    }
+
+    fn send_advance_clause(
+        &mut self,
+        offset: i32,
+        request_id: u64,
+    ) -> anyhow::Result<super::composition::ClauseAdvance> {
+        let mut request =
+            tonic::Request::new(shared::proto::AdvanceClauseRequest { offset, request_id });
+        request.set_timeout(INPUT_RPC_DEADLINE);
+        let response = Self::block_on_server_rpc(
+            self.runtime.as_ref(),
+            &self.recovery,
+            "advance_clause",
+            INPUT_RPC_DEADLINE,
+            self.azookey_client.advance_clause(request),
+        )?;
+        let response = response.into_inner();
+        self.observe_server_session("advance_clause", response.server_session_id);
+        self.invalidate_input_ledger();
+        Ok(super::composition::ClauseAdvance {
+            shrunk: Self::candidates_from_composing_text(response.shrunk_text)?,
+            navigation: Self::candidates_from_composing_text(response.navigation_text)?,
+        })
+    }
+
+    fn send_prepare_future_clauses(
+        &mut self,
+        initial_offset: i32,
+        request_id: u64,
+    ) -> anyhow::Result<Vec<super::composition::ClauseAdvance>> {
+        let mut request = tonic::Request::new(shared::proto::PrepareFutureClausesRequest {
+            initial_offset,
+            request_id,
+        });
+        request.set_timeout(INPUT_RPC_DEADLINE);
+        let response = Self::block_on_server_rpc(
+            self.runtime.as_ref(),
+            &self.recovery,
+            "prepare_future_clauses",
+            INPUT_RPC_DEADLINE,
+            self.azookey_client.prepare_future_clauses(request),
+        )?;
+        let response = response.into_inner();
+        self.observe_server_session("prepare_future_clauses", response.server_session_id);
+        response
+            .advances
+            .into_iter()
+            .map(|advance| {
+                Ok(super::composition::ClauseAdvance {
+                    shrunk: Self::candidates_from_composing_text(advance.shrunk_text)?,
+                    navigation: Self::candidates_from_composing_text(advance.navigation_text)?,
+                })
+            })
+            .collect()
     }
 
     fn send_move_cursor(&mut self, offset: i32, request_id: u64) -> anyhow::Result<Candidates> {
@@ -1630,6 +1698,122 @@ impl IPCService {
         Ok(candidates)
     }
 
+    #[tracing::instrument(skip(self, previous_candidates))]
+    pub(crate) fn advance_clause(
+        &mut self,
+        offset: i32,
+        previous_candidates: &Candidates,
+    ) -> anyhow::Result<super::composition::ClauseAdvance> {
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
+        let mut completed_advance = None;
+        let result = self.run_non_idempotent_edit_with_reconnect(
+            "advance_clause",
+            request_id,
+            Some(previous_candidates),
+            |this| {
+                let advance = this.send_advance_clause(offset, request_id)?;
+                let navigation = advance.navigation.clone();
+                completed_advance = Some(advance);
+                Ok(navigation)
+            },
+        );
+        self.log_client_performance_from_start(
+            performance_start,
+            request_id,
+            "advance_clause",
+            "rpc_total",
+            || match &result {
+                Ok((_, recovery)) => format!(
+                    "status=success;recovery={};offset={offset}",
+                    recovery.log_value()
+                ),
+                Err(error) => format!("status=error;offset={offset};error={error:?}"),
+            },
+        );
+        let (navigation, _) = result?;
+        Ok(
+            completed_advance.unwrap_or_else(|| super::composition::ClauseAdvance {
+                // If the transport failed after the server had already advanced,
+                // refresh can recover only the current navigation candidates.
+                shrunk: navigation.clone(),
+                navigation,
+            }),
+        )
+    }
+
+    #[tracing::instrument(skip(self, previous_candidates))]
+    pub(crate) fn prepare_future_clauses(
+        &mut self,
+        initial_offset: i32,
+        previous_candidates: &Candidates,
+    ) -> anyhow::Result<Vec<super::composition::ClauseAdvance>> {
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
+        let result = self
+            .run_rpc_with_reconnect("prepare_future_clauses", |this| {
+                this.send_prepare_future_clauses(initial_offset, request_id)
+            })
+            .map_err(|error| {
+                if Self::should_reconnect_rpc_error(&error) {
+                    Self::mark_server_recovery_required(
+                        &self.recovery,
+                        "prepare_future_clauses_reconnect_failed",
+                    );
+                    preserve_recovery_error(error)
+                } else {
+                    error
+                }
+            })
+            .and_then(|(advances, reconnected)| {
+                if self.take_server_reset_recovered() {
+                    Self::mark_server_recovery_required(
+                        &self.recovery,
+                        "prepare_future_clauses_session_change",
+                    );
+                    return Err(preserve_recovery_error(anyhow::anyhow!(
+                        "prepare_future_clauses reached a different server session"
+                    )));
+                }
+
+                if reconnected {
+                    let refreshed = self
+                        .send_move_cursor(0, request_id)
+                        .map_err(preserve_recovery_error)?;
+                    if !Self::prepare_future_clauses_reconnect_state_is_valid(
+                        previous_candidates,
+                        &refreshed,
+                    ) {
+                        Self::mark_server_recovery_required(
+                            &self.recovery,
+                            "prepare_future_clauses_state_mismatch",
+                        );
+                        return Err(preserve_recovery_error(anyhow::anyhow!(
+                            "prepare_future_clauses composition changed after reconnect"
+                        )));
+                    }
+                }
+
+                Ok(advances)
+            });
+        self.log_client_performance_from_start(
+            performance_start,
+            request_id,
+            "prepare_future_clauses",
+            "rpc_total",
+            || match &result {
+                Ok(advances) => format!(
+                    "status=success;initial_offset={initial_offset};advance_count={}",
+                    advances.len()
+                ),
+                Err(error) => {
+                    format!("status=error;initial_offset={initial_offset};error={error:?}")
+                }
+            },
+        );
+        result
+    }
+
     #[tracing::instrument]
     pub fn move_cursor(&mut self, offset: i32) -> anyhow::Result<Candidates> {
         self.move_cursor_inner(offset, None)
@@ -2153,7 +2337,8 @@ mod tests {
         pop_input_segment_character, preserve_recovery_error, recovery_generation_is_current,
         requires_ipc_recovery, restart_generation_ready, restart_request_needed, Candidates,
         ClauseSnapshotOperation, CompositionOperation, IPCService, InputLedger,
-        IpcDeadlineExceeded, NonIdempotentEditAttempt, INPUT_STYLE_DIRECT, INPUT_STYLE_ROMAN2KANA,
+        IpcDeadlineExceeded, NonIdempotentEditAttempt, ServerRecoveryState, INPUT_STYLE_DIRECT,
+        INPUT_STYLE_ROMAN2KANA,
     };
     use std::{
         future::Future,
@@ -2235,6 +2420,16 @@ mod tests {
     fn server_restart_recovery_ignores_stale_generation_completion() {
         assert!(recovery_generation_is_current(7, 7));
         assert!(!recovery_generation_is_current(7, 8));
+    }
+
+    #[test]
+    fn explicit_recovery_marks_pending_and_advances_generation() {
+        let recovery = ServerRecoveryState::default();
+
+        IPCService::mark_recovery_pending(&recovery);
+
+        assert!(recovery.pending.load(Ordering::Acquire));
+        assert_eq!(recovery.generation.load(Ordering::Acquire), 1);
     }
 
     #[test]
@@ -2601,6 +2796,44 @@ mod tests {
         let error = anyhow::anyhow!("named pipe disconnected");
 
         assert!(IPCService::should_reconnect_rpc_error(&error));
+    }
+
+    #[test]
+    fn prepare_future_clauses_retry_accepts_unchanged_composition() {
+        let candidates = Candidates {
+            texts: vec!["いい加減".to_string()],
+            sub_texts: vec!["統一".to_string()],
+            hiragana: "いいかげんとういつ".to_string(),
+            corresponding_count: vec![7],
+            candidate_ids: vec![1],
+        };
+        let refreshed = Candidates {
+            candidate_ids: vec![2],
+            ..candidates.clone()
+        };
+
+        assert!(IPCService::prepare_future_clauses_reconnect_state_is_valid(
+            &candidates,
+            &refreshed
+        ));
+    }
+
+    #[test]
+    fn prepare_future_clauses_retry_rejects_reset_server_state() {
+        let previous = Candidates {
+            texts: vec!["いい加減".to_string()],
+            sub_texts: vec!["統一".to_string()],
+            hiragana: "いいかげんとういつ".to_string(),
+            corresponding_count: vec![7],
+            candidate_ids: vec![1],
+        };
+
+        assert!(
+            !IPCService::prepare_future_clauses_reconnect_state_is_valid(
+                &previous,
+                &Candidates::default()
+            )
+        );
     }
 
     #[test]
