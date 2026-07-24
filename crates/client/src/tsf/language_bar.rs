@@ -111,7 +111,7 @@ impl TextServiceFactory_Impl {
         };
         let mode = toggled_input_mode(base_mode);
 
-        self.request_input_mode_switch_after_composition(mode)
+        self.request_language_bar_input_mode_toggle(mode)
     }
 
     fn handle_right_click(&self, pt: &POINT) -> Result<()> {

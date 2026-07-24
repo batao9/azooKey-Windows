@@ -78,6 +78,10 @@ fn requires_server_resynchronization(error: &anyhow::Error) -> bool {
     is_edit_session_error(error)
 }
 
+fn language_bar_toggle_requires_deferred_replay(composition: &Composition) -> bool {
+    !composition.deferred_actions.is_empty() || !composition.deferred_inputs.is_empty()
+}
+
 fn mode_switch_request_is_current(
     requested_generation: u64,
     current_generation: u64,
@@ -4833,6 +4837,34 @@ impl TextServiceFactory {
             }
         }
         result
+    }
+
+    pub(crate) fn request_language_bar_input_mode_toggle(&self, mode: InputMode) -> Result<()> {
+        let composition = {
+            let text_service = self.borrow()?;
+            let composition = text_service.borrow_composition()?.clone();
+            composition
+        };
+        if !language_bar_toggle_requires_deferred_replay(&composition) {
+            return self.request_input_mode_switch_after_composition(mode);
+        }
+
+        // A pending asynchronous language-bar request must not overtake queued recovery input.
+        // Invalidate it, then enqueue this click behind the existing deferred actions so the
+        // normal handle_action path replays user input before applying SetIMEMode.
+        self.borrow_mut()?.invalidate_mode_switch_requests();
+        let config_snapshot = IMEState::app_config_snapshot()?;
+        let deferred = DeferredUserAction {
+            action: UserAction::ToggleInputMode,
+            is_shift_pressed: false,
+            is_shift_key: false,
+            shift_alphabet_shortcut: false,
+        };
+        if !self.enqueue_deferred_user_action(&composition, deferred, &config_snapshot)? {
+            tracing::warn!("Failed to plan deferred language-bar input mode toggle");
+            return Ok(());
+        }
+        self.flush_deferred_user_actions()
     }
 
     #[tracing::instrument]

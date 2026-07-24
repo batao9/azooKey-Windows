@@ -1,10 +1,11 @@
 use super::{
-    deferred_action_suffix, idle_mode_switch_request_is_current, mode_switch_request_is_current,
+    deferred_action_suffix, idle_mode_switch_request_is_current,
+    language_bar_toggle_requires_deferred_replay, mode_switch_request_is_current,
     requires_action_recovery, requires_server_resynchronization, Candidates,
     CapsLockKeyboardLayout, ClauseActionBackend, ClauseActionEffect, ClauseActionStateMut,
     ClauseAdvance, ClauseNavigationReadyUiSync, ClauseSnapshot, ClauseState, Composition,
-    CompositionReducer, CompositionState, DeferredClientAction, DeferredProjection,
-    DeferredUserAction, FutureClauseSnapshot, TextServiceFactory,
+    CompositionReducer, CompositionState, DeferredClientAction, DeferredInputEvent,
+    DeferredProjection, DeferredUserAction, FutureClauseSnapshot, TextServiceFactory,
 };
 use crate::engine::{
     client_action::{
@@ -73,6 +74,25 @@ fn edit_session_callback_failure_requires_server_resynchronization_before_replay
 
     assert!(requires_action_recovery(&error));
     assert!(requires_server_resynchronization(&error));
+}
+
+#[test]
+fn language_bar_toggle_joins_deferred_action_and_input_replay() {
+    let deferred_action = DeferredClientAction {
+        action: ClientAction::AppendText("a".to_string()),
+        transition: CompositionState::Composing,
+    };
+    let mut composition = Composition::default();
+    assert!(!language_bar_toggle_requires_deferred_replay(&composition));
+
+    composition.deferred_actions.push(deferred_action.clone());
+    assert!(language_bar_toggle_requires_deferred_replay(&composition));
+
+    composition.deferred_actions.clear();
+    composition
+        .deferred_inputs
+        .push_back(DeferredInputEvent::Actions(vec![deferred_action]));
+    assert!(language_bar_toggle_requires_deferred_replay(&composition));
 }
 
 #[test]
