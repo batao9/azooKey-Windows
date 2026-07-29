@@ -1,6 +1,7 @@
 use std::{
     collections::{HashSet, VecDeque},
     rc::Rc,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -56,6 +57,13 @@ use windows::Win32::{
 };
 
 use anyhow::{Context, Result};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClauseBoundarySync {
+    Synchronized,
+    Unavailable,
+    BackendDesynchronized,
+}
 
 const VK_CAPITAL_KEY_CODE: usize = 0x14;
 const VK_TRANSLATED_CAPSLOCK_KEY_CODE: usize = 0xF0;
@@ -131,7 +139,8 @@ fn has_same_com_identity<I: windows::core::Interface>(left: &I, right: &I) -> bo
 mod clause_state;
 pub(super) use clause_state::{
     CandidateSelection, ClauseActionBackend, ClauseActionEffect, ClauseActionStateMut,
-    ClauseAdvance, ClauseCommand, ClauseState, ClauseTransitionInput,
+    ClauseAdvance, ClauseAdvanceRawInput, ClauseBoundaryAdjustment, ClauseCommand, ClauseState,
+    ClauseTransitionInput,
 };
 
 struct PreparedClauseBackend {
@@ -211,8 +220,13 @@ pub struct Composition {
     pub future_clause_snapshots: Vec<FutureClauseSnapshot>,
     pub current_clause_is_split_derived: bool,
     pub current_clause_is_direct_split_remainder: bool,
+    current_clause_is_pending_remainder: bool,
     pub current_clause_has_split_left_neighbor: bool,
+    pub current_clause_right_boundary_displacement: i32,
+    current_clause_right_boundary_origin: Option<Arc<FutureClauseSnapshot>>,
     pub current_clause_split_group_id: Option<u64>,
+    current_clause_consumed_prefix_restore: Option<ConsumedPrefixRestore>,
+    current_clause_remainder_origin: Option<Arc<str>>,
     pub next_split_group_id: u64,
 
     pub state: CompositionState,
@@ -274,9 +288,28 @@ pub struct ClauseSnapshot {
     selection_index: i32,
     is_split_derived: bool,
     is_direct_split_remainder: bool,
+    is_pending_remainder: bool,
     has_split_left_neighbor: bool,
+    right_boundary_displacement: i32,
+    right_boundary_origin: Option<Arc<FutureClauseSnapshot>>,
     split_group_id: Option<u64>,
     candidates: Candidates,
+    consumed_prefix_restore: Option<ConsumedPrefixRestore>,
+    remainder_origin: Option<Arc<str>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConsumedPrefixRestore {
+    snapshot: Arc<FutureClauseSnapshot>,
+    was_fully_consumed: bool,
+}
+
+impl std::ops::Deref for ConsumedPrefixRestore {
+    type Target = FutureClauseSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        self.snapshot.as_ref()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -290,11 +323,16 @@ pub struct FutureClauseSnapshot {
     selection_index: i32,
     is_split_derived: bool,
     is_direct_split_remainder: bool,
+    is_pending_remainder: bool,
     has_split_left_neighbor: bool,
+    right_boundary_displacement: i32,
+    right_boundary_origin: Option<Arc<FutureClauseSnapshot>>,
     split_group_id: Option<u64>,
     selected_text: String,
     selected_sub_text: String,
     candidates: Candidates,
+    consumed_prefix_restore: Option<ConsumedPrefixRestore>,
+    remainder_origin: Option<Arc<str>>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1104,6 +1142,8 @@ impl TextServiceFactory {
         selection_index: i32,
         is_split_derived: bool,
         has_split_left_neighbor: bool,
+        right_boundary_displacement: i32,
+        right_boundary_origin: Option<Arc<FutureClauseSnapshot>>,
         candidates: &Candidates,
     ) -> ClauseSnapshot {
         ClauseSnapshot {
@@ -1116,9 +1156,14 @@ impl TextServiceFactory {
             selection_index,
             is_split_derived,
             is_direct_split_remainder: false,
+            is_pending_remainder: false,
             has_split_left_neighbor,
+            right_boundary_displacement,
+            right_boundary_origin,
             split_group_id: None,
             candidates: candidates.clone(),
+            consumed_prefix_restore: None,
+            remainder_origin: None,
         }
     }
 
@@ -1154,11 +1199,16 @@ impl TextServiceFactory {
             selection_index: selected.index,
             is_split_derived: false,
             is_direct_split_remainder: false,
+            is_pending_remainder: false,
             has_split_left_neighbor: false,
+            right_boundary_displacement: 0,
+            right_boundary_origin: None,
             split_group_id: None,
             selected_text: selected.text.clone(),
             selected_sub_text: selected.sub_text.clone(),
             candidates: candidates.clone(),
+            consumed_prefix_restore: None,
+            remainder_origin: None,
         }
     }
 
@@ -1187,17 +1237,42 @@ impl TextServiceFactory {
             selection_index: 0,
             is_split_derived: true,
             is_direct_split_remainder: true,
+            is_pending_remainder: false,
             has_split_left_neighbor: true,
+            right_boundary_displacement: 0,
+            right_boundary_origin: None,
             split_group_id: None,
             selected_text: clause_preview.to_string(),
             selected_sub_text: suffix.to_string(),
             candidates,
+            consumed_prefix_restore: None,
+            remainder_origin: None,
         }
     }
 
     #[inline]
     fn future_clause_display(snapshot: &FutureClauseSnapshot) -> String {
         format!("{}{}", snapshot.clause_preview, snapshot.suffix)
+    }
+
+    #[inline]
+    fn future_snapshot_origin(snapshot: &FutureClauseSnapshot) -> Arc<str> {
+        snapshot
+            .remainder_origin
+            .clone()
+            .or_else(|| {
+                snapshot
+                    .consumed_prefix_restore
+                    .as_deref()
+                    .map(Self::future_snapshot_origin)
+            })
+            .or_else(|| {
+                snapshot
+                    .right_boundary_origin
+                    .as_deref()
+                    .map(Self::future_snapshot_origin)
+            })
+            .unwrap_or_else(|| Arc::from(snapshot.raw_input.as_str()))
     }
 
     #[inline]
@@ -1415,7 +1490,7 @@ impl TextServiceFactory {
             .iter()
             .map(|snapshot| {
                 format!(
-                    "{}|{}|{}|{}|{}|{}|{}",
+                    "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
                     Self::sanitize_log_field(&Self::current_clause_preview(
                         &snapshot.preview,
                         &snapshot.fixed_prefix,
@@ -1433,14 +1508,72 @@ impl TextServiceFactory {
                     } else {
                         "-"
                     },
+                    if snapshot.is_pending_remainder {
+                        "pending"
+                    } else {
+                        "-"
+                    },
                     snapshot
                         .split_group_id
                         .map(|group_id| group_id.to_string())
-                        .unwrap_or_else(|| "-".to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    snapshot.right_boundary_displacement,
+                    Self::sanitize_log_field(&Self::debug_right_boundary_origin(
+                        snapshot.right_boundary_origin.as_ref(),
+                    )),
+                    Self::sanitize_log_field(&Self::debug_consumed_prefix_restore(
+                        snapshot.consumed_prefix_restore.as_ref(),
+                    )),
+                    snapshot.remainder_origin.as_deref().unwrap_or("-"),
                 )
             })
             .collect::<Vec<_>>()
             .join(" ; ")
+    }
+
+    #[inline]
+    fn debug_consumed_prefix_restore(restore: Option<&ConsumedPrefixRestore>) -> String {
+        let mut restore = restore;
+        let mut chain = Vec::new();
+        while let Some(edge) = restore {
+            let snapshot = edge.snapshot.as_ref();
+            chain.push(format!(
+                "{}|{}|{}|{}|{}|{}|{}|{}:{}",
+                snapshot.clause_preview,
+                snapshot.raw_hiragana,
+                snapshot.corresponding_count,
+                snapshot
+                    .split_group_id
+                    .map(|group_id| group_id.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                snapshot.right_boundary_displacement,
+                snapshot.remainder_origin.as_deref().unwrap_or("-"),
+                snapshot.is_pending_remainder,
+                Self::debug_right_boundary_origin(snapshot.right_boundary_origin.as_ref()),
+                if edge.was_fully_consumed {
+                    "full"
+                } else {
+                    "partial"
+                }
+            ));
+            restore = snapshot.consumed_prefix_restore.as_ref();
+        }
+        chain.join(">")
+    }
+
+    #[inline]
+    fn debug_right_boundary_origin(origin: Option<&Arc<FutureClauseSnapshot>>) -> String {
+        origin
+            .map(|snapshot| {
+                format!(
+                    "{}|{}|{}|{}",
+                    snapshot.clause_preview,
+                    snapshot.raw_hiragana,
+                    snapshot.corresponding_count,
+                    snapshot.right_boundary_displacement,
+                )
+            })
+            .unwrap_or_default()
     }
 
     #[inline]
@@ -1449,7 +1582,7 @@ impl TextServiceFactory {
             .iter()
             .map(|snapshot| {
                 format!(
-                    "{}|{}|{}|{}|{}|{}|{}|{}",
+                    "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
                     Self::sanitize_log_field(&snapshot.clause_preview),
                     Self::sanitize_log_field(&snapshot.suffix),
                     Self::sanitize_log_field(&snapshot.raw_hiragana),
@@ -1469,10 +1602,23 @@ impl TextServiceFactory {
                     } else {
                         "-"
                     },
+                    if snapshot.is_pending_remainder {
+                        "pending"
+                    } else {
+                        "-"
+                    },
                     snapshot
                         .split_group_id
                         .map(|group_id| group_id.to_string())
-                        .unwrap_or_else(|| "-".to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    snapshot.right_boundary_displacement,
+                    Self::sanitize_log_field(&Self::debug_right_boundary_origin(
+                        snapshot.right_boundary_origin.as_ref(),
+                    )),
+                    Self::sanitize_log_field(&Self::debug_consumed_prefix_restore(
+                        snapshot.consumed_prefix_restore.as_ref(),
+                    )),
+                    snapshot.remainder_origin.as_deref().unwrap_or("-"),
                 )
             })
             .collect::<Vec<_>>()
@@ -2048,6 +2194,7 @@ impl TextServiceFactory {
     fn replace_future_suffix_in_sub_text(
         sub_text: &str,
         future_snapshot: &FutureClauseSnapshot,
+        downstream_snapshot: Option<&FutureClauseSnapshot>,
     ) -> Option<String> {
         let future_raw = future_snapshot.raw_hiragana.as_str();
         let future_display = Self::future_clause_display(future_snapshot);
@@ -2056,6 +2203,14 @@ impl TextServiceFactory {
             .strip_suffix(future_raw)
             .map(|prefix| format!("{prefix}{future_display}"))
             .or_else(|| (sub_text == future_raw).then(|| future_display.clone()))
+            .or_else(|| {
+                let downstream_snapshot = downstream_snapshot?;
+                let raw_clause = future_raw.strip_suffix(&downstream_snapshot.raw_hiragana)?;
+                let mixed_suffix = format!("{raw_clause}{}", future_snapshot.suffix);
+                sub_text
+                    .strip_suffix(&mixed_suffix)
+                    .map(|prefix| format!("{prefix}{future_display}"))
+            })
     }
 
     #[inline]
@@ -2070,6 +2225,95 @@ impl TextServiceFactory {
             .strip_suffix(&future_display)
             .map(|prefix| format!("{prefix}{future_raw}"))
             .or_else(|| (sub_text == future_display).then(|| future_raw.to_string()))
+    }
+
+    #[inline]
+    fn restore_raw_suffix_from_snapshot_chain(
+        sub_text: &str,
+        snapshot: &FutureClauseSnapshot,
+    ) -> Option<String> {
+        Self::restore_raw_suffix_from_sub_text(sub_text, snapshot).or_else(|| {
+            let mut restore = snapshot.consumed_prefix_restore.as_ref();
+            while let Some(edge) = restore {
+                let restored = edge.snapshot.as_ref();
+                if let Some(raw_suffix) = Self::restore_raw_suffix_from_sub_text(sub_text, restored)
+                {
+                    return Some(raw_suffix);
+                }
+                restore = restored.consumed_prefix_restore.as_ref();
+            }
+            None
+        })
+    }
+
+    #[inline]
+    fn consumed_restore_owns_reappearing_suffix(
+        raw_input: &str,
+        raw_suffix: &str,
+        restored: &FutureClauseSnapshot,
+    ) -> bool {
+        raw_input != restored.raw_input
+            && raw_input.ends_with(&restored.raw_input)
+            && restored.raw_hiragana.ends_with(raw_suffix)
+    }
+
+    #[inline]
+    fn has_same_following_raw_input_boundary(
+        left: &FutureClauseSnapshot,
+        right: &FutureClauseSnapshot,
+    ) -> bool {
+        left.raw_input
+            .chars()
+            .skip(left.corresponding_count.max(0) as usize)
+            .eq(right
+                .raw_input
+                .chars()
+                .skip(right.corresponding_count.max(0) as usize))
+    }
+
+    #[inline]
+    fn truncate_future_snapshots_to_restored_boundary(
+        future_clause_snapshots: &mut Vec<FutureClauseSnapshot>,
+        restored: &FutureClauseSnapshot,
+        maximum_removed_snapshots: Option<usize>,
+    ) -> bool {
+        let following_raw_input =
+            Self::current_raw_input_suffix(&restored.raw_input, restored.corresponding_count);
+        if following_raw_input.is_empty() {
+            if maximum_removed_snapshots
+                .is_some_and(|maximum| future_clause_snapshots.len() > maximum)
+            {
+                return false;
+            }
+            if future_clause_snapshots.first().is_some_and(|first| {
+                future_clause_snapshots
+                    .iter()
+                    .any(|snapshot| snapshot.split_group_id != first.split_group_id)
+            }) {
+                return false;
+            }
+            future_clause_snapshots.clear();
+            return true;
+        }
+        let Some(following_index) = future_clause_snapshots
+            .iter()
+            .position(|snapshot| snapshot.raw_input == following_raw_input)
+        else {
+            return false;
+        };
+        let removed_snapshots = &future_clause_snapshots[following_index + 1..];
+        if maximum_removed_snapshots.is_some_and(|maximum| removed_snapshots.len() > maximum) {
+            return false;
+        }
+        if removed_snapshots.first().is_some_and(|first| {
+            removed_snapshots
+                .iter()
+                .any(|snapshot| snapshot.split_group_id != first.split_group_id)
+        }) {
+            return false;
+        }
+        future_clause_snapshots.truncate(following_index + 1);
+        true
     }
 
     #[inline]
@@ -2088,9 +2332,12 @@ impl TextServiceFactory {
         };
 
         for sub_text in candidates.sub_texts.iter_mut() {
-            if let Some(updated) =
-                Self::replace_future_suffix_in_sub_text(sub_text, future_snapshot)
-            {
+            let downstream_snapshot = future_clause_snapshots.iter().rev().nth(1);
+            if let Some(updated) = Self::replace_future_suffix_in_sub_text(
+                sub_text,
+                future_snapshot,
+                downstream_snapshot,
+            ) {
                 *sub_text = updated;
             }
         }
@@ -2100,6 +2347,72 @@ impl TextServiceFactory {
             .get(selection_index.max(0) as usize)
             .cloned()
             .unwrap_or_else(|| Self::current_raw_suffix(&candidates.hiragana, corresponding_count))
+    }
+
+    #[inline]
+    fn coalesce_adjacent_pending_remainders(
+        future_clause_snapshots: &mut Vec<FutureClauseSnapshot>,
+    ) {
+        loop {
+            let Some(current) = future_clause_snapshots.last() else {
+                return;
+            };
+            let Some(trailing) = future_clause_snapshots.iter().rev().nth(1) else {
+                return;
+            };
+            if !current.is_pending_remainder
+                || !trailing.is_pending_remainder
+                || current.remainder_origin.is_none()
+                || (trailing.remainder_origin.is_some()
+                    && trailing.remainder_origin != current.remainder_origin
+                    && trailing.remainder_origin.as_deref() != Some(current.raw_input.as_str()))
+                || current.suffix != Self::future_clause_display(trailing)
+            {
+                return;
+            }
+
+            let current = future_clause_snapshots
+                .pop()
+                .expect("checked current pending remainder");
+            let trailing = future_clause_snapshots
+                .pop()
+                .expect("checked trailing pending remainder");
+            let joined_preview = format!("{}{}", current.clause_preview, trailing.clause_preview);
+            let mut joined_snapshot = Self::build_conservative_future_clause_snapshot(
+                &joined_preview,
+                &trailing.suffix,
+                &current.raw_input,
+                &current.raw_hiragana,
+                current
+                    .corresponding_count
+                    .saturating_add(trailing.corresponding_count),
+            );
+            joined_snapshot.is_split_derived =
+                current.is_split_derived || trailing.is_split_derived;
+            joined_snapshot.is_direct_split_remainder = true;
+            joined_snapshot.is_pending_remainder = true;
+            joined_snapshot.has_split_left_neighbor = true;
+            joined_snapshot.right_boundary_displacement = trailing.right_boundary_displacement;
+            joined_snapshot.right_boundary_origin = trailing.right_boundary_origin;
+            joined_snapshot.split_group_id = current.split_group_id.or(trailing.split_group_id);
+            joined_snapshot.consumed_prefix_restore = trailing
+                .consumed_prefix_restore
+                .or(current.consumed_prefix_restore);
+            joined_snapshot.remainder_origin =
+                current.remainder_origin.or(trailing.remainder_origin);
+            diagnostic_log(format!(
+                "kind=future-cache\tevent=join-adjacent-pending-remainders\traw_hiragana={}\tjoined={}",
+                Self::sanitize_log_field(&current.raw_hiragana),
+                Self::sanitize_log_field(&format!(
+                    "{}|{}|{}|{}",
+                    joined_snapshot.clause_preview,
+                    joined_snapshot.suffix,
+                    joined_snapshot.raw_hiragana,
+                    joined_snapshot.corresponding_count,
+                )),
+            ));
+            future_clause_snapshots.push(joined_snapshot);
+        }
     }
 
     #[inline]
@@ -2115,8 +2428,13 @@ impl TextServiceFactory {
         selection_index: i32,
         current_clause_is_split_derived: bool,
         current_clause_is_direct_split_remainder: bool,
+        current_clause_is_pending_remainder: bool,
         current_clause_has_split_left_neighbor: bool,
+        current_clause_right_boundary_displacement: i32,
+        current_clause_right_boundary_origin: Option<Arc<FutureClauseSnapshot>>,
         current_clause_split_group_id: Option<u64>,
+        current_clause_consumed_prefix_restore: Option<ConsumedPrefixRestore>,
+        current_clause_remainder_origin: Option<Arc<str>>,
         candidates: &Candidates,
     ) {
         let mut snapshot = Self::build_future_clause_snapshot(
@@ -2131,8 +2449,13 @@ impl TextServiceFactory {
         );
         snapshot.is_split_derived = current_clause_is_split_derived;
         snapshot.is_direct_split_remainder = current_clause_is_direct_split_remainder;
+        snapshot.is_pending_remainder = current_clause_is_pending_remainder;
         snapshot.has_split_left_neighbor = current_clause_has_split_left_neighbor;
+        snapshot.right_boundary_displacement = current_clause_right_boundary_displacement;
+        snapshot.right_boundary_origin = current_clause_right_boundary_origin;
         snapshot.split_group_id = current_clause_split_group_id;
+        snapshot.consumed_prefix_restore = current_clause_consumed_prefix_restore;
+        snapshot.remainder_origin = current_clause_remainder_origin;
         diagnostic_log(format!(
             "kind=future-cache\tevent=push-current\tpreview={}\tsuffix={}\traw_input={}\traw_hiragana={}\tfuture_clause_snapshots_before={}\tis_split_derived={}\tis_direct_split_remainder={}\tsplit_group_id={}\tpushed={}",
             Self::sanitize_log_field(preview),
@@ -2160,6 +2483,7 @@ impl TextServiceFactory {
             )),
         ));
         future_clause_snapshots.push(snapshot);
+        Self::coalesce_adjacent_pending_remainders(future_clause_snapshots);
     }
 
     #[inline]
@@ -2231,6 +2555,7 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    #[cfg(test)]
     fn maybe_push_split_future_clause_snapshot(
         future_clause_snapshots: &mut Vec<FutureClauseSnapshot>,
         raw_input: &str,
@@ -2240,10 +2565,273 @@ impl TextServiceFactory {
         allow_bootstrap_without_existing_future: bool,
         current_clause_split_group_id: Option<u64>,
     ) {
+        let mut current_clause_consumed_prefix_restore = None;
+        Self::maybe_push_split_future_clause_snapshot_with_restore(
+            future_clause_snapshots,
+            raw_input,
+            raw_hiragana,
+            corresponding_count,
+            raw_suffix_hint,
+            allow_bootstrap_without_existing_future,
+            current_clause_split_group_id,
+            &mut current_clause_consumed_prefix_restore,
+            None,
+            true,
+        );
+    }
+
+    #[inline]
+    fn attach_consumed_restore_tail(
+        restore: ConsumedPrefixRestore,
+        tail: Option<ConsumedPrefixRestore>,
+    ) -> ConsumedPrefixRestore {
+        let Some(tail) = tail else {
+            return restore;
+        };
+        let mut snapshot = (*restore.snapshot).clone();
+        snapshot.consumed_prefix_restore = Some(match snapshot.consumed_prefix_restore.take() {
+            Some(nested) => Self::attach_consumed_restore_tail(nested, Some(tail)),
+            None => tail,
+        });
+        ConsumedPrefixRestore {
+            snapshot: Arc::new(snapshot),
+            was_fully_consumed: restore.was_fully_consumed,
+        }
+    }
+
+    #[inline]
+    fn restore_for_consumed_snapshot(snapshot: &FutureClauseSnapshot) -> ConsumedPrefixRestore {
+        if snapshot.is_conservative {
+            return snapshot.consumed_prefix_restore.clone().unwrap_or_else(|| {
+                let mut original = snapshot.clone();
+                original.consumed_prefix_restore = None;
+                ConsumedPrefixRestore {
+                    snapshot: Arc::new(original),
+                    was_fully_consumed: false,
+                }
+            });
+        }
+
+        ConsumedPrefixRestore {
+            snapshot: Arc::new(snapshot.clone()),
+            was_fully_consumed: false,
+        }
+    }
+
+    #[inline]
+    fn mark_restore_fully_consumed(mut restore: ConsumedPrefixRestore) -> ConsumedPrefixRestore {
+        restore.was_fully_consumed = true;
+        restore
+    }
+
+    #[inline]
+    fn consumed_restore_can_materialize(restore: &ConsumedPrefixRestore) -> bool {
+        restore.was_fully_consumed || restore.right_boundary_displacement <= 0
+    }
+
+    #[inline]
+    fn find_consumed_restore(
+        mut restore: Option<&ConsumedPrefixRestore>,
+        mut predicate: impl FnMut(&ConsumedPrefixRestore) -> bool,
+    ) -> Option<&ConsumedPrefixRestore> {
+        while let Some(edge) = restore {
+            if predicate(edge) {
+                return Some(edge);
+            }
+            restore = edge.consumed_prefix_restore.as_ref();
+        }
+        None
+    }
+
+    #[inline]
+    fn find_consumed_restore_origin(
+        mut restore: Option<&ConsumedPrefixRestore>,
+        mut predicate: impl FnMut(&FutureClauseSnapshot) -> bool,
+    ) -> Option<Arc<FutureClauseSnapshot>> {
+        while let Some(edge) = restore {
+            if let Some(origin) = edge.right_boundary_origin.as_ref() {
+                if predicate(origin) {
+                    return Some(origin.clone());
+                }
+            }
+            restore = edge.consumed_prefix_restore.as_ref();
+        }
+        None
+    }
+
+    #[inline]
+    fn reset_boundary_restored_snapshot_selection(snapshot: &mut FutureClauseSnapshot) {
+        let saved_selection_is_candidate_backed = (0..snapshot.candidates.texts.len())
+            .filter_map(|index| Self::select_candidate(&snapshot.candidates, index as i32))
+            .any(|candidate| {
+                candidate.text == snapshot.selected_text
+                    && candidate.sub_text == snapshot.selected_sub_text
+                    && candidate.corresponding_count == snapshot.corresponding_count
+            });
+        if !saved_selection_is_candidate_backed {
+            return;
+        }
+
+        let Some(selected) = (0..snapshot.candidates.texts.len())
+            .filter_map(|index| Self::select_candidate(&snapshot.candidates, index as i32))
+            .find(|candidate| candidate.corresponding_count == snapshot.corresponding_count)
+        else {
+            return;
+        };
+        snapshot.selection_index = selected.index;
+        snapshot.clause_preview = selected.text.clone();
+        snapshot.suffix = selected.sub_text.clone();
+        snapshot.selected_text = selected.text;
+        snapshot.selected_sub_text = selected.sub_text;
+    }
+
+    #[inline]
+    fn future_snapshot_has_distinct_selected_candidate(snapshot: &FutureClauseSnapshot) -> bool {
+        (0..snapshot.candidates.texts.len())
+            .rev()
+            .filter_map(|index| Self::select_candidate(&snapshot.candidates, index as i32))
+            .find(|candidate| candidate.corresponding_count == snapshot.corresponding_count)
+            .is_some_and(|reading_candidate| reading_candidate.text != snapshot.selected_text)
+    }
+
+    #[inline]
+    fn future_snapshot_restores_unadjusted_clause(snapshot: &FutureClauseSnapshot) -> bool {
+        snapshot
+            .consumed_prefix_restore
+            .as_deref()
+            .is_some_and(|source| {
+                !source.is_conservative
+                    && !source.is_split_derived
+                    && !Self::future_snapshot_crosses_own_unadjusted_clause_boundary(source)
+            })
+            || snapshot
+                .right_boundary_origin
+                .as_deref()
+                .is_some_and(|source| {
+                    !source.is_conservative
+                        && !source.is_split_derived
+                        && !Self::future_snapshot_crosses_own_unadjusted_clause_boundary(source)
+                })
+    }
+
+    #[inline]
+    fn future_snapshot_restore_source_stays_within_unadjusted_clause(
+        snapshot: &FutureClauseSnapshot,
+    ) -> bool {
+        let Some(source) = snapshot.consumed_prefix_restore.as_deref() else {
+            return false;
+        };
+        if !source.is_conservative && !source.is_split_derived {
+            return source
+                .right_boundary_origin
+                .as_deref()
+                .is_some_and(|origin| {
+                    !origin.is_conservative
+                        && !origin.is_split_derived
+                        && Self::has_same_following_raw_input_boundary(source, origin)
+                });
+        }
+        let mut candidate = Some(source);
+        while let Some(restored) = candidate {
+            if !restored.is_conservative && !restored.is_split_derived {
+                return Self::has_same_following_raw_input_boundary(source, restored);
+            }
+            if let Some(origin) = restored.right_boundary_origin.as_deref() {
+                if !origin.is_conservative && !origin.is_split_derived {
+                    return Self::has_same_following_raw_input_boundary(source, origin);
+                }
+            }
+            candidate = restored.consumed_prefix_restore.as_deref();
+        }
+        false
+    }
+
+    #[inline]
+    fn future_snapshot_crosses_own_unadjusted_clause_boundary(
+        snapshot: &FutureClauseSnapshot,
+    ) -> bool {
+        snapshot
+            .right_boundary_origin
+            .as_deref()
+            .filter(|origin| !origin.is_conservative && !origin.is_split_derived)
+            .is_some_and(|origin| {
+                snapshot.raw_input == origin.raw_input
+                    && snapshot.corresponding_count > origin.corresponding_count
+            })
+    }
+
+    #[inline]
+    fn future_snapshot_restore_crosses_unadjusted_clause_boundary(
+        snapshot: &FutureClauseSnapshot,
+    ) -> bool {
+        let mut candidate = Some(snapshot);
+        while let Some(restored) = candidate {
+            if Self::future_snapshot_crosses_own_unadjusted_clause_boundary(restored) {
+                return true;
+            }
+            candidate = restored.consumed_prefix_restore.as_deref();
+        }
+        false
+    }
+
+    #[inline]
+    fn future_snapshot_materialization_crosses_unadjusted_clause_boundary(
+        snapshot: &FutureClauseSnapshot,
+    ) -> bool {
+        if snapshot.is_split_derived {
+            Self::future_snapshot_restore_crosses_unadjusted_clause_boundary(snapshot)
+        } else {
+            Self::future_snapshot_crosses_own_unadjusted_clause_boundary(snapshot)
+        }
+    }
+
+    #[inline]
+    fn rebase_restored_future_snapshot(
+        snapshot: &mut FutureClauseSnapshot,
+        downstream: Option<&FutureClauseSnapshot>,
+    ) {
+        let downstream_display = downstream
+            .map(Self::future_clause_display)
+            .unwrap_or_default();
+        let previous_suffix = snapshot.suffix.clone();
+        snapshot.suffix = downstream_display.clone();
+        if let Some(prefix) = snapshot.selected_sub_text.strip_suffix(&previous_suffix) {
+            snapshot.selected_sub_text = format!("{prefix}{downstream_display}");
+        }
+        for sub_text in snapshot.candidates.sub_texts.iter_mut() {
+            if let Some(prefix) = sub_text.strip_suffix(&previous_suffix) {
+                *sub_text = format!("{prefix}{downstream_display}");
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_push_split_future_clause_snapshot_with_restore(
+        future_clause_snapshots: &mut Vec<FutureClauseSnapshot>,
+        raw_input: &str,
+        raw_hiragana: &str,
+        corresponding_count: i32,
+        raw_suffix_hint: &str,
+        allow_bootstrap_without_existing_future: bool,
+        current_clause_split_group_id: Option<u64>,
+        current_clause_consumed_prefix_restore: &mut Option<ConsumedPrefixRestore>,
+        released_remainder_origin: Option<Arc<str>>,
+        allow_released_origin_coalesce: bool,
+    ) {
         let raw_input_suffix = Self::current_raw_input_suffix(raw_input, corresponding_count);
         let normalized_raw_suffix_hint = future_clause_snapshots
-            .last()
-            .and_then(|snapshot| Self::restore_raw_suffix_from_sub_text(raw_suffix_hint, snapshot))
+            .iter()
+            .rev()
+            .find_map(|snapshot| {
+                Self::restore_raw_suffix_from_snapshot_chain(raw_suffix_hint, snapshot)
+            })
+            .or_else(|| {
+                current_clause_consumed_prefix_restore
+                    .as_deref()
+                    .and_then(|snapshot| {
+                        Self::restore_raw_suffix_from_snapshot_chain(raw_suffix_hint, snapshot)
+                    })
+            })
             .unwrap_or_else(|| raw_suffix_hint.to_string());
         let mut raw_suffix = if let Some(snapshot) = future_clause_snapshots
             .iter()
@@ -2260,16 +2848,103 @@ impl TextServiceFactory {
         }) {
             snapshot.raw_hiragana.clone()
         } else if !future_clause_snapshots.is_empty() && !allow_bootstrap_without_existing_future {
-            Self::current_raw_suffix(raw_hiragana, corresponding_count)
+            if raw_input.chars().count() == raw_hiragana.chars().count() {
+                Self::current_raw_suffix(raw_hiragana, corresponding_count)
+            } else {
+                String::new()
+            }
         } else {
             String::new()
         };
+        if raw_suffix.is_empty() && !raw_input_suffix.is_empty() {
+            return;
+        }
         if raw_suffix.is_empty() {
+            while let Some(snapshot) = future_clause_snapshots.pop() {
+                let restore = Self::restore_for_consumed_snapshot(&snapshot);
+                let restore = Self::mark_restore_fully_consumed(restore);
+                *current_clause_consumed_prefix_restore = Some(Self::attach_consumed_restore_tail(
+                    restore,
+                    current_clause_consumed_prefix_restore.take(),
+                ));
+            }
             return;
         }
 
+        let contracted_origin = Self::find_consumed_restore_origin(
+            current_clause_consumed_prefix_restore.as_ref(),
+            |origin| origin.right_boundary_displacement <= 0 && origin.raw_hiragana == raw_suffix,
+        );
+        if let Some(origin) = contracted_origin {
+            let mut restored = (*origin).clone();
+            restored.is_pending_remainder |= future_clause_snapshots.is_empty()
+                || future_clause_snapshots
+                    .last()
+                    .is_some_and(|snapshot| snapshot.is_pending_remainder);
+            if Self::truncate_future_snapshots_to_restored_boundary(
+                future_clause_snapshots,
+                &restored,
+                Some(1),
+            ) {
+                let _ = current_clause_consumed_prefix_restore
+                    .take()
+                    .expect("checked consumed-prefix restore");
+                *current_clause_consumed_prefix_restore = restored.consumed_prefix_restore.take();
+                restored.is_split_derived = current_clause_split_group_id.is_some();
+                restored.is_direct_split_remainder = true;
+                restored.has_split_left_neighbor = true;
+                restored.split_group_id = current_clause_split_group_id;
+                Self::reset_boundary_restored_snapshot_selection(&mut restored);
+                Self::rebase_restored_future_snapshot(
+                    &mut restored,
+                    future_clause_snapshots.last(),
+                );
+                future_clause_snapshots.push(restored);
+                return;
+            }
+        }
+
+        if let Some(restore) = Self::find_consumed_restore(
+            current_clause_consumed_prefix_restore.as_ref(),
+            |restored| {
+                Self::consumed_restore_can_materialize(restored)
+                    && restored.raw_hiragana == raw_suffix
+                    && !Self::future_snapshot_materialization_crosses_unadjusted_clause_boundary(
+                        restored,
+                    )
+            },
+        )
+        .cloned()
+        {
+            let mut restored = (*restore).clone();
+            restored.is_pending_remainder |= future_clause_snapshots.is_empty()
+                || future_clause_snapshots
+                    .last()
+                    .is_some_and(|snapshot| snapshot.is_pending_remainder);
+            if Self::truncate_future_snapshots_to_restored_boundary(
+                future_clause_snapshots,
+                &restored,
+                None,
+            ) {
+                let _ = current_clause_consumed_prefix_restore.take();
+                *current_clause_consumed_prefix_restore = restored.consumed_prefix_restore.take();
+                Self::reset_boundary_restored_snapshot_selection(&mut restored);
+                Self::rebase_restored_future_snapshot(
+                    &mut restored,
+                    future_clause_snapshots.last(),
+                );
+                future_clause_snapshots.push(restored);
+                return;
+            }
+        }
+
         if future_clause_snapshots.is_empty() {
-            if !allow_bootstrap_without_existing_future {
+            let can_bootstrap_from_consumed_restore = current_clause_consumed_prefix_restore
+                .as_ref()
+                .is_some_and(|restored| {
+                    Self::consumed_restore_owns_reappearing_suffix(raw_input, &raw_suffix, restored)
+                });
+            if !allow_bootstrap_without_existing_future && !can_bootstrap_from_consumed_restore {
                 return;
             }
 
@@ -2290,9 +2965,23 @@ impl TextServiceFactory {
                 &raw_suffix,
                 split_raw_input.chars().count() as i32,
             );
+            split_snapshot.remainder_origin = current_clause_consumed_prefix_restore
+                .as_deref()
+                .map(Self::future_snapshot_origin)
+                .or_else(|| released_remainder_origin.clone());
             split_snapshot.is_split_derived = current_clause_split_group_id.is_some();
             split_snapshot.is_direct_split_remainder = true;
+            split_snapshot.is_pending_remainder = true;
             split_snapshot.split_group_id = current_clause_split_group_id;
+            if current_clause_consumed_prefix_restore
+                .as_ref()
+                .is_some_and(|restored| {
+                    Self::consumed_restore_owns_reappearing_suffix(raw_input, &raw_suffix, restored)
+                })
+            {
+                split_snapshot.consumed_prefix_restore =
+                    current_clause_consumed_prefix_restore.take();
+            }
             diagnostic_log(format!(
                 "kind=future-cache\tevent=bootstrap-split\traw_suffix={}\traw_input_suffix={}\tpushed={}",
                 Self::sanitize_log_field(&raw_suffix),
@@ -2309,8 +2998,132 @@ impl TextServiceFactory {
             return;
         }
 
+        if let Some(restore) = future_clause_snapshots.last().and_then(|snapshot| {
+            Self::find_consumed_restore(snapshot.consumed_prefix_restore.as_ref(), |restored| {
+                Self::consumed_restore_can_materialize(restored)
+                    && restored.raw_hiragana == raw_suffix
+                    && Self::has_same_following_raw_input_boundary(restored, snapshot)
+                    && !Self::future_snapshot_materialization_crosses_unadjusted_clause_boundary(
+                        restored,
+                    )
+                    && (restored.split_group_id.is_none()
+                        || restored.split_group_id == current_clause_split_group_id
+                        || restored.was_fully_consumed)
+                    && (Self::future_snapshot_has_distinct_selected_candidate(restored)
+                        || Self::future_snapshot_restores_unadjusted_clause(restored)
+                        || !restored.is_conservative)
+            })
+            .cloned()
+        }) {
+            let mut restored = (*restore).clone();
+            restored.is_pending_remainder |= future_clause_snapshots
+                .last()
+                .is_some_and(|snapshot| snapshot.is_pending_remainder);
+            if Self::truncate_future_snapshots_to_restored_boundary(
+                future_clause_snapshots,
+                &restored,
+                None,
+            ) {
+                *current_clause_consumed_prefix_restore = restored.consumed_prefix_restore.take();
+                Self::reset_boundary_restored_snapshot_selection(&mut restored);
+                diagnostic_log(format!(
+                    "kind=future-cache\tevent=restore-consumed-prefix\traw_suffix={}\trestored={}",
+                    Self::sanitize_log_field(&raw_suffix),
+                    Self::sanitize_log_field(&format!(
+                        "{}|{}|{}|{}",
+                        restored.clause_preview,
+                        restored.suffix,
+                        restored.raw_hiragana,
+                        restored.corresponding_count,
+                    )),
+                ));
+                Self::rebase_restored_future_snapshot(
+                    &mut restored,
+                    future_clause_snapshots.last(),
+                );
+                future_clause_snapshots.push(restored);
+                return;
+            }
+        }
+
+        if let Some(origin) = future_clause_snapshots.last().and_then(|snapshot| {
+            Self::find_consumed_restore_origin(
+                snapshot.consumed_prefix_restore.as_ref(),
+                |origin| {
+                    origin.right_boundary_displacement <= 0 && origin.raw_hiragana == raw_suffix
+                },
+            )
+            .or_else(|| {
+                snapshot
+                    .right_boundary_origin
+                    .as_deref()
+                    .and_then(|boundary_origin| {
+                        Self::find_consumed_restore_origin(
+                            boundary_origin.consumed_prefix_restore.as_ref(),
+                            |origin| {
+                                origin.right_boundary_displacement <= 0
+                                    && origin.raw_hiragana == raw_suffix
+                            },
+                        )
+                    })
+            })
+        }) {
+            let mut restored = (*origin).clone();
+            restored.is_pending_remainder |= future_clause_snapshots
+                .last()
+                .is_some_and(|snapshot| snapshot.is_pending_remainder);
+            if Self::truncate_future_snapshots_to_restored_boundary(
+                future_clause_snapshots,
+                &restored,
+                Some(1),
+            ) {
+                *current_clause_consumed_prefix_restore = restored.consumed_prefix_restore.take();
+                restored.is_split_derived = current_clause_split_group_id.is_some();
+                restored.is_direct_split_remainder = true;
+                restored.is_pending_remainder = false;
+                restored.has_split_left_neighbor = true;
+                restored.split_group_id = current_clause_split_group_id;
+                Self::reset_boundary_restored_snapshot_selection(&mut restored);
+                Self::rebase_restored_future_snapshot(
+                    &mut restored,
+                    future_clause_snapshots.last(),
+                );
+                diagnostic_log(format!(
+                    "kind=future-cache\tevent=restore-boundary-origin\traw_suffix={}\trestored={}",
+                    Self::sanitize_log_field(&raw_suffix),
+                    Self::sanitize_log_field(&format!(
+                        "{}|{}|{}|{}",
+                        restored.clause_preview,
+                        restored.suffix,
+                        restored.raw_hiragana,
+                        restored.corresponding_count,
+                    )),
+                ));
+                future_clause_snapshots.push(restored);
+                return;
+            }
+        }
+
         while let Some(snapshot) = future_clause_snapshots.last() {
             if Self::future_snapshot_matches_raw_suffix(snapshot, &raw_suffix) {
+                break;
+            }
+            let earlier_snapshot_matches = future_clause_snapshots
+                .iter()
+                .rev()
+                .skip(1)
+                .any(|earlier| earlier.raw_hiragana == raw_suffix);
+            if snapshot.raw_hiragana.ends_with(&raw_suffix) && earlier_snapshot_matches {
+                let restore = Self::restore_for_consumed_snapshot(snapshot);
+                let restore = Self::mark_restore_fully_consumed(restore);
+                *current_clause_consumed_prefix_restore = Some(Self::attach_consumed_restore_tail(
+                    restore,
+                    current_clause_consumed_prefix_restore.take(),
+                ));
+                future_clause_snapshots.pop();
+                continue;
+            }
+            if snapshot.raw_hiragana.ends_with(&raw_suffix) && !earlier_snapshot_matches {
                 break;
             }
             diagnostic_log(format!(
@@ -2358,11 +3171,140 @@ impl TextServiceFactory {
             .rev()
             .nth(1)
             .map(|snapshot| snapshot.raw_input.clone());
-
-        if !snapshot.is_conservative
+        let has_reappearing_restore_with_adjusted_right_boundary = snapshot
+            .consumed_prefix_restore
+            .as_deref()
+            .is_some_and(|restored| {
+                restored.raw_hiragana == raw_suffix
+                    && !Self::has_same_following_raw_input_boundary(restored, snapshot)
+            });
+        let has_right_expanded_partial_restore_for_raw_suffix = snapshot
+            .consumed_prefix_restore
+            .as_ref()
+            .is_some_and(|restored| {
+                !restored.was_fully_consumed
+                    && restored.right_boundary_displacement > 0
+                    && Self::consumed_restore_owns_reappearing_suffix(
+                        raw_input,
+                        &raw_suffix,
+                        restored,
+                    )
+            });
+        let can_coalesce_by_provenance = allow_released_origin_coalesce
+            || snapshot.right_boundary_displacement < 0
+            || Self::find_consumed_restore(snapshot.consumed_prefix_restore.as_ref(), |source| {
+                source.right_boundary_displacement < 0
+            })
+            .is_some()
+                && !Self::future_snapshot_restore_crosses_unadjusted_clause_boundary(snapshot)
+            || Self::future_snapshot_restores_unadjusted_clause(snapshot)
+            || Self::future_snapshot_restore_source_stays_within_unadjusted_clause(snapshot);
+        let has_matching_remainder_origin = released_remainder_origin.is_some()
+            && released_remainder_origin == snapshot.remainder_origin;
+        let has_same_remainder_origin = has_matching_remainder_origin
+            && (can_coalesce_by_provenance
+                || (snapshot.consumed_prefix_restore.is_none()
+                    && snapshot.right_boundary_origin.is_none()));
+        let pending_remainder_can_coalesce = snapshot.is_pending_remainder
+            && (has_same_remainder_origin
+                || snapshot.consumed_prefix_restore.is_some()
+                || trailing_raw_hiragana.is_some());
+        let direct_restore_owns_reappearing_suffix = snapshot.is_direct_split_remainder
+            && snapshot
+                .consumed_prefix_restore
+                .as_ref()
+                .is_some_and(|restored| {
+                    !Self::future_snapshot_restore_crosses_unadjusted_clause_boundary(restored)
+                        && Self::consumed_restore_owns_reappearing_suffix(
+                            raw_input,
+                            &raw_suffix,
+                            restored,
+                        )
+                });
+        let can_coalesce_released_prefix = pending_remainder_can_coalesce
+            || direct_restore_owns_reappearing_suffix
+            || has_same_remainder_origin
+            || (can_coalesce_by_provenance && has_reappearing_restore_with_adjusted_right_boundary);
+        let is_pending_remainder = snapshot.is_pending_remainder;
+        let preserves_navigated_same_origin_boundary = has_same_remainder_origin
             && snapshot.is_direct_split_remainder
-            && snapshot.split_group_id == current_clause_split_group_id
-            && trailing_raw_hiragana.is_some()
+            && !snapshot.is_pending_remainder
+            && snapshot.right_boundary_displacement == 0
+            && snapshot.consumed_prefix_restore.is_none()
+            && trailing_raw_hiragana.is_none()
+            && snapshot.remainder_origin.as_deref() != Some(raw_input_suffix.as_str());
+
+        if snapshot.raw_hiragana != raw_suffix && snapshot.raw_hiragana.ends_with(&raw_suffix) {
+            let trailing_raw_hiragana = trailing_raw_hiragana.unwrap_or_default();
+            let trailing_raw_input = trailing_raw_input.unwrap_or_default();
+            let split_preview = if trailing_raw_hiragana.is_empty() {
+                raw_suffix.clone()
+            } else {
+                raw_suffix
+                    .strip_suffix(&trailing_raw_hiragana)
+                    .unwrap_or(&raw_suffix)
+                    .to_string()
+            };
+            let split_corresponding_count = if trailing_raw_input.is_empty() {
+                raw_input_suffix.chars().count() as i32
+            } else {
+                raw_input_suffix
+                    .strip_suffix(&trailing_raw_input)
+                    .unwrap_or(&raw_input_suffix)
+                    .chars()
+                    .count() as i32
+            };
+            if split_preview.is_empty() || split_corresponding_count <= 0 {
+                return;
+            }
+            let mut replaced_snapshot = Self::build_conservative_future_clause_snapshot(
+                &split_preview,
+                &snapshot.suffix,
+                &raw_input_suffix,
+                &raw_suffix,
+                split_corresponding_count,
+            );
+            replaced_snapshot.is_split_derived = current_clause_split_group_id.is_some();
+            replaced_snapshot.is_direct_split_remainder = true;
+            replaced_snapshot.is_pending_remainder = snapshot.is_pending_remainder
+                || (!snapshot.is_split_derived && released_remainder_origin.is_some());
+            replaced_snapshot.has_split_left_neighbor = true;
+            replaced_snapshot.split_group_id = current_clause_split_group_id;
+            replaced_snapshot.remainder_origin = Some(Self::future_snapshot_origin(snapshot));
+            let restore = Self::restore_for_consumed_snapshot(snapshot);
+            replaced_snapshot.consumed_prefix_restore = Some(Self::attach_consumed_restore_tail(
+                restore,
+                current_clause_consumed_prefix_restore.take(),
+            ));
+            diagnostic_log(format!(
+                "kind=future-cache\tevent=replace-consumed-prefix\traw_suffix={}\traw_input_suffix={}\treplaced={}",
+                Self::sanitize_log_field(&raw_suffix),
+                Self::sanitize_log_field(&raw_input_suffix),
+                Self::sanitize_log_field(&format!(
+                    "{}|{}|{}|{}",
+                    replaced_snapshot.clause_preview,
+                    replaced_snapshot.suffix,
+                    replaced_snapshot.raw_hiragana,
+                    replaced_snapshot.corresponding_count,
+                )),
+            ));
+            future_clause_snapshots.pop();
+            future_clause_snapshots.push(replaced_snapshot);
+            return;
+        }
+
+        if snapshot.raw_hiragana != raw_suffix
+            && !snapshot.is_conservative
+            && !has_right_expanded_partial_restore_for_raw_suffix
+            && !preserves_navigated_same_origin_boundary
+            && can_coalesce_released_prefix
+            && (snapshot.split_group_id == current_clause_split_group_id
+                || is_pending_remainder
+                || has_same_remainder_origin)
+            && (trailing_raw_hiragana.is_some()
+                || is_pending_remainder
+                || direct_restore_owns_reappearing_suffix
+                || has_same_remainder_origin)
         {
             let trailing_raw_hiragana = trailing_raw_hiragana.unwrap_or_default();
             let trailing_raw_input = trailing_raw_input.unwrap_or_default();
@@ -2392,8 +3334,11 @@ impl TextServiceFactory {
             );
             replaced_snapshot.is_split_derived = true;
             replaced_snapshot.is_direct_split_remainder = true;
+            replaced_snapshot.is_pending_remainder = snapshot.is_pending_remainder;
             replaced_snapshot.has_split_left_neighbor = true;
             replaced_snapshot.split_group_id = current_clause_split_group_id;
+            replaced_snapshot.consumed_prefix_restore = snapshot.consumed_prefix_restore.clone();
+            replaced_snapshot.remainder_origin = Some(Self::future_snapshot_origin(snapshot));
             diagnostic_log(format!(
                 "kind=future-cache\tevent=replace-actual-direct-remainder\traw_suffix={}\traw_input_suffix={}\treplaced={}",
                 Self::sanitize_log_field(&raw_suffix),
@@ -2411,7 +3356,10 @@ impl TextServiceFactory {
             return;
         }
 
-        if snapshot.is_conservative {
+        if snapshot.is_conservative
+            && !has_right_expanded_partial_restore_for_raw_suffix
+            && can_coalesce_released_prefix
+        {
             let trailing_raw_hiragana = trailing_raw_hiragana.unwrap_or_default();
             let trailing_raw_input = trailing_raw_input.unwrap_or_default();
             let split_preview = if trailing_raw_hiragana.is_empty() {
@@ -2440,7 +3388,10 @@ impl TextServiceFactory {
             );
             replaced_snapshot.is_split_derived = current_clause_split_group_id.is_some();
             replaced_snapshot.is_direct_split_remainder = true;
+            replaced_snapshot.is_pending_remainder = snapshot.is_pending_remainder;
             replaced_snapshot.split_group_id = current_clause_split_group_id;
+            replaced_snapshot.consumed_prefix_restore = snapshot.consumed_prefix_restore.clone();
+            replaced_snapshot.remainder_origin = Some(Self::future_snapshot_origin(snapshot));
             diagnostic_log(format!(
                 "kind=future-cache\tevent=replace-derived-split\traw_suffix={}\traw_input_suffix={}\tcurrent_clause_split_group_id={}\treplaced={}",
                 Self::sanitize_log_field(&raw_suffix),
@@ -2481,7 +3432,17 @@ impl TextServiceFactory {
         );
         split_snapshot.is_split_derived = current_clause_split_group_id.is_some();
         split_snapshot.is_direct_split_remainder = true;
+        split_snapshot.is_pending_remainder = true;
         split_snapshot.split_group_id = current_clause_split_group_id;
+        split_snapshot.remainder_origin = released_remainder_origin;
+        if current_clause_consumed_prefix_restore
+            .as_ref()
+            .is_some_and(|restored| {
+                Self::consumed_restore_owns_reappearing_suffix(raw_input, &raw_suffix, restored)
+            })
+        {
+            split_snapshot.consumed_prefix_restore = current_clause_consumed_prefix_restore.take();
+        }
         diagnostic_log(format!(
             "kind=future-cache\tevent=push-split\traw_suffix={}\traw_input_suffix={}\tpushed={}",
             Self::sanitize_log_field(&raw_suffix),
@@ -2522,14 +3483,25 @@ impl TextServiceFactory {
         let mut temp_current_clause_is_split_derived = *state.current_clause_is_split_derived;
         let mut temp_current_clause_is_direct_split_remainder =
             *state.current_clause_is_direct_split_remainder;
+        let mut temp_current_clause_is_pending_remainder =
+            *state.current_clause_is_pending_remainder;
         let mut temp_current_clause_has_split_left_neighbor =
             *state.current_clause_has_split_left_neighbor;
+        let mut temp_current_clause_right_boundary_displacement =
+            *state.current_clause_right_boundary_displacement;
+        let mut temp_current_clause_right_boundary_origin =
+            state.current_clause_right_boundary_origin.clone();
         let mut temp_current_clause_split_group_id = *state.current_clause_split_group_id;
+        let mut temp_current_clause_consumed_prefix_restore =
+            state.current_clause_consumed_prefix_restore.clone();
+        let mut temp_current_clause_remainder_origin =
+            state.current_clause_remainder_origin.clone();
         let mut temp_next_split_group_id = *state.next_split_group_id;
         let initial_suffix = state.suffix.clone();
         let initial_raw_input_suffix =
             Self::current_raw_input_suffix(state.raw_input, *state.corresponding_count);
         let initial_raw_hiragana = state.raw_hiragana.clone();
+        let auto_split_group_id = *state.current_clause_split_group_id;
         let mut collected = Vec::new();
 
         while !backend.advances.is_empty() {
@@ -2548,9 +3520,18 @@ impl TextServiceFactory {
                     current_clause_is_split_derived: &mut temp_current_clause_is_split_derived,
                     current_clause_is_direct_split_remainder:
                         &mut temp_current_clause_is_direct_split_remainder,
+                    current_clause_is_pending_remainder:
+                        &mut temp_current_clause_is_pending_remainder,
                     current_clause_has_split_left_neighbor:
                         &mut temp_current_clause_has_split_left_neighbor,
+                    current_clause_right_boundary_displacement:
+                        &mut temp_current_clause_right_boundary_displacement,
+                    current_clause_right_boundary_origin:
+                        &mut temp_current_clause_right_boundary_origin,
                     current_clause_split_group_id: &mut temp_current_clause_split_group_id,
+                    current_clause_consumed_prefix_restore:
+                        &mut temp_current_clause_consumed_prefix_restore,
+                    current_clause_remainder_origin: &mut temp_current_clause_remainder_origin,
                     next_split_group_id: &mut temp_next_split_group_id,
                 };
                 let before = clause_state::MoveClauseProgressMarker::from_state(&temp_state);
@@ -2606,8 +3587,22 @@ impl TextServiceFactory {
             } else {
                 snapshot.is_split_derived = temp_current_clause_is_split_derived;
                 snapshot.is_direct_split_remainder = temp_current_clause_is_direct_split_remainder;
+                snapshot.is_pending_remainder = temp_current_clause_is_pending_remainder;
                 snapshot.has_split_left_neighbor = temp_current_clause_has_split_left_neighbor;
+                snapshot.right_boundary_displacement =
+                    temp_current_clause_right_boundary_displacement;
+                snapshot.right_boundary_origin = temp_current_clause_right_boundary_origin.clone();
                 snapshot.split_group_id = temp_current_clause_split_group_id;
+                snapshot.remainder_origin = temp_current_clause_remainder_origin.clone();
+            }
+            if let Some(split_group_id) = auto_split_group_id {
+                snapshot.is_split_derived = true;
+                snapshot.is_direct_split_remainder = false;
+                snapshot.is_pending_remainder = false;
+                snapshot.has_split_left_neighbor = true;
+                snapshot.right_boundary_displacement = 0;
+                snapshot.right_boundary_origin = None;
+                snapshot.split_group_id = Some(split_group_id);
             }
             collected.push(snapshot);
 
@@ -2634,8 +3629,13 @@ impl TextServiceFactory {
         selection_index: &mut i32,
         current_clause_is_split_derived: &mut bool,
         current_clause_is_direct_split_remainder: &mut bool,
+        current_clause_is_pending_remainder: &mut bool,
         current_clause_has_split_left_neighbor: &mut bool,
+        current_clause_right_boundary_displacement: &mut i32,
+        current_clause_right_boundary_origin: &mut Option<Arc<FutureClauseSnapshot>>,
         current_clause_split_group_id: &mut Option<u64>,
+        current_clause_consumed_prefix_restore: &mut Option<ConsumedPrefixRestore>,
+        current_clause_remainder_origin: &mut Option<Arc<str>>,
         candidates: &mut Candidates,
         fixed_prefix: &str,
         snapshot: &FutureClauseSnapshot,
@@ -2647,12 +3647,17 @@ impl TextServiceFactory {
         *corresponding_count = snapshot.corresponding_count;
         *current_clause_is_split_derived = snapshot.is_split_derived;
         *current_clause_is_direct_split_remainder = snapshot.is_direct_split_remainder;
+        *current_clause_is_pending_remainder = snapshot.is_pending_remainder;
         *current_clause_has_split_left_neighbor = snapshot.has_split_left_neighbor;
+        *current_clause_right_boundary_displacement = snapshot.right_boundary_displacement;
+        *current_clause_right_boundary_origin = snapshot.right_boundary_origin.clone();
         *current_clause_split_group_id = if *current_clause_is_split_derived {
             snapshot.split_group_id
         } else {
             None
         };
+        *current_clause_consumed_prefix_restore = snapshot.consumed_prefix_restore.clone();
+        *current_clause_remainder_origin = snapshot.remainder_origin.clone();
         *selection_index = Self::resolve_selection_index(
             &snapshot.candidates,
             &snapshot.selected_text,
@@ -2706,23 +3711,64 @@ impl TextServiceFactory {
     #[inline]
     fn future_snapshot_matches_server(
         future_clause_snapshots: &[FutureClauseSnapshot],
+        server_raw_input: Option<&str>,
         server_candidates: &Candidates,
     ) -> bool {
         future_clause_snapshots
             .last()
             .map(|snapshot| {
-                server_candidates.hiragana == snapshot.raw_hiragana
-                    || server_candidates
-                        .hiragana
-                        .starts_with(&snapshot.raw_hiragana)
-                    || server_candidates.hiragana.ends_with(&snapshot.raw_hiragana)
-                    || snapshot.raw_hiragana.ends_with(&server_candidates.hiragana)
-                    || Self::has_recoverable_single_n_raw_hiragana_suffix(
-                        &server_candidates.hiragana,
-                        &snapshot.raw_hiragana,
-                    )
+                server_raw_input.map_or(true, |raw_input| snapshot.raw_input == raw_input)
+                    && (server_candidates.hiragana == snapshot.raw_hiragana
+                        || server_candidates
+                            .hiragana
+                            .starts_with(&snapshot.raw_hiragana)
+                        || server_candidates.hiragana.ends_with(&snapshot.raw_hiragana)
+                        || snapshot.raw_hiragana.ends_with(&server_candidates.hiragana)
+                        || Self::has_recoverable_single_n_raw_hiragana_suffix(
+                            &server_candidates.hiragana,
+                            &snapshot.raw_hiragana,
+                        ))
             })
             .unwrap_or(false)
+    }
+
+    #[inline]
+    fn rehydrate_future_clause_snapshot_candidates(
+        snapshot: &FutureClauseSnapshot,
+        live_candidates: &Candidates,
+    ) -> FutureClauseSnapshot {
+        let mut hydrated = snapshot.clone();
+        if live_candidates.texts.is_empty() || live_candidates.hiragana != snapshot.raw_hiragana {
+            return hydrated;
+        }
+
+        for index in 0..live_candidates.texts.len() {
+            let Some(candidate) = Self::select_candidate(live_candidates, index as i32) else {
+                continue;
+            };
+            if candidate.corresponding_count != snapshot.corresponding_count {
+                continue;
+            }
+            let already_present = hydrated
+                .candidates
+                .texts
+                .iter()
+                .any(|text| text == &candidate.text);
+            if already_present {
+                continue;
+            }
+            hydrated.candidates.texts.push(candidate.text);
+            hydrated.candidates.sub_texts.push(candidate.sub_text);
+            hydrated
+                .candidates
+                .corresponding_count
+                .push(candidate.corresponding_count);
+            hydrated
+                .candidates
+                .candidate_ids
+                .push(candidate.candidate_id);
+        }
+        hydrated
     }
 
     #[inline]
@@ -2730,7 +3776,7 @@ impl TextServiceFactory {
         backend: &mut B,
         candidates: &mut Candidates,
         snapshot: &FutureClauseSnapshot,
-    ) -> Result<()> {
+    ) -> Result<ClauseBoundarySync> {
         Self::sync_backend_current_clause_to_target(
             backend,
             candidates,
@@ -2747,60 +3793,135 @@ impl TextServiceFactory {
         target_raw_hiragana: &str,
         target_sub_text: &str,
         target_corresponding_count: i32,
-    ) -> Result<()> {
-        let mut last_signature = None;
+    ) -> Result<ClauseBoundarySync> {
+        let original_candidates = candidates.clone();
+        let mut applied_directions = Vec::new();
+        let mut seen_signatures = HashSet::new();
+        if let Some(signature) = Self::clause_boundary_sync_signature(candidates) {
+            seen_signatures.insert(signature);
+        }
         let max_steps = candidates.hiragana.chars().count().max(1);
         let target_raw_suffix =
             Self::current_raw_suffix(target_raw_hiragana, target_corresponding_count);
 
         for _ in 0..max_steps {
-            if let Some(selected) = Self::select_candidate(candidates, 0) {
-                let candidate_raw_suffix =
-                    Self::current_raw_suffix(&candidates.hiragana, selected.corresponding_count);
-                let exact_match = selected.corresponding_count == target_corresponding_count
-                    && (selected.sub_text == target_sub_text
-                        || candidates.hiragana == target_raw_hiragana
-                        || candidate_raw_suffix == target_raw_suffix);
-                if exact_match {
-                    return Ok(());
-                }
-                if selected.corresponding_count < target_corresponding_count {
-                    return Ok(());
-                }
+            let Some(selected) = Self::select_candidate(candidates, 0) else {
+                return Ok(ClauseBoundarySync::Unavailable);
+            };
+            let candidate_raw_suffix =
+                Self::current_raw_suffix(&candidates.hiragana, selected.corresponding_count);
+            let exact_match = selected.corresponding_count == target_corresponding_count
+                && (selected.sub_text == target_sub_text
+                    || candidates.hiragana == target_raw_hiragana
+                    || candidate_raw_suffix == target_raw_suffix);
+            if exact_match {
+                return Ok(ClauseBoundarySync::Synchronized);
             }
+            let direction = match selected
+                .corresponding_count
+                .cmp(&target_corresponding_count)
+            {
+                std::cmp::Ordering::Greater => -1,
+                std::cmp::Ordering::Less => 1,
+                std::cmp::Ordering::Equal => return Ok(ClauseBoundarySync::Unavailable),
+            };
 
             let previous_candidates = candidates.clone();
-            let _ = backend.move_cursor_with_context(-1, &previous_candidates)?;
+            let _ = backend.move_cursor_with_context(direction, &previous_candidates)?;
             let next_candidates = backend.move_cursor(0)?;
             if next_candidates.texts.is_empty() {
-                let _ = backend.move_cursor_with_context(1, &next_candidates)?;
-                return Ok(());
+                return Ok(ClauseBoundarySync::BackendDesynchronized);
             }
 
-            let signature = format!(
-                "{}|{}|{}",
-                next_candidates.hiragana,
-                next_candidates
-                    .corresponding_count
-                    .first()
-                    .copied()
-                    .unwrap_or_default(),
-                next_candidates
-                    .sub_texts
-                    .first()
-                    .cloned()
-                    .unwrap_or_default(),
-            );
-            if last_signature.as_ref() == Some(&signature) {
-                *candidates = next_candidates;
-                return Ok(());
+            if Self::clause_boundary_sync_signature(&previous_candidates)
+                != Self::clause_boundary_sync_signature(&next_candidates)
+            {
+                applied_directions.push(direction);
             }
+            let Some(signature) = Self::clause_boundary_sync_signature(&next_candidates) else {
+                let rolled_back = Self::rollback_backend_clause_cursor_moves(
+                    backend,
+                    candidates,
+                    &original_candidates,
+                    &applied_directions,
+                )?;
+                return Ok(if rolled_back {
+                    ClauseBoundarySync::Unavailable
+                } else {
+                    ClauseBoundarySync::BackendDesynchronized
+                });
+            };
 
             *candidates = next_candidates;
-            last_signature = Some(signature);
+            if !seen_signatures.insert(signature) {
+                let rolled_back = Self::rollback_backend_clause_cursor_moves(
+                    backend,
+                    candidates,
+                    &original_candidates,
+                    &applied_directions,
+                )?;
+                return Ok(if rolled_back {
+                    ClauseBoundarySync::Unavailable
+                } else {
+                    ClauseBoundarySync::BackendDesynchronized
+                });
+            }
         }
 
-        Ok(())
+        let rolled_back = Self::rollback_backend_clause_cursor_moves(
+            backend,
+            candidates,
+            &original_candidates,
+            &applied_directions,
+        )?;
+        Ok(if rolled_back {
+            ClauseBoundarySync::Unavailable
+        } else {
+            ClauseBoundarySync::BackendDesynchronized
+        })
+    }
+
+    #[inline]
+    fn clause_boundary_sync_signature(candidates: &Candidates) -> Option<(String, i32, String)> {
+        Self::select_candidate(candidates, 0).map(|selected| {
+            (
+                candidates.hiragana.clone(),
+                selected.corresponding_count,
+                selected.sub_text,
+            )
+        })
+    }
+
+    #[inline]
+    fn rollback_backend_clause_cursor_moves<B: ClauseActionBackend>(
+        backend: &mut B,
+        candidates: &mut Candidates,
+        original_candidates: &Candidates,
+        applied_directions: &[i32],
+    ) -> Result<bool> {
+        for direction in applied_directions.iter().rev() {
+            let previous_candidates = candidates.clone();
+            let _ = backend.move_cursor_with_context(-direction, &previous_candidates)?;
+            let restored_candidates = backend.move_cursor(0)?;
+            if restored_candidates.texts.is_empty() {
+                return Ok(false);
+            }
+            *candidates = restored_candidates;
+        }
+
+        if applied_directions.is_empty() {
+            return Ok(true);
+        }
+        let restored = Self::select_candidate(candidates, 0);
+        let original = Self::select_candidate(original_candidates, 0);
+        let missed_start = restored
+            .as_ref()
+            .map(|candidate| candidate.corresponding_count)
+            != original
+                .as_ref()
+                .map(|candidate| candidate.corresponding_count)
+            || candidates.hiragana != original_candidates.hiragana;
+        Ok(!missed_start)
     }
 
     #[inline]
@@ -4981,9 +6102,19 @@ impl TextServiceFactory {
             let mut current_clause_is_split_derived = composition.current_clause_is_split_derived;
             let mut current_clause_is_direct_split_remainder =
                 composition.current_clause_is_direct_split_remainder;
+            let mut current_clause_is_pending_remainder =
+                composition.current_clause_is_pending_remainder;
             let mut current_clause_has_split_left_neighbor =
                 composition.current_clause_has_split_left_neighbor;
+            let mut current_clause_right_boundary_displacement =
+                composition.current_clause_right_boundary_displacement;
+            let mut current_clause_right_boundary_origin =
+                composition.current_clause_right_boundary_origin.clone();
             let mut current_clause_split_group_id = composition.current_clause_split_group_id;
+            let mut current_clause_consumed_prefix_restore =
+                composition.current_clause_consumed_prefix_restore.clone();
+            let mut current_clause_remainder_origin =
+                composition.current_clause_remainder_origin.clone();
             let mut next_split_group_id = composition.next_split_group_id;
             let mut selection_index = composition.selection_index;
             let mut temporary_latin = composition.temporary_latin;
@@ -5015,9 +6146,19 @@ impl TextServiceFactory {
                     persisted.current_clause_is_split_derived = current_clause_is_split_derived;
                     persisted.current_clause_is_direct_split_remainder =
                         current_clause_is_direct_split_remainder;
+                    persisted.current_clause_is_pending_remainder =
+                        current_clause_is_pending_remainder;
                     persisted.current_clause_has_split_left_neighbor =
                         current_clause_has_split_left_neighbor;
+                    persisted.current_clause_right_boundary_displacement =
+                        current_clause_right_boundary_displacement;
+                    persisted.current_clause_right_boundary_origin =
+                        current_clause_right_boundary_origin.clone();
                     persisted.current_clause_split_group_id = current_clause_split_group_id;
+                    persisted.current_clause_consumed_prefix_restore =
+                        current_clause_consumed_prefix_restore.clone();
+                    persisted.current_clause_remainder_origin =
+                        current_clause_remainder_origin.clone();
                     persisted.next_split_group_id = next_split_group_id;
                     persisted.suffix = suffix.clone();
                     persisted.corresponding_count = corresponding_count;
@@ -5048,8 +6189,13 @@ impl TextServiceFactory {
                     future_clause_snapshots.clear();
                     current_clause_is_split_derived = false;
                     current_clause_is_direct_split_remainder = false;
+                    current_clause_is_pending_remainder = false;
                     current_clause_has_split_left_neighbor = false;
+                    current_clause_right_boundary_displacement = 0;
+                    current_clause_right_boundary_origin = None;
                     current_clause_split_group_id = None;
+                    current_clause_consumed_prefix_restore = None;
+                    current_clause_remainder_origin = None;
                     next_split_group_id = 0;
 
                     self.discard_composition_text()?;
@@ -5085,8 +6231,13 @@ impl TextServiceFactory {
                     future_clause_snapshots.clear();
                     current_clause_is_split_derived = false;
                     current_clause_is_direct_split_remainder = false;
+                    current_clause_is_pending_remainder = false;
                     current_clause_has_split_left_neighbor = false;
+                    current_clause_right_boundary_displacement = 0;
+                    current_clause_right_boundary_origin = None;
                     current_clause_split_group_id = None;
+                    current_clause_consumed_prefix_restore = None;
+                    current_clause_remainder_origin = None;
                     next_split_group_id = 0;
 
                     self.discard_composition_text()?;
@@ -5115,8 +6266,13 @@ impl TextServiceFactory {
                 future_clause_snapshots.clear();
                 current_clause_is_split_derived = false;
                 current_clause_is_direct_split_remainder = false;
+                current_clause_is_pending_remainder = false;
                 current_clause_has_split_left_neighbor = false;
+                current_clause_right_boundary_displacement = 0;
+                current_clause_right_boundary_origin = None;
                 current_clause_split_group_id = None;
+                current_clause_consumed_prefix_restore = None;
+                current_clause_remainder_origin = None;
                 next_split_group_id = 0;
                 selection_index = 0;
                 if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
@@ -5241,8 +6397,13 @@ impl TextServiceFactory {
                         future_clause_snapshots.clear();
                         current_clause_is_split_derived = false;
                         current_clause_is_direct_split_remainder = false;
+                        current_clause_is_pending_remainder = false;
                         current_clause_has_split_left_neighbor = false;
+                        current_clause_right_boundary_displacement = 0;
+                        current_clause_right_boundary_origin = None;
                         current_clause_split_group_id = None;
+                        current_clause_consumed_prefix_restore = None;
+                        current_clause_remainder_origin = None;
                         next_split_group_id = 0;
                         let delivery = ipc_service.update_candidate_window(
                             Some(false),
@@ -5283,8 +6444,13 @@ impl TextServiceFactory {
 
                         current_clause_is_split_derived = false;
                         current_clause_is_direct_split_remainder = false;
+                        current_clause_is_pending_remainder = false;
                         current_clause_has_split_left_neighbor = false;
+                        current_clause_right_boundary_displacement = 0;
+                        current_clause_right_boundary_origin = None;
                         current_clause_split_group_id = None;
+                        current_clause_consumed_prefix_restore = None;
+                        current_clause_remainder_origin = None;
                         let appended_candidates =
                             ipc_service.append_text_with_context(text.clone(), &candidates)?;
                         let session_changed = ipc_service.take_server_reset_recovered()
@@ -5342,8 +6508,13 @@ impl TextServiceFactory {
                         )?;
                         current_clause_is_split_derived = false;
                         current_clause_is_direct_split_remainder = false;
+                        current_clause_is_pending_remainder = false;
                         current_clause_has_split_left_neighbor = false;
+                        current_clause_right_boundary_displacement = 0;
+                        current_clause_right_boundary_origin = None;
                         current_clause_split_group_id = None;
+                        current_clause_consumed_prefix_restore = None;
+                        current_clause_remainder_origin = None;
                         let appended_candidates =
                             ipc_service.append_text_with_context(text.clone(), &candidates)?;
                         let session_changed = ipc_service.take_server_reset_recovered()
@@ -5401,8 +6572,13 @@ impl TextServiceFactory {
                         )?;
                         current_clause_is_split_derived = false;
                         current_clause_is_direct_split_remainder = false;
+                        current_clause_is_pending_remainder = false;
                         current_clause_has_split_left_neighbor = false;
+                        current_clause_right_boundary_displacement = 0;
+                        current_clause_right_boundary_origin = None;
                         current_clause_split_group_id = None;
+                        current_clause_consumed_prefix_restore = None;
+                        current_clause_remainder_origin = None;
                         let appended_candidates = ipc_service
                             .append_text_direct_with_context(text.clone(), &candidates)?;
                         let session_changed = ipc_service.take_server_reset_recovered()
@@ -5465,8 +6641,13 @@ impl TextServiceFactory {
                         )?;
                         current_clause_is_split_derived = false;
                         current_clause_is_direct_split_remainder = false;
+                        current_clause_is_pending_remainder = false;
                         current_clause_has_split_left_neighbor = false;
+                        current_clause_right_boundary_displacement = 0;
+                        current_clause_right_boundary_origin = None;
                         current_clause_split_group_id = None;
+                        current_clause_consumed_prefix_restore = None;
+                        current_clause_remainder_origin = None;
                         if ipc_service.take_server_reset_recovered()
                             && Self::has_client_composition_state(
                                 &raw_input,
@@ -5545,8 +6726,13 @@ impl TextServiceFactory {
                             future_clause_snapshots.clear();
                             current_clause_is_split_derived = false;
                             current_clause_is_direct_split_remainder = false;
+                            current_clause_is_pending_remainder = false;
                             current_clause_has_split_left_neighbor = false;
+                            current_clause_right_boundary_displacement = 0;
+                            current_clause_right_boundary_origin = None;
                             current_clause_split_group_id = None;
+                            current_clause_consumed_prefix_restore = None;
+                            current_clause_remainder_origin = None;
 
                             if committed_prefix.is_empty() {
                                 self.set_text("", "")?;
@@ -5681,8 +6867,13 @@ impl TextServiceFactory {
                                 &mut future_clause_snapshots,
                                 &mut current_clause_is_split_derived,
                                 &mut current_clause_is_direct_split_remainder,
+                                &mut current_clause_is_pending_remainder,
                                 &mut current_clause_has_split_left_neighbor,
+                                &mut current_clause_right_boundary_displacement,
+                                &mut current_clause_right_boundary_origin,
                                 &mut current_clause_split_group_id,
+                                &mut current_clause_consumed_prefix_restore,
+                                &mut current_clause_remainder_origin,
                                 &mut next_split_group_id,
                             );
                             let transition = ClauseState::transition_with_backend(
@@ -5821,8 +7012,13 @@ impl TextServiceFactory {
                                 &mut future_clause_snapshots,
                                 &mut current_clause_is_split_derived,
                                 &mut current_clause_is_direct_split_remainder,
+                                &mut current_clause_is_pending_remainder,
                                 &mut current_clause_has_split_left_neighbor,
+                                &mut current_clause_right_boundary_displacement,
+                                &mut current_clause_right_boundary_origin,
                                 &mut current_clause_split_group_id,
+                                &mut current_clause_consumed_prefix_restore,
+                                &mut current_clause_remainder_origin,
                                 &mut next_split_group_id,
                             );
                             let transition = ClauseState::transition_with_backend(
@@ -5985,8 +7181,13 @@ impl TextServiceFactory {
                                 &mut future_clause_snapshots,
                                 &mut current_clause_is_split_derived,
                                 &mut current_clause_is_direct_split_remainder,
+                                &mut current_clause_is_pending_remainder,
                                 &mut current_clause_has_split_left_neighbor,
+                                &mut current_clause_right_boundary_displacement,
+                                &mut current_clause_right_boundary_origin,
                                 &mut current_clause_split_group_id,
+                                &mut current_clause_consumed_prefix_restore,
+                                &mut current_clause_remainder_origin,
                                 &mut next_split_group_id,
                             );
                             let transition = ClauseState::transition_with_backend(
@@ -6113,8 +7314,13 @@ impl TextServiceFactory {
                         future_clause_snapshots.clear();
                         current_clause_is_split_derived = false;
                         current_clause_is_direct_split_remainder = false;
+                        current_clause_is_pending_remainder = false;
                         current_clause_has_split_left_neighbor = false;
+                        current_clause_right_boundary_displacement = 0;
+                        current_clause_right_boundary_origin = None;
                         current_clause_split_group_id = None;
+                        current_clause_consumed_prefix_restore = None;
+                        current_clause_remainder_origin = None;
                         next_split_group_id = 0;
                         ipc_service.clear_text()?;
                     }
@@ -6147,8 +7353,13 @@ impl TextServiceFactory {
                                 &mut future_clause_snapshots,
                                 &mut current_clause_is_split_derived,
                                 &mut current_clause_is_direct_split_remainder,
+                                &mut current_clause_is_pending_remainder,
                                 &mut current_clause_has_split_left_neighbor,
+                                &mut current_clause_right_boundary_displacement,
+                                &mut current_clause_right_boundary_origin,
                                 &mut current_clause_split_group_id,
+                                &mut current_clause_consumed_prefix_restore,
+                                &mut current_clause_remainder_origin,
                                 &mut next_split_group_id,
                             );
                             let transition = ClauseState::transition_without_backend(
@@ -6222,8 +7433,13 @@ impl TextServiceFactory {
                         )?;
                         current_clause_is_split_derived = false;
                         current_clause_is_direct_split_remainder = false;
+                        current_clause_is_pending_remainder = false;
                         current_clause_has_split_left_neighbor = false;
+                        current_clause_right_boundary_displacement = 0;
+                        current_clause_right_boundary_origin = None;
                         current_clause_split_group_id = None;
+                        current_clause_consumed_prefix_restore = None;
+                        current_clause_remainder_origin = None;
                         let shrunk_raw_input =
                             Self::current_raw_input_suffix(&raw_input, corresponding_count);
                         let resolved_symbol_text = match mode {
@@ -6347,8 +7563,13 @@ impl TextServiceFactory {
                         )?;
                         current_clause_is_split_derived = false;
                         current_clause_is_direct_split_remainder = false;
+                        current_clause_is_pending_remainder = false;
                         current_clause_has_split_left_neighbor = false;
+                        current_clause_right_boundary_displacement = 0;
+                        current_clause_right_boundary_origin = None;
                         current_clause_split_group_id = None;
+                        current_clause_consumed_prefix_restore = None;
+                        current_clause_remainder_origin = None;
                         let mut updated_raw_input =
                             Self::current_raw_input_suffix(&raw_input, corresponding_count);
                         updated_raw_input.push_str(text);
@@ -6456,8 +7677,13 @@ impl TextServiceFactory {
                         )?;
                         current_clause_is_split_derived = false;
                         current_clause_is_direct_split_remainder = false;
+                        current_clause_is_pending_remainder = false;
                         current_clause_has_split_left_neighbor = false;
+                        current_clause_right_boundary_displacement = 0;
+                        current_clause_right_boundary_origin = None;
                         current_clause_split_group_id = None;
+                        current_clause_consumed_prefix_restore = None;
+                        current_clause_remainder_origin = None;
                         let mut updated_raw_input =
                             Self::current_raw_input_suffix(&raw_input, corresponding_count);
                         updated_raw_input.push_str(text);

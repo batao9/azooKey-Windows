@@ -1103,9 +1103,17 @@ impl IPCService {
         let response = response.into_inner();
         self.observe_server_session("advance_clause", response.server_session_id);
         self.invalidate_input_ledger();
+        let shrunk = Self::candidates_from_composing_text(response.shrunk_text)?;
+        let navigation = Self::candidates_from_composing_text(response.navigation_text)?;
+        let raw_input = if response.raw_input.is_empty() && !navigation.hiragana.is_empty() {
+            super::composition::ClauseAdvanceRawInput::Unavailable
+        } else {
+            super::composition::ClauseAdvanceRawInput::Verified(response.raw_input)
+        };
         Ok(super::composition::ClauseAdvance {
-            shrunk: Self::candidates_from_composing_text(response.shrunk_text)?,
-            navigation: Self::candidates_from_composing_text(response.navigation_text)?,
+            shrunk,
+            navigation,
+            raw_input,
         })
     }
 
@@ -1135,6 +1143,7 @@ impl IPCService {
                 Ok(super::composition::ClauseAdvance {
                     shrunk: Self::candidates_from_composing_text(advance.shrunk_text)?,
                     navigation: Self::candidates_from_composing_text(advance.navigation_text)?,
+                    raw_input: super::composition::ClauseAdvanceRawInput::Unverified,
                 })
             })
             .collect()
@@ -1155,6 +1164,55 @@ impl IPCService {
         self.observe_server_session("move_cursor", response.server_session_id);
         self.record_successful_move(offset);
         Self::candidates_from_composing_text(response.composing_text)
+    }
+
+    fn send_adjust_clause_boundary(
+        &mut self,
+        current_input_count: i32,
+        direction: i32,
+        expected_raw_input: &str,
+        request_id: u64,
+    ) -> anyhow::Result<super::composition::ClauseBoundaryAdjustment> {
+        let mut request = tonic::Request::new(shared::proto::AdjustClauseBoundaryRequest {
+            current_input_count,
+            direction,
+            request_id,
+            expected_raw_input: expected_raw_input.to_string(),
+        });
+        request.set_timeout(INPUT_RPC_DEADLINE);
+        let response = Self::block_on_server_rpc(
+            self.runtime.as_ref(),
+            &self.recovery,
+            "adjust_clause_boundary",
+            INPUT_RPC_DEADLINE,
+            self.azookey_client.adjust_clause_boundary(request),
+        )?
+        .into_inner();
+        self.observe_server_session("adjust_clause_boundary", response.server_session_id);
+        if !response.applied {
+            return Ok(super::composition::ClauseBoundaryAdjustment::skipped());
+        }
+
+        let candidates = Self::candidates_from_composing_text(response.composing_text)?;
+        if candidates.texts.is_empty()
+            || !candidates
+                .corresponding_count
+                .contains(&response.adjusted_input_count)
+        {
+            anyhow::bail!(
+                "adjust_clause_boundary returned no candidate for input boundary {}",
+                response.adjusted_input_count
+            );
+        }
+
+        // Cursor materialization is absolute and may include a large jump from
+        // the server's previous position. The recovery ledger stores only
+        // relative edits, so do not replay an ambiguous pre-adjustment cursor.
+        self.invalidate_input_ledger();
+        Ok(super::composition::ClauseBoundaryAdjustment::applied(
+            candidates,
+            response.adjusted_input_count,
+        ))
     }
 
     fn send_update_composition_snapshot(
@@ -1742,6 +1800,7 @@ impl IPCService {
                 // refresh can recover only the current navigation candidates.
                 shrunk: navigation.clone(),
                 navigation,
+                raw_input: super::composition::ClauseAdvanceRawInput::Unavailable,
             }),
         )
     }
@@ -1860,6 +1919,61 @@ impl IPCService {
         );
         let (candidates, _) = result?;
         Ok(candidates)
+    }
+
+    #[tracing::instrument(skip(self, previous_candidates))]
+    pub(crate) fn adjust_clause_boundary(
+        &mut self,
+        current_input_count: i32,
+        direction: i32,
+        expected_raw_input: &str,
+        previous_candidates: &Candidates,
+    ) -> anyhow::Result<super::composition::ClauseBoundaryAdjustment> {
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
+        let result = self
+            .run_rpc_with_reconnect("adjust_clause_boundary", |this| {
+                this.send_adjust_clause_boundary(
+                    current_input_count,
+                    direction,
+                    expected_raw_input,
+                    request_id,
+                )
+            })
+            .and_then(|(adjustment, reconnected)| {
+                if reconnected
+                    && adjustment.adjusted_input_count.is_some()
+                    && !previous_candidates.hiragana.is_empty()
+                    && adjustment.candidates.hiragana != previous_candidates.hiragana
+                {
+                    anyhow::bail!(
+                        "adjust_clause_boundary reconnected into an unrelated composition"
+                    );
+                }
+                Ok(adjustment)
+            });
+        self.log_client_performance_from_start(
+            performance_start,
+            request_id,
+            "adjust_clause_boundary",
+            "rpc_total",
+            || match &result {
+                Ok(adjustment) => format!(
+                    "status=success;current_input_count={current_input_count};expected_input_count={};direction={direction};applied={};adjusted_input_count={}",
+                    expected_raw_input.chars().count(),
+                    adjustment.adjusted_input_count.is_some(),
+                    adjustment
+                        .adjusted_input_count
+                        .map(|count| count.to_string())
+                        .unwrap_or_else(|| "-".to_string())
+                ),
+                Err(error) => format!(
+                    "status=error;current_input_count={current_input_count};expected_input_count={};direction={direction};error={error:?}",
+                    expected_raw_input.chars().count()
+                ),
+            },
+        );
+        result
     }
 
     #[tracing::instrument(skip(self, previous_candidates))]

@@ -75,6 +75,27 @@ message MoveCursorRequest {
   uint64 request_id = 2;
 }
 
+// Moves a clause boundary to the adjacent independent input segment. The
+// current boundary is expressed in raw input elements so alternate romaji
+// spellings remain atomic even when their kana lengths differ.
+message AdjustClauseBoundaryRequest {
+  int32 current_input_count = 1;
+  int32 direction = 2;
+  uint64 request_id = 3;
+  // Raw input currently materialized on the client (the full current
+  // remainder, not only the selected clause). This gives
+  // current_input_count an unambiguous coordinate space.
+  string expected_raw_input = 4;
+}
+
+message AdjustClauseBoundaryResponse {
+  ComposingText composing_text = 1;
+  bool applied = 2;
+  int32 adjusted_input_count = 3;
+  int32 cursor_offset = 4;
+  uint64 server_session_id = 5;
+}
+
 enum CompositionSnapshotOperation {
   COMPOSITION_SNAPSHOT_OPERATION_UNSPECIFIED = 0;
   COMPOSITION_SNAPSHOT_OPERATION_CLEAR = 1;
@@ -113,6 +134,9 @@ message AdvanceClauseResponse {
   ComposingText shrunk_text = 1;
   ComposingText navigation_text = 2;
   uint64 server_session_id = 3;
+  // Raw input that remains after the server atomically shrinks the current
+  // clause. The client uses this to validate cached future-clause snapshots.
+  string raw_input = 4;
 }
 
 message PreparedClauseAdvance {
@@ -209,6 +233,7 @@ service AzookeyService {
   rpc AdvanceClause (AdvanceClauseRequest) returns (AdvanceClauseResponse);
   rpc PrepareFutureClauses (PrepareFutureClausesRequest) returns (PrepareFutureClausesResponse);
   rpc MoveCursor (MoveCursorRequest) returns (MoveCursorResponse);
+  rpc AdjustClauseBoundary (AdjustClauseBoundaryRequest) returns (AdjustClauseBoundaryResponse);
   rpc UpdateCompositionSnapshot (UpdateCompositionSnapshotRequest) returns (UpdateCompositionSnapshotResponse);
   rpc ClearText (ClearTextRequest) returns (ClearTextResponse);
   rpc SetContext (SetContextRequest) returns (SetContextResponse);

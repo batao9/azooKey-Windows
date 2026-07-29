@@ -3,8 +3,9 @@ use super::{
     language_bar_toggle_requires_deferred_replay, mode_switch_request_is_current,
     requires_action_recovery, requires_server_resynchronization, Candidates,
     CapsLockKeyboardLayout, ClauseActionBackend, ClauseActionEffect, ClauseActionStateMut,
-    ClauseAdvance, ClauseNavigationReadyUiSync, ClauseSnapshot, ClauseState, Composition,
-    CompositionReducer, CompositionState, DeferredClientAction, DeferredInputEvent,
+    ClauseAdvance, ClauseAdvanceRawInput, ClauseBoundaryAdjustment, ClauseBoundarySync,
+    ClauseNavigationReadyUiSync, ClauseSnapshot, ClauseState, Composition, CompositionReducer,
+    CompositionState, ConsumedPrefixRestore, DeferredClientAction, DeferredInputEvent,
     DeferredProjection, DeferredUserAction, FutureClauseSnapshot, TextServiceFactory,
 };
 use crate::engine::{
@@ -1368,6 +1369,7 @@ fn move_clause_to_last_stops_when_right_move_makes_no_progress() {
     let mut current_clause_is_direct_split_remainder = false;
     let mut current_clause_has_split_left_neighbor = false;
     let mut current_clause_split_group_id = None;
+    let mut current_clause_consumed_prefix_restore = None;
     let mut next_split_group_id = 1;
     let mut backend = NonProgressMoveBackend { shrink_calls: 0 };
 
@@ -1384,8 +1386,13 @@ fn move_clause_to_last_stops_when_right_move_makes_no_progress() {
         future_clause_snapshots: &mut future_clause_snapshots,
         current_clause_is_split_derived: &mut current_clause_is_split_derived,
         current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+        current_clause_is_pending_remainder: &mut false,
         current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+        current_clause_right_boundary_displacement: &mut 0,
+        current_clause_right_boundary_origin: &mut None,
         current_clause_split_group_id: &mut current_clause_split_group_id,
+        current_clause_consumed_prefix_restore: &mut current_clause_consumed_prefix_restore,
+        current_clause_remainder_origin: &mut None,
         next_split_group_id: &mut next_split_group_id,
     };
 
@@ -1430,6 +1437,7 @@ impl ClauseActionBackend for BatchedClauseAdvanceBackend {
         Ok(ClauseAdvance {
             shrunk: next.clone(),
             navigation: next,
+            raw_input: ClauseAdvanceRawInput::Unverified,
         })
     }
 }
@@ -1450,6 +1458,7 @@ fn move_clause_right_uses_one_batched_backend_operation() {
     let mut current_clause_is_direct_split_remainder = false;
     let mut current_clause_has_split_left_neighbor = false;
     let mut current_clause_split_group_id = None;
+    let mut current_clause_consumed_prefix_restore = None;
     let mut next_split_group_id = 1;
     let mut backend = BatchedClauseAdvanceBackend { advance_calls: 0 };
 
@@ -1466,8 +1475,13 @@ fn move_clause_right_uses_one_batched_backend_operation() {
         future_clause_snapshots: &mut future_clause_snapshots,
         current_clause_is_split_derived: &mut current_clause_is_split_derived,
         current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+        current_clause_is_pending_remainder: &mut false,
         current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+        current_clause_right_boundary_displacement: &mut 0,
+        current_clause_right_boundary_origin: &mut None,
         current_clause_split_group_id: &mut current_clause_split_group_id,
+        current_clause_consumed_prefix_restore: &mut current_clause_consumed_prefix_restore,
+        current_clause_remainder_origin: &mut None,
         next_split_group_id: &mut next_split_group_id,
     };
 
@@ -1583,6 +1597,7 @@ fn ensure_clause_navigation_uses_two_constant_backend_operations() {
     let mut current_clause_is_direct_split_remainder = false;
     let mut current_clause_has_split_left_neighbor = false;
     let mut current_clause_split_group_id = None;
+    let mut current_clause_consumed_prefix_restore = None;
     let mut next_split_group_id = 1;
     let mut backend = NonProgressEnsureBackend {
         move_cursor_zero_calls: 0,
@@ -1603,8 +1618,13 @@ fn ensure_clause_navigation_uses_two_constant_backend_operations() {
         future_clause_snapshots: &mut future_clause_snapshots,
         current_clause_is_split_derived: &mut current_clause_is_split_derived,
         current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+        current_clause_is_pending_remainder: &mut false,
         current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+        current_clause_right_boundary_displacement: &mut 0,
+        current_clause_right_boundary_origin: &mut None,
         current_clause_split_group_id: &mut current_clause_split_group_id,
+        current_clause_consumed_prefix_restore: &mut current_clause_consumed_prefix_restore,
+        current_clause_remainder_origin: &mut None,
         next_split_group_id: &mut next_split_group_id,
     };
 
@@ -1616,6 +1636,183 @@ fn ensure_clause_navigation_uses_two_constant_backend_operations() {
     assert_eq!(backend.prepare_calls, 1);
     assert_eq!(backend.shrink_calls, 0);
     assert!(future_clause_snapshots.is_empty());
+}
+
+struct AtomicBoundaryBackend {
+    adjustment: ClauseBoundaryAdjustment,
+    adjust_calls: usize,
+    move_calls: usize,
+    last_adjustment_request: Option<(i32, i32, String, String, String, Candidates)>,
+}
+
+impl ClauseActionBackend for AtomicBoundaryBackend {
+    fn move_cursor(&mut self, _offset: i32) -> anyhow::Result<Candidates> {
+        self.move_calls += 1;
+        Ok(Candidates::default())
+    }
+
+    fn shrink_text(&mut self, _offset: i32) -> anyhow::Result<Candidates> {
+        Ok(Candidates::default())
+    }
+
+    fn adjust_clause_boundary(
+        &mut self,
+        current_input_count: i32,
+        direction: i32,
+        expected_raw_input: &str,
+        target_raw_hiragana: &str,
+        target_sub_text: &str,
+        previous_candidates: &Candidates,
+    ) -> anyhow::Result<ClauseBoundaryAdjustment> {
+        self.adjust_calls += 1;
+        self.last_adjustment_request = Some((
+            current_input_count,
+            direction,
+            expected_raw_input.to_string(),
+            target_raw_hiragana.to_string(),
+            target_sub_text.to_string(),
+            previous_candidates.clone(),
+        ));
+        Ok(self.adjustment.clone())
+    }
+}
+
+#[test]
+fn adjust_boundary_uses_one_atomic_backend_operation() {
+    let mut preview = "か".to_string();
+    let mut suffix = "とう".to_string();
+    let mut raw_input = "katou".to_string();
+    let mut raw_hiragana = "かとう".to_string();
+    let mut fixed_prefix = String::new();
+    let mut corresponding_count = 2;
+    let mut selection_index = 0;
+    let mut current_candidates = candidates(&["か"], &["とう"], "かとう", &[2]);
+    let mut clause_snapshots = Vec::new();
+    let mut future_clause_snapshots = Vec::new();
+    let mut current_clause_is_split_derived = true;
+    let mut current_clause_is_direct_split_remainder = false;
+    let mut current_clause_has_split_left_neighbor = false;
+    let mut current_clause_split_group_id = Some(1);
+    let mut current_clause_consumed_prefix_restore = None;
+    let mut next_split_group_id = 2;
+    let mut backend = AtomicBoundaryBackend {
+        adjustment: ClauseBoundaryAdjustment::applied(
+            candidates(&["加藤"], &["う"], "かとう", &[4]),
+            4,
+        ),
+        adjust_calls: 0,
+        move_calls: 0,
+        last_adjustment_request: None,
+    };
+
+    let mut state = ClauseActionStateMut {
+        preview: &mut preview,
+        suffix: &mut suffix,
+        raw_input: &mut raw_input,
+        raw_hiragana: &mut raw_hiragana,
+        fixed_prefix: &mut fixed_prefix,
+        corresponding_count: &mut corresponding_count,
+        selection_index: &mut selection_index,
+        candidates: &mut current_candidates,
+        clause_snapshots: &mut clause_snapshots,
+        future_clause_snapshots: &mut future_clause_snapshots,
+        current_clause_is_split_derived: &mut current_clause_is_split_derived,
+        current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+        current_clause_is_pending_remainder: &mut false,
+        current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+        current_clause_right_boundary_displacement: &mut 0,
+        current_clause_right_boundary_origin: &mut None,
+        current_clause_split_group_id: &mut current_clause_split_group_id,
+        current_clause_consumed_prefix_restore: &mut current_clause_consumed_prefix_restore,
+        current_clause_remainder_origin: &mut None,
+        next_split_group_id: &mut next_split_group_id,
+    };
+
+    let effect = TextServiceFactory::apply_adjust_boundary(&mut state, &mut backend, 1)
+        .expect("atomic boundary adjustment should return");
+
+    assert!(effect.applied);
+    assert_eq!(backend.adjust_calls, 1);
+    assert_eq!(backend.move_calls, 0);
+    assert_eq!(
+        backend.last_adjustment_request,
+        Some((
+            2,
+            1,
+            "katou".to_string(),
+            "か".to_string(),
+            "とう".to_string(),
+            candidates(&["か"], &["とう"], "かとう", &[2]),
+        ))
+    );
+    assert_eq!(corresponding_count, 4);
+    assert_eq!(preview, "加藤");
+}
+
+#[test]
+fn adjust_boundary_noop_keeps_client_state_transactional() {
+    let mut preview = "か".to_string();
+    let mut suffix = "とう".to_string();
+    let mut raw_input = "katou".to_string();
+    let mut raw_hiragana = "かとう".to_string();
+    let mut fixed_prefix = String::new();
+    let mut corresponding_count = 2;
+    let mut selection_index = 0;
+    let mut current_candidates = candidates(&["か"], &["とう"], "かとう", &[2]);
+    let before_candidates = current_candidates.clone();
+    let mut clause_snapshots = Vec::new();
+    let mut future_clause_snapshots = Vec::new();
+    let mut current_clause_is_split_derived = true;
+    let mut current_clause_is_direct_split_remainder = false;
+    let mut current_clause_has_split_left_neighbor = false;
+    let mut current_clause_split_group_id = Some(1);
+    let mut current_clause_consumed_prefix_restore = None;
+    let mut next_split_group_id = 2;
+    let mut backend = AtomicBoundaryBackend {
+        adjustment: ClauseBoundaryAdjustment::skipped(),
+        adjust_calls: 0,
+        move_calls: 0,
+        last_adjustment_request: None,
+    };
+
+    let mut state = ClauseActionStateMut {
+        preview: &mut preview,
+        suffix: &mut suffix,
+        raw_input: &mut raw_input,
+        raw_hiragana: &mut raw_hiragana,
+        fixed_prefix: &mut fixed_prefix,
+        corresponding_count: &mut corresponding_count,
+        selection_index: &mut selection_index,
+        candidates: &mut current_candidates,
+        clause_snapshots: &mut clause_snapshots,
+        future_clause_snapshots: &mut future_clause_snapshots,
+        current_clause_is_split_derived: &mut current_clause_is_split_derived,
+        current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+        current_clause_is_pending_remainder: &mut false,
+        current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+        current_clause_right_boundary_displacement: &mut 0,
+        current_clause_right_boundary_origin: &mut None,
+        current_clause_split_group_id: &mut current_clause_split_group_id,
+        current_clause_consumed_prefix_restore: &mut current_clause_consumed_prefix_restore,
+        current_clause_remainder_origin: &mut None,
+        next_split_group_id: &mut next_split_group_id,
+    };
+
+    let effect = TextServiceFactory::apply_adjust_boundary(&mut state, &mut backend, 1)
+        .expect("no-op boundary adjustment should return");
+
+    assert!(!effect.applied);
+    assert_eq!(backend.adjust_calls, 1);
+    assert_eq!(backend.move_calls, 0);
+    assert_eq!(preview, "か");
+    assert_eq!(suffix, "とう");
+    assert_eq!(raw_input, "katou");
+    assert_eq!(raw_hiragana, "かとう");
+    assert_eq!(corresponding_count, 2);
+    assert_eq!(selection_index, 0);
+    assert_eq!(current_candidates, before_candidates);
+    assert_eq!(current_clause_split_group_id, Some(1));
+    assert_eq!(next_split_group_id, 2);
 }
 
 struct PreserveSelectionEnsureBackend;
@@ -1706,6 +1903,7 @@ fn ensure_clause_navigation_preserves_current_candidate_selection() {
     let mut current_clause_is_direct_split_remainder = false;
     let mut current_clause_has_split_left_neighbor = false;
     let mut current_clause_split_group_id = None;
+    let mut current_clause_consumed_prefix_restore = None;
     let mut next_split_group_id = 1;
     let mut backend = PreserveSelectionEnsureBackend;
 
@@ -1722,8 +1920,13 @@ fn ensure_clause_navigation_preserves_current_candidate_selection() {
         future_clause_snapshots: &mut future_clause_snapshots,
         current_clause_is_split_derived: &mut current_clause_is_split_derived,
         current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+        current_clause_is_pending_remainder: &mut false,
         current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+        current_clause_right_boundary_displacement: &mut 0,
+        current_clause_right_boundary_origin: &mut None,
         current_clause_split_group_id: &mut current_clause_split_group_id,
+        current_clause_consumed_prefix_restore: &mut current_clause_consumed_prefix_restore,
+        current_clause_remainder_origin: &mut None,
         next_split_group_id: &mut next_split_group_id,
     };
 
@@ -1758,6 +1961,7 @@ fn ensure_clause_navigation_matches_current_preview_before_reusing_index() {
     let mut current_clause_is_direct_split_remainder = false;
     let mut current_clause_has_split_left_neighbor = false;
     let mut current_clause_split_group_id = None;
+    let mut current_clause_consumed_prefix_restore = None;
     let mut next_split_group_id = 1;
     let mut backend = ReorderedNavigationEnsureBackend;
 
@@ -1774,8 +1978,13 @@ fn ensure_clause_navigation_matches_current_preview_before_reusing_index() {
         future_clause_snapshots: &mut future_clause_snapshots,
         current_clause_is_split_derived: &mut current_clause_is_split_derived,
         current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+        current_clause_is_pending_remainder: &mut false,
         current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+        current_clause_right_boundary_displacement: &mut 0,
+        current_clause_right_boundary_origin: &mut None,
         current_clause_split_group_id: &mut current_clause_split_group_id,
+        current_clause_consumed_prefix_restore: &mut current_clause_consumed_prefix_restore,
+        current_clause_remainder_origin: &mut None,
         next_split_group_id: &mut next_split_group_id,
     };
 
@@ -1810,6 +2019,7 @@ fn ensure_clause_navigation_preserves_fkey_display_preview() {
     let mut current_clause_is_direct_split_remainder = false;
     let mut current_clause_has_split_left_neighbor = false;
     let mut current_clause_split_group_id = None;
+    let mut current_clause_consumed_prefix_restore = None;
     let mut next_split_group_id = 1;
     let mut backend = FKeyDisplayEnsureBackend { shrunk: false };
 
@@ -1826,8 +2036,13 @@ fn ensure_clause_navigation_preserves_fkey_display_preview() {
         future_clause_snapshots: &mut future_clause_snapshots,
         current_clause_is_split_derived: &mut current_clause_is_split_derived,
         current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+        current_clause_is_pending_remainder: &mut false,
         current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+        current_clause_right_boundary_displacement: &mut 0,
+        current_clause_right_boundary_origin: &mut None,
         current_clause_split_group_id: &mut current_clause_split_group_id,
+        current_clause_consumed_prefix_restore: &mut current_clause_consumed_prefix_restore,
+        current_clause_remainder_origin: &mut None,
         next_split_group_id: &mut next_split_group_id,
     };
 
@@ -1878,6 +2093,7 @@ fn ensure_clause_navigation_clamps_out_of_range_selection_index() {
     let mut current_clause_is_direct_split_remainder = false;
     let mut current_clause_has_split_left_neighbor = false;
     let mut current_clause_split_group_id = None;
+    let mut current_clause_consumed_prefix_restore = None;
     let mut next_split_group_id = 1;
     let mut backend = PreserveSelectionEnsureBackend;
 
@@ -1894,8 +2110,13 @@ fn ensure_clause_navigation_clamps_out_of_range_selection_index() {
         future_clause_snapshots: &mut future_clause_snapshots,
         current_clause_is_split_derived: &mut current_clause_is_split_derived,
         current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+        current_clause_is_pending_remainder: &mut false,
         current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+        current_clause_right_boundary_displacement: &mut 0,
+        current_clause_right_boundary_origin: &mut None,
         current_clause_split_group_id: &mut current_clause_split_group_id,
+        current_clause_consumed_prefix_restore: &mut current_clause_consumed_prefix_restore,
+        current_clause_remainder_origin: &mut None,
         next_split_group_id: &mut next_split_group_id,
     };
 
@@ -1985,6 +2206,7 @@ fn move_clause_right_preserves_future_clause_when_server_returns_collapsed_remai
     let mut current_clause_is_direct_split_remainder = false;
     let mut current_clause_has_split_left_neighbor = false;
     let mut current_clause_split_group_id = None;
+    let mut current_clause_consumed_prefix_restore = None;
     let mut next_split_group_id = 1;
     let mut backend = MoveRightCollapsedRemainderBackend { moved_left: false };
 
@@ -2001,8 +2223,13 @@ fn move_clause_right_preserves_future_clause_when_server_returns_collapsed_remai
         future_clause_snapshots: &mut future_clause_snapshots,
         current_clause_is_split_derived: &mut current_clause_is_split_derived,
         current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+        current_clause_is_pending_remainder: &mut false,
         current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+        current_clause_right_boundary_displacement: &mut 0,
+        current_clause_right_boundary_origin: &mut None,
         current_clause_split_group_id: &mut current_clause_split_group_id,
+        current_clause_consumed_prefix_restore: &mut current_clause_consumed_prefix_restore,
+        current_clause_remainder_origin: &mut None,
         next_split_group_id: &mut next_split_group_id,
     };
 
@@ -2103,6 +2330,7 @@ fn initial_auto_split_recovers_single_n_suffix_without_reinput() {
     let mut current_clause_is_direct_split_remainder = false;
     let mut current_clause_has_split_left_neighbor = false;
     let mut current_clause_split_group_id = None;
+    let mut current_clause_consumed_prefix_restore = None;
     let mut next_split_group_id = 1;
     let mut backend = InitialSplitSingleNBoundaryBackend {
         server: SingleNBoundaryServerState::Full,
@@ -2123,8 +2351,13 @@ fn initial_auto_split_recovers_single_n_suffix_without_reinput() {
             future_clause_snapshots: &mut future_clause_snapshots,
             current_clause_is_split_derived: &mut current_clause_is_split_derived,
             current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+            current_clause_is_pending_remainder: &mut false,
             current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+            current_clause_right_boundary_displacement: &mut 0,
+            current_clause_right_boundary_origin: &mut None,
             current_clause_split_group_id: &mut current_clause_split_group_id,
+            current_clause_consumed_prefix_restore: &mut current_clause_consumed_prefix_restore,
+            current_clause_remainder_origin: &mut None,
             next_split_group_id: &mut next_split_group_id,
         };
         let effect = TextServiceFactory::ensure_clause_navigation_ready(&mut state, &mut backend)
@@ -2168,8 +2401,13 @@ fn initial_auto_split_recovers_single_n_suffix_without_reinput() {
             future_clause_snapshots: &mut future_clause_snapshots,
             current_clause_is_split_derived: &mut current_clause_is_split_derived,
             current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+            current_clause_is_pending_remainder: &mut false,
             current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+            current_clause_right_boundary_displacement: &mut 0,
+            current_clause_right_boundary_origin: &mut None,
             current_clause_split_group_id: &mut current_clause_split_group_id,
+            current_clause_consumed_prefix_restore: &mut current_clause_consumed_prefix_restore,
+            current_clause_remainder_origin: &mut None,
             next_split_group_id: &mut next_split_group_id,
         };
         let effect = TextServiceFactory::apply_move_clause(&mut state, &mut backend, 1)

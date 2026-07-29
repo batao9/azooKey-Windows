@@ -7,13 +7,14 @@ use windows::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass, HIG
 
 use shared::proto::azookey_service_server::{AzookeyService, AzookeyServiceServer};
 use shared::proto::{
-    AdvanceClauseRequest, AdvanceClauseResponse, AppendTextRequest, AppendTextResponse,
-    ClearTextRequest, ClearTextResponse, ComposingText, CompositionOperationKind,
-    CompositionSnapshotOperation, MoveCursorRequest, MoveCursorResponse, PerformanceLogRequest,
-    PerformanceLogResponse, PrepareFutureClausesRequest, PrepareFutureClausesResponse,
-    PreparedClauseAdvance, RemoveTextRequest, RemoveTextResponse, ReplaceCompositionRequest,
-    ReplaceCompositionResponse, ShrinkTextRequest, ShrinkTextResponse, Suggestion,
-    UpdateCompositionSnapshotRequest, UpdateCompositionSnapshotResponse,
+    AdjustClauseBoundaryRequest, AdjustClauseBoundaryResponse, AdvanceClauseRequest,
+    AdvanceClauseResponse, AppendTextRequest, AppendTextResponse, ClearTextRequest,
+    ClearTextResponse, ComposingText, CompositionOperationKind, CompositionSnapshotOperation,
+    MoveCursorRequest, MoveCursorResponse, PerformanceLogRequest, PerformanceLogResponse,
+    PrepareFutureClausesRequest, PrepareFutureClausesResponse, PreparedClauseAdvance,
+    RemoveTextRequest, RemoveTextResponse, ReplaceCompositionRequest, ReplaceCompositionResponse,
+    ShrinkTextRequest, ShrinkTextResponse, Suggestion, UpdateCompositionSnapshotRequest,
+    UpdateCompositionSnapshotResponse,
 };
 use shared::{AppConfig, SERVER_PIPE_PATH};
 
@@ -409,6 +410,15 @@ unsafe extern "C" {
     fn AppendTextDirect(input: *const c_char, cursorPtr: *mut c_int) -> *mut c_char;
     fn RemoveText(cursorPtr: *mut c_int) -> *mut c_char;
     fn MoveCursor(offset: c_int, cursorPtr: *mut c_int) -> *mut c_char;
+    fn GetRawInput() -> *mut c_char;
+    fn AdjustClauseBoundary(
+        currentInputCount: c_int,
+        direction: c_int,
+        expectedRawInput: *const c_char,
+        appliedPtr: *mut c_int,
+        adjustedInputCountPtr: *mut c_int,
+        cursorOffsetPtr: *mut c_int,
+    ) -> *mut c_char;
     fn ClearComposingTextSnapshots();
     fn PushComposingTextSnapshot();
     fn PopComposingTextSnapshot();
@@ -417,7 +427,10 @@ unsafe extern "C" {
     fn Warmup() -> bool;
     fn HasActiveComposition() -> bool;
     fn GetComposedText(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
-    fn GetComposedTextForCursorPrefix(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
+    fn GetComposedTextForCursorPrefix(
+        requiredInputCount: c_int,
+        lengthPtr: *mut c_int,
+    ) -> *mut *mut FFICandidate;
     fn FreeCString(ptr: *mut c_char);
     fn FreeCandidateList(ptr: *mut *mut FFICandidate, length: c_int);
     fn CommitLearningCandidate(candidateId: u64, commitKind: c_int) -> bool;
@@ -1158,6 +1171,64 @@ fn move_cursor(offset: i32) -> Result<RawComposingText, String> {
     }
 }
 
+fn get_raw_input() -> Result<String, String> {
+    unsafe { ffi_text_result("GetRawInput", GetRawInput()) }
+}
+
+struct RawClauseBoundaryAdjustment {
+    text: String,
+    applied: bool,
+    adjusted_input_count: i32,
+    cursor_offset: i32,
+}
+
+fn adjust_clause_boundary(
+    current_input_count: i32,
+    direction: i32,
+    expected_raw_input: &str,
+) -> Result<RawClauseBoundaryAdjustment, String> {
+    let expected_raw_input =
+        cstring_from_input("AdjustClauseBoundary.expectedRawInput", expected_raw_input)?;
+    unsafe {
+        let mut applied: c_int = 0;
+        let mut adjusted_input_count: c_int = current_input_count;
+        let mut cursor_offset: c_int = 0;
+        let result = AdjustClauseBoundary(
+            current_input_count,
+            direction,
+            expected_raw_input.as_ptr(),
+            &mut applied,
+            &mut adjusted_input_count,
+            &mut cursor_offset,
+        );
+        let text = ffi_text_result("AdjustClauseBoundary", result)?;
+
+        Ok(RawClauseBoundaryAdjustment {
+            text,
+            applied: applied != 0,
+            adjusted_input_count,
+            cursor_offset,
+        })
+    }
+}
+
+fn rollback_clause_boundary(
+    adjusted_input_count: i32,
+    original_input_count: i32,
+    direction: i32,
+    expected_raw_input: &str,
+) -> Result<(), String> {
+    let rollback = adjust_clause_boundary(adjusted_input_count, -direction, expected_raw_input)?;
+    if rollback.applied && rollback.adjusted_input_count == original_input_count {
+        Ok(())
+    } else {
+        Err(format!(
+            "AdjustClauseBoundary rollback failed: applied={} adjusted_input_count={} expected_input_count={original_input_count}",
+            rollback.applied, rollback.adjusted_input_count
+        ))
+    }
+}
+
 fn remove_text() -> Result<RawComposingText, String> {
     unsafe {
         let mut cursor: c_int = 0;
@@ -1198,7 +1269,11 @@ fn update_active_composition_state(text: &str) {
     HAS_ACTIVE_COMPOSITION.store(!text.is_empty(), Ordering::Relaxed);
 }
 
-fn get_composed_text(use_cursor_prefix: bool, request_id: u64) -> Result<ComposedText, String> {
+fn get_composed_text(
+    use_cursor_prefix: bool,
+    required_cursor_prefix_input_count: Option<i32>,
+    request_id: u64,
+) -> Result<ComposedText, String> {
     let mut length: c_int = 0;
     let operation = if use_cursor_prefix {
         "get_composed_text_for_cursor_prefix"
@@ -1208,7 +1283,10 @@ fn get_composed_text(use_cursor_prefix: bool, request_id: u64) -> Result<Compose
     let ffi_call_start = Instant::now();
     let result = unsafe {
         if use_cursor_prefix {
-            GetComposedTextForCursorPrefix(&mut length)
+            GetComposedTextForCursorPrefix(
+                required_cursor_prefix_input_count.unwrap_or(-1),
+                &mut length,
+            )
         } else {
             GetComposedText(&mut length)
         }
@@ -1395,7 +1473,7 @@ impl AzookeyService for MyAzookeyService {
             "input_len={input_len};input_style={input_style}"
         );
         let get_composed_start = Instant::now();
-        let composed_text = get_composed_text(false, request_id)
+        let composed_text = get_composed_text(false, None, request_id)
             .map_err(|error| status_from_error("append_text", error))?;
         performance_event_lazy!(
             request_id,
@@ -1481,7 +1559,7 @@ impl AzookeyService for MyAzookeyService {
                 suggestions: Vec::new(),
             }
         } else {
-            get_composed_text(false, request_id)
+            get_composed_text(false, None, request_id)
                 .map_err(|error| status_from_error("replace_composition", error))?
         };
         update_active_composition_state(&composing_text.text);
@@ -1528,7 +1606,7 @@ impl AzookeyService for MyAzookeyService {
             composing_text.text.chars().count()
         );
         let get_composed_start = Instant::now();
-        let composed_text = get_composed_text(false, request_id)
+        let composed_text = get_composed_text(false, None, request_id)
             .map_err(|error| status_from_error("remove_text", error))?;
         performance_event_lazy!(
             request_id,
@@ -1584,7 +1662,7 @@ impl AzookeyService for MyAzookeyService {
             composing_text.text.chars().count()
         );
         let get_composed_start = Instant::now();
-        let composed_text = get_composed_text(use_cursor_prefix, request_id)
+        let composed_text = get_composed_text(use_cursor_prefix, None, request_id)
             .map_err(|error| status_from_error("move_cursor", error))?;
         performance_event_lazy!(
             request_id,
@@ -1611,6 +1689,150 @@ impl AzookeyService for MyAzookeyService {
                 hiragana: composed_text.hiragana.unwrap_or(composing_text.text),
                 suggestions: composed_text.suggestions,
             }),
+            server_session_id: server_session_id(),
+        }))
+    }
+
+    async fn adjust_clause_boundary(
+        &self,
+        request: Request<AdjustClauseBoundaryRequest>,
+    ) -> Result<Response<AdjustClauseBoundaryResponse>, Status> {
+        let _mutation_guard = self.mutation_lock.lock().await;
+        let request = request.into_inner();
+        let _request_guard = ServerRequestGuard::begin(true);
+        let request_id = request_id_or_next(request.request_id);
+        set_request_id(request_id);
+        let handler_start = Instant::now();
+        let current_input_count = validate_shrink_offset(request.current_input_count)?;
+        let expected_raw_input = request.expected_raw_input;
+        let expected_input_count = expected_raw_input.chars().count();
+        if current_input_count as usize > expected_input_count {
+            return Err(Status::invalid_argument(
+                "adjust_clause_boundary boundary exceeds expected raw input",
+            ));
+        }
+        let direction = match request.direction {
+            -1 | 1 => request.direction,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "adjust_clause_boundary direction must be -1 or 1",
+                ));
+            }
+        };
+
+        let adjust_start = Instant::now();
+        let adjustment =
+            adjust_clause_boundary(current_input_count, direction, &expected_raw_input)
+                .map_err(|error| status_from_error("adjust_clause_boundary", error))?;
+        performance_event_lazy!(
+            request_id,
+            "adjust_clause_boundary",
+            "swift_adjust_boundary",
+            elapsed_ms(adjust_start),
+            "current_input_count={current_input_count};expected_input_count={};direction={direction};applied={};adjusted_input_count={};cursor_offset={}",
+            expected_input_count,
+            adjustment.applied,
+            adjustment.adjusted_input_count,
+            adjustment.cursor_offset
+        );
+
+        if !adjustment.applied {
+            performance_event_lazy!(
+                request_id,
+                "adjust_clause_boundary",
+                "total",
+                elapsed_ms(handler_start),
+                "status=skipped;current_input_count={current_input_count};expected_input_count={};direction={direction}",
+                expected_input_count
+            );
+            return Ok(Response::new(AdjustClauseBoundaryResponse {
+                composing_text: None,
+                applied: false,
+                adjusted_input_count: current_input_count,
+                cursor_offset: 0,
+                server_session_id: server_session_id(),
+            }));
+        }
+
+        let get_composed_start = Instant::now();
+        let composed_text =
+            match get_composed_text(true, Some(adjustment.adjusted_input_count), request_id) {
+                Ok(composed_text) => composed_text,
+                Err(error) => {
+                    rollback_clause_boundary(
+                        adjustment.adjusted_input_count,
+                        current_input_count,
+                        direction,
+                        &expected_raw_input,
+                    )
+                    .map_err(|rollback_error| {
+                        status_from_error(
+                            "adjust_clause_boundary",
+                            format!("{error}; {rollback_error}"),
+                        )
+                    })?;
+                    return Err(status_from_error("adjust_clause_boundary", error));
+                }
+            };
+        performance_event_lazy!(
+            request_id,
+            "adjust_clause_boundary",
+            "swift_get_composed_text",
+            elapsed_ms(get_composed_start),
+            "suggestions={}",
+            composed_text.suggestions.len()
+        );
+
+        if !composed_text
+            .suggestions
+            .iter()
+            .any(|candidate| candidate.corresponding_count == adjustment.adjusted_input_count)
+        {
+            rollback_clause_boundary(
+                adjustment.adjusted_input_count,
+                current_input_count,
+                direction,
+                &expected_raw_input,
+            )
+            .map_err(|error| status_from_error("adjust_clause_boundary", error))?;
+            performance_event_lazy!(
+                request_id,
+                "adjust_clause_boundary",
+                "total",
+                elapsed_ms(handler_start),
+                "status=skipped_invalid_candidates;current_input_count={current_input_count};expected_input_count={};direction={direction};adjusted_input_count={}",
+                expected_input_count,
+                adjustment.adjusted_input_count
+            );
+            return Ok(Response::new(AdjustClauseBoundaryResponse {
+                composing_text: None,
+                applied: false,
+                adjusted_input_count: current_input_count,
+                cursor_offset: 0,
+                server_session_id: server_session_id(),
+            }));
+        }
+
+        update_active_composition_state(&adjustment.text);
+        performance_event_lazy!(
+            request_id,
+            "adjust_clause_boundary",
+            "total",
+            elapsed_ms(handler_start),
+            "status=success;current_input_count={current_input_count};expected_input_count={};direction={direction};adjusted_input_count={};cursor_offset={};suggestions={}",
+            expected_input_count,
+            adjustment.adjusted_input_count,
+            adjustment.cursor_offset,
+            composed_text.suggestions.len()
+        );
+        Ok(Response::new(AdjustClauseBoundaryResponse {
+            composing_text: Some(ComposingText {
+                hiragana: composed_text.hiragana.unwrap_or(adjustment.text),
+                suggestions: composed_text.suggestions,
+            }),
+            applied: true,
+            adjusted_input_count: adjustment.adjusted_input_count,
+            cursor_offset: adjustment.cursor_offset,
             server_session_id: server_session_id(),
         }))
     }
@@ -1709,7 +1931,7 @@ impl AzookeyService for MyAzookeyService {
             composing_text.text.chars().count()
         );
         let get_composed_start = Instant::now();
-        let composed_text = get_composed_text(false, request_id)
+        let composed_text = get_composed_text(false, None, request_id)
             .map_err(|error| status_from_error("shrink_text", error))?;
         performance_event_lazy!(
             request_id,
@@ -1756,6 +1978,8 @@ impl AzookeyService for MyAzookeyService {
         let shrink_start = Instant::now();
         let shrunk_text =
             shrink_text(raw_offset).map_err(|error| status_from_error("advance_clause", error))?;
+        let raw_input =
+            get_raw_input().map_err(|error| status_from_error("advance_clause", error))?;
         performance_event_lazy!(
             request_id,
             "advance_clause",
@@ -1767,7 +1991,7 @@ impl AzookeyService for MyAzookeyService {
         let move_start = Instant::now();
         let navigation_text =
             move_cursor(0).map_err(|error| status_from_error("advance_clause", error))?;
-        let navigation_composed = get_composed_text(true, request_id)
+        let navigation_composed = get_composed_text(true, None, request_id)
             .map_err(|error| status_from_error("advance_clause", error))?;
         performance_event_lazy!(
             request_id,
@@ -1801,6 +2025,7 @@ impl AzookeyService for MyAzookeyService {
             }),
             navigation_text: Some(navigation_composing_text),
             server_session_id: server_session_id(),
+            raw_input,
         }))
     }
 
@@ -1832,9 +2057,10 @@ impl AzookeyService for MyAzookeyService {
                 let navigation_text = move_cursor(0).map_err(|error| {
                     Box::new(status_from_error("prepare_future_clauses", error))
                 })?;
-                let navigation_composed = get_composed_text(true, request_id).map_err(|error| {
-                    Box::new(status_from_error("prepare_future_clauses", error))
-                })?;
+                let navigation_composed =
+                    get_composed_text(true, None, request_id).map_err(|error| {
+                        Box::new(status_from_error("prepare_future_clauses", error))
+                    })?;
 
                 let Some(selected) = navigation_composed.suggestions.first() else {
                     break;

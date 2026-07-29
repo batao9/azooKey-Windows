@@ -2177,6 +2177,114 @@ func cursorPrefixBoundaryFirstClauseResults(
     return _strdup(composingText.convertTarget)!
 }
 
+@_silgen_name("GetRawInput")
+@MainActor public func get_raw_input() -> UnsafeMutablePointer<CChar>? {
+    let characters = composingText.input.compactMap(inputCharacter)
+    guard characters.count == composingText.input.count else {
+        serverLog(
+            "ERROR",
+            "GetRawInput: failed inputCount=\(composingText.input.count) characterCount=\(characters.count)"
+        )
+        return nil
+    }
+    return _strdup(String(characters))
+}
+
+@_silgen_name("AdjustClauseBoundary")
+@MainActor public func adjust_clause_boundary(
+    currentInputCount: Int32,
+    direction: Int32,
+    expectedRawInput: UnsafePointer<CChar>? = nil,
+    appliedPtr: UnsafeMutablePointer<CInt>,
+    adjustedInputCountPtr: UnsafeMutablePointer<CInt>,
+    cursorOffsetPtr: UnsafeMutablePointer<CInt>
+) -> UnsafeMutablePointer<CChar> {
+    appliedPtr.pointee = 0
+    adjustedInputCountPtr.pointee = currentInputCount
+    cursorOffsetPtr.pointee = 0
+
+    guard currentInputCount >= 0, direction != 0 else {
+        serverLog(
+            "DEBUG",
+            "AdjustClauseBoundary: skipped currentInputCount=\(currentInputCount) direction=\(direction) reason=invalid_request"
+        )
+        return _strdup(composingText.convertTarget)!
+    }
+
+    if let expectedRawInput {
+        let expected = String(cString: expectedRawInput)
+        let actualCharacters = composingText.input.compactMap(inputCharacter)
+        let actual = String(actualCharacters)
+        guard actualCharacters.count == composingText.input.count, actual == expected else {
+            serverLog(
+                "ERROR",
+                "AdjustClauseBoundary: skipped currentInputCount=\(currentInputCount) direction=\(direction) reason=raw_input_mismatch expectedInputCount=\(expected.count) actualInputCount=\(composingText.input.count)"
+            )
+            return _strdup(composingText.convertTarget)!
+        }
+    }
+
+    let surfaceIndexByInputIndex = composingText.inputIndexToSurfaceIndexMap()
+    let inputBoundaries = surfaceIndexByInputIndex.keys.sorted()
+    guard let currentBoundaryIndex = inputBoundaries.firstIndex(of: Int(currentInputCount)),
+          let currentSurfaceIndex = surfaceIndexByInputIndex[Int(currentInputCount)]
+    else {
+        serverLog(
+            "DEBUG",
+            "AdjustClauseBoundary: skipped currentInputCount=\(currentInputCount) direction=\(direction) reason=missing_input_boundary"
+        )
+        return _strdup(composingText.convertTarget)!
+    }
+
+    let targetBoundaryIndex = direction < 0
+        ? currentBoundaryIndex - 1
+        : currentBoundaryIndex + 1
+    guard inputBoundaries.indices.contains(targetBoundaryIndex) else {
+        serverLog(
+            "DEBUG",
+            "AdjustClauseBoundary: skipped currentInputCount=\(currentInputCount) direction=\(direction) reason=edge"
+        )
+        return _strdup(composingText.convertTarget)!
+    }
+
+    let adjustedInputCount = inputBoundaries[targetBoundaryIndex]
+    guard adjustedInputCount > 0 else {
+        serverLog(
+            "DEBUG",
+            "AdjustClauseBoundary: skipped currentInputCount=\(currentInputCount) direction=\(direction) reason=empty_current_clause"
+        )
+        return _strdup(composingText.convertTarget)!
+    }
+    guard let targetSurfaceIndex = surfaceIndexByInputIndex[adjustedInputCount] else {
+        serverLog(
+            "DEBUG",
+            "AdjustClauseBoundary: skipped currentInputCount=\(currentInputCount) direction=\(direction) reason=missing_surface_boundary"
+        )
+        return _strdup(composingText.convertTarget)!
+    }
+
+    let requestedCursorOffset = targetSurfaceIndex - composingText.convertTargetCursorPosition
+    let cursorOffset = composingText.moveCursorFromCursorPosition(count: requestedCursorOffset)
+    guard composingText.convertTargetCursorPosition == targetSurfaceIndex else {
+        let rollbackOffset = currentSurfaceIndex - composingText.convertTargetCursorPosition
+        _ = composingText.moveCursorFromCursorPosition(count: rollbackOffset)
+        serverLog(
+            "ERROR",
+            "AdjustClauseBoundary: skipped currentInputCount=\(currentInputCount) direction=\(direction) reason=cursor_clamped"
+        )
+        return _strdup(composingText.convertTarget)!
+    }
+
+    appliedPtr.pointee = 1
+    adjustedInputCountPtr.pointee = CInt(adjustedInputCount)
+    cursorOffsetPtr.pointee = CInt(cursorOffset)
+    serverLog(
+        "DEBUG",
+        "AdjustClauseBoundary: applied currentInputCount=\(currentInputCount) adjustedInputCount=\(adjustedInputCount) direction=\(direction) currentSurfaceIndex=\(currentSurfaceIndex) targetSurfaceIndex=\(targetSurfaceIndex) cursorOffset=\(cursorOffset)"
+    )
+    return _strdup(composingText.convertTarget)!
+}
+
 @_silgen_name("ClearComposingTextSnapshots")
 @MainActor public func clear_composing_text_snapshots() {
     composingTextSnapshots.removeAll()
@@ -2525,12 +2633,24 @@ public func free_candidate_list(
 }
 
 @_silgen_name("GetComposedTextForCursorPrefix")
-@MainActor public func get_composed_text_for_cursor_prefix(lengthPtr: UnsafeMutablePointer<CInt>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
+@MainActor public func get_composed_text_for_cursor_prefix(
+    requiredInputCount: Int32,
+    lengthPtr: UnsafeMutablePointer<CInt>
+) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
     let functionStart = performanceNow()
     let performanceEnabled = serverLogCallbacks.isPerformanceLogEnabled()
     let hiragana = composingText.convertTarget
     let suffixAfterCursor = String(hiragana.dropFirst(composingText.convertTargetCursorPosition))
     let prefixComposingText = composingText.prefixToCursorPosition()
+    let requiredBoundary = requiredInputCount >= 0 ? Int(requiredInputCount) : nil
+    if let requiredBoundary, requiredBoundary != prefixComposingText.input.count {
+        lengthPtr.pointee = 0
+        serverLog(
+            "ERROR",
+            "GetComposedTextForCursorPrefix: skipped reason=required_boundary_mismatch requiredInputCount=\(requiredBoundary) actualInputCount=\(prefixComposingText.input.count)"
+        )
+        return to_list_pointer([])
+    }
     let previewState = makeCandidatePreviewComposingTextForCursorPrefix(
         prefixComposingText: prefixComposingText,
         suffixAfterCursor: suffixAfterCursor
@@ -2638,12 +2758,13 @@ public func free_candidate_list(
         zenzaiFirstClauseResults: converted.firstClauseResults,
         mergedFirstClauseResults: cursorPrefixFirstClauseResults
     )
-    let firstClauseCorrespondingCount = cursorPrefixFirstClauseCorrespondingCount(
-        firstClauseResults: boundaryFirstClauseResults,
-        originalComposingText: prefixComposingText,
-        previewComposingText: previewPrefixComposingText,
-        resolutionCache: &cursorPrefixResolutionCache
-    )
+    let firstClauseCorrespondingCount = requiredBoundary
+        ?? cursorPrefixFirstClauseCorrespondingCount(
+            firstClauseResults: boundaryFirstClauseResults,
+            originalComposingText: prefixComposingText,
+            previewComposingText: previewPrefixComposingText,
+            resolutionCache: &cursorPrefixResolutionCache
+        )
     let preliminaryCursorPrefixResults = cursorPrefixCandidateDisplayResults(
         mainResults: cursorPrefixMainResults,
         firstClauseResults: cursorPrefixFirstClauseResults,

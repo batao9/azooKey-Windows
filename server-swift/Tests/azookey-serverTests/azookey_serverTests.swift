@@ -447,6 +447,276 @@ private func testCandidate(
     }
 }
 
+@Test func clauseBoundaryAdjustmentKeepsAlternateRomajiSegmentsAtomic() async {
+    await MainActor.run {
+        let previousComposingText = composingText
+        defer {
+            composingText = previousComposingText
+        }
+
+        let cases = [
+            (raw: "tya", kana: "ちゃ"),
+            (raw: "cha", kana: "ちゃ"),
+            (raw: "tyu", kana: "ちゅ"),
+            (raw: "chu", kana: "ちゅ"),
+        ]
+        for testCase in cases {
+            composingText = ComposingText()
+            composingText.insertAtCursorPosition(
+                "\(testCase.raw)ibu",
+                inputStyle: .roman2kana
+            )
+            #expect(composingText.convertTarget == "\(testCase.kana)いぶ")
+
+            var applied: CInt = 0
+            var adjustedInputCount: CInt = -1
+            var cursorOffset: CInt = 0
+            free_c_string(
+                adjust_clause_boundary(
+                    currentInputCount: 4,
+                    direction: -1,
+                    appliedPtr: &applied,
+                    adjustedInputCountPtr: &adjustedInputCount,
+                    cursorOffsetPtr: &cursorOffset
+                )
+            )
+
+            #expect(applied == 1)
+            #expect(adjustedInputCount == 3)
+            #expect(composingText.convertTargetCursorPosition == testCase.kana.count)
+            #expect(cursorOffset < 0)
+
+            applied = 0
+            adjustedInputCount = -1
+            cursorOffset = 0
+            free_c_string(
+                adjust_clause_boundary(
+                    currentInputCount: 3,
+                    direction: -1,
+                    appliedPtr: &applied,
+                    adjustedInputCountPtr: &adjustedInputCount,
+                    cursorOffsetPtr: &cursorOffset
+                )
+            )
+
+            #expect(applied == 0)
+            #expect(adjustedInputCount == 3)
+            #expect(cursorOffset == 0)
+            #expect(composingText.convertTargetCursorPosition == testCase.kana.count)
+
+            free_c_string(
+                adjust_clause_boundary(
+                    currentInputCount: 3,
+                    direction: 1,
+                    appliedPtr: &applied,
+                    adjustedInputCountPtr: &adjustedInputCount,
+                    cursorOffsetPtr: &cursorOffset
+                )
+            )
+            #expect(applied == 1)
+            #expect(adjustedInputCount == 4)
+            #expect(composingText.convertTargetCursorPosition == testCase.kana.count + 1)
+        }
+    }
+}
+
+@Test func rawInputIdentitySurvivesClauseShrinkWithoutNormalizingRomaji() async {
+    await MainActor.run {
+        let previousComposingText = composingText
+        defer {
+            composingText = previousComposingText
+        }
+
+        let input = "aruteidonagaibunsyoudemofukusuuni"
+        composingText = ComposingText()
+        composingText.insertAtCursorPosition(input, inputStyle: .roman2kana)
+        free_c_string(shrink_text(offset: 8))
+
+        let rawInput = get_raw_input()
+        defer {
+            free_c_string(rawInput)
+        }
+        #expect(rawInput.map { String(cString: $0) } == String(input.dropFirst(8)))
+    }
+}
+
+@Test func clauseBoundaryAdjustmentSkipsEdgesAndUnknownInputBoundaries() async {
+    await MainActor.run {
+        let previousComposingText = composingText
+        defer {
+            composingText = previousComposingText
+        }
+
+        composingText = ComposingText()
+        composingText.insertAtCursorPosition("tyaibu", inputStyle: .roman2kana)
+        let endInputCount = CInt(composingText.input.count)
+        let endSurfaceIndex = composingText.convertTargetCursorPosition
+
+        for (currentInputCount, direction) in [
+            (endInputCount, CInt(1)),
+            (CInt(2), CInt(-1)),
+            (CInt(-1), CInt(-1)),
+        ] {
+            var applied: CInt = 1
+            var adjustedInputCount: CInt = -1
+            var cursorOffset: CInt = 99
+            free_c_string(
+                adjust_clause_boundary(
+                    currentInputCount: currentInputCount,
+                    direction: direction,
+                    appliedPtr: &applied,
+                    adjustedInputCountPtr: &adjustedInputCount,
+                    cursorOffsetPtr: &cursorOffset
+                )
+            )
+
+            #expect(applied == 0)
+            #expect(adjustedInputCount == currentInputCount)
+            #expect(cursorOffset == 0)
+            #expect(composingText.convertTargetCursorPosition == endSurfaceIndex)
+        }
+
+        var applied: CInt = 1
+        var adjustedInputCount: CInt = -1
+        var cursorOffset: CInt = 99
+        "different-input".withCString { expectedRawInputPointer in
+            free_c_string(
+                adjust_clause_boundary(
+                    currentInputCount: 3,
+                    direction: 1,
+                    expectedRawInput: expectedRawInputPointer,
+                    appliedPtr: &applied,
+                    adjustedInputCountPtr: &adjustedInputCount,
+                    cursorOffsetPtr: &cursorOffset
+                )
+            )
+        }
+        #expect(applied == 0)
+        #expect(adjustedInputCount == 3)
+        #expect(cursorOffset == 0)
+        #expect(composingText.convertTargetCursorPosition == endSurfaceIndex)
+
+        var length: CInt = -1
+        let candidates = get_composed_text_for_cursor_prefix(
+            requiredInputCount: endInputCount - 1,
+            lengthPtr: &length
+        )
+        free_candidate_list(candidates, length)
+        #expect(length == 0)
+    }
+}
+
+@Test func clauseBoundaryCandidatesPreserveTheAdjustedInputBoundary() async throws {
+    let packageRoot = packageRootURL()
+    let dictionaryURL = packageRoot
+        .appending(path: "azooKey_dictionary_storage")
+        .appending(path: "Dictionary")
+
+    await MainActor.run {
+        let previousConverter = converter
+        let previousSupplementConverter = normalNBestSupplementConverter
+        let previousComposingText = composingText
+        let previousLearningType = currentLearningType
+        let previousExecURL = execURL
+        defer {
+            converter = previousConverter
+            normalNBestSupplementConverter = previousSupplementConverter
+            composingText = previousComposingText
+            currentLearningType = previousLearningType
+            execURL = previousExecURL
+        }
+
+        converter = KanaKanjiConverter(dictionaryURL: dictionaryURL, preloadDictionary: true)
+        normalNBestSupplementConverter = KanaKanjiConverter(
+            dictionaryURL: dictionaryURL,
+            preloadDictionary: false
+        )
+        currentLearningType = .nothing
+        execURL = packageRoot
+
+        @MainActor func candidateCounts(requiredInputCount: CInt) -> [CInt] {
+            var length: CInt = 0
+            let list = get_composed_text_for_cursor_prefix(
+                requiredInputCount: requiredInputCount,
+                lengthPtr: &length
+            )
+            defer {
+                free_candidate_list(list, length)
+            }
+            return (0..<Int(length)).compactMap { index in
+                list.advanced(by: index).pointee?.pointee.correspondingCount
+            }
+        }
+
+        @MainActor func adjust(
+            rawInput: String,
+            shrinkOffset: CInt = 0,
+            currentInputCount: CInt,
+            direction: CInt,
+            expectedInputCount: CInt
+        ) {
+            composingText = ComposingText()
+            composingText.insertAtCursorPosition(rawInput, inputStyle: .roman2kana)
+            if shrinkOffset > 0 {
+                free_c_string(shrink_text(offset: shrinkOffset))
+            }
+
+            var applied: CInt = 0
+            var adjustedInputCount: CInt = -1
+            var cursorOffset: CInt = 0
+            let expectedRawInput = String(rawInput.dropFirst(Int(shrinkOffset)))
+            expectedRawInput.withCString { expectedRawInputPointer in
+                free_c_string(
+                    adjust_clause_boundary(
+                        currentInputCount: currentInputCount,
+                        direction: direction,
+                        expectedRawInput: expectedRawInputPointer,
+                        appliedPtr: &applied,
+                        adjustedInputCountPtr: &adjustedInputCount,
+                        cursorOffsetPtr: &cursorOffset
+                    )
+                )
+            }
+
+            #expect(applied == 1)
+            #expect(adjustedInputCount == expectedInputCount)
+            let counts = candidateCounts(requiredInputCount: expectedInputCount)
+            #expect(
+                counts.contains(expectedInputCount),
+                "expected boundary \(expectedInputCount), candidates: \(counts)"
+            )
+        }
+
+        let input = "aruteidonagaibunsyoudemofukusuuni"
+        adjust(
+            rawInput: input,
+            currentInputCount: 8,
+            direction: 1,
+            expectedInputCount: 10
+        )
+        adjust(
+            rawInput: input,
+            currentInputCount: 10,
+            direction: 1,
+            expectedInputCount: 12
+        )
+        adjust(
+            rawInput: input,
+            shrinkOffset: 8,
+            currentInputCount: 16,
+            direction: -1,
+            expectedInputCount: 14
+        )
+        adjust(
+            rawInput: input,
+            shrinkOffset: 8,
+            currentInputCount: 16,
+            direction: 1,
+            expectedInputCount: 18
+        )
+    }
+}
+
 @Test func shrinkTextSupportsLongOffsetsAndClampsDirectFfiInput() async {
     await MainActor.run {
         let previousComposingText = composingText
