@@ -381,6 +381,77 @@ private func testCandidate(
     }
 }
 
+@Test func learningCandidateBatchCommitsAllSelectionsAndPersistsOverridesOnce() async throws {
+    let packageRoot = packageRootURL()
+    let dictionaryURL = packageRoot
+        .appending(path: "azooKey_dictionary_storage")
+        .appending(path: "Dictionary")
+    let memoryURL = FileManager.default.temporaryDirectory
+        .appending(path: "azookey-server-learning-batch-test-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: memoryURL, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: memoryURL)
+    }
+
+    try await MainActor.run {
+        let previousConverter = converter
+        let previousSupplementConverter = normalNBestSupplementConverter
+        let previousLearningType = currentLearningType
+        let previousLearningMemoryDirectoryURL = currentLearningMemoryDirectoryURL
+        let previousLearningCandidateCache = learningCandidateCache
+        let previousLearningSelectionOverrides = learningSelectionOverrides
+        defer {
+            converter = previousConverter
+            normalNBestSupplementConverter = previousSupplementConverter
+            currentLearningType = previousLearningType
+            currentLearningMemoryDirectoryURL = previousLearningMemoryDirectoryURL
+            learningCandidateCache = previousLearningCandidateCache
+            learningSelectionOverrides = previousLearningSelectionOverrides
+        }
+
+        converter = KanaKanjiConverter(dictionaryURL: dictionaryURL, preloadDictionary: true)
+        normalNBestSupplementConverter = KanaKanjiConverter(
+            dictionaryURL: dictionaryURL,
+            preloadDictionary: false
+        )
+        currentLearningType = .inputAndOutput
+        currentLearningMemoryDirectoryURL = memoryURL
+        learningCandidateCache.removeAll()
+        learningSelectionOverrides.removeAll()
+        let options = testLearningConvertRequestOptions(memoryURL: memoryURL)
+
+        @MainActor func candidateId(reading: String, output: String) throws -> UInt64 {
+            var source = ComposingText()
+            source.insertAtCursorPosition(reading, inputStyle: .direct)
+            let candidates = converter.requestCandidates(source, options: options).mainResults
+            let index = try #require(candidates.firstIndex { $0.text == output })
+            let firstId = try #require(cacheLearningCandidates(candidates))
+            return learningCandidateId(at: index, batchFirstId: firstId)
+        }
+
+        let candidateIds = try [
+            candidateId(reading: "かとう", output: "加藤"),
+            candidateId(reading: "はしる", output: "走る"),
+        ]
+        let commitKinds = [Int32(1), Int32(1)]
+        let committedCount = candidateIds.withUnsafeBufferPointer { candidateIdsPointer in
+            commitKinds.withUnsafeBufferPointer { commitKindsPointer in
+                commit_learning_candidates(
+                    candidateIds: candidateIdsPointer.baseAddress,
+                    commitKinds: commitKindsPointer.baseAddress,
+                    count: Int32(candidateIds.count)
+                )
+            }
+        }
+
+        #expect(committedCount == 2)
+        learningSelectionOverrides.removeAll()
+        loadLearningSelectionOverrides()
+        #expect(learningSelectionOverrides["カトウ"] == "加藤")
+        #expect(learningSelectionOverrides["ハシル"] == "走る")
+    }
+}
+
 @Test func ffiFreeCStringAcceptsNullAndAllocatedStrings() async throws {
     free_c_string(nil)
 
@@ -653,7 +724,8 @@ private func testCandidate(
             shrinkOffset: CInt = 0,
             currentInputCount: CInt,
             direction: CInt,
-            expectedInputCount: CInt
+            expectedInputCount: CInt,
+            expectedCursorPosition: CInt? = nil
         ) {
             composingText = ComposingText()
             composingText.insertAtCursorPosition(rawInput, inputStyle: .roman2kana)
@@ -680,6 +752,10 @@ private func testCandidate(
 
             #expect(applied == 1)
             #expect(adjustedInputCount == expectedInputCount)
+            #expect(get_cursor_position() == composingText.convertTargetCursorPosition)
+            if let expectedCursorPosition {
+                #expect(get_cursor_position() == expectedCursorPosition)
+            }
             let counts = candidateCounts(requiredInputCount: expectedInputCount)
             #expect(
                 counts.contains(expectedInputCount),
@@ -688,6 +764,13 @@ private func testCandidate(
         }
 
         let input = "aruteidonagaibunsyoudemofukusuuni"
+        adjust(
+            rawInput: input,
+            currentInputCount: 8,
+            direction: -1,
+            expectedInputCount: 6,
+            expectedCursorPosition: 4
+        )
         adjust(
             rawInput: input,
             currentInputCount: 8,
@@ -714,6 +797,71 @@ private func testCandidate(
             direction: 1,
             expectedInputCount: 18
         )
+    }
+}
+
+@Test func cursorPrefixActualConverterSelectsTheDisplayedFirstClauseBoundary() async {
+    let packageRoot = packageRootURL()
+    let dictionaryURL = packageRoot
+        .appending(path: "azooKey_dictionary_storage")
+        .appending(path: "Dictionary")
+
+    await MainActor.run {
+        let previousConverter = converter
+        let previousSupplementConverter = normalNBestSupplementConverter
+        let previousComposingText = composingText
+        let previousLearningType = currentLearningType
+        let previousLearningCandidateCache = learningCandidateCache
+        let previousConfig = config
+        let previousExecURL = execURL
+        defer {
+            converter = previousConverter
+            normalNBestSupplementConverter = previousSupplementConverter
+            composingText = previousComposingText
+            currentLearningType = previousLearningType
+            learningCandidateCache = previousLearningCandidateCache
+            config = previousConfig
+            execURL = previousExecURL
+        }
+
+        converter = KanaKanjiConverter(dictionaryURL: dictionaryURL, preloadDictionary: true)
+        normalNBestSupplementConverter = KanaKanjiConverter(
+            dictionaryURL: dictionaryURL,
+            preloadDictionary: false
+        )
+        currentLearningType = .nothing
+        learningCandidateCache.removeAll()
+        config["enable"] = false
+        config["backend"] = "cpu"
+        config["context"] = ""
+        execURL = packageRoot
+        composingText = ComposingText()
+        composingText.insertAtCursorPosition(
+            "aruteidonagaibunsyoudemofukusuubunsetunibunkatusareru",
+            inputStyle: .roman2kana
+        )
+
+        var length: CInt = 0
+        let list = get_composed_text_for_cursor_prefix(
+            requiredInputCount: -1,
+            lengthPtr: &length
+        )
+        defer {
+            free_candidate_list(list, length)
+        }
+        let candidates = (0..<Int(length)).compactMap { index -> (String, CInt)? in
+            guard let candidate = list.advanced(by: index).pointee?.pointee else {
+                return nil
+            }
+            return (String(cString: candidate.text), candidate.correspondingCount)
+        }
+
+        #expect(!candidates.isEmpty)
+        #expect(
+            Set(candidates.map(\.1)) == [8],
+            "first-clause candidates: \(candidates)"
+        )
+        #expect(candidates.contains { $0.0 == "ある程度" })
     }
 }
 
@@ -1599,6 +1747,35 @@ private func testCandidate(
     }
 
     #expect(resultTexts == ["いい加減", "いいかげん"])
+}
+
+@Test func cursorPrefixCandidatesRejectBoundaryThatConsumesPastDisplayedRuby() async throws {
+    let boundary = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition(
+            "aruteidonagaibunsyoudemofukusuubunsetunibunkatusareru",
+            inputStyle: .roman2kana
+        )
+        let preview = makeCandidatePreviewComposingText(from: source).composingText
+        let overconsuming = testCandidate(
+            word: "ある程度",
+            ruby: "あるていど",
+            composingCount: .inputCount(10)
+        )
+        let displayAligned = testCandidate(
+            word: "ある程度",
+            ruby: "あるていど",
+            composingCount: .inputCount(8)
+        )
+
+        return cursorPrefixFirstClauseCorrespondingCount(
+            firstClauseResults: [overconsuming, displayAligned],
+            originalComposingText: source,
+            previewComposingText: preview
+        )
+    }
+
+    #expect(boundary == 8)
 }
 
 @Test func cursorPrefixCandidatesPreferClauseTerminalBoundaryOverLongerNounPrefix() async throws {

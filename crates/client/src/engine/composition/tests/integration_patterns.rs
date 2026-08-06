@@ -1912,6 +1912,29 @@ fn clause_integration_auto_clause_navigation_handles_last_clause_edges() {
 }
 
 #[test]
+fn clause_integration_auto_clause_navigation_adjusts_preserved_first_clause_both_directions() {
+    let left_extra = vec![HarnessUserAction::Right, HarnessUserAction::ShiftLeft];
+    let (left, _, left_history) = run_from_auto_clause_preserved_suffix(&left_extra);
+    assert_eq!(
+        harness_raw_clauses(&left),
+        "あるてい / ど / ながい / ぶんせつでも / ふくすうにぶんかつされる",
+        "history: {}",
+        history_string(&left_history),
+    );
+    assert_eq!(harness_clause_input_lengths(&left), "6 / 2 / 5 / 11 / 22");
+
+    let right_extra = vec![HarnessUserAction::Right, HarnessUserAction::ShiftRight];
+    let (right, _, right_history) = run_from_auto_clause_preserved_suffix(&right_extra);
+    assert_eq!(
+        harness_raw_clauses(&right),
+        "あるていどな / がい / ぶんせつでも / ふくすうにぶんかつされる",
+        "history: {}",
+        history_string(&right_history),
+    );
+    assert_eq!(harness_clause_input_lengths(&right), "10 / 3 / 11 / 22");
+}
+
+#[test]
 fn clause_integration_auto_clause_navigation_removes_consumed_next_clause() {
     let extra = vec![
         HarnessUserAction::Right,

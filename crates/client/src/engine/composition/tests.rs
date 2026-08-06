@@ -78,6 +78,149 @@ fn edit_session_callback_failure_requires_server_resynchronization_before_replay
 }
 
 #[test]
+fn final_remove_does_not_materialize_a_stale_non_empty_server_candidate() {
+    let stale_candidates = candidates(&["亜"], &[""], "あ", &[1]);
+
+    assert!(
+        TextServiceFactory::select_candidate_for_remove_text_transition(
+            &stale_candidates,
+            0,
+            &CompositionState::None,
+        )
+        .is_none()
+    );
+    assert!(
+        TextServiceFactory::select_candidate_for_remove_text_transition(
+            &stale_candidates,
+            0,
+            &CompositionState::Composing,
+        )
+        .is_some()
+    );
+}
+
+#[test]
+fn final_remove_leaves_terminal_end_to_the_followup_action() {
+    let actions = vec![
+        DeferredClientAction {
+            action: ClientAction::RemoveText,
+            transition: CompositionState::None,
+        },
+        DeferredClientAction {
+            action: ClientAction::EndComposition,
+            transition: CompositionState::None,
+        },
+    ];
+
+    assert!(TextServiceFactory::followup_owns_terminal_end(&actions, 0));
+    assert!(!TextServiceFactory::followup_owns_terminal_end(&actions, 1));
+
+    let composing_remove = vec![DeferredClientAction {
+        action: ClientAction::RemoveText,
+        transition: CompositionState::Composing,
+    }];
+    assert!(!TextServiceFactory::followup_owns_terminal_end(
+        &composing_remove,
+        0,
+    ));
+}
+
+#[test]
+fn terminal_end_reuses_only_a_delivered_preceding_ui_cleanup() {
+    assert!(TextServiceFactory::preceding_action_sent_terminal_ui_cleanup(Some(0), 1));
+    assert!(
+        !TextServiceFactory::preceding_action_sent_terminal_ui_cleanup(None, 1),
+        "an unavailable first hide must be retried by EndComposition"
+    );
+    assert!(
+        !TextServiceFactory::preceding_action_sent_terminal_ui_cleanup(Some(0), 2),
+        "only the immediately preceding delivery can suppress the retry"
+    );
+    assert!(!TextServiceFactory::preceding_action_sent_terminal_ui_cleanup(Some(0), 0,));
+}
+
+#[test]
+fn terminal_end_commits_tsf_before_waiting_for_ui_cleanup() {
+    let order = std::cell::RefCell::new(Vec::new());
+
+    TextServiceFactory::run_terminal_end_cleanup(
+        false,
+        || {
+            order.borrow_mut().push("end");
+            Ok(())
+        },
+        || {
+            order.borrow_mut().push("hide");
+            Ok(WindowRpcDelivery::Sent)
+        },
+    )
+    .expect("terminal cleanup should succeed");
+
+    assert_eq!(*order.borrow(), ["end", "hide"]);
+}
+
+#[test]
+fn terminal_end_still_hides_ui_after_tsf_failure_and_preserves_the_tsf_error() {
+    let order = std::cell::RefCell::new(Vec::new());
+
+    let error = TextServiceFactory::run_terminal_end_cleanup(
+        false,
+        || {
+            order.borrow_mut().push("end");
+            anyhow::bail!("tsf end failed")
+        },
+        || {
+            order.borrow_mut().push("hide");
+            Ok(WindowRpcDelivery::Sent)
+        },
+    )
+    .expect_err("TSF failure must remain visible to recovery");
+
+    assert_eq!(*order.borrow(), ["end", "hide"]);
+    assert!(error.to_string().contains("tsf end failed"));
+}
+
+#[test]
+fn terminal_end_skips_duplicate_ui_cleanup_after_terminal_remove() {
+    let order = std::cell::RefCell::new(Vec::new());
+
+    TextServiceFactory::run_terminal_end_cleanup(
+        true,
+        || {
+            order.borrow_mut().push("end");
+            Ok(())
+        },
+        || {
+            order.borrow_mut().push("hide");
+            Ok(WindowRpcDelivery::Sent)
+        },
+    )
+    .expect("terminal cleanup should succeed");
+
+    assert_eq!(*order.borrow(), ["end"]);
+}
+
+#[test]
+fn terminal_end_does_not_replay_after_ui_cleanup_failure() {
+    let order = std::cell::RefCell::new(Vec::new());
+
+    TextServiceFactory::run_terminal_end_cleanup(
+        false,
+        || {
+            order.borrow_mut().push("end");
+            Ok(())
+        },
+        || -> anyhow::Result<WindowRpcDelivery> {
+            order.borrow_mut().push("hide");
+            anyhow::bail!("candidate window unavailable")
+        },
+    )
+    .expect("an irreversible TSF commit must not be replayed after a UI failure");
+
+    assert_eq!(*order.borrow(), ["end", "hide"]);
+}
+
+#[test]
 fn language_bar_toggle_joins_deferred_action_and_input_replay() {
     let deferred_action = DeferredClientAction {
         action: ClientAction::AppendText("a".to_string()),
@@ -698,6 +841,27 @@ fn display_override_clears_learning_candidate_ids() {
 }
 
 #[test]
+fn candidate_suffix_sync_updates_only_candidates_at_the_active_boundary() {
+    let mut current_candidates = candidates(
+        &["発表", "はっぴょう", "発表に"],
+        &["はっぴょうにのぞむ", "はっぴょうにのぞむ", "のぞむ"],
+        "はっぴょうにのぞむ",
+        &[8, 8, 10],
+    );
+
+    TextServiceFactory::sync_candidate_suffixes_for_boundary(
+        &mut current_candidates,
+        8,
+        "発表に臨む",
+    );
+
+    assert_eq!(
+        current_candidates.sub_texts,
+        vec!["発表に臨む", "発表に臨む", "のぞむ"]
+    );
+}
+
+#[test]
 fn skipped_candidate_window_update_does_not_remember_visibility() {
     assert_eq!(
         TextServiceFactory::delivered_candidate_window_visibility(
@@ -1150,15 +1314,44 @@ fn right_arrow_prepares_clause_navigation_without_initial_move() {
     )
     .expect("right arrow should prepare clause navigation");
 
-    assert_eq!(actions, vec![ClientAction::EnsureClauseNavigationReady]);
+    assert_eq!(
+        actions,
+        vec![ClientAction::EnsureClauseNavigationReady {
+            prepare_future_clauses: true,
+        }]
+    );
 }
 
 #[test]
-fn initial_left_arrow_defers_clause_navigation_ready_ui_sync_until_last_clause() {
-    let actions = vec![
-        ClientAction::EnsureClauseNavigationReady,
-        ClientAction::MoveClause(TextServiceFactory::MOVE_CLAUSE_TO_LAST),
-    ];
+fn initial_left_arrow_defers_batch_move_ui_sync_until_last_clause() {
+    let composition = Composition {
+        state: CompositionState::Composing,
+        preview: "いい加減統一しろ".to_string(),
+        raw_input: "iikagentouitusiro".to_string(),
+        raw_hiragana: "いいかげんとういつしろ".to_string(),
+        corresponding_count: 17,
+        ..Composition::default()
+    };
+
+    let (_, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Navigation(Navigation::Left),
+        &InputMode::Kana,
+        false,
+        &AppConfig::default(),
+        false,
+    )
+    .expect("left arrow should prepare navigation and move to the last clause");
+
+    assert_eq!(
+        actions,
+        vec![
+            ClientAction::EnsureClauseNavigationReady {
+                prepare_future_clauses: false,
+            },
+            ClientAction::MoveClause(TextServiceFactory::MOVE_CLAUSE_TO_LAST),
+        ]
+    );
 
     assert!(TextServiceFactory::should_defer_clause_navigation_ready_sync(&actions, 0));
     assert!(!TextServiceFactory::should_defer_clause_navigation_ready_sync(&actions, 1));
@@ -1494,6 +1687,234 @@ fn move_clause_right_uses_one_batched_backend_operation() {
     assert_eq!(suffix, "");
 }
 
+struct MoveToLastPreparationBackend {
+    prepare_calls: usize,
+    direct_advance_calls: usize,
+}
+
+impl ClauseActionBackend for MoveToLastPreparationBackend {
+    fn move_cursor(&mut self, _offset: i32) -> anyhow::Result<Candidates> {
+        panic!("move_cursor must be included in prepare_future_clauses")
+    }
+
+    fn shrink_text(&mut self, _offset: i32) -> anyhow::Result<Candidates> {
+        panic!("shrink_text must be included in prepare_future_clauses")
+    }
+
+    fn advance_clause(
+        &mut self,
+        _offset: i32,
+        _previous_candidates: &Candidates,
+    ) -> anyhow::Result<ClauseAdvance> {
+        self.direct_advance_calls += 1;
+        panic!("move-to-last must not replay a direct clause advance")
+    }
+
+    fn prepare_future_clauses(
+        &mut self,
+        initial_offset: i32,
+        _previous_candidates: &Candidates,
+        leave_at_last: bool,
+    ) -> anyhow::Result<(Vec<ClauseAdvance>, bool)> {
+        self.prepare_calls += 1;
+        assert_eq!(initial_offset, 1);
+        assert!(leave_at_last);
+
+        let second = candidates(&["乙"], &["丙"], "いう", &[1]);
+        let third = candidates(&["丙"], &[""], "う", &[1]);
+        Ok((
+            vec![
+                ClauseAdvance {
+                    shrunk: second.clone(),
+                    navigation: second,
+                    raw_input: ClauseAdvanceRawInput::Unverified,
+                },
+                ClauseAdvance {
+                    shrunk: third.clone(),
+                    navigation: third,
+                    raw_input: ClauseAdvanceRawInput::Unverified,
+                },
+            ],
+            true,
+        ))
+    }
+}
+
+#[test]
+fn move_clause_to_last_uses_one_preparation_without_replaying_rpc_advances() {
+    let mut preview = "甲".to_string();
+    let mut suffix = "乙丙".to_string();
+    let mut raw_input = "abc".to_string();
+    let mut raw_hiragana = "あいう".to_string();
+    let mut fixed_prefix = String::new();
+    let mut corresponding_count = 1;
+    let mut selection_index = 0;
+    let mut current_candidates = candidates(&["甲"], &["乙丙"], "あいう", &[1]);
+    let mut clause_snapshots = Vec::new();
+    let mut future_clause_snapshots = Vec::new();
+    let mut current_clause_is_split_derived = true;
+    let mut current_clause_is_direct_split_remainder = false;
+    let mut current_clause_has_split_left_neighbor = false;
+    let mut current_clause_split_group_id = Some(1);
+    let mut current_clause_consumed_prefix_restore = None;
+    let mut next_split_group_id = 2;
+    let mut backend = MoveToLastPreparationBackend {
+        prepare_calls: 0,
+        direct_advance_calls: 0,
+    };
+
+    let mut state = ClauseActionStateMut {
+        preview: &mut preview,
+        suffix: &mut suffix,
+        raw_input: &mut raw_input,
+        raw_hiragana: &mut raw_hiragana,
+        fixed_prefix: &mut fixed_prefix,
+        corresponding_count: &mut corresponding_count,
+        selection_index: &mut selection_index,
+        candidates: &mut current_candidates,
+        clause_snapshots: &mut clause_snapshots,
+        future_clause_snapshots: &mut future_clause_snapshots,
+        current_clause_is_split_derived: &mut current_clause_is_split_derived,
+        current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+        current_clause_is_pending_remainder: &mut false,
+        current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+        current_clause_right_boundary_displacement: &mut 0,
+        current_clause_right_boundary_origin: &mut None,
+        current_clause_split_group_id: &mut current_clause_split_group_id,
+        current_clause_consumed_prefix_restore: &mut current_clause_consumed_prefix_restore,
+        current_clause_remainder_origin: &mut None,
+        next_split_group_id: &mut next_split_group_id,
+    };
+
+    let effect = TextServiceFactory::apply_move_clause(
+        &mut state,
+        &mut backend,
+        TextServiceFactory::MOVE_CLAUSE_TO_LAST,
+    )
+    .expect("move to last should consume the prepared clause sequence");
+
+    assert!(effect.applied);
+    assert_eq!(backend.prepare_calls, 1);
+    assert_eq!(backend.direct_advance_calls, 0);
+    assert_eq!(preview, "甲乙丙");
+    assert!(suffix.is_empty());
+    assert_eq!(clause_snapshots.len(), 2);
+    assert!(future_clause_snapshots.is_empty());
+}
+
+struct IncompleteMoveToLastBackend {
+    prepare_calls: usize,
+    direct_advance_calls: usize,
+}
+
+impl IncompleteMoveToLastBackend {
+    fn advance_for_clause(text: &str, suffix: &str, hiragana: &str) -> ClauseAdvance {
+        let next = candidates(&[text], &[suffix], hiragana, &[1]);
+        ClauseAdvance {
+            shrunk: next.clone(),
+            navigation: next,
+            raw_input: ClauseAdvanceRawInput::Unverified,
+        }
+    }
+}
+
+impl ClauseActionBackend for IncompleteMoveToLastBackend {
+    fn move_cursor(&mut self, _offset: i32) -> anyhow::Result<Candidates> {
+        panic!("move_cursor must be included in the clause operation")
+    }
+
+    fn shrink_text(&mut self, _offset: i32) -> anyhow::Result<Candidates> {
+        panic!("shrink_text must be included in the clause operation")
+    }
+
+    fn advance_clause(
+        &mut self,
+        offset: i32,
+        _previous_candidates: &Candidates,
+    ) -> anyhow::Result<ClauseAdvance> {
+        self.direct_advance_calls += 1;
+        assert_eq!(offset, 1);
+        match self.direct_advance_calls {
+            1 => Ok(Self::advance_for_clause("乙", "丙", "いう")),
+            2 => Ok(Self::advance_for_clause("丙", "", "う")),
+            _ => panic!("fallback advanced past the final clause"),
+        }
+    }
+
+    fn prepare_future_clauses(
+        &mut self,
+        initial_offset: i32,
+        _previous_candidates: &Candidates,
+        leave_at_last: bool,
+    ) -> anyhow::Result<(Vec<ClauseAdvance>, bool)> {
+        self.prepare_calls += 1;
+        assert_eq!(initial_offset, 1);
+        assert!(leave_at_last);
+        Ok((vec![Self::advance_for_clause("乙", "丙", "いう")], false))
+    }
+}
+
+#[test]
+fn incomplete_move_to_last_preparation_falls_back_from_rolled_back_server_state() {
+    let mut preview = "甲".to_string();
+    let mut suffix = "乙丙".to_string();
+    let mut raw_input = "abc".to_string();
+    let mut raw_hiragana = "あいう".to_string();
+    let mut fixed_prefix = String::new();
+    let mut corresponding_count = 1;
+    let mut selection_index = 0;
+    let mut current_candidates = candidates(&["甲"], &["乙丙"], "あいう", &[1]);
+    let mut clause_snapshots = Vec::new();
+    let mut future_clause_snapshots = Vec::new();
+    let mut current_clause_is_split_derived = true;
+    let mut current_clause_is_direct_split_remainder = false;
+    let mut current_clause_has_split_left_neighbor = false;
+    let mut current_clause_split_group_id = Some(1);
+    let mut current_clause_consumed_prefix_restore = None;
+    let mut next_split_group_id = 2;
+    let mut backend = IncompleteMoveToLastBackend {
+        prepare_calls: 0,
+        direct_advance_calls: 0,
+    };
+
+    let mut state = ClauseActionStateMut {
+        preview: &mut preview,
+        suffix: &mut suffix,
+        raw_input: &mut raw_input,
+        raw_hiragana: &mut raw_hiragana,
+        fixed_prefix: &mut fixed_prefix,
+        corresponding_count: &mut corresponding_count,
+        selection_index: &mut selection_index,
+        candidates: &mut current_candidates,
+        clause_snapshots: &mut clause_snapshots,
+        future_clause_snapshots: &mut future_clause_snapshots,
+        current_clause_is_split_derived: &mut current_clause_is_split_derived,
+        current_clause_is_direct_split_remainder: &mut current_clause_is_direct_split_remainder,
+        current_clause_is_pending_remainder: &mut false,
+        current_clause_has_split_left_neighbor: &mut current_clause_has_split_left_neighbor,
+        current_clause_right_boundary_displacement: &mut 0,
+        current_clause_right_boundary_origin: &mut None,
+        current_clause_split_group_id: &mut current_clause_split_group_id,
+        current_clause_consumed_prefix_restore: &mut current_clause_consumed_prefix_restore,
+        current_clause_remainder_origin: &mut None,
+        next_split_group_id: &mut next_split_group_id,
+    };
+
+    let effect = TextServiceFactory::apply_move_clause(
+        &mut state,
+        &mut backend,
+        TextServiceFactory::MOVE_CLAUSE_TO_LAST,
+    )
+    .expect("incomplete preparation should use the safe sequential fallback");
+
+    assert!(effect.applied);
+    assert_eq!(backend.prepare_calls, 1);
+    assert_eq!(backend.direct_advance_calls, 2);
+    assert_eq!(preview, "甲乙丙");
+    assert!(suffix.is_empty());
+    assert_eq!(clause_snapshots.len(), 2);
+}
+
 impl ClauseActionBackend for NonProgressEnsureBackend {
     fn move_cursor(&mut self, offset: i32) -> anyhow::Result<Candidates> {
         if offset == 0 {
@@ -1519,10 +1940,12 @@ impl ClauseActionBackend for NonProgressEnsureBackend {
         &mut self,
         initial_offset: i32,
         _previous_candidates: &Candidates,
-    ) -> anyhow::Result<Vec<ClauseAdvance>> {
+        leave_at_last: bool,
+    ) -> anyhow::Result<(Vec<ClauseAdvance>, bool)> {
         self.prepare_calls += 1;
         assert_eq!(initial_offset, 7);
-        Ok(Vec::new())
+        assert!(!leave_at_last);
+        Ok((Vec::new(), false))
     }
 }
 
@@ -1568,11 +1991,12 @@ fn prepare_future_clauses_bounds_suffix_clone_work() {
     let previous = candidates(&["節"], &["残り"], &"あ".repeat(128), &[1]);
     let mut backend = BoundedPrepareBackend::default();
 
-    let prepared = backend
-        .prepare_future_clauses(1, &previous)
+    let (prepared, completed) = backend
+        .prepare_future_clauses(1, &previous, false)
         .expect("bounded preparation should succeed");
 
     assert_eq!(prepared.len(), shared::MAX_PREPARED_CLAUSE_ADVANCES);
+    assert!(!completed);
     assert_eq!(
         backend.navigation_calls,
         shared::MAX_PREPARED_CLAUSE_ADVANCES
@@ -1581,8 +2005,9 @@ fn prepare_future_clauses_bounds_suffix_clone_work() {
     assert_eq!(backend.pops, shared::MAX_PREPARED_CLAUSE_ADVANCES);
 }
 
-#[test]
-fn ensure_clause_navigation_uses_two_constant_backend_operations() {
+fn run_ensure_clause_navigation(
+    prepare_future_clauses: bool,
+) -> (ClauseActionEffect, NonProgressEnsureBackend, usize) {
     let mut preview = "いい加減統一".to_string();
     let mut suffix = String::new();
     let mut raw_input = "iikagentouitu".to_string();
@@ -1628,14 +2053,36 @@ fn ensure_clause_navigation_uses_two_constant_backend_operations() {
         next_split_group_id: &mut next_split_group_id,
     };
 
-    let effect = TextServiceFactory::ensure_clause_navigation_ready(&mut state, &mut backend)
-        .expect("ensure clause navigation should return");
+    let effect = TextServiceFactory::ensure_clause_navigation_ready_with_preparation(
+        &mut state,
+        &mut backend,
+        prepare_future_clauses,
+    )
+    .expect("ensure clause navigation should return");
+
+    (effect, backend, future_clause_snapshots.len())
+}
+
+#[test]
+fn ensure_clause_navigation_uses_two_constant_backend_operations() {
+    let (effect, backend, future_clause_snapshot_count) = run_ensure_clause_navigation(true);
 
     assert!(effect.applied);
     assert_eq!(backend.move_cursor_zero_calls, 1);
     assert_eq!(backend.prepare_calls, 1);
     assert_eq!(backend.shrink_calls, 0);
-    assert!(future_clause_snapshots.is_empty());
+    assert_eq!(future_clause_snapshot_count, 0);
+}
+
+#[test]
+fn initial_left_ensure_skips_future_preparation() {
+    let (effect, backend, future_clause_snapshot_count) = run_ensure_clause_navigation(false);
+
+    assert!(effect.applied);
+    assert_eq!(backend.move_cursor_zero_calls, 1);
+    assert_eq!(backend.prepare_calls, 0);
+    assert_eq!(backend.shrink_calls, 0);
+    assert_eq!(future_clause_snapshot_count, 0);
 }
 
 struct AtomicBoundaryBackend {

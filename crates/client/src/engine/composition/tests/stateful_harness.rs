@@ -1753,7 +1753,9 @@ fn apply_user_action(
 
     for action in actions {
         match action {
-            ClientAction::EnsureClauseNavigationReady => {
+            ClientAction::EnsureClauseNavigationReady {
+                prepare_future_clauses,
+            } => {
                 let mut state = ClauseActionStateMut {
                     preview: &mut harness.preview,
                     suffix: &mut harness.suffix,
@@ -1782,8 +1784,12 @@ fn apply_user_action(
                     current_clause_remainder_origin: &mut harness.current_clause_remainder_origin,
                     next_split_group_id: &mut harness.next_split_group_id,
                 };
-                TextServiceFactory::ensure_clause_navigation_ready(&mut state, backend)
-                    .expect("ensure_clause_navigation_ready");
+                TextServiceFactory::ensure_clause_navigation_ready_with_preparation(
+                    &mut state,
+                    backend,
+                    prepare_future_clauses,
+                )
+                .expect("ensure_clause_navigation_ready");
                 backend.ensure_spec_clause_navigation_ready();
             }
             ClientAction::MoveClause(direction) => {

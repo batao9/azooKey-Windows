@@ -410,6 +410,7 @@ unsafe extern "C" {
     fn AppendTextDirect(input: *const c_char, cursorPtr: *mut c_int) -> *mut c_char;
     fn RemoveText(cursorPtr: *mut c_int) -> *mut c_char;
     fn MoveCursor(offset: c_int, cursorPtr: *mut c_int) -> *mut c_char;
+    fn GetCursorPosition() -> c_int;
     fn GetRawInput() -> *mut c_char;
     fn AdjustClauseBoundary(
         currentInputCount: c_int,
@@ -434,6 +435,11 @@ unsafe extern "C" {
     fn FreeCString(ptr: *mut c_char);
     fn FreeCandidateList(ptr: *mut *mut FFICandidate, length: c_int);
     fn CommitLearningCandidate(candidateId: u64, commitKind: c_int) -> bool;
+    fn CommitLearningCandidates(
+        candidateIds: *const u64,
+        commitKinds: *const c_int,
+        count: c_int,
+    ) -> c_int;
     fn ResetLearningMemory() -> bool;
     fn LoadConfig();
     fn SetRequestId(request_id: u64);
@@ -1129,6 +1135,20 @@ fn validate_shrink_offset(offset: i32) -> Result<i32, Status> {
     }
 }
 
+#[inline]
+fn retained_prepared_snapshot_count(
+    request_succeeded: bool,
+    leave_at_last: bool,
+    completed: bool,
+    advance_count: usize,
+) -> usize {
+    if request_succeeded && leave_at_last && completed {
+        advance_count
+    } else {
+        0
+    }
+}
+
 fn initialize(path: &str) -> Result<(), String> {
     let path = cstring_from_input("Initialize.path", path)?;
     unsafe {
@@ -1171,6 +1191,10 @@ fn move_cursor(offset: i32) -> Result<RawComposingText, String> {
     }
 }
 
+fn get_cursor_position() -> i32 {
+    unsafe { GetCursorPosition() }
+}
+
 fn get_raw_input() -> Result<String, String> {
     unsafe { ffi_text_result("GetRawInput", GetRawInput()) }
 }
@@ -1180,6 +1204,36 @@ struct RawClauseBoundaryAdjustment {
     applied: bool,
     adjusted_input_count: i32,
     cursor_offset: i32,
+}
+
+fn hiragana_boundary_fallback(
+    hiragana: &str,
+    cursor: i32,
+    corresponding_count: i32,
+) -> Option<ComposedText> {
+    let cursor = usize::try_from(cursor).ok()?;
+    let mut prefix = String::new();
+    let mut suffix = String::new();
+    for (index, character) in hiragana.chars().enumerate() {
+        if index < cursor {
+            prefix.push(character);
+        } else {
+            suffix.push(character);
+        }
+    }
+    if prefix.is_empty() || cursor > hiragana.chars().count() {
+        return None;
+    }
+
+    Some(ComposedText {
+        hiragana: Some(hiragana.to_string()),
+        suggestions: vec![Suggestion {
+            text: prefix,
+            subtext: suffix,
+            corresponding_count,
+            candidate_id: 0,
+        }],
+    })
 }
 
 fn adjust_clause_boundary(
@@ -1247,6 +1301,23 @@ fn clear_text() {
 
 fn swift_commit_learning_candidate(candidate_id: u64, commit_kind: i32) -> bool {
     unsafe { CommitLearningCandidate(candidate_id, commit_kind as c_int) }
+}
+
+fn swift_commit_learning_candidates(commits: &[shared::proto::LearningCandidateCommit]) -> usize {
+    let Ok(count) = c_int::try_from(commits.len()) else {
+        return 0;
+    };
+    let candidate_ids = commits
+        .iter()
+        .map(|commit| commit.candidate_id)
+        .collect::<Vec<_>>();
+    let commit_kinds = commits
+        .iter()
+        .map(|commit| commit.commit_kind as c_int)
+        .collect::<Vec<_>>();
+    let committed =
+        unsafe { CommitLearningCandidates(candidate_ids.as_ptr(), commit_kinds.as_ptr(), count) };
+    usize::try_from(committed).unwrap_or_default()
 }
 
 fn swift_reset_learning_memory() -> bool {
@@ -1755,7 +1826,7 @@ impl AzookeyService for MyAzookeyService {
         }
 
         let get_composed_start = Instant::now();
-        let composed_text =
+        let mut composed_text =
             match get_composed_text(true, Some(adjustment.adjusted_input_count), request_id) {
                 Ok(composed_text) => composed_text,
                 Err(error) => {
@@ -1788,29 +1859,34 @@ impl AzookeyService for MyAzookeyService {
             .iter()
             .any(|candidate| candidate.corresponding_count == adjustment.adjusted_input_count)
         {
-            rollback_clause_boundary(
+            let cursor = get_cursor_position();
+            if let Some(fallback) = hiragana_boundary_fallback(
+                &adjustment.text,
+                cursor,
                 adjustment.adjusted_input_count,
-                current_input_count,
-                direction,
-                &expected_raw_input,
-            )
-            .map_err(|error| status_from_error("adjust_clause_boundary", error))?;
-            performance_event_lazy!(
-                request_id,
-                "adjust_clause_boundary",
-                "total",
-                elapsed_ms(handler_start),
-                "status=skipped_invalid_candidates;current_input_count={current_input_count};expected_input_count={};direction={direction};adjusted_input_count={}",
-                expected_input_count,
-                adjustment.adjusted_input_count
-            );
-            return Ok(Response::new(AdjustClauseBoundaryResponse {
-                composing_text: None,
-                applied: false,
-                adjusted_input_count: current_input_count,
-                cursor_offset: 0,
-                server_session_id: server_session_id(),
-            }));
+            ) {
+                composed_text = fallback;
+                performance_event_lazy!(
+                    request_id,
+                    "adjust_clause_boundary",
+                    "candidate_fallback",
+                    0,
+                    "status=hiragana;current_input_count={current_input_count};expected_input_count={};direction={direction};adjusted_input_count={};cursor={cursor}",
+                    expected_input_count,
+                    adjustment.adjusted_input_count
+                );
+            } else {
+                rollback_clause_boundary(
+                    adjustment.adjusted_input_count,
+                    current_input_count,
+                    direction,
+                    &expected_raw_input,
+                )
+                .map_err(|error| status_from_error("adjust_clause_boundary", error))?;
+                return Err(Status::internal(
+                    "adjust_clause_boundary could not materialize the adjusted boundary",
+                ));
+            }
         }
 
         update_active_composition_state(&adjustment.text);
@@ -2040,9 +2116,11 @@ impl AzookeyService for MyAzookeyService {
         set_request_id(request_id);
         let handler_start = Instant::now();
         let mut offset = validate_shrink_offset(request.initial_offset)?;
+        let leave_at_last = request.leave_at_last;
         let mut advances = Vec::new();
         let mut snapshot_count = 0usize;
         let mut last_signature = None;
+        let mut completed = false;
 
         let result = (|| -> Result<(), Box<Status>> {
             for _ in 0..shared::MAX_PREPARED_CLAUSE_ADVANCES {
@@ -2092,30 +2170,47 @@ impl AzookeyService for MyAzookeyService {
                     navigation_text: Some(navigation_composing_text),
                 });
                 if is_last {
+                    completed = true;
                     break;
                 }
             }
             Ok(())
         })();
 
-        for _ in 0..snapshot_count {
+        let retained_snapshot_count = retained_prepared_snapshot_count(
+            result.is_ok(),
+            leave_at_last,
+            completed,
+            advances.len(),
+        );
+        for _ in retained_snapshot_count..snapshot_count {
             unsafe {
                 PopComposingTextSnapshot();
             }
         }
         result.map_err(|status| *status)?;
 
+        if leave_at_last && completed {
+            if let Some(final_text) = advances
+                .last()
+                .and_then(|advance| advance.navigation_text.as_ref())
+            {
+                update_active_composition_state(&final_text.hiragana);
+            }
+        }
+
         performance_event_lazy!(
             request_id,
             "prepare_future_clauses",
             "total",
             elapsed_ms(handler_start),
-            "status=success;advance_count={}",
-            advances.len()
+            "status=success;advance_count={};leave_at_last={leave_at_last};completed={completed}",
+            advances.len(),
         );
         Ok(Response::new(PrepareFutureClausesResponse {
             advances,
             server_session_id: server_session_id(),
+            completed,
         }))
     }
 
@@ -2236,6 +2331,43 @@ impl AzookeyService for MyAzookeyService {
         Ok(Response::new(
             shared::proto::CommitLearningCandidateResponse {
                 server_session_id: server_session_id(),
+            },
+        ))
+    }
+
+    async fn commit_learning_candidates(
+        &self,
+        request: Request<shared::proto::CommitLearningCandidatesRequest>,
+    ) -> Result<Response<shared::proto::CommitLearningCandidatesResponse>, Status> {
+        let _mutation_guard = self.mutation_lock.lock().await;
+        let request = request.into_inner();
+        let _request_guard = ServerRequestGuard::begin(true);
+        let request_id = request_id_or_next(request.request_id);
+        set_request_id(request_id);
+        let handler_start = Instant::now();
+        let requested_count = request.commits.len();
+
+        let commit_start = Instant::now();
+        let committed_count = swift_commit_learning_candidates(&request.commits);
+        performance_event_lazy!(
+            request_id,
+            "commit_learning_candidates",
+            "swift_commit_learning_candidates",
+            elapsed_ms(commit_start),
+            "requested_count={requested_count};committed_count={committed_count}"
+        );
+        performance_event_lazy!(
+            request_id,
+            "commit_learning_candidates",
+            "total",
+            elapsed_ms(handler_start),
+            "status=success;requested_count={requested_count};committed_count={committed_count}"
+        );
+
+        Ok(Response::new(
+            shared::proto::CommitLearningCandidatesResponse {
+                server_session_id: server_session_id(),
+                committed_count: u32::try_from(committed_count).unwrap_or(u32::MAX),
             },
         ))
     }
@@ -2446,7 +2578,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod path_tests {
-    use super::{resolve_log_path_from_roots, validate_shrink_offset, MyAzookeyService};
+    use super::{
+        hiragana_boundary_fallback, resolve_log_path_from_roots, retained_prepared_snapshot_count,
+        validate_shrink_offset, MyAzookeyService,
+    };
     use std::{ffi::OsStr, path::Path};
 
     #[tokio::test]
@@ -2484,6 +2619,34 @@ mod path_tests {
     fn shrink_offset_rejects_negative_values_before_swift_ffi() {
         let status = validate_shrink_offset(-1).expect_err("negative offset must fail");
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn incomplete_move_to_last_preparation_rolls_back_all_server_snapshots() {
+        assert_eq!(retained_prepared_snapshot_count(true, true, false, 16), 0);
+        assert_eq!(retained_prepared_snapshot_count(false, true, true, 4), 0);
+        assert_eq!(retained_prepared_snapshot_count(true, false, true, 4), 0);
+        assert_eq!(retained_prepared_snapshot_count(true, true, true, 4), 4);
+    }
+
+    #[test]
+    fn boundary_fallback_materializes_the_exact_hiragana_cursor_prefix() {
+        let fallback =
+            hiragana_boundary_fallback("あるていどながい", 4, 6).expect("valid non-empty boundary");
+
+        assert_eq!(fallback.hiragana.as_deref(), Some("あるていどながい"));
+        assert_eq!(fallback.suggestions.len(), 1);
+        assert_eq!(fallback.suggestions[0].text, "あるてい");
+        assert_eq!(fallback.suggestions[0].subtext, "どながい");
+        assert_eq!(fallback.suggestions[0].corresponding_count, 6);
+        assert_eq!(fallback.suggestions[0].candidate_id, 0);
+    }
+
+    #[test]
+    fn boundary_fallback_rejects_empty_or_out_of_range_prefixes() {
+        assert!(hiragana_boundary_fallback("ある", 0, 0).is_none());
+        assert!(hiragana_boundary_fallback("ある", 3, 3).is_none());
+        assert!(hiragana_boundary_fallback("ある", -1, 0).is_none());
     }
 
     #[test]

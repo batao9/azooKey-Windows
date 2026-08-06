@@ -13,7 +13,7 @@ use crate::engine::{
     client_action::SetSelectionType,
     ipc_service::{Candidates, ClauseSnapshotOperation, IPCService},
 };
-use crate::trace::diagnostic_log;
+use crate::trace::diagnostic_log_lazy;
 
 #[derive(Debug, Clone)]
 pub(crate) struct CandidateSelection {
@@ -138,12 +138,14 @@ pub(crate) trait ClauseActionBackend {
         &mut self,
         initial_offset: i32,
         previous_candidates: &Candidates,
-    ) -> Result<Vec<ClauseAdvance>> {
+        leave_at_last: bool,
+    ) -> Result<(Vec<ClauseAdvance>, bool)> {
         let mut offset = initial_offset;
         let mut previous = previous_candidates.clone();
         let mut advances = Vec::new();
         let mut last_signature = None;
         let mut snapshot_count = 0;
+        let mut completed = false;
         let max_steps = previous
             .hiragana
             .chars()
@@ -171,14 +173,18 @@ pub(crate) trait ClauseActionBackend {
             offset = selected.corresponding_count;
             previous = advance.navigation;
             if is_last {
+                completed = true;
                 break;
             }
         }
 
-        for _ in 0..snapshot_count {
+        let retained_snapshot_count = (leave_at_last && completed)
+            .then_some(advances.len())
+            .unwrap_or(0);
+        for _ in retained_snapshot_count..snapshot_count {
             self.update_composition_snapshot(ClauseSnapshotOperation::Pop, &previous)?;
         }
-        Ok(advances)
+        Ok((advances, completed))
     }
 
     fn move_cursor_with_context(
@@ -245,8 +251,9 @@ impl ClauseActionBackend for IPCService {
         &mut self,
         initial_offset: i32,
         previous_candidates: &Candidates,
-    ) -> Result<Vec<ClauseAdvance>> {
-        IPCService::prepare_future_clauses(self, initial_offset, previous_candidates)
+        leave_at_last: bool,
+    ) -> Result<(Vec<ClauseAdvance>, bool)> {
+        IPCService::prepare_future_clauses(self, initial_offset, previous_candidates, leave_at_last)
     }
 
     fn move_cursor_with_context(
@@ -403,9 +410,19 @@ pub(crate) enum ClauseCommand<'a> {
     CommitFirst,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct ClauseTransitionInput {
     pub(crate) candidates: Option<Candidates>,
+    pub(crate) prepare_future_clauses: bool,
+}
+
+impl Default for ClauseTransitionInput {
+    fn default() -> Self {
+        Self {
+            candidates: None,
+            prepare_future_clauses: true,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -496,9 +513,12 @@ impl ClauseState {
     ) -> Result<ClauseTransition> {
         let candidates = input.candidates;
         let effect = match command {
-            ClauseCommand::StartClauseNavigation => {
-                Self::ensure_clause_navigation_ready(state, backend, candidates)?
-            }
+            ClauseCommand::StartClauseNavigation => Self::ensure_clause_navigation_ready(
+                state,
+                backend,
+                candidates,
+                input.prepare_future_clauses,
+            )?,
             ClauseCommand::MoveBy(direction) => Self::apply_move_clause(state, backend, direction)?,
             ClauseCommand::MoveLeft => Self::apply_move_clause(state, backend, -1)?,
             ClauseCommand::MoveRight => Self::apply_move_clause(state, backend, 1)?,
@@ -552,6 +572,7 @@ impl ClauseState {
         state: &mut ClauseActionStateMut<'_>,
         backend: &mut B,
         candidates: Option<Candidates>,
+        prepare_future_clauses: bool,
     ) -> Result<ClauseActionEffect> {
         if ClauseState::is_clause_navigation_state_active(state)
             || state.candidates.texts.is_empty()
@@ -610,6 +631,11 @@ impl ClauseState {
         {
             *sub_text = display_suffix.clone();
         }
+        TextServiceFactory::sync_candidate_suffixes_for_boundary(
+            state.candidates,
+            selected.corresponding_count,
+            &display_suffix,
+        );
         *state.preview =
             TextServiceFactory::merge_preview_with_prefix(state.fixed_prefix, &selected.text);
         *state.suffix = display_suffix;
@@ -625,9 +651,16 @@ impl ClauseState {
         *state.current_clause_split_group_id = Some(split_group_id);
         *state.current_clause_consumed_prefix_restore = None;
         *state.current_clause_remainder_origin = None;
-        let prepared =
-            backend.prepare_future_clauses(selected.corresponding_count, state.candidates)?;
-        TextServiceFactory::rebuild_future_clause_snapshots_from_prepared(state, prepared)?;
+        if prepare_future_clauses {
+            let (prepared, _) = backend.prepare_future_clauses(
+                selected.corresponding_count,
+                state.candidates,
+                false,
+            )?;
+            TextServiceFactory::rebuild_future_clause_snapshots_from_prepared(state, prepared)?;
+        } else {
+            state.future_clause_snapshots.clear();
+        }
         if let Some(set_type) = display_override_set_type {
             let suffix_raw_input = state
                 .future_clause_snapshots
@@ -679,10 +712,55 @@ impl ClauseState {
         direction: i32,
     ) -> Result<ClauseActionEffect> {
         if direction == TextServiceFactory::MOVE_CLAUSE_TO_LAST {
+            let (prepared, completed) = backend.prepare_future_clauses(
+                *state.corresponding_count,
+                state.candidates,
+                true,
+            )?;
+            if !completed {
+                if prepared.is_empty() {
+                    return Ok(ClauseActionEffect::skipped());
+                }
+                let mut applied_any = false;
+                loop {
+                    let before = MoveClauseProgressMarker::from_state(state);
+                    let effect = ClauseState::apply_move_clause(state, backend, 1)?;
+                    if effect.server_reset {
+                        return Ok(effect);
+                    }
+                    if !effect.applied {
+                        break;
+                    }
+                    let after = MoveClauseProgressMarker::from_state(state);
+                    if before == after {
+                        break;
+                    }
+                    applied_any = true;
+                    if state.suffix.is_empty() {
+                        break;
+                    }
+                }
+                return Ok(if applied_any {
+                    ClauseActionEffect::applied(true)
+                } else {
+                    ClauseActionEffect::skipped()
+                });
+            }
+            if prepared.is_empty() {
+                return Ok(ClauseActionEffect::skipped());
+            }
+
+            TextServiceFactory::rebuild_future_clause_snapshots_from_prepared(
+                state,
+                prepared.clone(),
+            )?;
+            let mut prepared_backend = super::PreparedClauseBackend {
+                advances: prepared.into(),
+            };
             let mut applied_any = false;
             loop {
                 let before = MoveClauseProgressMarker::from_state(state);
-                let effect = ClauseState::apply_move_clause(state, backend, 1)?;
+                let effect = ClauseState::apply_move_clause(state, &mut prepared_backend, 1)?;
                 if effect.server_reset {
                     return Ok(effect);
                 }
@@ -697,6 +775,10 @@ impl ClauseState {
                 if state.suffix.is_empty() {
                     break;
                 }
+            }
+
+            if !state.suffix.is_empty() || !prepared_backend.advances.is_empty() {
+                anyhow::bail!("prepared move-to-last did not consume the complete clause sequence");
             }
 
             return Ok(if applied_any {
@@ -733,6 +815,10 @@ impl ClauseState {
             let current_clause_preview =
                 TextServiceFactory::current_clause_preview(state.preview, state.fixed_prefix);
             let current_corresponding_count = *state.corresponding_count;
+            let continuing_split_group_id = state
+                .current_clause_is_split_derived
+                .then_some(*state.current_clause_split_group_id)
+                .flatten();
             let previous_candidates = state.candidates.clone();
 
             state.clause_snapshots.push(snapshot.clone());
@@ -752,11 +838,13 @@ impl ClauseState {
             );
             if let ClauseAdvanceRawInput::Verified(server_raw_input) = &raw_input_identity {
                 if state.raw_input.as_str() != server_raw_input.as_str() {
-                    diagnostic_log(format!(
+                    diagnostic_log_lazy(|| {
+                        format!(
                         "kind=future-cache\tevent=raw-input-reconcile\tclient_raw_input={}\tserver_raw_input={}",
                         TextServiceFactory::sanitize_log_field(state.raw_input),
                         TextServiceFactory::sanitize_log_field(server_raw_input),
-                    ));
+                    )
+                    });
                     *state.raw_input = server_raw_input.clone();
                 }
             }
@@ -795,9 +883,9 @@ impl ClauseState {
                             state.future_clause_snapshots.push(restored_future);
                             let restored = state.clause_snapshots.pop().unwrap_or(snapshot);
                             Self::restore_current_clause_snapshot(state, restored);
-                            diagnostic_log(
-                                "kind=future-cache\tevent=sync-desynchronized-rollback".to_string(),
-                            );
+                            diagnostic_log_lazy(|| {
+                                "kind=future-cache\tevent=sync-desynchronized-rollback".to_string()
+                            });
                             return Ok(ClauseActionEffect::skipped());
                         }
                         ClauseBoundarySync::Unavailable => {
@@ -905,13 +993,13 @@ impl ClauseState {
                     return Ok(ClauseActionEffect::skipped());
                 };
 
-                *state.current_clause_is_split_derived = false;
+                *state.current_clause_is_split_derived = continuing_split_group_id.is_some();
                 *state.current_clause_is_direct_split_remainder = false;
                 *state.current_clause_is_pending_remainder = false;
-                *state.current_clause_has_split_left_neighbor = false;
+                *state.current_clause_has_split_left_neighbor = continuing_split_group_id.is_some();
                 *state.current_clause_right_boundary_displacement = 0;
                 *state.current_clause_right_boundary_origin = None;
-                *state.current_clause_split_group_id = None;
+                *state.current_clause_split_group_id = continuing_split_group_id;
                 *state.current_clause_consumed_prefix_restore = None;
                 *state.current_clause_remainder_origin = None;
                 *state.selection_index = selected.index;
@@ -921,6 +1009,11 @@ impl ClauseState {
                     state.fixed_prefix,
                     state.suffix,
                     &selected,
+                );
+                TextServiceFactory::sync_candidate_suffixes_for_boundary(
+                    state.candidates,
+                    selected.corresponding_count,
+                    &display_suffix,
                 );
                 *state.preview = TextServiceFactory::merge_preview_with_prefix(
                     state.fixed_prefix,

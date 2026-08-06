@@ -110,6 +110,25 @@ pub(crate) fn is_edit_session_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<EditSessionFailure>().is_some()
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CloseCompositionProgress {
+    #[default]
+    NotStarted,
+    TextMutated,
+    Ended,
+}
+
+fn should_restore_detached_composition(
+    error: &anyhow::Error,
+    progress: CloseCompositionProgress,
+) -> bool {
+    progress != CloseCompositionProgress::Ended
+        && !matches!(
+            error.downcast_ref::<EditSessionFailure>(),
+            Some(EditSessionFailure::UnexpectedAsync)
+        )
+}
+
 fn complete_sync_edit_session<T>(
     request_result: std::result::Result<HRESULT, HRESULT>,
     callback_started: bool,
@@ -252,6 +271,20 @@ fn close_composition_callback(
     context: ITfContext,
     discard_text: bool,
 ) -> Rc<dyn Fn(u32) -> anyhow::Result<()>> {
+    close_composition_callback_with_progress(
+        composition,
+        context,
+        discard_text,
+        Rc::new(Cell::new(CloseCompositionProgress::NotStarted)),
+    )
+}
+
+fn close_composition_callback_with_progress(
+    composition: ITfComposition,
+    context: ITfContext,
+    discard_text: bool,
+    progress: Rc<Cell<CloseCompositionProgress>>,
+) -> Rc<dyn Fn(u32) -> anyhow::Result<()>> {
     Rc::new(move |cookie| unsafe {
         let range: ITfRange = composition.GetRange()?;
 
@@ -262,6 +295,7 @@ fn close_composition_callback(
             let text = read_all_range_text(cookie, &range_new)?;
             range.SetText(cookie, TF_ST_CORRECTION, &text)?;
         }
+        progress.set(CloseCompositionProgress::TextMutated);
 
         let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
         prop.Clear(cookie, &range)?;
@@ -277,6 +311,7 @@ fn close_composition_callback(
 
         context.SetSelection(cookie, &[selection])?;
         composition.EndComposition(cookie)?;
+        progress.set(CloseCompositionProgress::Ended);
         Ok(())
     })
 }
@@ -317,6 +352,16 @@ fn prepare_set_text(text: &str, subtext: &str) -> anyhow::Result<(i32, Vec<u16>)
         utf16_code_unit_len(text)?,
         format!("{text}{subtext}").as_str().to_wide_16_unpadded(),
     ))
+}
+
+#[inline]
+fn should_apply_display_attribute(text_len: i32) -> bool {
+    text_len > 0
+}
+
+#[inline]
+fn should_clear_display_attribute(text_len: i32, combined_text_is_empty: bool) -> bool {
+    text_len == 0 && !combined_text_is_empty
 }
 
 fn has_same_com_identity<I: Interface>(left: &I, right: &I) -> bool {
@@ -428,22 +473,52 @@ impl TextServiceFactory {
 
     fn close_composition(&self, discard_text: bool) -> Result<()> {
         let text_service = self.borrow()?;
+        let composition = {
+            let current = text_service.borrow_composition()?;
+            current.tip_composition.clone()
+        };
 
-        if let Some(composition) = text_service.borrow_composition()?.tip_composition.clone() {
-            write_edit_session(
-                text_service.tid,
-                text_service.context()?,
-                close_composition_callback(
-                    composition,
-                    text_service.context::<ITfContext>()?,
+        if let Some(composition) = composition {
+            // Resolve every fallible prerequisite before detaching the live handle. If the
+            // context is already unavailable, the composition must remain current so a
+            // later close attempt can still find it.
+            let tid = text_service.tid;
+            let context = text_service.context::<ITfContext>()?;
+
+            // Detach before asking TSF to end the composition. EndComposition may invoke
+            // OnCompositionTerminated reentrantly; leaving this handle current would make
+            // that self-initiated callback reset deferred input queued for recovery.
+            text_service.borrow_mut_composition()?.tip_composition = None;
+            let progress = Rc::new(Cell::new(CloseCompositionProgress::NotStarted));
+
+            let result = write_edit_session(
+                tid,
+                context.clone(),
+                close_composition_callback_with_progress(
+                    composition.clone(),
+                    context,
                     discard_text,
+                    progress.clone(),
                 ),
-            )?;
+            );
+
+            if let Err(error) = &result {
+                // Until EndComposition succeeds the old handle remains active and must be
+                // retained for a later close retry, even if SetText already changed its
+                // range. Unexpected asynchronous execution is the exception: its callback
+                // may still terminate the detached handle after this function returns.
+                if should_restore_detached_composition(error, progress.get()) {
+                    let mut current = text_service.borrow_mut_composition()?;
+                    if current.tip_composition.is_none() {
+                        current.tip_composition = Some(composition);
+                    }
+                }
+            }
+
+            result?;
         } else {
             tracing::warn!("Composition is not started");
         }
-
-        text_service.borrow_mut_composition()?.tip_composition = None;
 
         Ok(())
     }
@@ -512,22 +587,23 @@ impl TextServiceFactory {
     pub fn start_composition(&self) -> Result<()> {
         tracing::debug!("start_composition");
 
-        let mut text_service = self.borrow_mut()?;
-        let context = text_service.context()?;
-        let context_composition = text_service.context::<ITfContextComposition>()?;
-        let sink = text_service.this::<ITfCompositionSink>()?;
-        let insert = text_service.context::<ITfInsertAtSelection>()?;
-
         let tip_exists = {
+            let text_service = self.borrow()?;
             let composition = text_service.borrow_composition()?;
             composition.tip_composition.is_some()
         };
 
         if tip_exists {
-            drop(text_service);
             self.end_composition()?;
-            return Ok(());
         }
+
+        // Closing a stale composition can run host callbacks and switch the active
+        // context. Acquire every interface only after the close has completed.
+        let mut text_service = self.borrow_mut()?;
+        let context = text_service.context()?;
+        let context_composition = text_service.context::<ITfContextComposition>()?;
+        let sink = text_service.this::<ITfCompositionSink>()?;
+        let insert = text_service.context::<ITfInsertAtSelection>()?;
 
         let composition = write_edit_session::<ITfComposition>(
             text_service.tid,
@@ -581,6 +657,7 @@ impl TextServiceFactory {
                 text_service.context()?,
                 Rc::new({
                     let (text_len, text) = prepare_set_text(text, subtext)?;
+                    let combined_text_is_empty = text.is_empty();
                     let context = text_service.context::<ITfContext>()?;
                     let display_attribute_atom = text_service.display_attribute_atom.clone();
 
@@ -588,16 +665,31 @@ impl TextServiceFactory {
                         let range = composition.GetRange()?;
                         range.SetText(cookie, TF_ST_CORRECTION, &text)?;
 
-                        // first, set the display attribute to the "text" part
-                        let text_range = range.Clone()?;
-                        text_range.Collapse(cookie, TF_ANCHOR_START)?;
-                        let mut shifted: i32 = 0;
-                        text_range.ShiftEnd(cookie, text_len, &mut shifted, std::ptr::null())?;
-                        let display_attribute = display_attribute_atom.get(&GUID_DISPLAY_ATTRIBUTE);
-                        if let Some(display_attribute) = display_attribute {
-                            let pvar = VARIANT::from(*display_attribute as i32);
+                        // TSF rejects ShiftEnd(0) / SetValue on an empty range in hosts such
+                        // as Windows 11 Notepad. Final deletion still has to update the
+                        // composition range and caret, but there is no display span to style.
+                        if should_apply_display_attribute(text_len) {
+                            let text_range = range.Clone()?;
+                            text_range.Collapse(cookie, TF_ANCHOR_START)?;
+                            let mut shifted: i32 = 0;
+                            text_range.ShiftEnd(
+                                cookie,
+                                text_len,
+                                &mut shifted,
+                                std::ptr::null(),
+                            )?;
+                            let display_attribute =
+                                display_attribute_atom.get(&GUID_DISPLAY_ATTRIBUTE);
+                            if let Some(display_attribute) = display_attribute {
+                                let pvar = VARIANT::from(*display_attribute as i32);
+                                let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
+                                prop.SetValue(cookie, &text_range, &pvar)?;
+                            }
+                        } else if should_clear_display_attribute(text_len, combined_text_is_empty) {
+                            // TF_ST_CORRECTION can retain the old property on the new
+                            // suffix-only text. With no primary span, clear it explicitly.
                             let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
-                            prop.SetValue(cookie, &text_range, &pvar)?;
+                            prop.Clear(cookie, &range)?;
                         }
 
                         range.Collapse(cookie, TF_ANCHOR_END)?;
@@ -1060,7 +1152,9 @@ mod tests {
         caret_position_or_none, collect_range_text, commit_shift_start_after_prepare,
         complete_async_edit_session_request, complete_async_position_request,
         complete_sync_edit_session, is_non_destructive_edit_session_error, prepare_set_text,
-        AsyncEditSession, EditSessionFailure,
+        should_apply_display_attribute, should_clear_display_attribute,
+        should_restore_detached_composition, AsyncEditSession, CloseCompositionProgress,
+        EditSessionFailure,
     };
     use std::{cell::Cell, rc::Rc};
     use windows::{
@@ -1115,6 +1209,25 @@ mod tests {
             );
             assert_eq!(combined.len(), 7);
         }
+    }
+
+    #[test]
+    fn empty_primary_text_skips_the_tsf_display_attribute_range() {
+        let (empty_len, empty_text) =
+            prepare_set_text("", "").expect("empty composition text should be valid");
+        let (suffix_only_len, suffix_only_text) =
+            prepare_set_text("", "かな").expect("suffix-only composition text should be valid");
+
+        assert_eq!(empty_len, 0);
+        assert!(empty_text.is_empty());
+        assert_eq!(suffix_only_len, 0);
+        assert!(!suffix_only_text.is_empty());
+        assert!(!should_apply_display_attribute(empty_len));
+        assert!(!should_apply_display_attribute(suffix_only_len));
+        assert!(should_apply_display_attribute(1));
+        assert!(!should_clear_display_attribute(empty_len, true));
+        assert!(should_clear_display_attribute(suffix_only_len, false));
+        assert!(!should_clear_display_attribute(1, false));
     }
 
     #[test]
@@ -1181,6 +1294,34 @@ mod tests {
             Some(&EditSessionFailure::Callback(TF_E_LOCKED))
         );
         assert!(!is_non_destructive_edit_session_error(&error));
+    }
+
+    #[test]
+    fn close_restores_detached_composition_until_end_succeeds() {
+        let rejected = anyhow::Error::new(EditSessionFailure::Session(TF_E_LOCKED));
+        let callback_failed = anyhow::Error::new(EditSessionFailure::Callback(TF_E_LOCKED));
+        let unexpectedly_async = anyhow::Error::new(EditSessionFailure::UnexpectedAsync);
+
+        assert!(should_restore_detached_composition(
+            &rejected,
+            CloseCompositionProgress::NotStarted,
+        ));
+        assert!(should_restore_detached_composition(
+            &callback_failed,
+            CloseCompositionProgress::NotStarted,
+        ));
+        assert!(should_restore_detached_composition(
+            &callback_failed,
+            CloseCompositionProgress::TextMutated,
+        ));
+        assert!(!should_restore_detached_composition(
+            &callback_failed,
+            CloseCompositionProgress::Ended,
+        ));
+        assert!(!should_restore_detached_composition(
+            &unexpectedly_async,
+            CloseCompositionProgress::NotStarted,
+        ));
     }
 
     #[test]

@@ -1068,6 +1068,36 @@ impl IPCService {
         Ok(())
     }
 
+    fn send_commit_learning_candidates(
+        &mut self,
+        commits: &[(u64, i32)],
+        request_id: u64,
+    ) -> anyhow::Result<u32> {
+        let mut request = tonic::Request::new(shared::proto::CommitLearningCandidatesRequest {
+            commits: commits
+                .iter()
+                .map(
+                    |(candidate_id, commit_kind)| shared::proto::LearningCandidateCommit {
+                        candidate_id: *candidate_id,
+                        commit_kind: *commit_kind,
+                    },
+                )
+                .collect(),
+            request_id,
+        });
+        request.set_timeout(LEARNING_RPC_DEADLINE);
+        let response = Self::block_on_server_rpc(
+            self.runtime.as_ref(),
+            &self.recovery,
+            "commit_learning_candidates",
+            LEARNING_RPC_DEADLINE,
+            self.azookey_client.commit_learning_candidates(request),
+        )?
+        .into_inner();
+        self.observe_server_session("commit_learning_candidates", response.server_session_id);
+        Ok(response.committed_count)
+    }
+
     fn send_shrink_text(&mut self, offset: i32, request_id: u64) -> anyhow::Result<Candidates> {
         let mut request =
             tonic::Request::new(shared::proto::ShrinkTextRequest { offset, request_id });
@@ -1121,10 +1151,12 @@ impl IPCService {
         &mut self,
         initial_offset: i32,
         request_id: u64,
-    ) -> anyhow::Result<Vec<super::composition::ClauseAdvance>> {
+        leave_at_last: bool,
+    ) -> anyhow::Result<(Vec<super::composition::ClauseAdvance>, bool)> {
         let mut request = tonic::Request::new(shared::proto::PrepareFutureClausesRequest {
             initial_offset,
             request_id,
+            leave_at_last,
         });
         request.set_timeout(INPUT_RPC_DEADLINE);
         let response = Self::block_on_server_rpc(
@@ -1136,7 +1168,10 @@ impl IPCService {
         )?;
         let response = response.into_inner();
         self.observe_server_session("prepare_future_clauses", response.server_session_id);
-        response
+        if leave_at_last && response.completed {
+            self.invalidate_input_ledger();
+        }
+        let advances = response
             .advances
             .into_iter()
             .map(|advance| {
@@ -1146,7 +1181,8 @@ impl IPCService {
                     raw_input: super::composition::ClauseAdvanceRawInput::Unverified,
                 })
             })
-            .collect()
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok((advances, response.completed))
     }
 
     fn send_move_cursor(&mut self, offset: i32, request_id: u64) -> anyhow::Result<Candidates> {
@@ -1716,6 +1752,48 @@ impl IPCService {
         result
     }
 
+    #[tracing::instrument(skip(self, commits))]
+    pub fn commit_learning_candidates(&mut self, commits: &[(u64, i32)]) -> anyhow::Result<()> {
+        if commits.is_empty() {
+            return Ok(());
+        }
+
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
+        // Learning is an external side effect and the server has no dedupe
+        // ledger. Never replay a batch after an ambiguous failure.
+        let result = self.send_commit_learning_candidates(commits, request_id);
+        self.log_client_performance_from_start(
+            performance_start,
+            request_id,
+            "commit_learning_candidates",
+            "rpc_total",
+            || match &result {
+                Ok(committed_count) => format!(
+                    "status=success;retry=false;requested_count={};committed_count={committed_count}",
+                    commits.len()
+                ),
+                Err(error) => format!(
+                    "status=error;requested_count={};error={error:?}",
+                    commits.len()
+                ),
+            },
+        );
+        match result {
+            Ok(committed_count) => {
+                if usize::try_from(committed_count).unwrap_or_default() != commits.len() {
+                    tracing::warn!(
+                        requested_count = commits.len(),
+                        committed_count,
+                        "Some conversion learning candidates were not committed"
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     #[tracing::instrument]
     pub fn shrink_text(&mut self, offset: i32) -> anyhow::Result<Candidates> {
         self.shrink_text_inner(offset, None)
@@ -1810,12 +1888,39 @@ impl IPCService {
         &mut self,
         initial_offset: i32,
         previous_candidates: &Candidates,
-    ) -> anyhow::Result<Vec<super::composition::ClauseAdvance>> {
+        leave_at_last: bool,
+    ) -> anyhow::Result<(Vec<super::composition::ClauseAdvance>, bool)> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let result = self
-            .run_rpc_with_reconnect("prepare_future_clauses", |this| {
-                this.send_prepare_future_clauses(initial_offset, request_id)
+        let result = if leave_at_last {
+            self.send_prepare_future_clauses(initial_offset, request_id, true)
+                .map_err(|error| {
+                    if Self::should_reconnect_rpc_error(&error) {
+                        Self::mark_server_recovery_required(
+                            &self.recovery,
+                            "prepare_future_clauses_to_last_failed",
+                        );
+                        preserve_recovery_error(error)
+                    } else {
+                        error
+                    }
+                })
+                .and_then(|prepared| {
+                    if self.take_server_reset_recovered() {
+                        Self::mark_server_recovery_required(
+                            &self.recovery,
+                            "prepare_future_clauses_to_last_session_change",
+                        );
+                        Err(preserve_recovery_error(anyhow::anyhow!(
+                            "prepare_future_clauses_to_last reached a different server session"
+                        )))
+                    } else {
+                        Ok(prepared)
+                    }
+                })
+        } else {
+            self.run_rpc_with_reconnect("prepare_future_clauses", |this| {
+                this.send_prepare_future_clauses(initial_offset, request_id, false)
             })
             .map_err(|error| {
                 if Self::should_reconnect_rpc_error(&error) {
@@ -1828,7 +1933,7 @@ impl IPCService {
                     error
                 }
             })
-            .and_then(|(advances, reconnected)| {
+            .and_then(|(prepared, reconnected)| {
                 if self.take_server_reset_recovered() {
                     Self::mark_server_recovery_required(
                         &self.recovery,
@@ -1857,20 +1962,21 @@ impl IPCService {
                     }
                 }
 
-                Ok(advances)
-            });
+                Ok(prepared)
+            })
+        };
         self.log_client_performance_from_start(
             performance_start,
             request_id,
             "prepare_future_clauses",
             "rpc_total",
             || match &result {
-                Ok(advances) => format!(
-                    "status=success;initial_offset={initial_offset};advance_count={}",
-                    advances.len()
+                Ok((advances, completed)) => format!(
+                    "status=success;initial_offset={initial_offset};advance_count={};leave_at_last={leave_at_last};completed={completed}",
+                    advances.len(),
                 ),
                 Err(error) => {
-                    format!("status=error;initial_offset={initial_offset};error={error:?}")
+                    format!("status=error;initial_offset={initial_offset};leave_at_last={leave_at_last};error={error:?}")
                 }
             },
         );
@@ -3021,6 +3127,33 @@ mod tests {
 
         assert!(ledger.operations.is_empty());
         assert!(!ledger.complete);
+    }
+
+    #[test]
+    fn move_to_last_recovery_uses_current_suffix_after_ledger_invalidation() {
+        let mut ledger = InputLedger {
+            operations: vec![CompositionOperation::Append {
+                text: "aruteidonagaibunsyou".to_string(),
+                input_style: INPUT_STYLE_ROMAN2KANA,
+            }],
+            complete: true,
+        };
+
+        mark_input_ledger_incomplete(&mut ledger);
+        let recovery_ledger = if ledger.complete {
+            ledger
+        } else {
+            fallback_input_ledger("bunsyou", "ぶんしょう")
+        };
+
+        assert_eq!(
+            recovery_ledger.operations,
+            vec![CompositionOperation::Append {
+                text: "bunsyou".to_string(),
+                input_style: INPUT_STYLE_ROMAN2KANA,
+            }]
+        );
+        assert!(recovery_ledger.complete);
     }
 
     #[test]

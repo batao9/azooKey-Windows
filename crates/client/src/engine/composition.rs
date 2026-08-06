@@ -11,7 +11,7 @@ use crate::tsf::edit_session::{
 use crate::{
     engine::user_action::UserAction,
     extension::VKeyExt as _,
-    trace::diagnostic_log,
+    trace::{diagnostic_log, diagnostic_log_enabled, diagnostic_log_lazy},
     tsf::factory::{TextServiceFactory, TextServiceFactory_Impl},
 };
 
@@ -959,6 +959,57 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn select_candidate_for_remove_text_transition(
+        candidates: &Candidates,
+        desired_index: i32,
+        transition: &CompositionState,
+    ) -> Option<CandidateSelection> {
+        if *transition == CompositionState::None {
+            None
+        } else {
+            Self::select_candidate(candidates, desired_index)
+        }
+    }
+
+    #[inline]
+    fn followup_owns_terminal_end(actions: &[DeferredClientAction], action_index: usize) -> bool {
+        actions.get(action_index + 1).is_some_and(|next| {
+            next.transition == CompositionState::None
+                && matches!(next.action, ClientAction::EndComposition)
+        })
+    }
+
+    #[inline]
+    fn preceding_action_sent_terminal_ui_cleanup(
+        terminal_ui_cleanup_sent_at: Option<usize>,
+        action_index: usize,
+    ) -> bool {
+        action_index.checked_sub(1) == terminal_ui_cleanup_sent_at
+    }
+
+    #[inline]
+    fn run_terminal_end_cleanup<T>(
+        ui_cleanup_already_sent: bool,
+        end_composition: impl FnOnce() -> Result<()>,
+        hide_candidate_window: impl FnOnce() -> Result<T>,
+    ) -> Result<()> {
+        let end_result = end_composition();
+        if !ui_cleanup_already_sent {
+            if let Err(error) = hide_candidate_window() {
+                tracing::warn!(
+                    ?error,
+                    "Failed to hide the candidate window after terminal composition cleanup"
+                );
+            }
+        }
+
+        // EndComposition is irreversible once it succeeds. UI cleanup remains
+        // best-effort so a transient window RPC failure cannot replay the
+        // terminal action over the next composition.
+        end_result
+    }
+
+    #[inline]
     fn select_navigation_candidate_for_current_preview(
         navigation_candidates: &Candidates,
         current_preview: &str,
@@ -1637,7 +1688,7 @@ impl TextServiceFactory {
             ClientAction::CommitTextDirect(_) => "CommitTextDirect",
             ClientAction::RemoveText => "RemoveText",
             ClientAction::MoveCursor(_) => "MoveCursor",
-            ClientAction::EnsureClauseNavigationReady => "EnsureClauseNavigationReady",
+            ClientAction::EnsureClauseNavigationReady { .. } => "EnsureClauseNavigationReady",
             ClientAction::MoveClause(_) => "MoveClause",
             ClientAction::AdjustBoundary(_) => "AdjustBoundary",
             ClientAction::SetIMEMode(_) => "SetIMEMode",
@@ -1668,6 +1719,10 @@ impl TextServiceFactory {
         clause_snapshots: &[ClauseSnapshot],
         future_clause_snapshots: &[FutureClauseSnapshot],
     ) {
+        if !diagnostic_log_enabled() {
+            return;
+        }
+
         let selected = Self::select_candidate(candidates, selection_index);
         let selected_text = selected
             .as_ref()
@@ -1745,10 +1800,23 @@ impl TextServiceFactory {
         state: &mut ClauseActionStateMut<'_>,
         backend: &mut B,
     ) -> Result<ClauseActionEffect> {
+        Self::ensure_clause_navigation_ready_with_preparation(state, backend, true)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn ensure_clause_navigation_ready_with_preparation<B: ClauseActionBackend>(
+        state: &mut ClauseActionStateMut<'_>,
+        backend: &mut B,
+        prepare_future_clauses: bool,
+    ) -> Result<ClauseActionEffect> {
         Ok(ClauseState::transition_with_backend(
             state,
             ClauseCommand::StartClauseNavigation,
-            ClauseTransitionInput::default(),
+            ClauseTransitionInput {
+                prepare_future_clauses,
+                ..ClauseTransitionInput::default()
+            },
             backend,
         )?
         .effect)
@@ -1973,6 +2041,14 @@ impl TextServiceFactory {
         }
 
         result
+    }
+
+    #[inline]
+    fn hide_candidate_window_ui(&self, ipc_service: &mut IPCService) -> Result<WindowRpcDelivery> {
+        let delivery =
+            ipc_service.update_candidate_window(Some(false), None, Some(vec![]), Some(0), None)?;
+        self.remember_candidate_window_visibility_if_sent(delivery, Some(false));
+        Ok(delivery)
     }
 
     #[inline]
@@ -2350,6 +2426,23 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn sync_candidate_suffixes_for_boundary(
+        candidates: &mut Candidates,
+        corresponding_count: i32,
+        suffix: &str,
+    ) {
+        for (sub_text, candidate_count) in candidates
+            .sub_texts
+            .iter_mut()
+            .zip(candidates.corresponding_count.iter())
+        {
+            if *candidate_count == corresponding_count {
+                suffix.clone_into(sub_text);
+            }
+        }
+    }
+
+    #[inline]
     fn coalesce_adjacent_pending_remainders(
         future_clause_snapshots: &mut Vec<FutureClauseSnapshot>,
     ) {
@@ -2400,7 +2493,8 @@ impl TextServiceFactory {
                 .or(current.consumed_prefix_restore);
             joined_snapshot.remainder_origin =
                 current.remainder_origin.or(trailing.remainder_origin);
-            diagnostic_log(format!(
+            diagnostic_log_lazy(|| {
+                format!(
                 "kind=future-cache\tevent=join-adjacent-pending-remainders\traw_hiragana={}\tjoined={}",
                 Self::sanitize_log_field(&current.raw_hiragana),
                 Self::sanitize_log_field(&format!(
@@ -2410,7 +2504,8 @@ impl TextServiceFactory {
                     joined_snapshot.raw_hiragana,
                     joined_snapshot.corresponding_count,
                 )),
-            ));
+            )
+            });
             future_clause_snapshots.push(joined_snapshot);
         }
     }
@@ -2456,7 +2551,8 @@ impl TextServiceFactory {
         snapshot.split_group_id = current_clause_split_group_id;
         snapshot.consumed_prefix_restore = current_clause_consumed_prefix_restore;
         snapshot.remainder_origin = current_clause_remainder_origin;
-        diagnostic_log(format!(
+        diagnostic_log_lazy(|| {
+            format!(
             "kind=future-cache\tevent=push-current\tpreview={}\tsuffix={}\traw_input={}\traw_hiragana={}\tfuture_clause_snapshots_before={}\tis_split_derived={}\tis_direct_split_remainder={}\tsplit_group_id={}\tpushed={}",
             Self::sanitize_log_field(preview),
             Self::sanitize_log_field(suffix),
@@ -2481,7 +2577,8 @@ impl TextServiceFactory {
                     .map(|group_id| group_id.to_string())
                     .unwrap_or_else(|| "-".to_string()),
             )),
-        ));
+        )
+        });
         future_clause_snapshots.push(snapshot);
         Self::coalesce_adjacent_pending_remainders(future_clause_snapshots);
     }
@@ -2982,7 +3079,8 @@ impl TextServiceFactory {
                 split_snapshot.consumed_prefix_restore =
                     current_clause_consumed_prefix_restore.take();
             }
-            diagnostic_log(format!(
+            diagnostic_log_lazy(|| {
+                format!(
                 "kind=future-cache\tevent=bootstrap-split\traw_suffix={}\traw_input_suffix={}\tpushed={}",
                 Self::sanitize_log_field(&raw_suffix),
                 Self::sanitize_log_field(&split_raw_input),
@@ -2993,7 +3091,8 @@ impl TextServiceFactory {
                     split_snapshot.raw_hiragana,
                     split_snapshot.corresponding_count,
                 )),
-            ));
+            )
+            });
             future_clause_snapshots.push(split_snapshot);
             return;
         }
@@ -3026,7 +3125,8 @@ impl TextServiceFactory {
             ) {
                 *current_clause_consumed_prefix_restore = restored.consumed_prefix_restore.take();
                 Self::reset_boundary_restored_snapshot_selection(&mut restored);
-                diagnostic_log(format!(
+                diagnostic_log_lazy(|| {
+                    format!(
                     "kind=future-cache\tevent=restore-consumed-prefix\traw_suffix={}\trestored={}",
                     Self::sanitize_log_field(&raw_suffix),
                     Self::sanitize_log_field(&format!(
@@ -3036,7 +3136,8 @@ impl TextServiceFactory {
                         restored.raw_hiragana,
                         restored.corresponding_count,
                     )),
-                ));
+                )
+                });
                 Self::rebase_restored_future_snapshot(
                     &mut restored,
                     future_clause_snapshots.last(),
@@ -3088,7 +3189,8 @@ impl TextServiceFactory {
                     &mut restored,
                     future_clause_snapshots.last(),
                 );
-                diagnostic_log(format!(
+                diagnostic_log_lazy(|| {
+                    format!(
                     "kind=future-cache\tevent=restore-boundary-origin\traw_suffix={}\trestored={}",
                     Self::sanitize_log_field(&raw_suffix),
                     Self::sanitize_log_field(&format!(
@@ -3098,7 +3200,8 @@ impl TextServiceFactory {
                         restored.raw_hiragana,
                         restored.corresponding_count,
                     )),
-                ));
+                )
+                });
                 future_clause_snapshots.push(restored);
                 return;
             }
@@ -3126,17 +3229,19 @@ impl TextServiceFactory {
             if snapshot.raw_hiragana.ends_with(&raw_suffix) && !earlier_snapshot_matches {
                 break;
             }
-            diagnostic_log(format!(
-                "kind=future-cache\tevent=trim-stale-split\traw_suffix={}\tdropped={}",
-                Self::sanitize_log_field(&raw_suffix),
-                Self::sanitize_log_field(&format!(
-                    "{}|{}|{}|{}",
-                    snapshot.clause_preview,
-                    snapshot.suffix,
-                    snapshot.raw_hiragana,
-                    snapshot.corresponding_count,
-                )),
-            ));
+            diagnostic_log_lazy(|| {
+                format!(
+                    "kind=future-cache\tevent=trim-stale-split\traw_suffix={}\tdropped={}",
+                    Self::sanitize_log_field(&raw_suffix),
+                    Self::sanitize_log_field(&format!(
+                        "{}|{}|{}|{}",
+                        snapshot.clause_preview,
+                        snapshot.suffix,
+                        snapshot.raw_hiragana,
+                        snapshot.corresponding_count,
+                    )),
+                )
+            });
             future_clause_snapshots.pop();
         }
 
@@ -3276,7 +3381,8 @@ impl TextServiceFactory {
                 restore,
                 current_clause_consumed_prefix_restore.take(),
             ));
-            diagnostic_log(format!(
+            diagnostic_log_lazy(|| {
+                format!(
                 "kind=future-cache\tevent=replace-consumed-prefix\traw_suffix={}\traw_input_suffix={}\treplaced={}",
                 Self::sanitize_log_field(&raw_suffix),
                 Self::sanitize_log_field(&raw_input_suffix),
@@ -3287,7 +3393,8 @@ impl TextServiceFactory {
                     replaced_snapshot.raw_hiragana,
                     replaced_snapshot.corresponding_count,
                 )),
-            ));
+            )
+            });
             future_clause_snapshots.pop();
             future_clause_snapshots.push(replaced_snapshot);
             return;
@@ -3339,7 +3446,8 @@ impl TextServiceFactory {
             replaced_snapshot.split_group_id = current_clause_split_group_id;
             replaced_snapshot.consumed_prefix_restore = snapshot.consumed_prefix_restore.clone();
             replaced_snapshot.remainder_origin = Some(Self::future_snapshot_origin(snapshot));
-            diagnostic_log(format!(
+            diagnostic_log_lazy(|| {
+                format!(
                 "kind=future-cache\tevent=replace-actual-direct-remainder\traw_suffix={}\traw_input_suffix={}\treplaced={}",
                 Self::sanitize_log_field(&raw_suffix),
                 Self::sanitize_log_field(&raw_input_suffix),
@@ -3350,7 +3458,8 @@ impl TextServiceFactory {
                     replaced_snapshot.raw_hiragana,
                     replaced_snapshot.corresponding_count,
                 )),
-            ));
+            )
+            });
             future_clause_snapshots.pop();
             future_clause_snapshots.push(replaced_snapshot);
             return;
@@ -3392,7 +3501,8 @@ impl TextServiceFactory {
             replaced_snapshot.split_group_id = current_clause_split_group_id;
             replaced_snapshot.consumed_prefix_restore = snapshot.consumed_prefix_restore.clone();
             replaced_snapshot.remainder_origin = Some(Self::future_snapshot_origin(snapshot));
-            diagnostic_log(format!(
+            diagnostic_log_lazy(|| {
+                format!(
                 "kind=future-cache\tevent=replace-derived-split\traw_suffix={}\traw_input_suffix={}\tcurrent_clause_split_group_id={}\treplaced={}",
                 Self::sanitize_log_field(&raw_suffix),
                 Self::sanitize_log_field(&raw_input_suffix),
@@ -3406,7 +3516,8 @@ impl TextServiceFactory {
                     replaced_snapshot.raw_hiragana,
                     replaced_snapshot.corresponding_count,
                 )),
-            ));
+            )
+            });
             future_clause_snapshots.pop();
             future_clause_snapshots.push(replaced_snapshot);
             return;
@@ -3443,7 +3554,8 @@ impl TextServiceFactory {
         {
             split_snapshot.consumed_prefix_restore = current_clause_consumed_prefix_restore.take();
         }
-        diagnostic_log(format!(
+        diagnostic_log_lazy(|| {
+            format!(
             "kind=future-cache\tevent=push-split\traw_suffix={}\traw_input_suffix={}\tpushed={}",
             Self::sanitize_log_field(&raw_suffix),
             Self::sanitize_log_field(&raw_input_suffix),
@@ -3454,7 +3566,8 @@ impl TextServiceFactory {
                 split_snapshot.raw_hiragana,
                 split_snapshot.corresponding_count,
             )),
-        ));
+        )
+        });
         future_clause_snapshots.push(split_snapshot);
     }
 
@@ -3666,7 +3779,8 @@ impl TextServiceFactory {
             snapshot.selection_index,
         );
         *candidates = snapshot.candidates.clone();
-        diagnostic_log(format!(
+        diagnostic_log_lazy(|| {
+            format!(
             "kind=future-cache\tevent=restore\tpreview={}\tsuffix={}\traw_input={}\traw_hiragana={}\tselection_index={}\tcorresponding_count={}\tis_split_derived={}\tis_direct_split_remainder={}\tsplit_group_id={}",
             Self::sanitize_log_field(preview),
             Self::sanitize_log_field(suffix),
@@ -3679,7 +3793,8 @@ impl TextServiceFactory {
             current_clause_split_group_id
                 .map(|group_id| group_id.to_string())
                 .unwrap_or_else(|| "-".to_string()),
-        ));
+        )
+        });
     }
 
     #[inline]
@@ -4062,17 +4177,16 @@ impl TextServiceFactory {
         ipc_service: &mut IPCService,
         pending_learning_commits: &mut Vec<PendingLearningCommit>,
     ) {
-        for commit in pending_learning_commits.drain(..) {
-            if let Err(error) = ipc_service
-                .commit_learning_candidate(commit.candidate_id, commit.kind.proto_value())
-            {
-                tracing::warn!(
-                    ?error,
-                    candidate_id = commit.candidate_id,
-                    kind = ?commit.kind,
-                    "Failed to commit conversion learning candidate"
-                );
-            }
+        let commits = pending_learning_commits
+            .drain(..)
+            .map(|commit| (commit.candidate_id, commit.kind.proto_value()))
+            .collect::<Vec<_>>();
+        if let Err(error) = ipc_service.commit_learning_candidates(&commits) {
+            tracing::warn!(
+                ?error,
+                candidate_count = commits.len(),
+                "Failed to commit conversion learning candidates"
+            );
         }
     }
 
@@ -4402,18 +4516,24 @@ impl TextServiceFactory {
     fn clause_navigation_actions(composition: &Composition, direction: i32) -> Vec<ClientAction> {
         if ClauseState::is_active_for_composition(composition) || !composition.suffix.is_empty() {
             return vec![
-                ClientAction::EnsureClauseNavigationReady,
+                ClientAction::EnsureClauseNavigationReady {
+                    prepare_future_clauses: true,
+                },
                 ClientAction::MoveClause(direction),
             ];
         }
 
         if direction < 0 {
             vec![
-                ClientAction::EnsureClauseNavigationReady,
+                ClientAction::EnsureClauseNavigationReady {
+                    prepare_future_clauses: false,
+                },
                 ClientAction::MoveClause(Self::MOVE_CLAUSE_TO_LAST),
             ]
         } else {
-            vec![ClientAction::EnsureClauseNavigationReady]
+            vec![ClientAction::EnsureClauseNavigationReady {
+                prepare_future_clauses: true,
+            }]
         }
     }
 
@@ -4422,7 +4542,7 @@ impl TextServiceFactory {
         matches!(
             (actions.get(index), actions.get(index + 1)),
             (
-                Some(ClientAction::EnsureClauseNavigationReady),
+                Some(ClientAction::EnsureClauseNavigationReady { .. }),
                 Some(ClientAction::MoveClause(direction)),
             ) if *direction == Self::MOVE_CLAUSE_TO_LAST
         )
@@ -4937,7 +5057,7 @@ impl TextServiceFactory {
                     projection.raw_input = text.clone();
                     projection.reliable = false;
                 }
-                ClientAction::EnsureClauseNavigationReady
+                ClientAction::EnsureClauseNavigationReady { .. }
                 | ClientAction::MoveClause(_)
                 | ClientAction::AdjustBoundary(_)
                 | ClientAction::SetSelection(_)
@@ -6123,6 +6243,7 @@ impl TextServiceFactory {
             let mut transition = transition;
             let mut deferred_clause_navigation_ready_ui_sync = None;
             let mut pending_learning_commits = Vec::new();
+            let mut terminal_ui_cleanup_sent_at = None;
             let has_learning_action = actions
                 .iter()
                 .any(|deferred| matches!(deferred.action, ClientAction::CommitLearning { .. }));
@@ -6198,15 +6319,11 @@ impl TextServiceFactory {
                     current_clause_remainder_origin = None;
                     next_split_group_id = 0;
 
+                    // Clear the UI before the fallible TSF edit. Otherwise a temporary
+                    // edit-session failure can leave stale ruby and candidates visible
+                    // after the document text has already disappeared.
+                    self.hide_candidate_window_ui(&mut ipc_service)?;
                     self.discard_composition_text()?;
-                    let delivery = ipc_service.update_candidate_window(
-                        Some(false),
-                        None,
-                        Some(vec![]),
-                        Some(0),
-                        None,
-                    )?;
-                    self.remember_candidate_window_visibility_if_sent(delivery, Some(false));
                     ipc_service.clear_text()?;
                 }};
             }
@@ -6306,14 +6423,10 @@ impl TextServiceFactory {
 
                 match action {
                     ClientAction::StartComposition => {
-                        let composition_started = self
-                            .borrow()?
-                            .borrow_composition()?
-                            .tip_composition
-                            .is_some();
-                        if !composition_started {
-                            self.start_composition()?;
-                        }
+                        // start_composition closes any stale TIP handle and then starts a
+                        // fresh composition. Merely seeing a handle is not sufficient: a
+                        // previous terminal edit may have emptied its range before failing.
+                        self.start_composition()?;
                         if app_config.general.show_candidate_window_after_space {
                             let delivery = ipc_service.update_candidate_window(
                                 Some(false),
@@ -6383,7 +6496,19 @@ impl TextServiceFactory {
                         );
                     }
                     ClientAction::EndComposition => {
-                        self.end_composition()?;
+                        // Let TSF commit the document before waiting for the synchronous UI
+                        // RPC. UI cleanup is still attempted after a TSF error, and terminal
+                        // RemoveText can own the cleanup before its fallible final edit.
+                        let ui_cleanup_already_sent =
+                            Self::preceding_action_sent_terminal_ui_cleanup(
+                                terminal_ui_cleanup_sent_at,
+                                action_index,
+                            );
+                        Self::run_terminal_end_cleanup(
+                            ui_cleanup_already_sent,
+                            || self.end_composition(),
+                            || self.hide_candidate_window_ui(&mut ipc_service),
+                        )?;
                         selection_index = 0;
                         corresponding_count = 0;
                         temporary_latin = false;
@@ -6393,6 +6518,7 @@ impl TextServiceFactory {
                         raw_input.clear();
                         raw_hiragana.clear();
                         fixed_prefix.clear();
+                        candidates = Candidates::default();
                         clause_snapshots.clear();
                         future_clause_snapshots.clear();
                         current_clause_is_split_derived = false;
@@ -6405,14 +6531,6 @@ impl TextServiceFactory {
                         current_clause_consumed_prefix_restore = None;
                         current_clause_remainder_origin = None;
                         next_split_group_id = 0;
-                        let delivery = ipc_service.update_candidate_window(
-                            Some(false),
-                            None,
-                            Some(vec![]),
-                            Some(0),
-                            None,
-                        )?;
-                        self.remember_candidate_window_visibility_if_sent(delivery, Some(false));
                         Self::flush_pending_learning_commits(
                             &mut ipc_service,
                             &mut pending_learning_commits,
@@ -6680,8 +6798,11 @@ impl TextServiceFactory {
                             persist_local_state!();
                             continue;
                         }
-                        if let Some(selected) = Self::select_candidate(&candidates, selection_index)
-                        {
+                        if let Some(selected) = Self::select_candidate_for_remove_text_transition(
+                            &candidates,
+                            selection_index,
+                            &transition,
+                        ) {
                             selection_index = selected.index;
                             corresponding_count = selected.corresponding_count;
 
@@ -6710,9 +6831,12 @@ impl TextServiceFactory {
                                 ),
                             )?;
                         } else {
-                            // Server side text is fully removed. Close TSF composition too
-                            // so preedit text does not linger in an inconsistent state.
+                            // The requested final state is authoritative even if the server
+                            // returns stale non-empty candidates. Never materialize that stale
+                            // response back into TSF; close the composition from the local state.
                             let committed_prefix = fixed_prefix.clone();
+                            let followup_owns_terminal_end =
+                                Self::followup_owns_terminal_end(actions, action_index);
 
                             transition = CompositionState::None;
                             selection_index = 0;
@@ -6722,6 +6846,7 @@ impl TextServiceFactory {
                             suffix.clear();
                             raw_input.clear();
                             raw_hiragana.clear();
+                            candidates = Candidates::default();
                             clause_snapshots.clear();
                             future_clause_snapshots.clear();
                             current_clause_is_split_derived = false;
@@ -6733,25 +6858,26 @@ impl TextServiceFactory {
                             current_clause_split_group_id = None;
                             current_clause_consumed_prefix_restore = None;
                             current_clause_remainder_origin = None;
+                            next_split_group_id = 0;
 
+                            // Hide before either TSF edit below can fail. This keeps the
+                            // candidate and ruby windows consistent with an empty document.
+                            let hide_delivery = self.hide_candidate_window_ui(&mut ipc_service)?;
+                            terminal_ui_cleanup_sent_at =
+                                hide_delivery.was_sent().then_some(action_index);
                             if committed_prefix.is_empty() {
                                 self.set_text("", "")?;
                             } else {
                                 self.set_text(&committed_prefix, "")?;
                             }
-                            self.end_composition()?;
-                            let delivery = ipc_service.update_candidate_window(
-                                Some(false),
-                                None,
-                                Some(vec![]),
-                                Some(0),
-                                None,
-                            )?;
-                            self.remember_candidate_window_visibility_if_sent(
-                                delivery,
-                                Some(false),
-                            );
-                            ipc_service.clear_text()?;
+
+                            // A planned terminal removal is followed by EndComposition.
+                            // Let that single action own the TIP close and server clear so
+                            // a failed duplicate cleanup cannot replay over the next input.
+                            if !followup_owns_terminal_end {
+                                self.end_composition()?;
+                                ipc_service.clear_text()?;
+                            }
 
                             preview.clear();
                             fixed_prefix.clear();
@@ -6823,7 +6949,9 @@ impl TextServiceFactory {
                             );
                         }
                     }
-                    ClientAction::EnsureClauseNavigationReady => {
+                    ClientAction::EnsureClauseNavigationReady {
+                        prepare_future_clauses,
+                    } => {
                         if ipc_service.take_server_reset_recovered()
                             && Self::has_client_composition_state(
                                 &raw_input,
@@ -6879,7 +7007,10 @@ impl TextServiceFactory {
                             let transition = ClauseState::transition_with_backend(
                                 &mut state,
                                 ClauseCommand::StartClauseNavigation,
-                                ClauseTransitionInput::default(),
+                                ClauseTransitionInput {
+                                    prepare_future_clauses: *prepare_future_clauses,
+                                    ..ClauseTransitionInput::default()
+                                },
                                 &mut ipc_service,
                             )?;
                             let effect = transition.effect;
@@ -7843,6 +7974,16 @@ impl TextServiceFactory {
 
             Ok(())
         })();
+
+        if result.is_err() && requested_transition == CompositionState::None {
+            // The requested state is authoritative even when a TSF callback fails
+            // midway through the edit. Repeat the cheap best-effort UI cleanup so
+            // deferred action replay is never required merely to hide stale UI.
+            if let Ok(Some(mut ipc_service)) = IMEState::ipc_service() {
+                let _ = self.hide_candidate_window_ui(&mut ipc_service);
+                let _ = IMEState::set_ipc_service(ipc_service);
+            }
+        }
 
         if result.as_ref().is_err_and(requires_action_recovery) {
             if let Some(actions) = retry_actions.as_ref() {

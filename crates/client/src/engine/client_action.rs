@@ -18,7 +18,9 @@ pub enum ClientAction {
     SetTextWithType(SetTextType),
 
     MoveCursor(i32),
-    EnsureClauseNavigationReady,
+    EnsureClauseNavigationReady {
+        prepare_future_clauses: bool,
+    },
     MoveClause(i32),
     AdjustBoundary(i32),
     SetSelection(SetSelectionType),

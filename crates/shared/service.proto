@@ -147,11 +147,18 @@ message PreparedClauseAdvance {
 message PrepareFutureClausesRequest {
   int32 initial_offset = 1;
   uint64 request_id = 2;
+  // Keep the server-side composition snapshots and cursor at the final
+  // prepared clause. Used by initial left-arrow navigation so the client can
+  // move to the last clause without replaying one RPC per clause.
+  bool leave_at_last = 3;
 }
 
 message PrepareFutureClausesResponse {
   repeated PreparedClauseAdvance advances = 1;
   uint64 server_session_id = 2;
+  // True only when preparation reached the final clause. If false, a
+  // leave_at_last request has been rolled back to its initial server state.
+  bool completed = 3;
 }
 
 // Response message for MoveCursor.
@@ -203,6 +210,21 @@ message CommitLearningCandidateResponse {
   uint64 server_session_id = 1; // Identifies the current server process session.
 }
 
+message LearningCandidateCommit {
+  uint64 candidate_id = 1;
+  LearningCommitKind commit_kind = 2;
+}
+
+message CommitLearningCandidatesRequest {
+  repeated LearningCandidateCommit commits = 1;
+  uint64 request_id = 2;
+}
+
+message CommitLearningCandidatesResponse {
+  uint64 server_session_id = 1; // Identifies the current server process session.
+  uint32 committed_count = 2;
+}
+
 message ResetLearningMemoryRequest {
   uint64 request_id = 1;
 }
@@ -239,6 +261,7 @@ service AzookeyService {
   rpc SetContext (SetContextRequest) returns (SetContextResponse);
   rpc UpdateConfig (UpdateConfigRequest) returns (UpdateConfigResponse);
   rpc CommitLearningCandidate (CommitLearningCandidateRequest) returns (CommitLearningCandidateResponse);
+  rpc CommitLearningCandidates (CommitLearningCandidatesRequest) returns (CommitLearningCandidatesResponse);
   rpc ResetLearningMemory (ResetLearningMemoryRequest) returns (ResetLearningMemoryResponse);
   rpc LogPerformance (PerformanceLogRequest) returns (PerformanceLogResponse);
 }

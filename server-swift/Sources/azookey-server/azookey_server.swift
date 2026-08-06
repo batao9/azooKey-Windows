@@ -692,15 +692,15 @@ private func learningCandidateOutput(_ candidate: Candidate) -> String {
     }
 }
 
-@MainActor private func recordLearningSelectionOverride(_ candidate: Candidate) {
+@MainActor private func updateLearningSelectionOverride(_ candidate: Candidate) -> Bool {
     guard candidate.isLearningTarget else {
-        return
+        return false
     }
 
     let ruby = learningCandidateRuby(candidate)
     let output = learningCandidateOutput(candidate)
     guard !ruby.isEmpty, !output.isEmpty else {
-        return
+        return false
     }
 
     if learningSelectionOverrides[ruby] == nil,
@@ -709,6 +709,13 @@ private func learningCandidateOutput(_ candidate: Candidate) -> String {
         learningSelectionOverrides.removeValue(forKey: evictedRuby)
     }
     learningSelectionOverrides[ruby] = output
+    return true
+}
+
+@MainActor private func recordLearningSelectionOverride(_ candidate: Candidate) {
+    guard updateLearningSelectionOverride(candidate) else {
+        return
+    }
     saveLearningSelectionOverrides()
 }
 
@@ -1223,10 +1230,16 @@ private func cursorPrefixBoundaryScore(
         candidate: candidate,
         prefixSurfaceCount: prefixSurfaceCount
     )
+    // A first-clause result can occasionally consume the first character of
+    // the following clause while its displayed ruby stops before it. Such a
+    // boundary makes the first Shift+Left change invisible (for example,
+    // "ある程度な" -> "ある程度"). Prefer a display-aligned boundary.
+    let overconsumedSurfacePenalty = prefixSurfaceCount > candidate.rubyCount ? 160 : 0
 
     return resolution.correspondingCount * 4
         + terminalBonus
         - tokenBoundaryPenalty
+        - overconsumedSurfacePenalty
         - candidateIndex
 }
 
@@ -2177,6 +2190,11 @@ func cursorPrefixBoundaryFirstClauseResults(
     return _strdup(composingText.convertTarget)!
 }
 
+@_silgen_name("GetCursorPosition")
+@MainActor public func get_cursor_position() -> CInt {
+    CInt(clamping: composingText.convertTargetCursorPosition)
+}
+
 @_silgen_name("GetRawInput")
 @MainActor public func get_raw_input() -> UnsafeMutablePointer<CChar>? {
     let characters = composingText.input.compactMap(inputCharacter)
@@ -2353,6 +2371,64 @@ func cursorPrefixBoundaryFirstClauseResults(
         "CommitLearningCandidate: completed candidateId=\(candidateId) commitKind=\(commitKind)"
     )
     return true
+}
+
+@_silgen_name("CommitLearningCandidates")
+@MainActor public func commit_learning_candidates(
+    candidateIds: UnsafePointer<UInt64>?,
+    commitKinds: UnsafePointer<Int32>?,
+    count: Int32
+) -> Int32 {
+    guard count >= 0, let candidateIds, let commitKinds else {
+        serverLog("WARN", "CommitLearningCandidates: invalid batch count=\(count)")
+        return 0
+    }
+    guard count > 0 else {
+        return 0
+    }
+    guard currentLearningType == .inputAndOutput else {
+        serverLog(
+            "DEBUG",
+            "CommitLearningCandidates: skipped learningType=\(currentLearningType) count=\(count)"
+        )
+        return count
+    }
+
+    var candidates: [(candidate: Candidate, candidateId: UInt64, commitKind: Int32)] = []
+    candidates.reserveCapacity(Int(count))
+    for index in 0..<Int(count) {
+        let candidateId = candidateIds[index]
+        let commitKind = commitKinds[index]
+        guard let candidate = consumeLearningCandidate(candidateId) else {
+            serverLog(
+                "WARN",
+                "CommitLearningCandidates: candidate not found candidateId=\(candidateId) commitKind=\(commitKind)"
+            )
+            continue
+        }
+        candidates.append((candidate, candidateId, commitKind))
+    }
+    guard !candidates.isEmpty else {
+        return 0
+    }
+
+    ensureLearningMemoryDirectoryIfNeeded()
+    var selectionOverrideChanged = false
+    for entry in candidates {
+        converter.setCompletedData(entry.candidate)
+        converter.updateLearningData(entry.candidate)
+        selectionOverrideChanged =
+            updateLearningSelectionOverride(entry.candidate) || selectionOverrideChanged
+    }
+    converter.commitUpdateLearningData()
+    if selectionOverrideChanged {
+        saveLearningSelectionOverrides()
+    }
+    serverLog(
+        "DEBUG",
+        "CommitLearningCandidates: completed requestedCount=\(count) committedCount=\(candidates.count)"
+    )
+    return Int32(candidates.count)
 }
 
 @_silgen_name("ResetLearningMemory")
