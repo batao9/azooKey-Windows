@@ -178,9 +178,11 @@ pub(crate) trait ClauseActionBackend {
             }
         }
 
-        let retained_snapshot_count = (leave_at_last && completed)
-            .then_some(advances.len())
-            .unwrap_or(0);
+        let retained_snapshot_count = if leave_at_last && completed {
+            advances.len()
+        } else {
+            0
+        };
         for _ in retained_snapshot_count..snapshot_count {
             self.update_composition_snapshot(ClauseSnapshotOperation::Pop, &previous)?;
         }

@@ -3832,7 +3832,7 @@ impl TextServiceFactory {
         future_clause_snapshots
             .last()
             .map(|snapshot| {
-                server_raw_input.map_or(true, |raw_input| snapshot.raw_input == raw_input)
+                server_raw_input.is_none_or(|raw_input| snapshot.raw_input == raw_input)
                     && (server_candidates.hiragana == snapshot.raw_hiragana
                         || server_candidates
                             .hiragana
