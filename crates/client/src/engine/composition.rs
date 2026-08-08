@@ -5050,6 +5050,9 @@ impl TextServiceFactory {
                 | ClientAction::AppendTextDirect(text) => projection.raw_input.push_str(text),
                 ClientAction::RemoveText => {
                     projection.raw_input.pop();
+                    // A mapped kana can consume more than one raw input element.
+                    // Execution will replace this estimate with the server identity.
+                    projection.reliable = false;
                 }
                 ClientAction::ShrinkText(text)
                 | ClientAction::ShrinkTextRaw(text)
@@ -6781,8 +6784,10 @@ impl TextServiceFactory {
                             persist_local_state!();
                             continue;
                         }
-                        raw_input.pop();
-                        candidates = ipc_service.remove_text_with_context(&candidates)?;
+                        let removal =
+                            ipc_service.remove_text_with_context(&candidates, &raw_input)?;
+                        raw_input = removal.raw_input;
+                        candidates = removal.candidates;
                         if ipc_service.take_server_reset_recovered()
                             && Self::has_client_composition_state(
                                 &raw_input,

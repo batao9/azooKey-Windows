@@ -37,6 +37,32 @@ private func packageRootURL() -> URL {
         .deletingLastPathComponent()
 }
 
+private func defaultWindowsRomajiRows() throws -> [RomajiTableRow] {
+    let tableURL = packageRootURL()
+        .deletingLastPathComponent()
+        .appending(path: "crates")
+        .appending(path: "shared")
+        .appending(path: "src")
+        .appending(path: "default_romaji_table.txt")
+    let content = try String(contentsOf: tableURL, encoding: .utf8)
+
+    return content.split(whereSeparator: \.isNewline).compactMap { line in
+        let trimmed = String(line).trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else {
+            return nil
+        }
+        let columns = trimmed.split(separator: "\t", omittingEmptySubsequences: false)
+        guard columns.count >= 2, !columns[0].isEmpty, !columns[1].isEmpty else {
+            return nil
+        }
+        return row(
+            String(columns[0]),
+            String(columns[1]),
+            columns.count >= 3 ? String(columns[2]) : ""
+        )
+    }
+}
+
 @Test func engineRuntimeDirectoryUsesAppData() {
     let directory = engineRuntimeDirectoryURL(
         appDataPath: #"C:\Users\test\AppData\Roaming"#,
@@ -591,6 +617,160 @@ private func testCandidate(
     }
 }
 
+@Test func clauseBoundaryAdjustmentIncludesDelayedSingleNBoundary() async {
+    await MainActor.run {
+        let previousComposingText = composingText
+        defer {
+            composingText = previousComposingText
+        }
+
+        composingText = ComposingText()
+        composingText.insertAtCursorPosition(
+            "iikagentouitusiro",
+            inputStyle: .roman2kana
+        )
+        #expect(composingText.convertTarget == "いいかげんとういつしろ")
+
+        _ = composingText.moveCursorFromCursorPosition(
+            count: 6 - composingText.convertTargetCursorPosition
+        )
+
+        @MainActor func adjust(
+            currentInputCount: CInt,
+            direction: CInt,
+            expectedInputCount: CInt,
+            expectedCursorPosition: CInt
+        ) {
+            var applied: CInt = 0
+            var adjustedInputCount: CInt = -1
+            var cursorOffset: CInt = 0
+            free_c_string(
+                adjust_clause_boundary(
+                    currentInputCount: currentInputCount,
+                    direction: direction,
+                    appliedPtr: &applied,
+                    adjustedInputCountPtr: &adjustedInputCount,
+                    cursorOffsetPtr: &cursorOffset
+                )
+            )
+
+            #expect(applied == 1)
+            #expect(adjustedInputCount == expectedInputCount)
+            #expect(composingText.convertTargetCursorPosition == expectedCursorPosition)
+        }
+
+        adjust(
+            currentInputCount: 9,
+            direction: -1,
+            expectedInputCount: 7,
+            expectedCursorPosition: 5
+        )
+        adjust(
+            currentInputCount: 7,
+            direction: 1,
+            expectedInputCount: 9,
+            expectedCursorPosition: 6
+        )
+        adjust(
+            currentInputCount: 9,
+            direction: -1,
+            expectedInputCount: 7,
+            expectedCursorPosition: 5
+        )
+        adjust(
+            currentInputCount: 7,
+            direction: -1,
+            expectedInputCount: 6,
+            expectedCursorPosition: 4
+        )
+    }
+}
+
+@Test func clauseBoundaryAdjustmentSupportsDelayedSingleNInCustomInputStyle() async throws {
+    try await MainActor.run {
+        let previousComposingText = composingText
+        defer {
+            composingText = previousComposingText
+        }
+
+        let inputStyle = try makeTemporaryCustomInputStyle([
+            row("n", "ん"),
+            row("na", "な"),
+            row("nn", "ん"),
+            row("n'", "ん"),
+            row("nya", "にゃ"),
+            row("ta", "た"),
+        ])
+        composingText = ComposingText()
+        composingText.insertAtCursorPosition("nta", inputStyle: inputStyle)
+        #expect(composingText.convertTarget == "んた")
+
+        var applied: CInt = 0
+        var adjustedInputCount: CInt = -1
+        var cursorOffset: CInt = 0
+        free_c_string(
+            adjust_clause_boundary(
+                currentInputCount: 3,
+                direction: -1,
+                appliedPtr: &applied,
+                adjustedInputCountPtr: &adjustedInputCount,
+                cursorOffsetPtr: &cursorOffset
+            )
+        )
+
+        #expect(applied == 1)
+        #expect(adjustedInputCount == 1)
+        #expect(composingText.convertTargetCursorPosition == 1)
+
+        free_c_string(
+            adjust_clause_boundary(
+                currentInputCount: 1,
+                direction: 1,
+                appliedPtr: &applied,
+                adjustedInputCountPtr: &adjustedInputCount,
+                cursorOffsetPtr: &cursorOffset
+            )
+        )
+
+        #expect(applied == 1)
+        #expect(adjustedInputCount == 3)
+        #expect(composingText.convertTargetCursorPosition == 2)
+    }
+}
+
+@Test func clauseBoundaryAdjustmentKeepsAtomicCustomNSequence() async throws {
+    try await MainActor.run {
+        let previousComposingText = composingText
+        defer {
+            composingText = previousComposingText
+        }
+
+        let inputStyle = try makeTemporaryCustomInputStyle([
+            row("nq", "んや"),
+        ])
+        composingText = ComposingText()
+        composingText.insertAtCursorPosition("nq", inputStyle: inputStyle)
+        #expect(composingText.convertTarget == "んや")
+
+        var applied: CInt = 0
+        var adjustedInputCount: CInt = -1
+        var cursorOffset: CInt = 0
+        free_c_string(
+            adjust_clause_boundary(
+                currentInputCount: 2,
+                direction: -1,
+                appliedPtr: &applied,
+                adjustedInputCountPtr: &adjustedInputCount,
+                cursorOffsetPtr: &cursorOffset
+            )
+        )
+
+        #expect(applied == 0)
+        #expect(adjustedInputCount == 2)
+        #expect(composingText.convertTargetCursorPosition == 2)
+    }
+}
+
 @Test func rawInputIdentitySurvivesClauseShrinkWithoutNormalizingRomaji() async {
     await MainActor.run {
         let previousComposingText = composingText
@@ -608,6 +788,69 @@ private func testCandidate(
             free_c_string(rawInput)
         }
         #expect(rawInput.map { String(cString: $0) } == String(input.dropFirst(8)))
+    }
+}
+
+@Test func removeTextReturnsCanonicalInputAfterMappedRomajiDeletion() async throws {
+    try await MainActor.run {
+        let previousComposingText = composingText
+        defer {
+            composingText = previousComposingText
+        }
+
+        let inputStyle = try makeTemporaryCustomInputStyle(defaultWindowsRomajiRows())
+        composingText = ComposingText()
+        for character in "buns" {
+            composingText.insertAtCursorPosition(String(character), inputStyle: inputStyle)
+        }
+
+        var cursor: CInt = 0
+        free_c_string(remove_text(cursorPtr: &cursor))
+        var rawInput = get_raw_input()
+        // The converter materializes the terminal `n` as kana while deleting
+        // the pending `s`; this cannot be reproduced with a client-side pop.
+        #expect(rawInput.map { String(cString: $0) } == "buん")
+        free_c_string(rawInput)
+
+        free_c_string(remove_text(cursorPtr: &cursor))
+        rawInput = get_raw_input()
+        #expect(rawInput.map { String(cString: $0) } == "bu")
+        free_c_string(rawInput)
+    }
+}
+
+@Test func removeTextCanConsumeMultipleRawElementsInLongComposition() async throws {
+    try await MainActor.run {
+        let previousComposingText = composingText
+        defer {
+            composingText = previousComposingText
+        }
+
+        // Exact key sequence recovered from the failing VM trace. The user
+        // corrected the terminal `bnun` with three Backspaces; the mapped input
+        // table removes two internal elements on the second deletion.
+        let input = "aruteidonageibunsyoudemofukusuubnun"
+        let inputStyle = try makeTemporaryCustomInputStyle(defaultWindowsRomajiRows())
+        composingText = ComposingText()
+        for character in input {
+            composingText.insertAtCursorPosition(String(character), inputStyle: inputStyle)
+        }
+        #expect(composingText.input.count == 35)
+
+        var cursor: CInt = 0
+        free_c_string(remove_text(cursorPtr: &cursor))
+        #expect(composingText.input.count == 34)
+        free_c_string(remove_text(cursorPtr: &cursor))
+        #expect(composingText.input.count == 32)
+        free_c_string(remove_text(cursorPtr: &cursor))
+        #expect(composingText.input.count == 31)
+
+        let rawInput = get_raw_input()
+        defer {
+            free_c_string(rawInput)
+        }
+        #expect(rawInput.map { String(cString: $0).count } == 31)
+        #expect(rawInput.map { String(cString: $0) } != String(input.dropLast(3)))
     }
 }
 

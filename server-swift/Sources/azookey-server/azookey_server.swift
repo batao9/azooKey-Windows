@@ -2208,6 +2208,54 @@ func cursorPrefixBoundaryFirstClauseResults(
     return _strdup(String(characters))
 }
 
+@MainActor private func clauseAdjustmentBoundaryMap(
+    composingText: ComposingText
+) -> [Int: Int] {
+    var boundaries = composingText.inputIndexToSurfaceIndexMap()
+    let independentBoundaries = boundaries.sorted { $0.key < $1.key }
+    let surfaceCharacters = Array(composingText.convertTarget)
+
+    for (start, end) in zip(independentBoundaries, independentBoundaries.dropFirst()) {
+        let inputStart = start.key
+        let surfaceStart = start.value
+        guard end.key > inputStart + 1,
+              end.value > surfaceStart + 1,
+              composingText.input.indices.contains(inputStart),
+              surfaceCharacters.indices.contains(surfaceStart),
+              boundaries[inputStart + 1] == nil
+        else {
+            continue
+        }
+
+        let firstElement = composingText.input[inputStart]
+        guard firstElement.inputStyle != .direct,
+              let firstInput = inputCharacter(firstElement),
+              asciiLowercase(firstInput) == "n",
+              surfaceCharacters[surfaceStart] == "ん"
+        else {
+            continue
+        }
+
+        var suffixComposingText = ComposingText()
+        suffixComposingText.insertAtCursorPosition(
+            Array(composingText.input[(inputStart + 1) ..< end.key])
+        )
+        let expectedSurfaceSuffix = String(
+            surfaceCharacters[(surfaceStart + 1) ..< end.value]
+        )
+        guard suffixComposingText.convertTarget == expectedSurfaceSuffix else {
+            continue
+        }
+
+        // A single `n` is resolved only after the following romaji segment starts,
+        // so the converter's independent-segment map omits the useful boundary
+        // between `ん` and that following kana (for example, `nto` -> `んと`).
+        boundaries[inputStart + 1] = surfaceStart + 1
+    }
+
+    return boundaries
+}
+
 @_silgen_name("AdjustClauseBoundary")
 @MainActor public func adjust_clause_boundary(
     currentInputCount: Int32,
@@ -2242,7 +2290,7 @@ func cursorPrefixBoundaryFirstClauseResults(
         }
     }
 
-    let surfaceIndexByInputIndex = composingText.inputIndexToSurfaceIndexMap()
+    let surfaceIndexByInputIndex = clauseAdjustmentBoundaryMap(composingText: composingText)
     let inputBoundaries = surfaceIndexByInputIndex.keys.sorted()
     guard let currentBoundaryIndex = inputBoundaries.firstIndex(of: Int(currentInputCount)),
           let currentSurfaceIndex = surfaceIndexByInputIndex[Int(currentInputCount)]

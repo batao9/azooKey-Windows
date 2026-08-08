@@ -486,6 +486,7 @@ fn deferred_projection_tracks_raw_input_before_navigation() {
     };
 
     assert_eq!(projection.raw_input, "a");
+    assert!(!projection.reliable);
     assert!(TextServiceFactory::plan_deferred_user_action(
         &projected_composition,
         &left,

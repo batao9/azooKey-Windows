@@ -1668,6 +1668,7 @@ impl AzookeyService for MyAzookeyService {
         let remove_start = Instant::now();
         let composing_text =
             remove_text().map_err(|error| status_from_error("remove_text", error))?;
+        let raw_input = get_raw_input().map_err(|error| status_from_error("remove_text", error))?;
         performance_event_lazy!(
             request_id,
             "remove_text",
@@ -1705,6 +1706,7 @@ impl AzookeyService for MyAzookeyService {
                 suggestions: composed_text.suggestions,
             }),
             server_session_id: server_session_id(),
+            raw_input: Some(raw_input),
         }))
     }
 
@@ -1735,6 +1737,10 @@ impl AzookeyService for MyAzookeyService {
         let get_composed_start = Instant::now();
         let composed_text = get_composed_text(use_cursor_prefix, None, request_id)
             .map_err(|error| status_from_error("move_cursor", error))?;
+        let raw_input = use_cursor_prefix
+            .then(get_raw_input)
+            .transpose()
+            .map_err(|error| status_from_error("move_cursor", error))?;
         performance_event_lazy!(
             request_id,
             "move_cursor",
@@ -1761,6 +1767,7 @@ impl AzookeyService for MyAzookeyService {
                 suggestions: composed_text.suggestions,
             }),
             server_session_id: server_session_id(),
+            raw_input,
         }))
     }
 

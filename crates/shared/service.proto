@@ -68,6 +68,9 @@ message RemoveTextRequest {
 message RemoveTextResponse {
   ComposingText composing_text = 1; // The resulting text and suggestions.
   uint64 server_session_id = 2; // Identifies the current server process session.
+  // New clients must not interpret an older server's missing field as an empty
+  // composition. Absence triggers reconstruction with the current server.
+  optional string raw_input = 3; // Exact remaining raw input after mapped deletion.
 }
 
 message MoveCursorRequest {
@@ -165,6 +168,9 @@ message PrepareFutureClausesResponse {
 message MoveCursorResponse {
   ComposingText composing_text = 1; // The resulting text and suggestions.
   uint64 server_session_id = 2; // Identifies the current server process session.
+  // Present for offset-zero refreshes so a client recovering an edit response
+  // can restore the server's exact raw-input identity without replaying it.
+  optional string raw_input = 3;
 }
 
 // Request message for ClearText.
