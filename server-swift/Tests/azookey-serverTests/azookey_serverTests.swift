@@ -37,6 +37,32 @@ private func packageRootURL() -> URL {
         .deletingLastPathComponent()
 }
 
+private func defaultWindowsRomajiRows() throws -> [RomajiTableRow] {
+    let tableURL = packageRootURL()
+        .deletingLastPathComponent()
+        .appending(path: "crates")
+        .appending(path: "shared")
+        .appending(path: "src")
+        .appending(path: "default_romaji_table.txt")
+    let content = try String(contentsOf: tableURL, encoding: .utf8)
+
+    return content.split(whereSeparator: \.isNewline).compactMap { line in
+        let trimmed = String(line).trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else {
+            return nil
+        }
+        let columns = trimmed.split(separator: "\t", omittingEmptySubsequences: false)
+        guard columns.count >= 2, !columns[0].isEmpty, !columns[1].isEmpty else {
+            return nil
+        }
+        return row(
+            String(columns[0]),
+            String(columns[1]),
+            columns.count >= 3 ? String(columns[2]) : ""
+        )
+    }
+}
+
 @Test func engineRuntimeDirectoryUsesAppData() {
     let directory = engineRuntimeDirectoryURL(
         appDataPath: #"C:\Users\test\AppData\Roaming"#,
@@ -381,6 +407,77 @@ private func testCandidate(
     }
 }
 
+@Test func learningCandidateBatchCommitsAllSelectionsAndPersistsOverridesOnce() async throws {
+    let packageRoot = packageRootURL()
+    let dictionaryURL = packageRoot
+        .appending(path: "azooKey_dictionary_storage")
+        .appending(path: "Dictionary")
+    let memoryURL = FileManager.default.temporaryDirectory
+        .appending(path: "azookey-server-learning-batch-test-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: memoryURL, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: memoryURL)
+    }
+
+    try await MainActor.run {
+        let previousConverter = converter
+        let previousSupplementConverter = normalNBestSupplementConverter
+        let previousLearningType = currentLearningType
+        let previousLearningMemoryDirectoryURL = currentLearningMemoryDirectoryURL
+        let previousLearningCandidateCache = learningCandidateCache
+        let previousLearningSelectionOverrides = learningSelectionOverrides
+        defer {
+            converter = previousConverter
+            normalNBestSupplementConverter = previousSupplementConverter
+            currentLearningType = previousLearningType
+            currentLearningMemoryDirectoryURL = previousLearningMemoryDirectoryURL
+            learningCandidateCache = previousLearningCandidateCache
+            learningSelectionOverrides = previousLearningSelectionOverrides
+        }
+
+        converter = KanaKanjiConverter(dictionaryURL: dictionaryURL, preloadDictionary: true)
+        normalNBestSupplementConverter = KanaKanjiConverter(
+            dictionaryURL: dictionaryURL,
+            preloadDictionary: false
+        )
+        currentLearningType = .inputAndOutput
+        currentLearningMemoryDirectoryURL = memoryURL
+        learningCandidateCache.removeAll()
+        learningSelectionOverrides.removeAll()
+        let options = testLearningConvertRequestOptions(memoryURL: memoryURL)
+
+        @MainActor func candidateId(reading: String, output: String) throws -> UInt64 {
+            var source = ComposingText()
+            source.insertAtCursorPosition(reading, inputStyle: .direct)
+            let candidates = converter.requestCandidates(source, options: options).mainResults
+            let index = try #require(candidates.firstIndex { $0.text == output })
+            let firstId = try #require(cacheLearningCandidates(candidates))
+            return learningCandidateId(at: index, batchFirstId: firstId)
+        }
+
+        let candidateIds = try [
+            candidateId(reading: "かとう", output: "加藤"),
+            candidateId(reading: "はしる", output: "走る"),
+        ]
+        let commitKinds = [Int32(1), Int32(1)]
+        let committedCount = candidateIds.withUnsafeBufferPointer { candidateIdsPointer in
+            commitKinds.withUnsafeBufferPointer { commitKindsPointer in
+                commit_learning_candidates(
+                    candidateIds: candidateIdsPointer.baseAddress,
+                    commitKinds: commitKindsPointer.baseAddress,
+                    count: Int32(candidateIds.count)
+                )
+            }
+        }
+
+        #expect(committedCount == 2)
+        learningSelectionOverrides.removeAll()
+        loadLearningSelectionOverrides()
+        #expect(learningSelectionOverrides["カトウ"] == "加藤")
+        #expect(learningSelectionOverrides["ハシル"] == "走る")
+    }
+}
+
 @Test func ffiFreeCStringAcceptsNullAndAllocatedStrings() async throws {
     free_c_string(nil)
 
@@ -444,6 +541,570 @@ private func testCandidate(
         push_composing_text_snapshot()
         clear_composing_text_snapshots()
         #expect(composingTextSnapshots.isEmpty)
+    }
+}
+
+@Test func clauseBoundaryAdjustmentKeepsAlternateRomajiSegmentsAtomic() async {
+    await MainActor.run {
+        let previousComposingText = composingText
+        defer {
+            composingText = previousComposingText
+        }
+
+        let cases = [
+            (raw: "tya", kana: "ちゃ"),
+            (raw: "cha", kana: "ちゃ"),
+            (raw: "tyu", kana: "ちゅ"),
+            (raw: "chu", kana: "ちゅ"),
+        ]
+        for testCase in cases {
+            composingText = ComposingText()
+            composingText.insertAtCursorPosition(
+                "\(testCase.raw)ibu",
+                inputStyle: .roman2kana
+            )
+            #expect(composingText.convertTarget == "\(testCase.kana)いぶ")
+
+            var applied: CInt = 0
+            var adjustedInputCount: CInt = -1
+            var cursorOffset: CInt = 0
+            free_c_string(
+                adjust_clause_boundary(
+                    currentInputCount: 4,
+                    direction: -1,
+                    appliedPtr: &applied,
+                    adjustedInputCountPtr: &adjustedInputCount,
+                    cursorOffsetPtr: &cursorOffset
+                )
+            )
+
+            #expect(applied == 1)
+            #expect(adjustedInputCount == 3)
+            #expect(composingText.convertTargetCursorPosition == testCase.kana.count)
+            #expect(cursorOffset < 0)
+
+            applied = 0
+            adjustedInputCount = -1
+            cursorOffset = 0
+            free_c_string(
+                adjust_clause_boundary(
+                    currentInputCount: 3,
+                    direction: -1,
+                    appliedPtr: &applied,
+                    adjustedInputCountPtr: &adjustedInputCount,
+                    cursorOffsetPtr: &cursorOffset
+                )
+            )
+
+            #expect(applied == 0)
+            #expect(adjustedInputCount == 3)
+            #expect(cursorOffset == 0)
+            #expect(composingText.convertTargetCursorPosition == testCase.kana.count)
+
+            free_c_string(
+                adjust_clause_boundary(
+                    currentInputCount: 3,
+                    direction: 1,
+                    appliedPtr: &applied,
+                    adjustedInputCountPtr: &adjustedInputCount,
+                    cursorOffsetPtr: &cursorOffset
+                )
+            )
+            #expect(applied == 1)
+            #expect(adjustedInputCount == 4)
+            #expect(composingText.convertTargetCursorPosition == testCase.kana.count + 1)
+        }
+    }
+}
+
+@Test func clauseBoundaryAdjustmentIncludesDelayedSingleNBoundary() async {
+    await MainActor.run {
+        let previousComposingText = composingText
+        defer {
+            composingText = previousComposingText
+        }
+
+        composingText = ComposingText()
+        composingText.insertAtCursorPosition(
+            "iikagentouitusiro",
+            inputStyle: .roman2kana
+        )
+        #expect(composingText.convertTarget == "いいかげんとういつしろ")
+
+        _ = composingText.moveCursorFromCursorPosition(
+            count: 6 - composingText.convertTargetCursorPosition
+        )
+
+        @MainActor func adjust(
+            currentInputCount: CInt,
+            direction: CInt,
+            expectedInputCount: CInt,
+            expectedCursorPosition: CInt
+        ) {
+            var applied: CInt = 0
+            var adjustedInputCount: CInt = -1
+            var cursorOffset: CInt = 0
+            free_c_string(
+                adjust_clause_boundary(
+                    currentInputCount: currentInputCount,
+                    direction: direction,
+                    appliedPtr: &applied,
+                    adjustedInputCountPtr: &adjustedInputCount,
+                    cursorOffsetPtr: &cursorOffset
+                )
+            )
+
+            #expect(applied == 1)
+            #expect(adjustedInputCount == expectedInputCount)
+            #expect(composingText.convertTargetCursorPosition == expectedCursorPosition)
+        }
+
+        adjust(
+            currentInputCount: 9,
+            direction: -1,
+            expectedInputCount: 7,
+            expectedCursorPosition: 5
+        )
+        adjust(
+            currentInputCount: 7,
+            direction: 1,
+            expectedInputCount: 9,
+            expectedCursorPosition: 6
+        )
+        adjust(
+            currentInputCount: 9,
+            direction: -1,
+            expectedInputCount: 7,
+            expectedCursorPosition: 5
+        )
+        adjust(
+            currentInputCount: 7,
+            direction: -1,
+            expectedInputCount: 6,
+            expectedCursorPosition: 4
+        )
+    }
+}
+
+@Test func clauseBoundaryAdjustmentSupportsDelayedSingleNInCustomInputStyle() async throws {
+    try await MainActor.run {
+        let previousComposingText = composingText
+        defer {
+            composingText = previousComposingText
+        }
+
+        let inputStyle = try makeTemporaryCustomInputStyle([
+            row("n", "ん"),
+            row("na", "な"),
+            row("nn", "ん"),
+            row("n'", "ん"),
+            row("nya", "にゃ"),
+            row("ta", "た"),
+        ])
+        composingText = ComposingText()
+        composingText.insertAtCursorPosition("nta", inputStyle: inputStyle)
+        #expect(composingText.convertTarget == "んた")
+
+        var applied: CInt = 0
+        var adjustedInputCount: CInt = -1
+        var cursorOffset: CInt = 0
+        free_c_string(
+            adjust_clause_boundary(
+                currentInputCount: 3,
+                direction: -1,
+                appliedPtr: &applied,
+                adjustedInputCountPtr: &adjustedInputCount,
+                cursorOffsetPtr: &cursorOffset
+            )
+        )
+
+        #expect(applied == 1)
+        #expect(adjustedInputCount == 1)
+        #expect(composingText.convertTargetCursorPosition == 1)
+
+        free_c_string(
+            adjust_clause_boundary(
+                currentInputCount: 1,
+                direction: 1,
+                appliedPtr: &applied,
+                adjustedInputCountPtr: &adjustedInputCount,
+                cursorOffsetPtr: &cursorOffset
+            )
+        )
+
+        #expect(applied == 1)
+        #expect(adjustedInputCount == 3)
+        #expect(composingText.convertTargetCursorPosition == 2)
+    }
+}
+
+@Test func clauseBoundaryAdjustmentKeepsAtomicCustomNSequence() async throws {
+    try await MainActor.run {
+        let previousComposingText = composingText
+        defer {
+            composingText = previousComposingText
+        }
+
+        let inputStyle = try makeTemporaryCustomInputStyle([
+            row("nq", "んや"),
+        ])
+        composingText = ComposingText()
+        composingText.insertAtCursorPosition("nq", inputStyle: inputStyle)
+        #expect(composingText.convertTarget == "んや")
+
+        var applied: CInt = 0
+        var adjustedInputCount: CInt = -1
+        var cursorOffset: CInt = 0
+        free_c_string(
+            adjust_clause_boundary(
+                currentInputCount: 2,
+                direction: -1,
+                appliedPtr: &applied,
+                adjustedInputCountPtr: &adjustedInputCount,
+                cursorOffsetPtr: &cursorOffset
+            )
+        )
+
+        #expect(applied == 0)
+        #expect(adjustedInputCount == 2)
+        #expect(composingText.convertTargetCursorPosition == 2)
+    }
+}
+
+@Test func rawInputIdentitySurvivesClauseShrinkWithoutNormalizingRomaji() async {
+    await MainActor.run {
+        let previousComposingText = composingText
+        defer {
+            composingText = previousComposingText
+        }
+
+        let input = "aruteidonagaibunsyoudemofukusuuni"
+        composingText = ComposingText()
+        composingText.insertAtCursorPosition(input, inputStyle: .roman2kana)
+        free_c_string(shrink_text(offset: 8))
+
+        let rawInput = get_raw_input()
+        defer {
+            free_c_string(rawInput)
+        }
+        #expect(rawInput.map { String(cString: $0) } == String(input.dropFirst(8)))
+    }
+}
+
+@Test func removeTextReturnsCanonicalInputAfterMappedRomajiDeletion() async throws {
+    try await MainActor.run {
+        let previousComposingText = composingText
+        defer {
+            composingText = previousComposingText
+        }
+
+        let inputStyle = try makeTemporaryCustomInputStyle(defaultWindowsRomajiRows())
+        composingText = ComposingText()
+        for character in "buns" {
+            composingText.insertAtCursorPosition(String(character), inputStyle: inputStyle)
+        }
+
+        var cursor: CInt = 0
+        free_c_string(remove_text(cursorPtr: &cursor))
+        var rawInput = get_raw_input()
+        // The converter materializes the terminal `n` as kana while deleting
+        // the pending `s`; this cannot be reproduced with a client-side pop.
+        #expect(rawInput.map { String(cString: $0) } == "buん")
+        free_c_string(rawInput)
+
+        free_c_string(remove_text(cursorPtr: &cursor))
+        rawInput = get_raw_input()
+        #expect(rawInput.map { String(cString: $0) } == "bu")
+        free_c_string(rawInput)
+    }
+}
+
+@Test func removeTextCanConsumeMultipleRawElementsInLongComposition() async throws {
+    try await MainActor.run {
+        let previousComposingText = composingText
+        defer {
+            composingText = previousComposingText
+        }
+
+        // Exact key sequence recovered from the failing VM trace. The user
+        // corrected the terminal `bnun` with three Backspaces; the mapped input
+        // table removes two internal elements on the second deletion.
+        let input = "aruteidonageibunsyoudemofukusuubnun"
+        let inputStyle = try makeTemporaryCustomInputStyle(defaultWindowsRomajiRows())
+        composingText = ComposingText()
+        for character in input {
+            composingText.insertAtCursorPosition(String(character), inputStyle: inputStyle)
+        }
+        #expect(composingText.input.count == 35)
+
+        var cursor: CInt = 0
+        free_c_string(remove_text(cursorPtr: &cursor))
+        #expect(composingText.input.count == 34)
+        free_c_string(remove_text(cursorPtr: &cursor))
+        #expect(composingText.input.count == 32)
+        free_c_string(remove_text(cursorPtr: &cursor))
+        #expect(composingText.input.count == 31)
+
+        let rawInput = get_raw_input()
+        defer {
+            free_c_string(rawInput)
+        }
+        #expect(rawInput.map { String(cString: $0).count } == 31)
+        #expect(rawInput.map { String(cString: $0) } != String(input.dropLast(3)))
+    }
+}
+
+@Test func clauseBoundaryAdjustmentSkipsEdgesAndUnknownInputBoundaries() async {
+    await MainActor.run {
+        let previousComposingText = composingText
+        defer {
+            composingText = previousComposingText
+        }
+
+        composingText = ComposingText()
+        composingText.insertAtCursorPosition("tyaibu", inputStyle: .roman2kana)
+        let endInputCount = CInt(composingText.input.count)
+        let endSurfaceIndex = composingText.convertTargetCursorPosition
+
+        for (currentInputCount, direction) in [
+            (endInputCount, CInt(1)),
+            (CInt(2), CInt(-1)),
+            (CInt(-1), CInt(-1)),
+        ] {
+            var applied: CInt = 1
+            var adjustedInputCount: CInt = -1
+            var cursorOffset: CInt = 99
+            free_c_string(
+                adjust_clause_boundary(
+                    currentInputCount: currentInputCount,
+                    direction: direction,
+                    appliedPtr: &applied,
+                    adjustedInputCountPtr: &adjustedInputCount,
+                    cursorOffsetPtr: &cursorOffset
+                )
+            )
+
+            #expect(applied == 0)
+            #expect(adjustedInputCount == currentInputCount)
+            #expect(cursorOffset == 0)
+            #expect(composingText.convertTargetCursorPosition == endSurfaceIndex)
+        }
+
+        var applied: CInt = 1
+        var adjustedInputCount: CInt = -1
+        var cursorOffset: CInt = 99
+        "different-input".withCString { expectedRawInputPointer in
+            free_c_string(
+                adjust_clause_boundary(
+                    currentInputCount: 3,
+                    direction: 1,
+                    expectedRawInput: expectedRawInputPointer,
+                    appliedPtr: &applied,
+                    adjustedInputCountPtr: &adjustedInputCount,
+                    cursorOffsetPtr: &cursorOffset
+                )
+            )
+        }
+        #expect(applied == 0)
+        #expect(adjustedInputCount == 3)
+        #expect(cursorOffset == 0)
+        #expect(composingText.convertTargetCursorPosition == endSurfaceIndex)
+
+        var length: CInt = -1
+        let candidates = get_composed_text_for_cursor_prefix(
+            requiredInputCount: endInputCount - 1,
+            lengthPtr: &length
+        )
+        free_candidate_list(candidates, length)
+        #expect(length == 0)
+    }
+}
+
+@Test func clauseBoundaryCandidatesPreserveTheAdjustedInputBoundary() async throws {
+    let packageRoot = packageRootURL()
+    let dictionaryURL = packageRoot
+        .appending(path: "azooKey_dictionary_storage")
+        .appending(path: "Dictionary")
+
+    await MainActor.run {
+        let previousConverter = converter
+        let previousSupplementConverter = normalNBestSupplementConverter
+        let previousComposingText = composingText
+        let previousLearningType = currentLearningType
+        let previousExecURL = execURL
+        defer {
+            converter = previousConverter
+            normalNBestSupplementConverter = previousSupplementConverter
+            composingText = previousComposingText
+            currentLearningType = previousLearningType
+            execURL = previousExecURL
+        }
+
+        converter = KanaKanjiConverter(dictionaryURL: dictionaryURL, preloadDictionary: true)
+        normalNBestSupplementConverter = KanaKanjiConverter(
+            dictionaryURL: dictionaryURL,
+            preloadDictionary: false
+        )
+        currentLearningType = .nothing
+        execURL = packageRoot
+
+        @MainActor func candidateCounts(requiredInputCount: CInt) -> [CInt] {
+            var length: CInt = 0
+            let list = get_composed_text_for_cursor_prefix(
+                requiredInputCount: requiredInputCount,
+                lengthPtr: &length
+            )
+            defer {
+                free_candidate_list(list, length)
+            }
+            return (0..<Int(length)).compactMap { index in
+                list.advanced(by: index).pointee?.pointee.correspondingCount
+            }
+        }
+
+        @MainActor func adjust(
+            rawInput: String,
+            shrinkOffset: CInt = 0,
+            currentInputCount: CInt,
+            direction: CInt,
+            expectedInputCount: CInt,
+            expectedCursorPosition: CInt? = nil
+        ) {
+            composingText = ComposingText()
+            composingText.insertAtCursorPosition(rawInput, inputStyle: .roman2kana)
+            if shrinkOffset > 0 {
+                free_c_string(shrink_text(offset: shrinkOffset))
+            }
+
+            var applied: CInt = 0
+            var adjustedInputCount: CInt = -1
+            var cursorOffset: CInt = 0
+            let expectedRawInput = String(rawInput.dropFirst(Int(shrinkOffset)))
+            expectedRawInput.withCString { expectedRawInputPointer in
+                free_c_string(
+                    adjust_clause_boundary(
+                        currentInputCount: currentInputCount,
+                        direction: direction,
+                        expectedRawInput: expectedRawInputPointer,
+                        appliedPtr: &applied,
+                        adjustedInputCountPtr: &adjustedInputCount,
+                        cursorOffsetPtr: &cursorOffset
+                    )
+                )
+            }
+
+            #expect(applied == 1)
+            #expect(adjustedInputCount == expectedInputCount)
+            #expect(get_cursor_position() == composingText.convertTargetCursorPosition)
+            if let expectedCursorPosition {
+                #expect(get_cursor_position() == expectedCursorPosition)
+            }
+            let counts = candidateCounts(requiredInputCount: expectedInputCount)
+            #expect(
+                counts.contains(expectedInputCount),
+                "expected boundary \(expectedInputCount), candidates: \(counts)"
+            )
+        }
+
+        let input = "aruteidonagaibunsyoudemofukusuuni"
+        adjust(
+            rawInput: input,
+            currentInputCount: 8,
+            direction: -1,
+            expectedInputCount: 6,
+            expectedCursorPosition: 4
+        )
+        adjust(
+            rawInput: input,
+            currentInputCount: 8,
+            direction: 1,
+            expectedInputCount: 10
+        )
+        adjust(
+            rawInput: input,
+            currentInputCount: 10,
+            direction: 1,
+            expectedInputCount: 12
+        )
+        adjust(
+            rawInput: input,
+            shrinkOffset: 8,
+            currentInputCount: 16,
+            direction: -1,
+            expectedInputCount: 14
+        )
+        adjust(
+            rawInput: input,
+            shrinkOffset: 8,
+            currentInputCount: 16,
+            direction: 1,
+            expectedInputCount: 18
+        )
+    }
+}
+
+@Test func cursorPrefixActualConverterSelectsTheDisplayedFirstClauseBoundary() async {
+    let packageRoot = packageRootURL()
+    let dictionaryURL = packageRoot
+        .appending(path: "azooKey_dictionary_storage")
+        .appending(path: "Dictionary")
+
+    await MainActor.run {
+        let previousConverter = converter
+        let previousSupplementConverter = normalNBestSupplementConverter
+        let previousComposingText = composingText
+        let previousLearningType = currentLearningType
+        let previousLearningCandidateCache = learningCandidateCache
+        let previousConfig = config
+        let previousExecURL = execURL
+        defer {
+            converter = previousConverter
+            normalNBestSupplementConverter = previousSupplementConverter
+            composingText = previousComposingText
+            currentLearningType = previousLearningType
+            learningCandidateCache = previousLearningCandidateCache
+            config = previousConfig
+            execURL = previousExecURL
+        }
+
+        converter = KanaKanjiConverter(dictionaryURL: dictionaryURL, preloadDictionary: true)
+        normalNBestSupplementConverter = KanaKanjiConverter(
+            dictionaryURL: dictionaryURL,
+            preloadDictionary: false
+        )
+        currentLearningType = .nothing
+        learningCandidateCache.removeAll()
+        config["enable"] = false
+        config["backend"] = "cpu"
+        config["context"] = ""
+        execURL = packageRoot
+        composingText = ComposingText()
+        composingText.insertAtCursorPosition(
+            "aruteidonagaibunsyoudemofukusuubunsetunibunkatusareru",
+            inputStyle: .roman2kana
+        )
+
+        var length: CInt = 0
+        let list = get_composed_text_for_cursor_prefix(
+            requiredInputCount: -1,
+            lengthPtr: &length
+        )
+        defer {
+            free_candidate_list(list, length)
+        }
+        let candidates = (0..<Int(length)).compactMap { index -> (String, CInt)? in
+            guard let candidate = list.advanced(by: index).pointee?.pointee else {
+                return nil
+            }
+            return (String(cString: candidate.text), candidate.correspondingCount)
+        }
+
+        #expect(!candidates.isEmpty)
+        #expect(
+            Set(candidates.map(\.1)) == [8],
+            "first-clause candidates: \(candidates)"
+        )
+        #expect(candidates.contains { $0.0 == "ある程度" })
     }
 }
 
@@ -1329,6 +1990,35 @@ private func testCandidate(
     }
 
     #expect(resultTexts == ["いい加減", "いいかげん"])
+}
+
+@Test func cursorPrefixCandidatesRejectBoundaryThatConsumesPastDisplayedRuby() async throws {
+    let boundary = await MainActor.run {
+        var source = ComposingText()
+        source.insertAtCursorPosition(
+            "aruteidonagaibunsyoudemofukusuubunsetunibunkatusareru",
+            inputStyle: .roman2kana
+        )
+        let preview = makeCandidatePreviewComposingText(from: source).composingText
+        let overconsuming = testCandidate(
+            word: "ある程度",
+            ruby: "あるていど",
+            composingCount: .inputCount(10)
+        )
+        let displayAligned = testCandidate(
+            word: "ある程度",
+            ruby: "あるていど",
+            composingCount: .inputCount(8)
+        )
+
+        return cursorPrefixFirstClauseCorrespondingCount(
+            firstClauseResults: [overconsuming, displayAligned],
+            originalComposingText: source,
+            previewComposingText: preview
+        )
+    }
+
+    #expect(boundary == 8)
 }
 
 @Test func cursorPrefixCandidatesPreferClauseTerminalBoundaryOverLongerNounPrefix() async throws {

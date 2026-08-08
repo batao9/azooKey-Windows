@@ -692,15 +692,15 @@ private func learningCandidateOutput(_ candidate: Candidate) -> String {
     }
 }
 
-@MainActor private func recordLearningSelectionOverride(_ candidate: Candidate) {
+@MainActor private func updateLearningSelectionOverride(_ candidate: Candidate) -> Bool {
     guard candidate.isLearningTarget else {
-        return
+        return false
     }
 
     let ruby = learningCandidateRuby(candidate)
     let output = learningCandidateOutput(candidate)
     guard !ruby.isEmpty, !output.isEmpty else {
-        return
+        return false
     }
 
     if learningSelectionOverrides[ruby] == nil,
@@ -709,6 +709,13 @@ private func learningCandidateOutput(_ candidate: Candidate) -> String {
         learningSelectionOverrides.removeValue(forKey: evictedRuby)
     }
     learningSelectionOverrides[ruby] = output
+    return true
+}
+
+@MainActor private func recordLearningSelectionOverride(_ candidate: Candidate) {
+    guard updateLearningSelectionOverride(candidate) else {
+        return
+    }
     saveLearningSelectionOverrides()
 }
 
@@ -1223,10 +1230,16 @@ private func cursorPrefixBoundaryScore(
         candidate: candidate,
         prefixSurfaceCount: prefixSurfaceCount
     )
+    // A first-clause result can occasionally consume the first character of
+    // the following clause while its displayed ruby stops before it. Such a
+    // boundary makes the first Shift+Left change invisible (for example,
+    // "ある程度な" -> "ある程度"). Prefer a display-aligned boundary.
+    let overconsumedSurfacePenalty = prefixSurfaceCount > candidate.rubyCount ? 160 : 0
 
     return resolution.correspondingCount * 4
         + terminalBonus
         - tokenBoundaryPenalty
+        - overconsumedSurfacePenalty
         - candidateIndex
 }
 
@@ -2177,6 +2190,167 @@ func cursorPrefixBoundaryFirstClauseResults(
     return _strdup(composingText.convertTarget)!
 }
 
+@_silgen_name("GetCursorPosition")
+@MainActor public func get_cursor_position() -> CInt {
+    CInt(clamping: composingText.convertTargetCursorPosition)
+}
+
+@_silgen_name("GetRawInput")
+@MainActor public func get_raw_input() -> UnsafeMutablePointer<CChar>? {
+    let characters = composingText.input.compactMap(inputCharacter)
+    guard characters.count == composingText.input.count else {
+        serverLog(
+            "ERROR",
+            "GetRawInput: failed inputCount=\(composingText.input.count) characterCount=\(characters.count)"
+        )
+        return nil
+    }
+    return _strdup(String(characters))
+}
+
+@MainActor private func clauseAdjustmentBoundaryMap(
+    composingText: ComposingText
+) -> [Int: Int] {
+    var boundaries = composingText.inputIndexToSurfaceIndexMap()
+    let independentBoundaries = boundaries.sorted { $0.key < $1.key }
+    let surfaceCharacters = Array(composingText.convertTarget)
+
+    for (start, end) in zip(independentBoundaries, independentBoundaries.dropFirst()) {
+        let inputStart = start.key
+        let surfaceStart = start.value
+        guard end.key > inputStart + 1,
+              end.value > surfaceStart + 1,
+              composingText.input.indices.contains(inputStart),
+              surfaceCharacters.indices.contains(surfaceStart),
+              boundaries[inputStart + 1] == nil
+        else {
+            continue
+        }
+
+        let firstElement = composingText.input[inputStart]
+        guard firstElement.inputStyle != .direct,
+              let firstInput = inputCharacter(firstElement),
+              asciiLowercase(firstInput) == "n",
+              surfaceCharacters[surfaceStart] == "ん"
+        else {
+            continue
+        }
+
+        var suffixComposingText = ComposingText()
+        suffixComposingText.insertAtCursorPosition(
+            Array(composingText.input[(inputStart + 1) ..< end.key])
+        )
+        let expectedSurfaceSuffix = String(
+            surfaceCharacters[(surfaceStart + 1) ..< end.value]
+        )
+        guard suffixComposingText.convertTarget == expectedSurfaceSuffix else {
+            continue
+        }
+
+        // A single `n` is resolved only after the following romaji segment starts,
+        // so the converter's independent-segment map omits the useful boundary
+        // between `ん` and that following kana (for example, `nto` -> `んと`).
+        boundaries[inputStart + 1] = surfaceStart + 1
+    }
+
+    return boundaries
+}
+
+@_silgen_name("AdjustClauseBoundary")
+@MainActor public func adjust_clause_boundary(
+    currentInputCount: Int32,
+    direction: Int32,
+    expectedRawInput: UnsafePointer<CChar>? = nil,
+    appliedPtr: UnsafeMutablePointer<CInt>,
+    adjustedInputCountPtr: UnsafeMutablePointer<CInt>,
+    cursorOffsetPtr: UnsafeMutablePointer<CInt>
+) -> UnsafeMutablePointer<CChar> {
+    appliedPtr.pointee = 0
+    adjustedInputCountPtr.pointee = currentInputCount
+    cursorOffsetPtr.pointee = 0
+
+    guard currentInputCount >= 0, direction != 0 else {
+        serverLog(
+            "DEBUG",
+            "AdjustClauseBoundary: skipped currentInputCount=\(currentInputCount) direction=\(direction) reason=invalid_request"
+        )
+        return _strdup(composingText.convertTarget)!
+    }
+
+    if let expectedRawInput {
+        let expected = String(cString: expectedRawInput)
+        let actualCharacters = composingText.input.compactMap(inputCharacter)
+        let actual = String(actualCharacters)
+        guard actualCharacters.count == composingText.input.count, actual == expected else {
+            serverLog(
+                "ERROR",
+                "AdjustClauseBoundary: skipped currentInputCount=\(currentInputCount) direction=\(direction) reason=raw_input_mismatch expectedInputCount=\(expected.count) actualInputCount=\(composingText.input.count)"
+            )
+            return _strdup(composingText.convertTarget)!
+        }
+    }
+
+    let surfaceIndexByInputIndex = clauseAdjustmentBoundaryMap(composingText: composingText)
+    let inputBoundaries = surfaceIndexByInputIndex.keys.sorted()
+    guard let currentBoundaryIndex = inputBoundaries.firstIndex(of: Int(currentInputCount)),
+          let currentSurfaceIndex = surfaceIndexByInputIndex[Int(currentInputCount)]
+    else {
+        serverLog(
+            "DEBUG",
+            "AdjustClauseBoundary: skipped currentInputCount=\(currentInputCount) direction=\(direction) reason=missing_input_boundary"
+        )
+        return _strdup(composingText.convertTarget)!
+    }
+
+    let targetBoundaryIndex = direction < 0
+        ? currentBoundaryIndex - 1
+        : currentBoundaryIndex + 1
+    guard inputBoundaries.indices.contains(targetBoundaryIndex) else {
+        serverLog(
+            "DEBUG",
+            "AdjustClauseBoundary: skipped currentInputCount=\(currentInputCount) direction=\(direction) reason=edge"
+        )
+        return _strdup(composingText.convertTarget)!
+    }
+
+    let adjustedInputCount = inputBoundaries[targetBoundaryIndex]
+    guard adjustedInputCount > 0 else {
+        serverLog(
+            "DEBUG",
+            "AdjustClauseBoundary: skipped currentInputCount=\(currentInputCount) direction=\(direction) reason=empty_current_clause"
+        )
+        return _strdup(composingText.convertTarget)!
+    }
+    guard let targetSurfaceIndex = surfaceIndexByInputIndex[adjustedInputCount] else {
+        serverLog(
+            "DEBUG",
+            "AdjustClauseBoundary: skipped currentInputCount=\(currentInputCount) direction=\(direction) reason=missing_surface_boundary"
+        )
+        return _strdup(composingText.convertTarget)!
+    }
+
+    let requestedCursorOffset = targetSurfaceIndex - composingText.convertTargetCursorPosition
+    let cursorOffset = composingText.moveCursorFromCursorPosition(count: requestedCursorOffset)
+    guard composingText.convertTargetCursorPosition == targetSurfaceIndex else {
+        let rollbackOffset = currentSurfaceIndex - composingText.convertTargetCursorPosition
+        _ = composingText.moveCursorFromCursorPosition(count: rollbackOffset)
+        serverLog(
+            "ERROR",
+            "AdjustClauseBoundary: skipped currentInputCount=\(currentInputCount) direction=\(direction) reason=cursor_clamped"
+        )
+        return _strdup(composingText.convertTarget)!
+    }
+
+    appliedPtr.pointee = 1
+    adjustedInputCountPtr.pointee = CInt(adjustedInputCount)
+    cursorOffsetPtr.pointee = CInt(cursorOffset)
+    serverLog(
+        "DEBUG",
+        "AdjustClauseBoundary: applied currentInputCount=\(currentInputCount) adjustedInputCount=\(adjustedInputCount) direction=\(direction) currentSurfaceIndex=\(currentSurfaceIndex) targetSurfaceIndex=\(targetSurfaceIndex) cursorOffset=\(cursorOffset)"
+    )
+    return _strdup(composingText.convertTarget)!
+}
+
 @_silgen_name("ClearComposingTextSnapshots")
 @MainActor public func clear_composing_text_snapshots() {
     composingTextSnapshots.removeAll()
@@ -2245,6 +2419,64 @@ func cursorPrefixBoundaryFirstClauseResults(
         "CommitLearningCandidate: completed candidateId=\(candidateId) commitKind=\(commitKind)"
     )
     return true
+}
+
+@_silgen_name("CommitLearningCandidates")
+@MainActor public func commit_learning_candidates(
+    candidateIds: UnsafePointer<UInt64>?,
+    commitKinds: UnsafePointer<Int32>?,
+    count: Int32
+) -> Int32 {
+    guard count >= 0, let candidateIds, let commitKinds else {
+        serverLog("WARN", "CommitLearningCandidates: invalid batch count=\(count)")
+        return 0
+    }
+    guard count > 0 else {
+        return 0
+    }
+    guard currentLearningType == .inputAndOutput else {
+        serverLog(
+            "DEBUG",
+            "CommitLearningCandidates: skipped learningType=\(currentLearningType) count=\(count)"
+        )
+        return count
+    }
+
+    var candidates: [(candidate: Candidate, candidateId: UInt64, commitKind: Int32)] = []
+    candidates.reserveCapacity(Int(count))
+    for index in 0..<Int(count) {
+        let candidateId = candidateIds[index]
+        let commitKind = commitKinds[index]
+        guard let candidate = consumeLearningCandidate(candidateId) else {
+            serverLog(
+                "WARN",
+                "CommitLearningCandidates: candidate not found candidateId=\(candidateId) commitKind=\(commitKind)"
+            )
+            continue
+        }
+        candidates.append((candidate, candidateId, commitKind))
+    }
+    guard !candidates.isEmpty else {
+        return 0
+    }
+
+    ensureLearningMemoryDirectoryIfNeeded()
+    var selectionOverrideChanged = false
+    for entry in candidates {
+        converter.setCompletedData(entry.candidate)
+        converter.updateLearningData(entry.candidate)
+        selectionOverrideChanged =
+            updateLearningSelectionOverride(entry.candidate) || selectionOverrideChanged
+    }
+    converter.commitUpdateLearningData()
+    if selectionOverrideChanged {
+        saveLearningSelectionOverrides()
+    }
+    serverLog(
+        "DEBUG",
+        "CommitLearningCandidates: completed requestedCount=\(count) committedCount=\(candidates.count)"
+    )
+    return Int32(candidates.count)
 }
 
 @_silgen_name("ResetLearningMemory")
@@ -2525,12 +2757,24 @@ public func free_candidate_list(
 }
 
 @_silgen_name("GetComposedTextForCursorPrefix")
-@MainActor public func get_composed_text_for_cursor_prefix(lengthPtr: UnsafeMutablePointer<CInt>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
+@MainActor public func get_composed_text_for_cursor_prefix(
+    requiredInputCount: Int32,
+    lengthPtr: UnsafeMutablePointer<CInt>
+) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
     let functionStart = performanceNow()
     let performanceEnabled = serverLogCallbacks.isPerformanceLogEnabled()
     let hiragana = composingText.convertTarget
     let suffixAfterCursor = String(hiragana.dropFirst(composingText.convertTargetCursorPosition))
     let prefixComposingText = composingText.prefixToCursorPosition()
+    let requiredBoundary = requiredInputCount >= 0 ? Int(requiredInputCount) : nil
+    if let requiredBoundary, requiredBoundary != prefixComposingText.input.count {
+        lengthPtr.pointee = 0
+        serverLog(
+            "ERROR",
+            "GetComposedTextForCursorPrefix: skipped reason=required_boundary_mismatch requiredInputCount=\(requiredBoundary) actualInputCount=\(prefixComposingText.input.count)"
+        )
+        return to_list_pointer([])
+    }
     let previewState = makeCandidatePreviewComposingTextForCursorPrefix(
         prefixComposingText: prefixComposingText,
         suffixAfterCursor: suffixAfterCursor
@@ -2638,12 +2882,13 @@ public func free_candidate_list(
         zenzaiFirstClauseResults: converted.firstClauseResults,
         mergedFirstClauseResults: cursorPrefixFirstClauseResults
     )
-    let firstClauseCorrespondingCount = cursorPrefixFirstClauseCorrespondingCount(
-        firstClauseResults: boundaryFirstClauseResults,
-        originalComposingText: prefixComposingText,
-        previewComposingText: previewPrefixComposingText,
-        resolutionCache: &cursorPrefixResolutionCache
-    )
+    let firstClauseCorrespondingCount = requiredBoundary
+        ?? cursorPrefixFirstClauseCorrespondingCount(
+            firstClauseResults: boundaryFirstClauseResults,
+            originalComposingText: prefixComposingText,
+            previewComposingText: previewPrefixComposingText,
+            resolutionCache: &cursorPrefixResolutionCache
+        )
     let preliminaryCursorPrefixResults = cursorPrefixCandidateDisplayResults(
         mainResults: cursorPrefixMainResults,
         firstClauseResults: cursorPrefixFirstClauseResults,

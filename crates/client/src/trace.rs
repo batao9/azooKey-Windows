@@ -1,21 +1,31 @@
-use std::fmt::Write as _;
-use std::path::PathBuf;
 use std::sync::OnceLock;
+
+#[cfg(debug_assertions)]
+use std::{fmt::Write as _, path::PathBuf};
+#[cfg(debug_assertions)]
 use tracing::field::{Field, Visit};
+#[cfg(debug_assertions)]
 use tracing_core::LevelFilter;
+#[cfg(debug_assertions)]
 use tracing_subscriber::filter::Targets;
+#[cfg(debug_assertions)]
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt};
+#[cfg(debug_assertions)]
 use windows::{core::PCWSTR, Win32::System::Diagnostics::Debug::OutputDebugStringW};
 
+#[cfg(debug_assertions)]
 use crate::extension::StringExt as _;
+#[cfg(debug_assertions)]
 use crate::tracing_chrome::{ChromeLayerBuilder, EventOrSpan};
 
 static LOGGER_INIT_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
 
+#[cfg(debug_assertions)]
 pub struct StringVisitor<'a> {
     string: &'a mut String,
 }
 
+#[cfg(debug_assertions)]
 impl<'a> Visit for StringVisitor<'a> {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         // do nothing
@@ -27,6 +37,19 @@ impl<'a> Visit for StringVisitor<'a> {
 
 pub fn diagnostic_log(_message: impl AsRef<str>) {}
 
+#[inline(always)]
+pub const fn diagnostic_log_enabled() -> bool {
+    false
+}
+
+#[inline(always)]
+pub fn diagnostic_log_lazy(message: impl FnOnce() -> String) {
+    if diagnostic_log_enabled() {
+        diagnostic_log(message());
+    }
+}
+
+#[cfg(debug_assertions)]
 fn resolve_trace_log_folder() -> PathBuf {
     if let Ok(appdata) = std::env::var("APPDATA") {
         return PathBuf::from(appdata).join("Azookey").join("logs");
@@ -56,12 +79,14 @@ fn contain_logger_initialization(
     }
 }
 
+#[cfg(not(debug_assertions))]
+fn setup_logger() -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
 fn setup_logger() -> anyhow::Result<()> {
     diagnostic_log("setup_logger called");
-    #[cfg(not(debug_assertions))]
-    {
-        return Ok(());
-    }
     let timestamp = chrono::Local::now().format("%Y-%m-%d-%H.%M.%S");
     let log_folder = resolve_trace_log_folder();
     let _ = std::fs::create_dir_all(&log_folder);

@@ -113,6 +113,18 @@ pub(crate) struct RecoveredComposition {
     pub(crate) candidates: Candidates,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TextRemoval {
+    pub(crate) candidates: Candidates,
+    pub(crate) raw_input: String,
+}
+
+#[derive(Debug)]
+struct CursorMove {
+    candidates: Candidates,
+    raw_input: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct InputLedgerSnapshot(InputLedger);
 
@@ -878,10 +890,22 @@ impl IPCService {
     fn should_retry_non_idempotent_edit_after_refresh(
         previous_candidates: Option<&Candidates>,
         refreshed_candidates: &Candidates,
+        previous_raw_input: Option<&str>,
+        refreshed_raw_input: Option<&str>,
     ) -> bool {
         previous_candidates.is_some_and(|previous| {
             previous.has_same_composition(refreshed_candidates)
                 && !refreshed_candidates.is_empty_composition()
+                && previous_raw_input.is_none_or(|previous| refreshed_raw_input == Some(previous))
+        })
+    }
+
+    fn verified_remove_raw_input(
+        completed_raw_input: Option<String>,
+        refreshed_raw_input: Option<String>,
+    ) -> anyhow::Result<String> {
+        completed_raw_input.or(refreshed_raw_input).ok_or_else(|| {
+            anyhow::anyhow!("remove_text completed without a verified server raw input")
         })
     }
 
@@ -899,11 +923,12 @@ impl IPCService {
         operation: &str,
         request_id: u64,
         previous_candidates: Option<&Candidates>,
+        previous_raw_input: Option<&str>,
         mut send: impl FnMut(&mut Self) -> anyhow::Result<Candidates>,
-    ) -> anyhow::Result<(Candidates, NonIdempotentEditRecovery)> {
+    ) -> anyhow::Result<(Candidates, NonIdempotentEditRecovery, Option<String>)> {
         match Self::classify_non_idempotent_edit_attempt(operation, send(self))? {
             NonIdempotentEditAttempt::Completed(candidates) => {
-                Ok((candidates, NonIdempotentEditRecovery::None))
+                Ok((candidates, NonIdempotentEditRecovery::None, None))
             }
             NonIdempotentEditAttempt::ReconnectAndRefresh(first_error) => {
                 match self.reconnect() {
@@ -923,11 +948,14 @@ impl IPCService {
                 // remove_text, shrink_text, and non-zero move_cursor may have already
                 // changed server state before the transport broke. Refresh first, and
                 // only replay the edit if the server state is still the previous one.
-                match self.send_move_cursor(0, request_id) {
-                    Ok(refreshed_candidates) => {
+                match self.send_move_cursor_with_raw_input(0, request_id) {
+                    Ok(refreshed) => {
+                        let refreshed_candidates = refreshed.candidates;
                         if Self::should_retry_non_idempotent_edit_after_refresh(
                             previous_candidates,
                             &refreshed_candidates,
+                            previous_raw_input,
+                            refreshed.raw_input.as_deref(),
                         ) {
                             tracing::warn!(
                                 "{operation} refreshed unchanged composition after reconnect, retrying edit RPC once"
@@ -936,6 +964,7 @@ impl IPCService {
                             return Ok((
                                 candidates,
                                 NonIdempotentEditRecovery::RetriedAfterUnchangedRefresh,
+                                None,
                             ));
                         }
 
@@ -948,6 +977,7 @@ impl IPCService {
                         Ok((
                             refreshed_candidates,
                             NonIdempotentEditRecovery::RefreshedAfterReconnect,
+                            refreshed.raw_input,
                         ))
                     }
                     Err(refresh_error) => {
@@ -962,9 +992,10 @@ impl IPCService {
     }
 
     fn should_reconnect_rpc_error(error: &anyhow::Error) -> bool {
-        if is_ipc_deadline(error) {
-            // A local timeout means the server may still apply the operation.
-            // Replaying before absolute-state reconstruction is unsafe.
+        if requires_ipc_recovery(error) {
+            // A timeout may still apply the operation, while a typed pending
+            // error means launcher-driven reconstruction is already required.
+            // Neither is safe to replace with an immediate reconnect result.
             return false;
         }
         let Some(status) = error.downcast_ref::<tonic::Status>() else {
@@ -1012,7 +1043,7 @@ impl IPCService {
         Ok(response)
     }
 
-    fn send_remove_text(&mut self, request_id: u64) -> anyhow::Result<Candidates> {
+    fn send_remove_text(&mut self, request_id: u64) -> anyhow::Result<TextRemoval> {
         let mut request = tonic::Request::new(shared::proto::RemoveTextRequest { request_id });
         request.set_timeout(INPUT_RPC_DEADLINE);
         let response = Self::block_on_server_rpc(
@@ -1024,8 +1055,21 @@ impl IPCService {
         )?;
         let response = response.into_inner();
         self.observe_server_session("remove_text", response.server_session_id);
+        let Some(raw_input) = response.raw_input else {
+            // A server built before raw-input synchronization cannot provide
+            // enough information to keep mapped romaji deletion coherent.
+            // Reconstruct on the current server instead of treating protobuf's
+            // absent scalar as an empty composition.
+            Self::mark_server_recovery_required(&self.recovery, "remove_text_missing_raw_input");
+            return Err(preserve_recovery_error(anyhow::anyhow!(
+                "remove_text response did not include canonical raw input"
+            )));
+        };
         self.record_successful_remove();
-        Self::candidates_from_composing_text(response.composing_text)
+        Ok(TextRemoval {
+            candidates: Self::candidates_from_composing_text(response.composing_text)?,
+            raw_input,
+        })
     }
 
     fn send_clear_text(&mut self, request_id: u64) -> anyhow::Result<()> {
@@ -1068,6 +1112,36 @@ impl IPCService {
         Ok(())
     }
 
+    fn send_commit_learning_candidates(
+        &mut self,
+        commits: &[(u64, i32)],
+        request_id: u64,
+    ) -> anyhow::Result<u32> {
+        let mut request = tonic::Request::new(shared::proto::CommitLearningCandidatesRequest {
+            commits: commits
+                .iter()
+                .map(
+                    |(candidate_id, commit_kind)| shared::proto::LearningCandidateCommit {
+                        candidate_id: *candidate_id,
+                        commit_kind: *commit_kind,
+                    },
+                )
+                .collect(),
+            request_id,
+        });
+        request.set_timeout(LEARNING_RPC_DEADLINE);
+        let response = Self::block_on_server_rpc(
+            self.runtime.as_ref(),
+            &self.recovery,
+            "commit_learning_candidates",
+            LEARNING_RPC_DEADLINE,
+            self.azookey_client.commit_learning_candidates(request),
+        )?
+        .into_inner();
+        self.observe_server_session("commit_learning_candidates", response.server_session_id);
+        Ok(response.committed_count)
+    }
+
     fn send_shrink_text(&mut self, offset: i32, request_id: u64) -> anyhow::Result<Candidates> {
         let mut request =
             tonic::Request::new(shared::proto::ShrinkTextRequest { offset, request_id });
@@ -1103,9 +1177,17 @@ impl IPCService {
         let response = response.into_inner();
         self.observe_server_session("advance_clause", response.server_session_id);
         self.invalidate_input_ledger();
+        let shrunk = Self::candidates_from_composing_text(response.shrunk_text)?;
+        let navigation = Self::candidates_from_composing_text(response.navigation_text)?;
+        let raw_input = if response.raw_input.is_empty() && !navigation.hiragana.is_empty() {
+            super::composition::ClauseAdvanceRawInput::Unavailable
+        } else {
+            super::composition::ClauseAdvanceRawInput::Verified(response.raw_input)
+        };
         Ok(super::composition::ClauseAdvance {
-            shrunk: Self::candidates_from_composing_text(response.shrunk_text)?,
-            navigation: Self::candidates_from_composing_text(response.navigation_text)?,
+            shrunk,
+            navigation,
+            raw_input,
         })
     }
 
@@ -1113,10 +1195,12 @@ impl IPCService {
         &mut self,
         initial_offset: i32,
         request_id: u64,
-    ) -> anyhow::Result<Vec<super::composition::ClauseAdvance>> {
+        leave_at_last: bool,
+    ) -> anyhow::Result<(Vec<super::composition::ClauseAdvance>, bool)> {
         let mut request = tonic::Request::new(shared::proto::PrepareFutureClausesRequest {
             initial_offset,
             request_id,
+            leave_at_last,
         });
         request.set_timeout(INPUT_RPC_DEADLINE);
         let response = Self::block_on_server_rpc(
@@ -1128,19 +1212,28 @@ impl IPCService {
         )?;
         let response = response.into_inner();
         self.observe_server_session("prepare_future_clauses", response.server_session_id);
-        response
+        if leave_at_last && response.completed {
+            self.invalidate_input_ledger();
+        }
+        let advances = response
             .advances
             .into_iter()
             .map(|advance| {
                 Ok(super::composition::ClauseAdvance {
                     shrunk: Self::candidates_from_composing_text(advance.shrunk_text)?,
                     navigation: Self::candidates_from_composing_text(advance.navigation_text)?,
+                    raw_input: super::composition::ClauseAdvanceRawInput::Unverified,
                 })
             })
-            .collect()
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok((advances, response.completed))
     }
 
-    fn send_move_cursor(&mut self, offset: i32, request_id: u64) -> anyhow::Result<Candidates> {
+    fn send_move_cursor_with_raw_input(
+        &mut self,
+        offset: i32,
+        request_id: u64,
+    ) -> anyhow::Result<CursorMove> {
         let mut request =
             tonic::Request::new(shared::proto::MoveCursorRequest { offset, request_id });
         request.set_timeout(INPUT_RPC_DEADLINE);
@@ -1154,7 +1247,64 @@ impl IPCService {
         let response = response.into_inner();
         self.observe_server_session("move_cursor", response.server_session_id);
         self.record_successful_move(offset);
-        Self::candidates_from_composing_text(response.composing_text)
+        Ok(CursorMove {
+            candidates: Self::candidates_from_composing_text(response.composing_text)?,
+            raw_input: response.raw_input,
+        })
+    }
+
+    fn send_move_cursor(&mut self, offset: i32, request_id: u64) -> anyhow::Result<Candidates> {
+        self.send_move_cursor_with_raw_input(offset, request_id)
+            .map(|result| result.candidates)
+    }
+
+    fn send_adjust_clause_boundary(
+        &mut self,
+        current_input_count: i32,
+        direction: i32,
+        expected_raw_input: &str,
+        request_id: u64,
+    ) -> anyhow::Result<super::composition::ClauseBoundaryAdjustment> {
+        let mut request = tonic::Request::new(shared::proto::AdjustClauseBoundaryRequest {
+            current_input_count,
+            direction,
+            request_id,
+            expected_raw_input: expected_raw_input.to_string(),
+        });
+        request.set_timeout(INPUT_RPC_DEADLINE);
+        let response = Self::block_on_server_rpc(
+            self.runtime.as_ref(),
+            &self.recovery,
+            "adjust_clause_boundary",
+            INPUT_RPC_DEADLINE,
+            self.azookey_client.adjust_clause_boundary(request),
+        )?
+        .into_inner();
+        self.observe_server_session("adjust_clause_boundary", response.server_session_id);
+        if !response.applied {
+            return Ok(super::composition::ClauseBoundaryAdjustment::skipped());
+        }
+
+        let candidates = Self::candidates_from_composing_text(response.composing_text)?;
+        if candidates.texts.is_empty()
+            || !candidates
+                .corresponding_count
+                .contains(&response.adjusted_input_count)
+        {
+            anyhow::bail!(
+                "adjust_clause_boundary returned no candidate for input boundary {}",
+                response.adjusted_input_count
+            );
+        }
+
+        // Cursor materialization is absolute and may include a large jump from
+        // the server's previous position. The recovery ledger stores only
+        // relative edits, so do not replay an ambiguous pre-adjustment cursor.
+        self.invalidate_input_ledger();
+        Ok(super::composition::ClauseBoundaryAdjustment::applied(
+            candidates,
+            response.adjusted_input_count,
+        ))
     }
 
     fn send_update_composition_snapshot(
@@ -1555,29 +1705,37 @@ impl IPCService {
     }
 
     #[tracing::instrument]
-    pub fn remove_text(&mut self) -> anyhow::Result<Candidates> {
-        self.remove_text_inner(None)
+    pub fn remove_text(&mut self) -> anyhow::Result<TextRemoval> {
+        self.remove_text_inner(None, None)
     }
 
-    #[tracing::instrument(skip(self, previous_candidates))]
+    #[tracing::instrument(skip(self, previous_candidates, previous_raw_input))]
     pub fn remove_text_with_context(
         &mut self,
         previous_candidates: &Candidates,
-    ) -> anyhow::Result<Candidates> {
-        self.remove_text_inner(Some(previous_candidates))
+        previous_raw_input: &str,
+    ) -> anyhow::Result<TextRemoval> {
+        self.remove_text_inner(Some(previous_candidates), Some(previous_raw_input))
     }
 
     fn remove_text_inner(
         &mut self,
         previous_candidates: Option<&Candidates>,
-    ) -> anyhow::Result<Candidates> {
+        previous_raw_input: Option<&str>,
+    ) -> anyhow::Result<TextRemoval> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
+        let mut completed_raw_input = None;
         let result = self.run_non_idempotent_edit_with_reconnect(
             "remove_text",
             request_id,
             previous_candidates,
-            |this| this.send_remove_text(request_id),
+            previous_raw_input,
+            |this| {
+                let removal = this.send_remove_text(request_id)?;
+                completed_raw_input = Some(removal.raw_input);
+                Ok(removal.candidates)
+            },
         );
         self.log_client_performance_from_start(
             performance_start,
@@ -1585,12 +1743,28 @@ impl IPCService {
             "remove_text",
             "rpc_total",
             || match &result {
-                Ok((_, recovery)) => format!("status=success;recovery={}", recovery.log_value()),
+                Ok((_, recovery, _)) => {
+                    format!("status=success;recovery={}", recovery.log_value())
+                }
                 Err(error) => format!("status=error;error={error:?}"),
             },
         );
-        let (candidates, _) = result?;
-        Ok(candidates)
+        let (candidates, _, refreshed_raw_input) = result?;
+        let raw_input =
+            match Self::verified_remove_raw_input(completed_raw_input, refreshed_raw_input) {
+                Ok(raw_input) => raw_input,
+                Err(error) => {
+                    Self::mark_server_recovery_required(
+                        &self.recovery,
+                        "remove_text_refresh_missing_raw_input",
+                    );
+                    return Err(preserve_recovery_error(error));
+                }
+            };
+        Ok(TextRemoval {
+            candidates,
+            raw_input,
+        })
     }
 
     #[tracing::instrument]
@@ -1658,6 +1832,48 @@ impl IPCService {
         result
     }
 
+    #[tracing::instrument(skip(self, commits))]
+    pub fn commit_learning_candidates(&mut self, commits: &[(u64, i32)]) -> anyhow::Result<()> {
+        if commits.is_empty() {
+            return Ok(());
+        }
+
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
+        // Learning is an external side effect and the server has no dedupe
+        // ledger. Never replay a batch after an ambiguous failure.
+        let result = self.send_commit_learning_candidates(commits, request_id);
+        self.log_client_performance_from_start(
+            performance_start,
+            request_id,
+            "commit_learning_candidates",
+            "rpc_total",
+            || match &result {
+                Ok(committed_count) => format!(
+                    "status=success;retry=false;requested_count={};committed_count={committed_count}",
+                    commits.len()
+                ),
+                Err(error) => format!(
+                    "status=error;requested_count={};error={error:?}",
+                    commits.len()
+                ),
+            },
+        );
+        match result {
+            Ok(committed_count) => {
+                if usize::try_from(committed_count).unwrap_or_default() != commits.len() {
+                    tracing::warn!(
+                        requested_count = commits.len(),
+                        committed_count,
+                        "Some conversion learning candidates were not committed"
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     #[tracing::instrument]
     pub fn shrink_text(&mut self, offset: i32) -> anyhow::Result<Candidates> {
         self.shrink_text_inner(offset, None)
@@ -1683,6 +1899,7 @@ impl IPCService {
             "shrink_text",
             request_id,
             previous_candidates,
+            None,
             |this| this.send_shrink_text(offset, request_id),
         );
         self.log_client_performance_from_start(
@@ -1691,14 +1908,14 @@ impl IPCService {
             "shrink_text",
             "rpc_total",
             || match &result {
-                Ok((_, recovery)) => format!(
+                Ok((_, recovery, _)) => format!(
                     "status=success;recovery={};offset={offset}",
                     recovery.log_value()
                 ),
                 Err(error) => format!("status=error;offset={offset};error={error:?}"),
             },
         );
-        let (candidates, _) = result?;
+        let (candidates, _, _) = result?;
         Ok(candidates)
     }
 
@@ -1715,6 +1932,7 @@ impl IPCService {
             "advance_clause",
             request_id,
             Some(previous_candidates),
+            None,
             |this| {
                 let advance = this.send_advance_clause(offset, request_id)?;
                 let navigation = advance.navigation.clone();
@@ -1728,20 +1946,21 @@ impl IPCService {
             "advance_clause",
             "rpc_total",
             || match &result {
-                Ok((_, recovery)) => format!(
+                Ok((_, recovery, _)) => format!(
                     "status=success;recovery={};offset={offset}",
                     recovery.log_value()
                 ),
                 Err(error) => format!("status=error;offset={offset};error={error:?}"),
             },
         );
-        let (navigation, _) = result?;
+        let (navigation, _, _) = result?;
         Ok(
             completed_advance.unwrap_or_else(|| super::composition::ClauseAdvance {
                 // If the transport failed after the server had already advanced,
                 // refresh can recover only the current navigation candidates.
                 shrunk: navigation.clone(),
                 navigation,
+                raw_input: super::composition::ClauseAdvanceRawInput::Unavailable,
             }),
         )
     }
@@ -1751,12 +1970,39 @@ impl IPCService {
         &mut self,
         initial_offset: i32,
         previous_candidates: &Candidates,
-    ) -> anyhow::Result<Vec<super::composition::ClauseAdvance>> {
+        leave_at_last: bool,
+    ) -> anyhow::Result<(Vec<super::composition::ClauseAdvance>, bool)> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let result = self
-            .run_rpc_with_reconnect("prepare_future_clauses", |this| {
-                this.send_prepare_future_clauses(initial_offset, request_id)
+        let result = if leave_at_last {
+            self.send_prepare_future_clauses(initial_offset, request_id, true)
+                .map_err(|error| {
+                    if Self::should_reconnect_rpc_error(&error) {
+                        Self::mark_server_recovery_required(
+                            &self.recovery,
+                            "prepare_future_clauses_to_last_failed",
+                        );
+                        preserve_recovery_error(error)
+                    } else {
+                        error
+                    }
+                })
+                .and_then(|prepared| {
+                    if self.take_server_reset_recovered() {
+                        Self::mark_server_recovery_required(
+                            &self.recovery,
+                            "prepare_future_clauses_to_last_session_change",
+                        );
+                        Err(preserve_recovery_error(anyhow::anyhow!(
+                            "prepare_future_clauses_to_last reached a different server session"
+                        )))
+                    } else {
+                        Ok(prepared)
+                    }
+                })
+        } else {
+            self.run_rpc_with_reconnect("prepare_future_clauses", |this| {
+                this.send_prepare_future_clauses(initial_offset, request_id, false)
             })
             .map_err(|error| {
                 if Self::should_reconnect_rpc_error(&error) {
@@ -1769,7 +2015,7 @@ impl IPCService {
                     error
                 }
             })
-            .and_then(|(advances, reconnected)| {
+            .and_then(|(prepared, reconnected)| {
                 if self.take_server_reset_recovered() {
                     Self::mark_server_recovery_required(
                         &self.recovery,
@@ -1798,20 +2044,21 @@ impl IPCService {
                     }
                 }
 
-                Ok(advances)
-            });
+                Ok(prepared)
+            })
+        };
         self.log_client_performance_from_start(
             performance_start,
             request_id,
             "prepare_future_clauses",
             "rpc_total",
             || match &result {
-                Ok(advances) => format!(
-                    "status=success;initial_offset={initial_offset};advance_count={}",
-                    advances.len()
+                Ok((advances, completed)) => format!(
+                    "status=success;initial_offset={initial_offset};advance_count={};leave_at_last={leave_at_last};completed={completed}",
+                    advances.len(),
                 ),
                 Err(error) => {
-                    format!("status=error;initial_offset={initial_offset};error={error:?}")
+                    format!("status=error;initial_offset={initial_offset};leave_at_last={leave_at_last};error={error:?}")
                 }
             },
         );
@@ -1843,6 +2090,7 @@ impl IPCService {
             "move_cursor",
             request_id,
             previous_candidates,
+            None,
             |this| this.send_move_cursor(offset, request_id),
         );
         self.log_client_performance_from_start(
@@ -1851,15 +2099,70 @@ impl IPCService {
             "move_cursor",
             "rpc_total",
             || match &result {
-                Ok((_, recovery)) => format!(
+                Ok((_, recovery, _)) => format!(
                     "status=success;recovery={};offset={offset}",
                     recovery.log_value()
                 ),
                 Err(error) => format!("status=error;offset={offset};error={error:?}"),
             },
         );
-        let (candidates, _) = result?;
+        let (candidates, _, _) = result?;
         Ok(candidates)
+    }
+
+    #[tracing::instrument(skip(self, previous_candidates))]
+    pub(crate) fn adjust_clause_boundary(
+        &mut self,
+        current_input_count: i32,
+        direction: i32,
+        expected_raw_input: &str,
+        previous_candidates: &Candidates,
+    ) -> anyhow::Result<super::composition::ClauseBoundaryAdjustment> {
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
+        let result = self
+            .run_rpc_with_reconnect("adjust_clause_boundary", |this| {
+                this.send_adjust_clause_boundary(
+                    current_input_count,
+                    direction,
+                    expected_raw_input,
+                    request_id,
+                )
+            })
+            .and_then(|(adjustment, reconnected)| {
+                if reconnected
+                    && adjustment.adjusted_input_count.is_some()
+                    && !previous_candidates.hiragana.is_empty()
+                    && adjustment.candidates.hiragana != previous_candidates.hiragana
+                {
+                    anyhow::bail!(
+                        "adjust_clause_boundary reconnected into an unrelated composition"
+                    );
+                }
+                Ok(adjustment)
+            });
+        self.log_client_performance_from_start(
+            performance_start,
+            request_id,
+            "adjust_clause_boundary",
+            "rpc_total",
+            || match &result {
+                Ok(adjustment) => format!(
+                    "status=success;current_input_count={current_input_count};expected_input_count={};direction={direction};applied={};adjusted_input_count={}",
+                    expected_raw_input.chars().count(),
+                    adjustment.adjusted_input_count.is_some(),
+                    adjustment
+                        .adjusted_input_count
+                        .map(|count| count.to_string())
+                        .unwrap_or_else(|| "-".to_string())
+                ),
+                Err(error) => format!(
+                    "status=error;current_input_count={current_input_count};expected_input_count={};direction={direction};error={error:?}",
+                    expected_raw_input.chars().count()
+                ),
+            },
+        );
+        result
     }
 
     #[tracing::instrument(skip(self, previous_candidates))]
@@ -1891,6 +2194,8 @@ impl IPCService {
                     if Self::should_retry_non_idempotent_edit_after_refresh(
                         Some(previous_candidates),
                         &refreshed_candidates,
+                        None,
+                        None,
                     ) {
                         self.send_update_composition_snapshot(operation, request_id)?;
                         Ok(NonIdempotentEditRecovery::RetriedAfterUnchangedRefresh)
@@ -2572,6 +2877,16 @@ mod tests {
     }
 
     #[test]
+    fn pending_recovery_never_uses_immediate_retry_policy() {
+        let error = preserve_recovery_error(anyhow::anyhow!(
+            "server response requires absolute-state reconstruction"
+        ));
+
+        assert!(requires_ipc_recovery(&error));
+        assert!(!IPCService::should_reconnect_rpc_error(&error));
+    }
+
+    #[test]
     fn grpc_deadline_status_never_replays_non_idempotent_rpc() {
         let error = anyhow::Error::new(tonic::Status::deadline_exceeded("server timed out"));
 
@@ -2696,8 +3011,50 @@ mod tests {
 
         assert!(IPCService::should_retry_non_idempotent_edit_after_refresh(
             Some(&previous),
-            &previous
+            &previous,
+            None,
+            None,
         ));
+    }
+
+    #[test]
+    fn remove_retry_requires_unchanged_raw_input_identity() {
+        let unchanged_candidates = Candidates {
+            texts: vec!["ん".to_string()],
+            sub_texts: vec![String::new()],
+            hiragana: "ん".to_string(),
+            corresponding_count: vec![1],
+            candidate_ids: vec![1],
+        };
+
+        assert!(IPCService::should_retry_non_idempotent_edit_after_refresh(
+            Some(&unchanged_candidates),
+            &unchanged_candidates,
+            Some("nn"),
+            Some("nn"),
+        ));
+        assert!(!IPCService::should_retry_non_idempotent_edit_after_refresh(
+            Some(&unchanged_candidates),
+            &unchanged_candidates,
+            Some("nn"),
+            Some("n"),
+        ));
+        assert!(!IPCService::should_retry_non_idempotent_edit_after_refresh(
+            Some(&unchanged_candidates),
+            &unchanged_candidates,
+            Some("nn"),
+            None,
+        ));
+    }
+
+    #[test]
+    fn remove_refresh_returns_canonical_raw_input_when_edit_response_was_lost() {
+        assert_eq!(
+            IPCService::verified_remove_raw_input(None, Some("bun".to_string()))
+                .expect("refresh raw input should recover the completed removal"),
+            "bun"
+        );
+        assert!(IPCService::verified_remove_raw_input(None, None).is_err());
     }
 
     #[test]
@@ -2716,7 +3073,9 @@ mod tests {
 
         assert!(IPCService::should_retry_non_idempotent_edit_after_refresh(
             Some(&previous),
-            &refreshed
+            &refreshed,
+            None,
+            None,
         ));
     }
 
@@ -2739,7 +3098,9 @@ mod tests {
 
         assert!(!IPCService::should_retry_non_idempotent_edit_after_refresh(
             Some(&previous),
-            &refreshed
+            &refreshed,
+            None,
+            None,
         ));
     }
 
@@ -2755,7 +3116,9 @@ mod tests {
 
         assert!(!IPCService::should_retry_non_idempotent_edit_after_refresh(
             Some(&previous),
-            &Candidates::default()
+            &Candidates::default(),
+            None,
+            None,
         ));
     }
 
@@ -2907,6 +3270,33 @@ mod tests {
 
         assert!(ledger.operations.is_empty());
         assert!(!ledger.complete);
+    }
+
+    #[test]
+    fn move_to_last_recovery_uses_current_suffix_after_ledger_invalidation() {
+        let mut ledger = InputLedger {
+            operations: vec![CompositionOperation::Append {
+                text: "aruteidonagaibunsyou".to_string(),
+                input_style: INPUT_STYLE_ROMAN2KANA,
+            }],
+            complete: true,
+        };
+
+        mark_input_ledger_incomplete(&mut ledger);
+        let recovery_ledger = if ledger.complete {
+            ledger
+        } else {
+            fallback_input_ledger("bunsyou", "ぶんしょう")
+        };
+
+        assert_eq!(
+            recovery_ledger.operations,
+            vec![CompositionOperation::Append {
+                text: "bunsyou".to_string(),
+                input_style: INPUT_STYLE_ROMAN2KANA,
+            }]
+        );
+        assert!(recovery_ledger.complete);
     }
 
     #[test]

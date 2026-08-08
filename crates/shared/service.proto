@@ -68,11 +68,35 @@ message RemoveTextRequest {
 message RemoveTextResponse {
   ComposingText composing_text = 1; // The resulting text and suggestions.
   uint64 server_session_id = 2; // Identifies the current server process session.
+  // New clients must not interpret an older server's missing field as an empty
+  // composition. Absence triggers reconstruction with the current server.
+  optional string raw_input = 3; // Exact remaining raw input after mapped deletion.
 }
 
 message MoveCursorRequest {
   int32 offset = 1; // Relative cursor movement in input units.
   uint64 request_id = 2;
+}
+
+// Moves a clause boundary to the adjacent independent input segment. The
+// current boundary is expressed in raw input elements so alternate romaji
+// spellings remain atomic even when their kana lengths differ.
+message AdjustClauseBoundaryRequest {
+  int32 current_input_count = 1;
+  int32 direction = 2;
+  uint64 request_id = 3;
+  // Raw input currently materialized on the client (the full current
+  // remainder, not only the selected clause). This gives
+  // current_input_count an unambiguous coordinate space.
+  string expected_raw_input = 4;
+}
+
+message AdjustClauseBoundaryResponse {
+  ComposingText composing_text = 1;
+  bool applied = 2;
+  int32 adjusted_input_count = 3;
+  int32 cursor_offset = 4;
+  uint64 server_session_id = 5;
 }
 
 enum CompositionSnapshotOperation {
@@ -113,6 +137,9 @@ message AdvanceClauseResponse {
   ComposingText shrunk_text = 1;
   ComposingText navigation_text = 2;
   uint64 server_session_id = 3;
+  // Raw input that remains after the server atomically shrinks the current
+  // clause. The client uses this to validate cached future-clause snapshots.
+  string raw_input = 4;
 }
 
 message PreparedClauseAdvance {
@@ -123,17 +150,27 @@ message PreparedClauseAdvance {
 message PrepareFutureClausesRequest {
   int32 initial_offset = 1;
   uint64 request_id = 2;
+  // Keep the server-side composition snapshots and cursor at the final
+  // prepared clause. Used by initial left-arrow navigation so the client can
+  // move to the last clause without replaying one RPC per clause.
+  bool leave_at_last = 3;
 }
 
 message PrepareFutureClausesResponse {
   repeated PreparedClauseAdvance advances = 1;
   uint64 server_session_id = 2;
+  // True only when preparation reached the final clause. If false, a
+  // leave_at_last request has been rolled back to its initial server state.
+  bool completed = 3;
 }
 
 // Response message for MoveCursor.
 message MoveCursorResponse {
   ComposingText composing_text = 1; // The resulting text and suggestions.
   uint64 server_session_id = 2; // Identifies the current server process session.
+  // Present for offset-zero refreshes so a client recovering an edit response
+  // can restore the server's exact raw-input identity without replaying it.
+  optional string raw_input = 3;
 }
 
 // Request message for ClearText.
@@ -179,6 +216,21 @@ message CommitLearningCandidateResponse {
   uint64 server_session_id = 1; // Identifies the current server process session.
 }
 
+message LearningCandidateCommit {
+  uint64 candidate_id = 1;
+  LearningCommitKind commit_kind = 2;
+}
+
+message CommitLearningCandidatesRequest {
+  repeated LearningCandidateCommit commits = 1;
+  uint64 request_id = 2;
+}
+
+message CommitLearningCandidatesResponse {
+  uint64 server_session_id = 1; // Identifies the current server process session.
+  uint32 committed_count = 2;
+}
+
 message ResetLearningMemoryRequest {
   uint64 request_id = 1;
 }
@@ -209,11 +261,13 @@ service AzookeyService {
   rpc AdvanceClause (AdvanceClauseRequest) returns (AdvanceClauseResponse);
   rpc PrepareFutureClauses (PrepareFutureClausesRequest) returns (PrepareFutureClausesResponse);
   rpc MoveCursor (MoveCursorRequest) returns (MoveCursorResponse);
+  rpc AdjustClauseBoundary (AdjustClauseBoundaryRequest) returns (AdjustClauseBoundaryResponse);
   rpc UpdateCompositionSnapshot (UpdateCompositionSnapshotRequest) returns (UpdateCompositionSnapshotResponse);
   rpc ClearText (ClearTextRequest) returns (ClearTextResponse);
   rpc SetContext (SetContextRequest) returns (SetContextResponse);
   rpc UpdateConfig (UpdateConfigRequest) returns (UpdateConfigResponse);
   rpc CommitLearningCandidate (CommitLearningCandidateRequest) returns (CommitLearningCandidateResponse);
+  rpc CommitLearningCandidates (CommitLearningCandidatesRequest) returns (CommitLearningCandidatesResponse);
   rpc ResetLearningMemory (ResetLearningMemoryRequest) returns (ResetLearningMemoryResponse);
   rpc LogPerformance (PerformanceLogRequest) returns (PerformanceLogResponse);
 }

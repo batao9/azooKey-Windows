@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashMap, sync::Arc};
 
 use super::*;
 
@@ -63,6 +63,7 @@ impl SimClause {
             (None, "じゅんびしてはっぴょうにのぞむ") => {
                 vec!["準備して発表に臨む".to_string()]
             }
+            (None, "じゅんびしてのぞむ") => vec!["準備して臨む".to_string()],
             (None, "ちゅういして") => vec!["注意して".to_string()],
             (None, "あるていどながいぶんせつでもふくすうにぶんかつされる") =>
             {
@@ -159,8 +160,13 @@ pub(super) struct ClauseHarness {
     pub(super) selection_index: i32,
     pub(super) current_clause_is_split_derived: bool,
     pub(super) current_clause_is_direct_split_remainder: bool,
+    pub(super) current_clause_is_pending_remainder: bool,
     pub(super) current_clause_has_split_left_neighbor: bool,
+    pub(super) current_clause_right_boundary_displacement: i32,
+    pub(super) current_clause_right_boundary_origin: Option<Arc<FutureClauseSnapshot>>,
     pub(super) current_clause_split_group_id: Option<u64>,
+    pub(super) current_clause_consumed_prefix_restore: Option<ConsumedPrefixRestore>,
+    pub(super) current_clause_remainder_origin: Option<Arc<str>>,
     pub(super) candidates: Candidates,
     pub(super) clause_snapshots: Vec<ClauseSnapshot>,
     pub(super) future_clause_snapshots: Vec<FutureClauseSnapshot>,
@@ -172,6 +178,7 @@ pub(super) enum HarnessUserAction {
     Left,
     Right,
     ShiftLeft,
+    ShiftRight,
     Space,
     Enter,
     SetTextType(SetTextType),
@@ -189,8 +196,13 @@ struct HarnessStateKey {
     selection_index: i32,
     current_clause_is_split_derived: bool,
     current_clause_is_direct_split_remainder: bool,
+    current_clause_is_pending_remainder: bool,
     current_clause_has_split_left_neighbor: bool,
+    current_clause_right_boundary_displacement: i32,
+    current_clause_right_boundary_origin: String,
     current_clause_split_group_id: Option<u64>,
+    current_clause_consumed_prefix_restore: String,
+    current_clause_remainder_origin: String,
     candidates: String,
     clause_snapshots: String,
     future_clause_snapshots: String,
@@ -202,6 +214,9 @@ struct HarnessStateKey {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct VisitedState {
     spec: SimSpecState,
+    server: SimSpecState,
+    server_snapshots: Vec<SimSpecState>,
+    blocked_boundary: bool,
     harness: HarnessStateKey,
 }
 
@@ -351,15 +366,39 @@ fn auto_clause_ju_spec_state() -> SimSpecState {
     }
 }
 
-fn auto_clause_tyu_spec_state() -> SimSpecState {
+fn auto_clause_digraph_spec_state(
+    digraph: &'static str,
+    raw_digraph: &'static str,
+) -> SimSpecState {
     SimSpecState {
         committed_clauses: Vec::new(),
         clauses: vec![clause(vec![
-            unit("ちゅ", "tyu", "ちゅ", 7),
+            unit(digraph, raw_digraph, digraph, 7),
             unit("う", "u", "う", 7),
             unit("い", "i", "い", 7),
             unit("し", "si", "し", 8),
             unit("て", "te", "て", 8),
+        ])],
+        current_index: 0,
+    }
+}
+
+fn auto_clause_tyu_spec_state() -> SimSpecState {
+    auto_clause_digraph_spec_state("ちゅ", "tyu")
+}
+
+fn auto_clause_terminal_restore_spec_state() -> SimSpecState {
+    SimSpecState {
+        committed_clauses: Vec::new(),
+        clauses: vec![clause(vec![
+            unit("じゅ", "ju", "じゅ", 4),
+            unit("ん", "n", "ん", 4),
+            unit("び", "bi", "び", 4),
+            unit("し", "si", "し", 4),
+            unit("て", "te", "て", 4),
+            unit("の", "no", "の", 6),
+            unit("ぞ", "zo", "ぞ", 6),
+            unit("む", "mu", "む", 6),
         ])],
         current_index: 0,
     }
@@ -546,6 +585,9 @@ fn auto_split_clauses_by_origin(units: &[SimUnit]) -> Vec<SimClause> {
 }
 
 fn auto_first_clause_candidates(spec: &SimSpecState) -> Option<Candidates> {
+    if spec.current_index != 0 || spec.clauses.len() != 1 {
+        return None;
+    }
     let only_clause = spec.clauses.first()?;
     let auto_clauses = auto_split_clauses_by_origin(&only_clause.units);
     if auto_clauses.len() <= 1 {
@@ -617,6 +659,8 @@ fn build_clause_snapshot_from_spec(spec: &SimSpecState, clause_index: usize) -> 
         clause.selected_candidate as i32,
         spec_clause_is_split_derived(spec, clause_index),
         spec_clause_has_split_left_neighbor(spec, clause_index),
+        0,
+        None,
         &candidates,
     );
     snapshot.is_direct_split_remainder = spec_clause_is_direct_split_remainder(spec, clause_index);
@@ -650,6 +694,7 @@ fn build_future_snapshot_from_spec(
     snapshot.is_split_derived = spec_clause_is_split_derived(spec, clause_index);
     snapshot.is_direct_split_remainder = spec_clause_is_direct_split_remainder(spec, clause_index);
     snapshot.has_split_left_neighbor = spec_clause_has_split_left_neighbor(spec, clause_index);
+    snapshot.right_boundary_displacement = 0;
     snapshot.split_group_id = spec_clause_split_group_id(spec, clause_index);
     snapshot
 }
@@ -691,11 +736,16 @@ fn build_harness_from_spec(spec: &SimSpecState, state: CompositionState) -> Clau
             spec,
             spec.current_index,
         ),
+        current_clause_is_pending_remainder: false,
         current_clause_has_split_left_neighbor: spec_clause_has_split_left_neighbor(
             spec,
             spec.current_index,
         ),
+        current_clause_right_boundary_displacement: 0,
+        current_clause_right_boundary_origin: None,
         current_clause_split_group_id: spec_clause_split_group_id(spec, spec.current_index),
+        current_clause_consumed_prefix_restore: None,
+        current_clause_remainder_origin: None,
         candidates,
         clause_snapshots,
         future_clause_snapshots,
@@ -719,6 +769,8 @@ fn build_logged_baseline_harness(spec: &SimSpecState, state: CompositionState) -
         0,
         false,
         false,
+        0,
+        None,
         &first_candidates,
     );
     first_snapshot.split_group_id = None;
@@ -733,6 +785,8 @@ fn build_logged_baseline_harness(spec: &SimSpecState, state: CompositionState) -
         0,
         true,
         false,
+        0,
+        None,
         &second_candidates,
     );
     second_snapshot.split_group_id = Some(1);
@@ -747,6 +801,8 @@ fn build_logged_baseline_harness(spec: &SimSpecState, state: CompositionState) -
         0,
         true,
         true,
+        0,
+        None,
         &third_candidates,
     );
     third_snapshot.split_group_id = Some(1);
@@ -763,8 +819,13 @@ fn build_logged_baseline_harness(spec: &SimSpecState, state: CompositionState) -
         selection_index: 0,
         current_clause_is_split_derived: true,
         current_clause_is_direct_split_remainder: true,
+        current_clause_is_pending_remainder: false,
         current_clause_has_split_left_neighbor: true,
+        current_clause_right_boundary_displacement: 0,
+        current_clause_right_boundary_origin: None,
         current_clause_split_group_id: Some(1),
+        current_clause_consumed_prefix_restore: None,
+        current_clause_remainder_origin: None,
         candidates: current_candidates,
         clause_snapshots: vec![first_snapshot, second_snapshot, third_snapshot],
         future_clause_snapshots: Vec::new(),
@@ -953,8 +1014,22 @@ fn harness_key(harness: &ClauseHarness) -> HarnessStateKey {
         selection_index: harness.selection_index,
         current_clause_is_split_derived: harness.current_clause_is_split_derived,
         current_clause_is_direct_split_remainder: harness.current_clause_is_direct_split_remainder,
+        current_clause_is_pending_remainder: harness.current_clause_is_pending_remainder,
         current_clause_has_split_left_neighbor: harness.current_clause_has_split_left_neighbor,
+        current_clause_right_boundary_displacement: harness
+            .current_clause_right_boundary_displacement,
+        current_clause_right_boundary_origin: TextServiceFactory::debug_right_boundary_origin(
+            harness.current_clause_right_boundary_origin.as_ref(),
+        ),
         current_clause_split_group_id: harness.current_clause_split_group_id,
+        current_clause_consumed_prefix_restore: TextServiceFactory::debug_consumed_prefix_restore(
+            harness.current_clause_consumed_prefix_restore.as_ref(),
+        ),
+        current_clause_remainder_origin: harness
+            .current_clause_remainder_origin
+            .as_deref()
+            .unwrap_or("-")
+            .to_string(),
         candidates: TextServiceFactory::debug_candidates(
             &harness.candidates,
             harness.selection_index,
@@ -993,8 +1068,16 @@ fn harness_as_composition(harness: &ClauseHarness) -> Composition {
         future_clause_snapshots: harness.future_clause_snapshots.clone(),
         current_clause_is_split_derived: harness.current_clause_is_split_derived,
         current_clause_is_direct_split_remainder: harness.current_clause_is_direct_split_remainder,
+        current_clause_is_pending_remainder: harness.current_clause_is_pending_remainder,
         current_clause_has_split_left_neighbor: harness.current_clause_has_split_left_neighbor,
+        current_clause_right_boundary_displacement: harness
+            .current_clause_right_boundary_displacement,
+        current_clause_right_boundary_origin: harness.current_clause_right_boundary_origin.clone(),
         current_clause_split_group_id: harness.current_clause_split_group_id,
+        current_clause_consumed_prefix_restore: harness
+            .current_clause_consumed_prefix_restore
+            .clone(),
+        current_clause_remainder_origin: harness.current_clause_remainder_origin.clone(),
         next_split_group_id: harness.next_split_group_id,
         state: harness.state.clone(),
         ..Composition::default()
@@ -1151,7 +1234,33 @@ impl ScenarioBackend {
             .insert(current_index + 1, pending_clause(vec![moved_unit]));
     }
 
-    fn split_server_left(&mut self) {
+    fn split_spec_right(&mut self) {
+        let current_index = self.spec.current_index;
+        if current_index + 1 >= self.spec.clauses.len()
+            || self.spec.clauses[current_index + 1].units.is_empty()
+        {
+            self.blocked_boundary = true;
+            return;
+        }
+
+        self.blocked_boundary = false;
+        let moved_unit = self.spec.clauses[current_index + 1].units.remove(0);
+        self.spec.clauses[current_index].units.push(moved_unit);
+        self.spec.clauses[current_index].selected_candidate = 0;
+        self.spec.clauses[current_index].display_override = None;
+        self.spec.clauses[current_index].clamp_selection();
+
+        if self.spec.clauses[current_index + 1].units.is_empty() {
+            self.spec.clauses.remove(current_index + 1);
+        } else {
+            let next_clause = &mut self.spec.clauses[current_index + 1];
+            next_clause.selected_candidate = 0;
+            next_clause.display_override = None;
+            next_clause.clamp_selection();
+        }
+    }
+
+    fn split_server_left(&mut self) -> bool {
         let current_index = self.server.current_index;
         let can_split = self
             .server
@@ -1161,7 +1270,7 @@ impl ScenarioBackend {
             .unwrap_or(false);
         if !can_split {
             self.blocked_boundary = true;
-            return;
+            return false;
         }
 
         self.blocked_boundary = false;
@@ -1176,7 +1285,7 @@ impl ScenarioBackend {
             self.server
                 .clauses
                 .insert(current_index + 1, pending_clause(vec![moved_unit]));
-            return;
+            return true;
         }
 
         let mut collapsed_units = vec![moved_unit];
@@ -1187,6 +1296,32 @@ impl ScenarioBackend {
         self.server
             .clauses
             .insert(current_index + 1, pending_clause(collapsed_units));
+        true
+    }
+
+    fn split_server_right(&mut self) -> bool {
+        let current_index = self.server.current_index;
+        if current_index + 1 >= self.server.clauses.len()
+            || self.server.clauses[current_index + 1].units.is_empty()
+        {
+            self.blocked_boundary = true;
+            return false;
+        }
+
+        self.blocked_boundary = false;
+        let moved_unit = self.server.clauses[current_index + 1].units.remove(0);
+        self.server.clauses[current_index].units.push(moved_unit);
+        self.server.clauses[current_index].selected_candidate = 0;
+        self.server.clauses[current_index].clamp_selection();
+
+        if self.server.clauses[current_index + 1].units.is_empty() {
+            self.server.clauses.remove(current_index + 1);
+        } else {
+            let next_clause = &mut self.server.clauses[current_index + 1];
+            next_clause.selected_candidate = 0;
+            next_clause.clamp_selection();
+        }
+        true
     }
 
     fn move_spec_right(&mut self) {
@@ -1259,6 +1394,7 @@ impl ScenarioBackend {
             HarnessUserAction::Left => self.move_spec_left(),
             HarnessUserAction::Right => self.move_spec_right(),
             HarnessUserAction::ShiftLeft => self.split_spec_left(),
+            HarnessUserAction::ShiftRight => self.split_spec_right(),
             HarnessUserAction::Space => {}
             HarnessUserAction::Enter => self.commit_spec_all_clauses(),
             HarnessUserAction::SetTextType(set_type) => {
@@ -1271,6 +1407,92 @@ impl ScenarioBackend {
 }
 
 impl ClauseActionBackend for ScenarioBackend {
+    fn adjust_clause_boundary(
+        &mut self,
+        current_input_count: i32,
+        direction: i32,
+        expected_raw_input: &str,
+        target_raw_hiragana: &str,
+        target_sub_text: &str,
+        previous_candidates: &Candidates,
+    ) -> anyhow::Result<ClauseBoundaryAdjustment> {
+        let current_index = self.spec.current_index;
+        let current_clause = self
+            .spec
+            .clauses
+            .get(current_index)
+            .expect("boundary adjustment requires a current spec clause");
+        assert_eq!(
+            current_input_count,
+            current_clause.corresponding_count(),
+            "client sent a stale clause-local input boundary"
+        );
+        assert_ne!(direction, 0, "client sent a zero boundary direction");
+        assert_eq!(
+            expected_raw_input,
+            spec_join_raw_input(&self.spec.clauses[current_index..]),
+            "client sent a boundary in the wrong raw-input coordinate space"
+        );
+        assert_eq!(
+            target_raw_hiragana,
+            current_clause.raw_hiragana(),
+            "client sent the wrong current-clause hiragana"
+        );
+        assert_eq!(
+            target_sub_text,
+            spec_join_display(&self.spec.clauses[(current_index + 1)..]),
+            "client sent the wrong rendered suffix"
+        );
+        let expected_candidates = candidates_for_clause(&self.spec, current_index);
+        assert_eq!(
+            previous_candidates.texts, expected_candidates.texts,
+            "client sent candidate texts for a different clause boundary"
+        );
+        assert_eq!(
+            previous_candidates.sub_texts, expected_candidates.sub_texts,
+            "client sent candidate suffixes for a different clause boundary"
+        );
+        assert_eq!(
+            previous_candidates.hiragana, expected_candidates.hiragana,
+            "client sent candidate hiragana for a different clause boundary"
+        );
+        assert_eq!(
+            previous_candidates.corresponding_count, expected_candidates.corresponding_count,
+            "client sent candidate input counts for a different clause boundary"
+        );
+
+        // ScenarioBackend verifies the client state machine against the ideal
+        // clause specification. Swift's raw cursor/snapshot behavior is covered
+        // separately by the real-converter boundary tests.
+        self.server = self.spec.clone();
+        assert_eq!(
+            expected_raw_input,
+            spec_join_raw_input(&self.server.clauses[self.server.current_index..]),
+            "backend was not materialized at the client clause remainder"
+        );
+        let changed = if direction < 0 {
+            self.split_server_left()
+        } else if direction > 0 {
+            self.split_server_right()
+        } else {
+            false
+        };
+        if !changed {
+            return Ok(ClauseBoundaryAdjustment::skipped());
+        }
+
+        let candidates = self.current_candidates();
+        let adjusted_input_count = candidates
+            .corresponding_count
+            .first()
+            .copied()
+            .unwrap_or(current_input_count);
+        Ok(ClauseBoundaryAdjustment::applied(
+            candidates,
+            adjusted_input_count,
+        ))
+    }
+
     fn move_cursor(&mut self, offset: i32) -> anyhow::Result<Candidates> {
         match offset {
             0 => {
@@ -1283,11 +1505,12 @@ impl ClauseActionBackend for ScenarioBackend {
                 }
             }
             -1 => {
-                self.split_server_left();
+                let _ = self.split_server_left();
                 Ok(self.current_candidates())
             }
             1 => {
                 self.blocked_boundary = false;
+                let _ = self.split_server_right();
                 Ok(self.current_candidates())
             }
             _ => Ok(self.current_candidates()),
@@ -1347,6 +1570,7 @@ fn op_name(op: HarnessUserAction) -> &'static str {
         HarnessUserAction::Left => "Left",
         HarnessUserAction::Right => "Right",
         HarnessUserAction::ShiftLeft => "ShiftLeft",
+        HarnessUserAction::ShiftRight => "ShiftRight",
         HarnessUserAction::Space => "Space",
         HarnessUserAction::Enter => "Enter",
         HarnessUserAction::SetTextType(SetTextType::Hiragana) => "F6",
@@ -1370,6 +1594,7 @@ fn harness_user_action(op: HarnessUserAction) -> UserAction {
         HarnessUserAction::Left => UserAction::Navigation(Navigation::Left),
         HarnessUserAction::Right => UserAction::Navigation(Navigation::Right),
         HarnessUserAction::ShiftLeft => UserAction::AdjustClauseBoundary(-1),
+        HarnessUserAction::ShiftRight => UserAction::AdjustClauseBoundary(1),
         HarnessUserAction::Space => UserAction::Space,
         HarnessUserAction::Enter => UserAction::Enter,
         HarnessUserAction::SetTextType(SetTextType::Hiragana) => {
@@ -1528,7 +1753,9 @@ fn apply_user_action(
 
     for action in actions {
         match action {
-            ClientAction::EnsureClauseNavigationReady => {
+            ClientAction::EnsureClauseNavigationReady {
+                prepare_future_clauses,
+            } => {
                 let mut state = ClauseActionStateMut {
                     preview: &mut harness.preview,
                     suffix: &mut harness.suffix,
@@ -1543,13 +1770,26 @@ fn apply_user_action(
                     current_clause_is_split_derived: &mut harness.current_clause_is_split_derived,
                     current_clause_is_direct_split_remainder: &mut harness
                         .current_clause_is_direct_split_remainder,
+                    current_clause_is_pending_remainder: &mut harness
+                        .current_clause_is_pending_remainder,
                     current_clause_has_split_left_neighbor: &mut harness
                         .current_clause_has_split_left_neighbor,
+                    current_clause_right_boundary_displacement: &mut harness
+                        .current_clause_right_boundary_displacement,
+                    current_clause_right_boundary_origin: &mut harness
+                        .current_clause_right_boundary_origin,
                     current_clause_split_group_id: &mut harness.current_clause_split_group_id,
+                    current_clause_consumed_prefix_restore: &mut harness
+                        .current_clause_consumed_prefix_restore,
+                    current_clause_remainder_origin: &mut harness.current_clause_remainder_origin,
                     next_split_group_id: &mut harness.next_split_group_id,
                 };
-                TextServiceFactory::ensure_clause_navigation_ready(&mut state, backend)
-                    .expect("ensure_clause_navigation_ready");
+                TextServiceFactory::ensure_clause_navigation_ready_with_preparation(
+                    &mut state,
+                    backend,
+                    prepare_future_clauses,
+                )
+                .expect("ensure_clause_navigation_ready");
                 backend.ensure_spec_clause_navigation_ready();
             }
             ClientAction::MoveClause(direction) => {
@@ -1570,9 +1810,19 @@ fn apply_user_action(
                             .current_clause_is_split_derived,
                         current_clause_is_direct_split_remainder: &mut harness
                             .current_clause_is_direct_split_remainder,
+                        current_clause_is_pending_remainder: &mut harness
+                            .current_clause_is_pending_remainder,
                         current_clause_has_split_left_neighbor: &mut harness
                             .current_clause_has_split_left_neighbor,
+                        current_clause_right_boundary_displacement: &mut harness
+                            .current_clause_right_boundary_displacement,
+                        current_clause_right_boundary_origin: &mut harness
+                            .current_clause_right_boundary_origin,
                         current_clause_split_group_id: &mut harness.current_clause_split_group_id,
+                        current_clause_consumed_prefix_restore: &mut harness
+                            .current_clause_consumed_prefix_restore,
+                        current_clause_remainder_origin: &mut harness
+                            .current_clause_remainder_origin,
                         next_split_group_id: &mut harness.next_split_group_id,
                     };
                     TextServiceFactory::apply_move_clause(&mut state, backend, direction)
@@ -1606,6 +1856,15 @@ fn apply_user_action(
                 }
             }
             ClientAction::AdjustBoundary(direction) => {
+                let expected_applied = if direction < 0 {
+                    backend
+                        .spec
+                        .clauses
+                        .get(backend.spec.current_index)
+                        .is_some_and(SimClause::can_split_left)
+                } else {
+                    direction > 0 && backend.spec.current_index + 1 < backend.spec.clauses.len()
+                };
                 let effect = {
                     let mut state = ClauseActionStateMut {
                         preview: &mut harness.preview,
@@ -1622,17 +1881,28 @@ fn apply_user_action(
                             .current_clause_is_split_derived,
                         current_clause_is_direct_split_remainder: &mut harness
                             .current_clause_is_direct_split_remainder,
+                        current_clause_is_pending_remainder: &mut harness
+                            .current_clause_is_pending_remainder,
                         current_clause_has_split_left_neighbor: &mut harness
                             .current_clause_has_split_left_neighbor,
+                        current_clause_right_boundary_displacement: &mut harness
+                            .current_clause_right_boundary_displacement,
+                        current_clause_right_boundary_origin: &mut harness
+                            .current_clause_right_boundary_origin,
                         current_clause_split_group_id: &mut harness.current_clause_split_group_id,
+                        current_clause_consumed_prefix_restore: &mut harness
+                            .current_clause_consumed_prefix_restore,
+                        current_clause_remainder_origin: &mut harness
+                            .current_clause_remainder_origin,
                         next_split_group_id: &mut harness.next_split_group_id,
                     };
                     TextServiceFactory::apply_adjust_boundary(&mut state, backend, direction)
                         .expect("apply_adjust_boundary")
                 };
-                assert!(
+                assert_eq!(
                     effect.applied,
-                    "AdjustBoundary unexpectedly skipped: {}\nharness clauses: {}\nspec clauses: {}\nserver clauses: {}\nharness raw clauses: {}\nspec raw clauses: {}\nserver raw clauses: {}\ncandidates: {}\nserver candidates: {}\nfuture_clause_snapshots: {}\npreview={} fixed_prefix={} suffix={} raw_input={} raw_hiragana={} corresponding_count={} selection_index={} spec_current_index={} server_current_index={}",
+                    expected_applied,
+                    "AdjustBoundary applied mismatch: {}\nharness clauses: {}\nspec clauses: {}\nserver clauses: {}\nharness raw clauses: {}\nspec raw clauses: {}\nserver raw clauses: {}\ncandidates: {}\nserver candidates: {}\nfuture_clause_snapshots: {}\npreview={} fixed_prefix={} suffix={} raw_input={} raw_hiragana={} corresponding_count={} selection_index={} spec_current_index={} server_current_index={}",
                     history_string(history),
                     harness_visible_clauses(harness),
                     spec_display(&backend.spec),
@@ -1685,9 +1955,19 @@ fn apply_user_action(
                             .current_clause_is_split_derived,
                         current_clause_is_direct_split_remainder: &mut harness
                             .current_clause_is_direct_split_remainder,
+                        current_clause_is_pending_remainder: &mut harness
+                            .current_clause_is_pending_remainder,
                         current_clause_has_split_left_neighbor: &mut harness
                             .current_clause_has_split_left_neighbor,
+                        current_clause_right_boundary_displacement: &mut harness
+                            .current_clause_right_boundary_displacement,
+                        current_clause_right_boundary_origin: &mut harness
+                            .current_clause_right_boundary_origin,
                         current_clause_split_group_id: &mut harness.current_clause_split_group_id,
+                        current_clause_consumed_prefix_restore: &mut harness
+                            .current_clause_consumed_prefix_restore,
+                        current_clause_remainder_origin: &mut harness
+                            .current_clause_remainder_origin,
                         next_split_group_id: &mut harness.next_split_group_id,
                     };
                     TextServiceFactory::apply_set_selection(&mut state, &selection)
@@ -1983,6 +2263,23 @@ pub(super) fn run_from_auto_clause_tyu(
     run_from_auto_clause(auto_clause_tyu_spec_state(), extra_actions)
 }
 
+pub(super) fn run_from_auto_clause_terminal_restore(
+    extra_actions: &[HarnessUserAction],
+) -> (ClauseHarness, ScenarioBackend, Vec<HarnessUserAction>) {
+    run_from_auto_clause(auto_clause_terminal_restore_spec_state(), extra_actions)
+}
+
+pub(super) fn run_from_auto_clause_digraph(
+    digraph: &'static str,
+    raw_digraph: &'static str,
+    extra_actions: &[HarnessUserAction],
+) -> (ClauseHarness, ScenarioBackend, Vec<HarnessUserAction>) {
+    run_from_auto_clause(
+        auto_clause_digraph_spec_state(digraph, raw_digraph),
+        extra_actions,
+    )
+}
+
 pub(super) fn run_from_auto_clause_preserved_suffix(
     extra_actions: &[HarnessUserAction],
 ) -> (ClauseHarness, ScenarioBackend, Vec<HarnessUserAction>) {
@@ -2013,6 +2310,7 @@ fn is_available(harness: &ClauseHarness, spec: &SimSpecState, op: HarnessUserAct
         HarnessUserAction::Left => spec.current_index > 0,
         HarnessUserAction::Right => spec.current_index + 1 < spec.clauses.len(),
         HarnessUserAction::ShiftLeft => spec.clauses[spec.current_index].can_split_left(),
+        HarnessUserAction::ShiftRight => spec.current_index + 1 < spec.clauses.len(),
         HarnessUserAction::Space => {
             matches!(
                 harness.state,
@@ -2039,16 +2337,23 @@ fn explore_histories(
     backend: ScenarioBackend,
     remaining_depth: usize,
     history: &mut Vec<HarnessUserAction>,
-    visited: &mut HashSet<VisitedState>,
+    visited: &mut HashMap<VisitedState, usize>,
 ) {
     assert_harness_matches_spec(&harness, &backend.spec, history);
     let visited_state = VisitedState {
         spec: backend.spec.clone(),
+        server: backend.server.clone(),
+        server_snapshots: backend.server_snapshots.clone(),
+        blocked_boundary: backend.blocked_boundary,
         harness: harness_key(&harness),
     };
-    if !visited.insert(visited_state) {
+    if visited
+        .get(&visited_state)
+        .is_some_and(|explored_depth| *explored_depth >= remaining_depth)
+    {
         return;
     }
+    visited.insert(visited_state, remaining_depth);
     if remaining_depth == 0 {
         return;
     }
@@ -2057,6 +2362,7 @@ fn explore_histories(
         HarnessUserAction::Left,
         HarnessUserAction::Right,
         HarnessUserAction::ShiftLeft,
+        HarnessUserAction::ShiftRight,
         HarnessUserAction::Space,
     ];
     for op in ops {
@@ -2082,7 +2388,7 @@ fn explore_histories(
 pub(super) fn assert_histories_match_up_to_depth_eight() {
     let (harness, backend, _) = run_to_baseline();
     let mut history = Vec::new();
-    let mut visited = HashSet::new();
+    let mut visited = HashMap::new();
 
     explore_histories(harness, backend, 8, &mut history, &mut visited);
 }
