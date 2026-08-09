@@ -11,6 +11,9 @@ const versionPattern = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const readJson = (path) => JSON.parse(readFileSync(path, "utf8"));
 const jsonText = (value) => `${JSON.stringify(value, null, 2)}\n`;
 
+export const textMatchesIgnoringLineEndings = (actual, expected) =>
+  actual.replace(/\r\n?/g, "\n") === expected.replace(/\r\n?/g, "\n");
+
 const runGit = (args, { optional = false } = {}) => {
   try {
     return execFileSync("git", args, {
@@ -142,7 +145,8 @@ const syncReleaseMetadata = (config) => {
 const checkReleaseMetadata = (config) => {
   const mismatches = [];
   for (const [relativePath, expected] of expectedReleaseMetadata(config)) {
-    if (readFileSync(join(repoRoot, relativePath), "utf8") !== expected) {
+    const actual = readFileSync(join(repoRoot, relativePath), "utf8");
+    if (!textMatchesIgnoringLineEndings(actual, expected)) {
       mismatches.push(relativePath);
     }
   }

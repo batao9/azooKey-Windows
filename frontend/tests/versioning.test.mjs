@@ -4,6 +4,7 @@ import test from "node:test";
 import {
     createBuildInfo,
     selectBuildChannel,
+    textMatchesIgnoringLineEndings,
     validateAppVersionConfig,
 } from "../../scripts/sync-version.mjs";
 
@@ -96,5 +97,16 @@ test("release channel requires an explicit request and exact matching tag", () =
     assert.throws(
         () => selectBuildChannel({ requested: "release", exactReleaseTag: false }),
         /exact release tag/,
+    );
+});
+
+test("release metadata checks ignore only platform line endings", () => {
+    assert.equal(
+        textMatchesIgnoringLineEndings("first\r\nsecond\r\n", "first\nsecond\n"),
+        true,
+    );
+    assert.equal(
+        textMatchesIgnoringLineEndings("first\r\nchanged\r\n", "first\nsecond\n"),
+        false,
     );
 });
