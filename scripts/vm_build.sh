@@ -40,7 +40,7 @@ mkdir -p "$ARTIFACT_DIR"
 
 BUILD_REVISION="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 BUILD_NUMBER="$(date -u +%Y%m%d%H%M%S)"
-BUILD_BASE_VERSION="$(git -C "$REPO_ROOT" describe --tags --abbrev=0 --match 'v[0-9]*' HEAD | sed 's/^v//')"
+BUILD_BASE_VERSION="$(git -C "$REPO_ROOT" describe --tags --abbrev=0 --match 'v[0-9]*' HEAD 2>/dev/null | sed 's/^v//' || true)"
 
 DEFAULT_GATEWAY_IP="$(ip route | awk '/default/ {print $3; exit}' || true)"
 HOST_IP="${SSH_HOST:-${DEFAULT_GATEWAY_IP:-127.0.0.1}}"
@@ -335,7 +335,7 @@ param(
   [Parameter(Mandatory = $true)][string]$HostTimestampUtc,
   [Parameter(Mandatory = $true)][string]$BuildNumber,
   [Parameter(Mandatory = $true)][string]$BuildRevision,
-  [Parameter(Mandatory = $true)][string]$BuildBaseVersion,
+  [Parameter(Mandatory = $true)][AllowEmptyString()][string]$BuildBaseVersion,
   [Parameter(Mandatory = $true)][string]$BuildBranch
 )
 
@@ -344,7 +344,11 @@ $env:Path += ";$env:USERPROFILE\\.cargo\\bin"
 $env:AZOOKEY_BUILD_CHANNEL = "validation"
 $env:AZOOKEY_BUILD_NUMBER = $BuildNumber
 $env:AZOOKEY_BUILD_REVISION = $BuildRevision
-$env:AZOOKEY_BUILD_BASE_VERSION = $BuildBaseVersion
+if ([string]::IsNullOrWhiteSpace($BuildBaseVersion)) {
+  Remove-Item Env:AZOOKEY_BUILD_BASE_VERSION -ErrorAction SilentlyContinue
+} else {
+  $env:AZOOKEY_BUILD_BASE_VERSION = $BuildBaseVersion
+}
 $env:GITHUB_REF_NAME = $BuildBranch
 
 $LLAMA_CPU_URL = "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-avx-x64.zip"

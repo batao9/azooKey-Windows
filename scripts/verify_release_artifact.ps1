@@ -170,7 +170,7 @@ if (-not [string]::IsNullOrWhiteSpace($BuildInfoPath)) {
     if ($buildInfo.channel -eq "release" -and $buildInfo.version -ne $buildInfo.releaseVersion) {
         throw "Release build version differs from releaseVersion: version=$($buildInfo.version) releaseVersion=$($buildInfo.releaseVersion)"
     }
-    if ($buildInfo.channel -eq "validation" -and $buildInfo.version -notmatch '\.dev\.[0-9]+\.g[0-9a-f]{8}$') {
+    if ($buildInfo.channel -eq "validation" -and $buildInfo.version -notmatch '(?:\.|-)dev\.[0-9]+\.g[0-9a-f]{8}$') {
         throw "Validation build version is not uniquely identified: $($buildInfo.version)"
     }
     Write-Host "Build identity: version=$($buildInfo.version) channel=$($buildInfo.channel) revision=$($buildInfo.revision)"

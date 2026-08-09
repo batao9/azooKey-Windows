@@ -63,6 +63,16 @@ const validateRevision = (value) => {
   return revision;
 };
 
+const createValidationVersion = (baseVersion, buildNumber, revision) => {
+  if (baseVersion.includes("-")) {
+    return `${baseVersion}.dev.${buildNumber}.g${revision.slice(0, 8)}`;
+  }
+
+  const [major, minor, patch] = baseVersion.split(".");
+  const nextPatch = (BigInt(patch) + 1n).toString();
+  return `${major}.${minor}.${nextPatch}-dev.${buildNumber}.g${revision.slice(0, 8)}`;
+};
+
 export const createBuildInfo = ({
   channel,
   releaseVersion,
@@ -88,7 +98,7 @@ export const createBuildInfo = ({
 
   const version = channel === "release"
     ? releaseVersion
-    : `${baseVersion}.dev.${buildNumber}.g${revision.slice(0, 8)}`;
+    : createValidationVersion(baseVersion, buildNumber, revision);
   assertVersion(version, "generated build version");
 
   return {

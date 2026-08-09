@@ -1478,6 +1478,18 @@ mod tests {
     }
 
     #[test]
+    fn validation_build_from_a_stable_base_updates_to_the_next_patch_release() {
+        let _env = EnvGuard::new();
+        unsafe {
+            env::set_var(CURRENT_VERSION_ENV, "1.0.1-dev.1842.gd1525a6b");
+        }
+
+        let response = update_check_response(&release("v1.0.1")).unwrap();
+
+        assert!(response.update_available);
+    }
+
+    #[test]
     fn selects_required_release_assets() {
         let assets = select_release_assets(&release("v0.1.0").assets).unwrap();
 

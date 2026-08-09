@@ -33,6 +33,21 @@ test("validation builds use the latest released version as their semver base", (
     });
 });
 
+test("validation builds increment a stable base patch before adding a prerelease", () => {
+    const info = createBuildInfo({
+        channel: "validation",
+        releaseVersion: "1.1.0",
+        baseVersion: "1.0.0",
+        buildNumber: "1842",
+        revision: REVISION,
+        branch: "feature/example",
+        installerGeneration: 2,
+    });
+
+    assert.equal(info.version, "1.0.1-dev.1842.gd1525a61");
+    assert.equal(info.baseVersion, "1.0.0");
+});
+
 test("release builds use the declared release version without a suffix", () => {
     const info = createBuildInfo({
         channel: "release",
