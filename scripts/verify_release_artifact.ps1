@@ -5,6 +5,18 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Sha256Path,
 
+    [Parameter(Mandatory = $true)]
+    [string]$BuildInfoPath,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateSet("release", "validation")]
+    [string]$ExpectedChannel,
+
+    [string]$ExpectedVersion,
+
+    [Parameter(Mandatory = $true)]
+    [string]$ExpectedRevision,
+
     [string]$LogDirectory = $env:RUNNER_TEMP,
 
     [switch]$RequireSignature,
@@ -66,6 +78,7 @@ function Assert-InstallPayload {
         "azookey-server.exe",
         "launcher.exe",
         "ui.exe",
+        "build-info.json",
         "zenz.gguf",
         "Dictionary",
         "EmojiDictionary",
@@ -120,6 +133,47 @@ $resolvedInstaller = (Resolve-Path -LiteralPath $InstallerPath).Path
 $installer = Get-Item -LiteralPath $resolvedInstaller
 if ($installer.Length -le 0) {
     throw "Installer is empty: $resolvedInstaller"
+}
+
+$buildInfo = $null
+if (-not [string]::IsNullOrWhiteSpace($BuildInfoPath)) {
+    $resolvedBuildInfo = (Resolve-Path -LiteralPath $BuildInfoPath).Path
+    $buildInfo = Get-Content -LiteralPath $resolvedBuildInfo -Raw | ConvertFrom-Json
+    foreach ($requiredProperty in @(
+        "version",
+        "releaseVersion",
+        "baseVersion",
+        "channel",
+        "buildNumber",
+        "revision",
+        "branch",
+        "installerGeneration"
+    )) {
+        if ($null -eq $buildInfo.PSObject.Properties[$requiredProperty]) {
+            throw "Build info is missing required property: $requiredProperty"
+        }
+    }
+    if ($buildInfo.channel -notin @("release", "validation")) {
+        throw "Build info has invalid channel: $($buildInfo.channel)"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedChannel) -and
+        $buildInfo.channel -ne $ExpectedChannel) {
+        throw "Build channel mismatch: expected=$ExpectedChannel actual=$($buildInfo.channel)"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedVersion) -and
+        $buildInfo.version -ne $ExpectedVersion) {
+        throw "Build version mismatch: expected=$ExpectedVersion actual=$($buildInfo.version)"
+    }
+    if ($buildInfo.revision -ne $ExpectedRevision.ToLowerInvariant()) {
+        throw "Build revision mismatch: expected=$ExpectedRevision actual=$($buildInfo.revision)"
+    }
+    if ($buildInfo.channel -eq "release" -and $buildInfo.version -ne $buildInfo.releaseVersion) {
+        throw "Release build version differs from releaseVersion: version=$($buildInfo.version) releaseVersion=$($buildInfo.releaseVersion)"
+    }
+    if ($buildInfo.channel -eq "validation" -and $buildInfo.version -notmatch '(?:\.|-)dev\.[0-9]+\.g[0-9a-f]{8}$') {
+        throw "Validation build version is not uniquely identified: $($buildInfo.version)"
+    }
+    Write-Host "Build identity: version=$($buildInfo.version) channel=$($buildInfo.channel) revision=$($buildInfo.revision)"
 }
 
 $sha256 = (Get-FileHash -LiteralPath $resolvedInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -193,6 +247,18 @@ try {
     }
     $installLocation = $entry.InstallLocation.TrimEnd("\")
     Assert-InstallPayload -InstallLocation $installLocation
+    if ($null -ne $buildInfo) {
+        if ($entry.DisplayVersion -ne $buildInfo.version) {
+            throw "Installed DisplayVersion mismatch: expected=$($buildInfo.version) actual=$($entry.DisplayVersion)"
+        }
+        $installedBuildInfoPath = Join-Path $installLocation "build-info.json"
+        $installedBuildInfo = Get-Content -LiteralPath $installedBuildInfoPath -Raw | ConvertFrom-Json
+        foreach ($property in @("version", "channel", "revision", "installerGeneration")) {
+            if ($installedBuildInfo.$property -ne $buildInfo.$property) {
+                throw "Installed build info mismatch for ${property}: expected=$($buildInfo.$property) actual=$($installedBuildInfo.$property)"
+            }
+        }
+    }
 
     $uninstaller = Get-ChildItem -LiteralPath $installLocation -Filter "unins*.exe" -File |
         Sort-Object Name |

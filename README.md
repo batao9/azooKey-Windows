@@ -129,6 +129,8 @@ cargo make build [--debug/--release]
 
 `build`フォルダーが作成され、ビルドされた実行ファイルが格納されます。
 
+通常の branch、PR、`master`、VM、ローカル build で作る installer は検証版として、直近の release を基準に `0.1.0-batao.11.dev.<build-number>.g<short-sha>` のような一意の版数を自動生成します。直近の release が stable 版なら、次 patch の prerelease（例: `1.0.1-dev.<build-number>.g<short-sha>`）を使います。正式版は `app-version.json` と一致する `v<version>` tag の CI だけが build channel を明示して生成します。実際の build channel、commit、installer generation は `build/build-info.json` に出力され、installer にも同梱されます。正式リリース版数を変更するときは `app-version.json` を編集後、`node scripts/sync-version.mjs --sync-release` で追従ファイルを同期します。
+
 配布用インストーラーは Inno Setup で作成する `build/azookey-setup.exe` の 1 種類です。Tauri は設定アプリ `frontend.exe` のビルドにのみ使用し、Tauri/NSIS インストーラーは生成・同梱しません。`frontend.exe` を含むアプリ本体、IME DLL、サーバー、UI、ランチャー、辞書、Zenzai model、llama backend は Inno installer が `{autopf}\Azookey`（通常は `C:\Program Files\Azookey`）に配置します。設定・学習・ログ・`EngineRuntime` は `%APPDATA%\Azookey`、候補 UI の WebView2 data は `%LOCALAPPDATA%\Azookey\ui-webview` に保存します。
 
 `launcher.exe`を管理者権限で実行すると、azookeyの変換エンジンが起動します。

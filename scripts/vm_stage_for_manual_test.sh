@@ -606,6 +606,7 @@ function Assert-RequiredInstallFiles {
     "launcher.exe",
     "azookey.dll",
     "azookey32.dll",
+    "build-info.json",
     "Dictionary",
     "EmojiDictionary",
     "zenz.gguf",
@@ -635,6 +636,29 @@ function Assert-RequiredInstallFiles {
   if ($userSidHelpers.Count -gt 0) {
     throw "Protected migration user SID helper was not cleaned up: $($userSidHelpers.FullName -join ', ')"
   }
+}
+
+function Assert-BuildIdentity {
+  param(
+    [Parameter(Mandatory = $true)]$UninstallEntry,
+    [Parameter(Mandatory = $true)][string]$InstallLocation
+  )
+
+  $buildInfoPath = Join-Path $InstallLocation "build-info.json"
+  $buildInfo = Get-Content -LiteralPath $buildInfoPath -Raw | ConvertFrom-Json
+  if ($buildInfo.channel -notin @("release", "validation")) {
+    throw "Installed build channel is invalid: $($buildInfo.channel)"
+  }
+  if ([string]::IsNullOrWhiteSpace($buildInfo.revision)) {
+    throw "Installed build revision is missing."
+  }
+  if ($buildInfo.installerGeneration -lt 1) {
+    throw "Installed installer generation is invalid: $($buildInfo.installerGeneration)"
+  }
+  if ($UninstallEntry.DisplayVersion -ne $buildInfo.version) {
+    throw "Installed DisplayVersion does not match build-info.json: display=$($UninstallEntry.DisplayVersion) build=$($buildInfo.version)"
+  }
+  Write-Host "build identity verified: version=$($buildInfo.version) channel=$($buildInfo.channel) revision=$($buildInfo.revision) generation=$($buildInfo.installerGeneration)"
 }
 
 function Assert-NoUntrustedWriteAccess {
@@ -1331,6 +1355,7 @@ if ($entry.MainBinaryName -ne "frontend.exe") {
 
 $installLocation = Normalize-RegistryPath -Path $entry.InstallLocation
 Assert-RequiredInstallFiles -InstallLocation $installLocation
+Assert-BuildIdentity -UninstallEntry $entry -InstallLocation $installLocation
 Assert-ProtectedInstallLocation -InstallLocation $installLocation
 Assert-BackgroundExecutablesUseGuiSubsystem -InstallLocation $installLocation
 Assert-SecureStartupTask -InstallLocation $installLocation

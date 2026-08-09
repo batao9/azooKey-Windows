@@ -12,7 +12,9 @@
     "build": "tsc && vite build",
     "pretauri": "npm run sync-version",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "pretauri:build": "npm run sync-version",
+    "tauri:build": "tauri build --no-bundle --config ../target/azookey-build/tauri.build.conf.json"
   },
   "dependencies": {
     "@radix-ui/react-alert-dialog": "^1.1.6",

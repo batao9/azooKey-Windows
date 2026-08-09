@@ -58,6 +58,9 @@ jobs:
       working-directory: frontend
       run: npm ci --prefer-offline --no-audit
 
+    - name: Verify release version metadata
+      run: node scripts/sync-version.mjs --check-release
+
     - name: Install Rust lint components
       run: rustup component add clippy rustfmt
 
@@ -175,10 +178,15 @@ jobs:
     - static-checks
     - windows-tests
     runs-on: windows-2022
+    env:
+      AZOOKEY_BUILD_CHANNEL: ${{ startsWith(github.ref, 'refs/tags/v') && 'release' || 'validation' }}
+      AZOOKEY_BUILD_NUMBER: ${{ github.run_number }}
+      AZOOKEY_BUILD_REVISION: ${{ github.sha }}
 
     steps:
     - uses: actions/checkout@v4
       with:
+        fetch-depth: 0
         submodules: recursive
 
     - name: Cache Rust
@@ -273,6 +281,12 @@ jobs:
         $parameters = @{
           InstallerPath = "build\azookey-setup.exe"
           Sha256Path = "build\SHA256SUMS.txt"
+          BuildInfoPath = "build\build-info.json"
+          ExpectedChannel = "${{ env.AZOOKEY_BUILD_CHANNEL }}"
+          ExpectedRevision = "${{ github.sha }}"
+        }
+        if ("${{ env.AZOOKEY_BUILD_CHANNEL }}" -eq "release") {
+          $parameters.ExpectedVersion = "${{ github.ref_name }}" -replace '^v', ''
         }
         if ("${{ github.event_name }}" -eq "workflow_dispatch" -and "${{ inputs.require_signature }}" -eq "true") {
           $parameters.RequireSignature = $true
@@ -282,10 +296,11 @@ jobs:
     - name: Upload Setup Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: azookey-setup
+        name: ${{ startsWith(github.ref, 'refs/tags/v') && 'azookey-setup' || format('azookey-setup-validation-{0}', github.run_number) }}
         path: |
           build/azookey-setup.exe
           build/SHA256SUMS.txt
+          build/build-info.json
         if-no-files-found: error
 
   installer-smoke:
@@ -300,7 +315,7 @@ jobs:
     - name: Download Setup Artifact
       uses: actions/download-artifact@v4
       with:
-        name: azookey-setup
+        name: ${{ startsWith(github.ref, 'refs/tags/v') && 'azookey-setup' || format('azookey-setup-validation-{0}', github.run_number) }}
         path: build
 
     - name: Verify silent install and uninstall
@@ -309,8 +324,14 @@ jobs:
         $parameters = @{
           InstallerPath = "build\azookey-setup.exe"
           Sha256Path = "build\SHA256SUMS.txt"
+          BuildInfoPath = "build\build-info.json"
+          ExpectedChannel = "${{ startsWith(github.ref, 'refs/tags/v') && 'release' || 'validation' }}"
+          ExpectedRevision = "${{ github.sha }}"
           LogDirectory = "installer-logs"
           SilentInstall = $true
+        }
+        if ("${{ startsWith(github.ref, 'refs/tags/v') && 'release' || 'validation' }}" -eq "release") {
+          $parameters.ExpectedVersion = "${{ github.ref_name }}" -replace '^v', ''
         }
         if ("${{ github.event_name }}" -eq "workflow_dispatch" -and "${{ inputs.require_signature }}" -eq "true") {
           $parameters.RequireSignature = $true

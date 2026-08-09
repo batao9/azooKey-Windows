@@ -38,6 +38,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ARTIFACT_DIR="$REPO_ROOT/.local/artifacts"
 mkdir -p "$ARTIFACT_DIR"
 
+BUILD_REVISION="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+BUILD_NUMBER="$(date -u +%Y%m%d%H%M%S)"
+BUILD_BASE_VERSION="$(git -C "$REPO_ROOT" describe --tags --abbrev=0 --match 'v[0-9]*' HEAD 2>/dev/null | sed 's/^v//' || true)"
+
 DEFAULT_GATEWAY_IP="$(ip route | awk '/default/ {print $3; exit}' || true)"
 HOST_IP="${SSH_HOST:-${DEFAULT_GATEWAY_IP:-127.0.0.1}}"
 FALLBACK_HOST=""
@@ -50,6 +54,7 @@ ACTIVE_HOST="$HOST_IP"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 HOST_TIMESTAMP_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 LOCAL_ARTIFACT="$ARTIFACT_DIR/azookey-setup-${TARGET_BRANCH_SLUG}-$TIMESTAMP.exe"
+LOCAL_BUILD_INFO="$ARTIFACT_DIR/azookey-setup-${TARGET_BRANCH_SLUG}-$TIMESTAMP.build-info.json"
 
 REMOTE_TMP_WIN="C:\\Users\\$SSH_USER\\AppData\\Local\\Temp"
 REMOTE_TAR_WIN="$REMOTE_TMP_WIN\\azookey-src.tar.gz"
@@ -60,6 +65,7 @@ REMOTE_ART_WIN="C:\\work\\artifacts"
 REMOTE_TAR_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-src.tar.gz"
 REMOTE_PS_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-vm-build.ps1"
 REMOTE_ART_SCP="/C:/work/artifacts/azookey-setup.exe"
+REMOTE_BUILD_INFO_SCP="/C:/work/artifacts/build-info.json"
 
 SSH_OPTS=(-i "$SSH_KEY" -p "$SSH_PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8)
 SCP_OPTS=(-i "$SSH_KEY" -P "$SSH_PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8)
@@ -326,11 +332,24 @@ param(
   [Parameter(Mandatory = $true)][string]$SourceTarPath,
   [Parameter(Mandatory = $true)][string]$SourceDir,
   [Parameter(Mandatory = $true)][string]$ArtifactDir,
-  [Parameter(Mandatory = $true)][string]$HostTimestampUtc
+  [Parameter(Mandatory = $true)][string]$HostTimestampUtc,
+  [Parameter(Mandatory = $true)][string]$BuildNumber,
+  [Parameter(Mandatory = $true)][string]$BuildRevision,
+  [Parameter(Mandatory = $true)][AllowEmptyString()][string]$BuildBaseVersion,
+  [Parameter(Mandatory = $true)][string]$BuildBranch
 )
 
 $ErrorActionPreference = "Stop"
 $env:Path += ";$env:USERPROFILE\\.cargo\\bin"
+$env:AZOOKEY_BUILD_CHANNEL = "validation"
+$env:AZOOKEY_BUILD_NUMBER = $BuildNumber
+$env:AZOOKEY_BUILD_REVISION = $BuildRevision
+if ([string]::IsNullOrWhiteSpace($BuildBaseVersion)) {
+  Remove-Item Env:AZOOKEY_BUILD_BASE_VERSION -ErrorAction SilentlyContinue
+} else {
+  $env:AZOOKEY_BUILD_BASE_VERSION = $BuildBaseVersion
+}
+$env:GITHUB_REF_NAME = $BuildBranch
 
 $LLAMA_CPU_URL = "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-avx-x64.zip"
 $LLAMA_CUDA_URL = "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-cuda-cu12.4-x64.zip"
@@ -592,6 +611,7 @@ cargo make build --release
 
 New-Item -Path $ArtifactDir -ItemType Directory -Force | Out-Null
 Copy-Item (Join-Path $SourceDir "build\\azookey-setup.exe") -Destination (Join-Path $ArtifactDir "azookey-setup.exe") -Force
+Copy-Item (Join-Path $SourceDir "build\\build-info.json") -Destination (Join-Path $ArtifactDir "build-info.json") -Force
 Write-Host "build finished: $ArtifactDir\\azookey-setup.exe"
 PS1
 }
@@ -648,10 +668,11 @@ main() {
   scp_to_vm "$TMP_REMOTE_PS" "$REMOTE_PS_SCP"
 
   log "VM 上でビルドを実行します（時間がかかる場合があります）"
-  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -SourceTarPath \"$REMOTE_TAR_WIN\" -SourceDir \"$REMOTE_SRC_WIN\" -ArtifactDir \"$REMOTE_ART_WIN\" -HostTimestampUtc \"$HOST_TIMESTAMP_UTC\""
+  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -SourceTarPath \"$REMOTE_TAR_WIN\" -SourceDir \"$REMOTE_SRC_WIN\" -ArtifactDir \"$REMOTE_ART_WIN\" -HostTimestampUtc \"$HOST_TIMESTAMP_UTC\" -BuildNumber \"$BUILD_NUMBER\" -BuildRevision \"$BUILD_REVISION\" -BuildBaseVersion \"$BUILD_BASE_VERSION\" -BuildBranch \"$TARGET_BRANCH\""
 
   log "成果物を WSL 側へ回収します"
   scp_from_vm "$REMOTE_ART_SCP" "$LOCAL_ARTIFACT"
+  scp_from_vm "$REMOTE_BUILD_INFO_SCP" "$LOCAL_BUILD_INFO"
 
   log "VM を停止します"
   vbox controlvm "$VM_NAME" acpipowerbutton >/dev/null || true
@@ -674,7 +695,7 @@ main() {
     fi
   fi
 
-  log "完了: $LOCAL_ARTIFACT"
+  log "完了: $LOCAL_ARTIFACT ($LOCAL_BUILD_INFO)"
 }
 
 trap cleanup EXIT
