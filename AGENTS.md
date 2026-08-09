@@ -63,6 +63,16 @@ VM ビルドでは、指定ブランチと現在ブランチが一致してい�
 
 インストール検証では、クリーンなスナップショットへ復元してから VM を起動し、インストーラーを転送してサイレント実行する。インストールログは `.local/logs/` に回収する。
 
+## リリース版数と検証ビルド
+
+- `app-version.json` の `version` は正式リリース版数、`installerGeneration` はインストール配置・移行契約の世代を表す。検証ビルドごとの版数をここへ手動で書かない。
+- release metadata を同期するときは `node scripts/sync-version.mjs --sync-release` を実行する。`frontend/package.json`、`frontend/package-lock.json`、`frontend/src-tauri/tauri.conf.json`、`installer/AppVersion.iss` を個別に編集しない。
+- 通常のブランチ、PR、`master`、VM の build は `validation` channel とする。最新の到達可能な release tag を基準に `<base>.dev.<build-number>.g<short-sha>` を自動生成する。
+- `release` channel は tag CI だけが `AZOOKEY_BUILD_CHANNEL=release` で明示的に選択し、さらに `HEAD` に `v<app-version>` と完全一致する tag がある場合だけ許可する。tag 上でも channel 未指定のローカル build は `validation` とする。配布 asset は master/PR build ではなく tag CI の `azookey-setup` artifact を使う。
+- build 時の生成物は `target/azookey-build/`、配布物へ埋め込む識別情報は `build/build-info.json` に置く。検証時は `version`、`channel`、`revision`、`installerGeneration` を確認する。
+- 検証版と正式版は置換検証のため同じ Inno `AppId` を使う。旧 AppData install の version/hash allowlist は特権移行の信頼ポリシーであり、build channel と混同したり、`validation` suffix だけを理由に緩和したりしない。
+- installer/version の変更では、正式版から検証版、検証版から別の検証版、検証版から次の正式版への更新経路を確認する。
+
 ## テスト方針
 
 - 変更に応じて必要な test を実装する。バグ修正では、まず再現 test や回帰 test の追加を優先する。

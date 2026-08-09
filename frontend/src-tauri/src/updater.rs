@@ -28,7 +28,7 @@ const UPDATE_RESULT_FILENAME: &str = "update-result.json";
 const UPDATE_RESULT_REGISTRY_KEY: &str = r"Software\Azookey";
 const UPDATE_RESULT_REGISTRY_VALUE: &str = "UpdateResultJson";
 const PENDING_UPDATE_REQUEST_REGISTRY_VALUE: &str = "PendingUpdateRequestId";
-const APP_VERSION_JSON: &str = include_str!("../../../app-version.json");
+const BUILD_VERSION: &str = env!("AZOOKEY_BUILD_VERSION");
 
 #[cfg(windows)]
 fn reject_reparse_point(path: &Path, label: &str) -> Result<()> {
@@ -88,11 +88,6 @@ fn protected_install_directory(executable: &Path) -> Result<PathBuf> {
         ));
     }
     Ok(actual)
-}
-
-#[derive(Debug, Deserialize)]
-struct AppVersionConfig {
-    version: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -346,9 +341,7 @@ fn current_version_string() -> Result<String> {
         }
     }
 
-    let config: AppVersionConfig =
-        serde_json::from_str(APP_VERSION_JSON).context("failed to parse app-version.json")?;
-    Ok(config.version)
+    Ok(BUILD_VERSION.to_string())
 }
 
 fn update_check_response(release: &GithubRelease) -> Result<UpdateCheckResponse> {
@@ -1456,6 +1449,30 @@ mod tests {
         }
 
         let response = update_check_response(&release("v0.1.0-batao.10")).unwrap();
+
+        assert!(response.update_available);
+    }
+
+    #[test]
+    fn validation_build_does_not_downgrade_to_its_base_release() {
+        let _env = EnvGuard::new();
+        unsafe {
+            env::set_var(CURRENT_VERSION_ENV, "0.1.0-batao.11.dev.1842.gd1525a6b");
+        }
+
+        let response = update_check_response(&release("v0.1.0-batao.11")).unwrap();
+
+        assert!(!response.update_available);
+    }
+
+    #[test]
+    fn validation_build_updates_to_the_next_release() {
+        let _env = EnvGuard::new();
+        unsafe {
+            env::set_var(CURRENT_VERSION_ENV, "0.1.0-batao.11.dev.1842.gd1525a6b");
+        }
+
+        let response = update_check_response(&release("v0.1.0-batao.12")).unwrap();
 
         assert!(response.update_available);
     }
