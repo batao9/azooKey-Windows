@@ -37,16 +37,7 @@ impl AppState {
             }
             Err(error) => {
                 eprintln!("Failed to load settings; using defaults: {}", error);
-                (
-                    AppConfig::default(),
-                    Some(ConfigStartupNotice {
-                        kind: "load_error".to_string(),
-                        message: format!(
-                            "設定の読み込みに失敗したため、既定値で起動しました: {error}"
-                        ),
-                        backup_path: None,
-                    }),
-                )
+                (AppConfig::default(), Some(notice_from_load_error(&error)))
             }
         };
 
@@ -144,6 +135,25 @@ fn notice_from_recovered_rewrite_error(
             "壊れた設定ファイルを退避しましたが、既定値設定の保存に失敗しました: {error}"
         ),
         backup_path: Some(recovery.backup_path.display().to_string()),
+    }
+}
+
+fn notice_from_load_error(error: &ConfigError) -> ConfigStartupNotice {
+    match error {
+        ConfigError::FutureVersion {
+            stored, current, ..
+        } => ConfigStartupNotice {
+            kind: "future_version".to_string(),
+            message: format!(
+                "このアプリより新しい設定ファイル（version {stored}、対応 version {current}）を検出しました。設定ファイルは書き換えず、既定値で起動しました。設定を変更するには新しいバージョンのアプリを使用してください。"
+            ),
+            backup_path: None,
+        },
+        _ => ConfigStartupNotice {
+            kind: "load_error".to_string(),
+            message: format!("設定の読み込みに失敗したため、既定値で起動しました: {error}"),
+            backup_path: None,
+        },
     }
 }
 
@@ -250,10 +260,17 @@ fn update_config_impl(
 ) -> Result<UpdateConfigResponse, String> {
     let _update_guard = state.config_update_lock.lock().unwrap();
     let _cross_process_guard = CrossProcessConfigGuard::acquire()?;
-    let current_config = AppConfig::read().unwrap_or_else(|error| {
-        eprintln!("Failed to read latest settings before update: {error}");
-        state.settings.lock().unwrap().clone()
-    });
+    let current_config = match AppConfig::read() {
+        Ok(config) => config,
+        Err(error) if error.is_version_compatibility_error() => {
+            eprintln!("Refusing to update incompatible settings: {error}");
+            return Err(error.to_string());
+        }
+        Err(error) => {
+            eprintln!("Failed to read latest settings before update: {error}");
+            state.settings.lock().unwrap().clone()
+        }
+    };
     let new_config = merge_config_update(current_config.clone(), base_config, new_config)?;
     let changed = current_config != new_config;
     if changed {
@@ -508,7 +525,7 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{env, ffi::OsString, io, path::Path, sync::MutexGuard};
+    use std::{env, ffi::OsString, fs, io, path::Path, sync::MutexGuard};
 
     fn env_lock() -> MutexGuard<'static, ()> {
         crate::test_env_lock()
@@ -653,6 +670,31 @@ mod tests {
     }
 
     #[test]
+    fn update_config_rejects_future_version_without_modifying_the_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let _appdata = AppDataGuard::set(temp.path());
+        let config_root = temp.path().join("Azookey");
+        fs::create_dir_all(&config_root).unwrap();
+        let config_path = config_root.join("settings.json");
+        let future_settings = r#"{
+            "version": "0.1.3",
+            "zenzai": "future-schema",
+            "future_only": { "must_be_preserved": true }
+        }"#;
+        fs::write(&config_path, future_settings).unwrap();
+        let state = test_state();
+        let mut update = AppConfig::default();
+        update.zenzai.enable = true;
+
+        let error = update_config_impl(&state, AppConfig::default(), update)
+            .expect_err("future-version settings must be read-only");
+
+        assert!(error.contains("newer than supported"));
+        assert_eq!(fs::read_to_string(config_path).unwrap(), future_settings);
+        assert!(!state.settings.lock().unwrap().zenzai.enable);
+    }
+
+    #[test]
     fn reset_learning_history_reports_unavailable_server() {
         let state = test_state();
 
@@ -708,6 +750,23 @@ mod tests {
 
         assert_eq!(notice.kind, "rewrite_error");
         assert!(notice.message.contains("設定は読み込めました"));
+        assert!(notice.backup_path.is_none());
+    }
+
+    #[test]
+    fn future_version_notice_explains_read_only_fallback() {
+        let error = ConfigError::FutureVersion {
+            path: PathBuf::from("settings.json"),
+            stored: "0.1.3".to_string(),
+            current: "0.1.2".to_string(),
+        };
+
+        let notice = notice_from_load_error(&error);
+
+        assert_eq!(notice.kind, "future_version");
+        assert!(notice.message.contains("version 0.1.3"));
+        assert!(notice.message.contains("書き換えず"));
+        assert!(notice.message.contains("新しいバージョン"));
         assert!(notice.backup_path.is_none());
     }
 }

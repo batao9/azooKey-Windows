@@ -1,0 +1,8 @@
+{
+  "version": "not-a-semantic-version",
+  "zenzai": {
+    "enable": true,
+    "profile": "must-not-be-overwritten",
+    "backend": "cpu"
+  }
+}

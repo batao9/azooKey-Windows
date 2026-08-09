@@ -137,6 +137,16 @@ pub enum ConfigError {
         path: PathBuf,
         source: serde_json::Error,
     },
+    InvalidVersion {
+        path: PathBuf,
+        version: String,
+        source: semver::Error,
+    },
+    FutureVersion {
+        path: PathBuf,
+        stored: String,
+        current: String,
+    },
     Backup {
         from: PathBuf,
         to: PathBuf,
@@ -174,6 +184,24 @@ impl fmt::Display for ConfigError {
             ConfigError::Parse { path, source } => {
                 write!(f, "failed to parse config {}: {}", path.display(), source)
             }
+            ConfigError::InvalidVersion {
+                path,
+                version,
+                source,
+            } => write!(
+                f,
+                "invalid settings version {version:?} in {}: {source}",
+                path.display()
+            ),
+            ConfigError::FutureVersion {
+                path,
+                stored,
+                current,
+            } => write!(
+                f,
+                "settings version {stored} in {} is newer than supported version {current}; refusing to rewrite it",
+                path.display()
+            ),
             ConfigError::Backup { from, to, source } => write!(
                 f,
                 "failed to back up corrupted config {} to {}: {}",
@@ -206,14 +234,24 @@ impl fmt::Display for ConfigError {
 impl error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
-            ConfigError::MissingAppData => None,
+            ConfigError::MissingAppData | ConfigError::FutureVersion { .. } => None,
             ConfigError::CreateDir { source, .. }
             | ConfigError::Read { source, .. }
             | ConfigError::Backup { source, .. }
             | ConfigError::WriteTemp { source, .. }
             | ConfigError::Persist { source, .. } => Some(source),
             ConfigError::Parse { source, .. } | ConfigError::Serialize { source } => Some(source),
+            ConfigError::InvalidVersion { source, .. } => Some(source),
         }
+    }
+}
+
+impl ConfigError {
+    pub fn is_version_compatibility_error(&self) -> bool {
+        matches!(
+            self,
+            ConfigError::InvalidVersion { .. } | ConfigError::FutureVersion { .. }
+        )
     }
 }
 
@@ -566,9 +604,24 @@ mod tests {
         env,
         ffi::OsString,
         fs, io,
-        path::Path,
+        path::{Path, PathBuf},
         sync::{Mutex, MutexGuard, OnceLock},
     };
+
+    const OLD_SETTINGS_FIXTURE: &str = include_str!("../tests/fixtures/settings-version/old.json");
+    const CURRENT_SETTINGS_FIXTURE: &str =
+        include_str!("../tests/fixtures/settings-version/current.json");
+    const FUTURE_SETTINGS_FIXTURE: &str =
+        include_str!("../tests/fixtures/settings-version/future.json");
+    const MALFORMED_SETTINGS_FIXTURE: &str =
+        include_str!("../tests/fixtures/settings-version/malformed.json");
+
+    fn write_settings_fixture(config_root: &Path, fixture: &str) -> PathBuf {
+        fs::create_dir_all(config_root).unwrap();
+        let config_path = config_root.join(SETTINGS_FILENAME);
+        fs::write(&config_path, fixture).unwrap();
+        config_path
+    }
 
     fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -776,6 +829,81 @@ mod tests {
 
         assert_eq!(migrated.version, CONFIG_VERSION);
         assert_eq!(migrated.general.numpad_input, NumpadInputMode::DirectInput);
+    }
+
+    #[test]
+    fn old_version_fixture_keeps_legacy_migration_and_rewrites_current_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let _appdata = AppDataGuard::set(temp.path());
+        let config_root = temp.path().join("Azookey");
+        let config_path = write_settings_fixture(&config_root, OLD_SETTINGS_FIXTURE);
+
+        let result = AppConfig::new_with_recovery().unwrap();
+
+        assert_eq!(result.config.version, CONFIG_VERSION);
+        assert_eq!(
+            result.config.general.numpad_input,
+            NumpadInputMode::DirectInput
+        );
+        let saved: AppConfig = serde_json::from_str(&fs::read_to_string(config_path).unwrap())
+            .expect("migrated settings should be valid JSON");
+        assert_eq!(saved.version, CONFIG_VERSION);
+        assert_eq!(saved.general.numpad_input, NumpadInputMode::DirectInput);
+    }
+
+    #[test]
+    fn current_version_fixture_loads_without_legacy_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let _appdata = AppDataGuard::set(temp.path());
+        let config_root = temp.path().join("Azookey");
+        write_settings_fixture(&config_root, CURRENT_SETTINGS_FIXTURE);
+
+        let config = AppConfig::read().unwrap();
+
+        assert_eq!(config.version, CONFIG_VERSION);
+        assert!(config.zenzai.enable);
+        assert_eq!(config.zenzai.profile, "current-version-profile");
+    }
+
+    #[test]
+    fn future_version_fixture_is_rejected_without_modifying_the_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let _appdata = AppDataGuard::set(temp.path());
+        let config_root = temp.path().join("Azookey");
+        let config_path = write_settings_fixture(&config_root, FUTURE_SETTINGS_FIXTURE);
+        let original = fs::read(&config_path).unwrap();
+
+        let error = AppConfig::new_with_recovery()
+            .expect_err("future-version settings must not be loaded or rewritten");
+
+        assert!(error.to_string().contains("newer than supported"));
+        assert_eq!(fs::read(&config_path).unwrap(), original);
+        assert_eq!(fs::read_dir(&config_root).unwrap().count(), 1);
+
+        let write_error = AppConfig::default()
+            .write()
+            .expect_err("direct writes must not overwrite future-version settings");
+        assert!(write_error.to_string().contains("newer than supported"));
+        assert_eq!(fs::read(config_path).unwrap(), original);
+    }
+
+    #[test]
+    fn malformed_version_fixture_is_backed_up_before_defaults_are_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let _appdata = AppDataGuard::set(temp.path());
+        let config_root = temp.path().join("Azookey");
+        let config_path = write_settings_fixture(&config_root, MALFORMED_SETTINGS_FIXTURE);
+        let original = fs::read(&config_path).unwrap();
+
+        let result = AppConfig::new_with_recovery().unwrap();
+        let recovery = result
+            .recovery
+            .expect("malformed settings versions should use corrupted-config recovery");
+
+        assert_eq!(fs::read(recovery.backup_path).unwrap(), original);
+        let saved: AppConfig = serde_json::from_str(&fs::read_to_string(config_path).unwrap())
+            .expect("recreated settings should be valid JSON");
+        assert_eq!(saved.version, CONFIG_VERSION);
     }
 
     #[test]
@@ -1086,9 +1214,11 @@ impl AppConfig {
         let config_root = get_config_root()?;
         ensure_config_dir(&config_root)?;
         let config_path = config_root.join(SETTINGS_FILENAME);
+        ensure_existing_config_is_writable(&config_path)?;
         let temp_path = temporary_config_path(&config_root);
         let config_str = serde_json::to_string_pretty(self)
             .map_err(|source| ConfigError::Serialize { source })?;
+        compare_config_version(&config_path, &config_str)?;
 
         write_temp_config(&temp_path, config_str.as_bytes())?;
         replace_config_file(&temp_path, &config_path).map_err(|source| {
@@ -1144,7 +1274,7 @@ impl AppConfig {
 
             match parse_config(&config_path, &config_str) {
                 Ok(config) => (config, None),
-                Err(ConfigError::Parse { .. }) => {
+                Err(ConfigError::Parse { .. } | ConfigError::InvalidVersion { .. }) => {
                     let backup_path = backup_corrupted_config(&config_path)?;
                     (
                         AppConfig::default(),
@@ -1167,14 +1297,63 @@ impl AppConfig {
     }
 }
 
+#[derive(Deserialize)]
+struct ConfigVersionHeader {
+    version: String,
+}
+
+fn compare_config_version(
+    config_path: &Path,
+    config_str: &str,
+) -> Result<std::cmp::Ordering, ConfigError> {
+    let header: ConfigVersionHeader =
+        serde_json::from_str(config_str).map_err(|source| ConfigError::Parse {
+            path: config_path.to_path_buf(),
+            source,
+        })?;
+    let stored =
+        semver::Version::parse(&header.version).map_err(|source| ConfigError::InvalidVersion {
+            path: config_path.to_path_buf(),
+            version: header.version,
+            source,
+        })?;
+    let current = semver::Version::parse(CONFIG_VERSION)
+        .expect("CONFIG_VERSION must be a valid semantic version");
+
+    match stored.cmp_precedence(&current) {
+        std::cmp::Ordering::Greater => Err(ConfigError::FutureVersion {
+            path: config_path.to_path_buf(),
+            stored: stored.to_string(),
+            current: current.to_string(),
+        }),
+        ordering => Ok(ordering),
+    }
+}
+
+fn ensure_existing_config_is_writable(config_path: &Path) -> Result<(), ConfigError> {
+    let config_str = match fs::read_to_string(config_path) {
+        Ok(config_str) => config_str,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(ConfigError::Read {
+                path: config_path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    compare_config_version(config_path, &config_str)?;
+    Ok(())
+}
+
 fn parse_config(config_path: &Path, config_str: &str) -> Result<AppConfig, ConfigError> {
+    let version_ordering = compare_config_version(config_path, config_str)?;
     let mut config: AppConfig =
         serde_json::from_str(config_str).map_err(|source| ConfigError::Parse {
             path: config_path.to_path_buf(),
             source,
         })?;
 
-    if config.version != CONFIG_VERSION {
+    if version_ordering == std::cmp::Ordering::Less {
         config.general.numpad_input = match config.general.numpad_input {
             // 旧仕様との互換: always_half(直接入力) -> direct_input
             NumpadInputMode::AlwaysHalf => NumpadInputMode::DirectInput,

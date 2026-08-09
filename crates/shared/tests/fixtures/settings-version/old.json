@@ -1,0 +1,11 @@
+{
+  "version": "0.1.1",
+  "zenzai": {
+    "enable": false,
+    "profile": "",
+    "backend": "cpu"
+  },
+  "general": {
+    "numpad_input": "always_half"
+  }
+}
