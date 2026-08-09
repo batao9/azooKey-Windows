@@ -176,7 +176,7 @@ const exactReleaseTagExists = (releaseVersion) => {
     .some((tag) => tag === expected);
 };
 
-export const selectBuildChannel = ({ requested, exactReleaseTag }) => {
+export const selectBuildChannel = ({ requested, exactReleaseTag, trustedReleaseContext = false }) => {
   const channel = requested?.trim().toLowerCase()
     || "validation";
   if (channel !== "release" && channel !== "validation") {
@@ -185,18 +185,29 @@ export const selectBuildChannel = ({ requested, exactReleaseTag }) => {
   if (channel === "release" && !exactReleaseTag) {
     throw new Error("Release builds require an exact release tag.");
   }
+  if (channel === "release" && !trustedReleaseContext) {
+    throw new Error("Release builds require the matching GitHub Actions tag context.");
+  }
   return channel;
 };
 
 const inferChannel = (releaseVersion) => {
   const requested = process.env.AZOOKEY_BUILD_CHANNEL?.trim().toLowerCase();
   const exactReleaseTag = exactReleaseTagExists(releaseVersion);
+  const expectedTagRef = `refs/tags/v${releaseVersion}`;
+  const trustedReleaseContext = process.env.GITHUB_ACTIONS === "true"
+    && process.env.GITHUB_REF === expectedTagRef;
   try {
-    return selectBuildChannel({ requested, exactReleaseTag });
+    return selectBuildChannel({ requested, exactReleaseTag, trustedReleaseContext });
   } catch (error) {
     if (requested === "release" && !exactReleaseTag) {
       throw new Error(
         `Release builds require HEAD to have the exact tag v${releaseVersion}.`,
+      );
+    }
+    if (requested === "release" && !trustedReleaseContext) {
+      throw new Error(
+        `Release builds require GitHub Actions to build ${expectedTagRef}.`,
       );
     }
     throw error;

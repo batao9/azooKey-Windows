@@ -96,7 +96,7 @@ test("validation build numbers must be canonical numeric semver identifiers", ()
     );
 });
 
-test("release channel requires an explicit request and exact matching tag", () => {
+test("release channel requires an explicit request, exact tag, and tag CI context", () => {
     assert.equal(
         selectBuildChannel({ requested: undefined, exactReleaseTag: false }),
         "validation",
@@ -106,12 +106,24 @@ test("release channel requires an explicit request and exact matching tag", () =
         "validation",
     );
     assert.equal(
-        selectBuildChannel({ requested: "release", exactReleaseTag: true }),
+        selectBuildChannel({
+            requested: "release",
+            exactReleaseTag: true,
+            trustedReleaseContext: true,
+        }),
         "release",
     );
     assert.throws(
         () => selectBuildChannel({ requested: "release", exactReleaseTag: false }),
         /exact release tag/,
+    );
+    assert.throws(
+        () => selectBuildChannel({
+            requested: "release",
+            exactReleaseTag: true,
+            trustedReleaseContext: false,
+        }),
+        /GitHub Actions tag context/,
     );
 });
 
