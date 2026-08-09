@@ -4,15 +4,10 @@ mod updater;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use shared::{AppConfig, AppConfigLoadResult, ConfigError, ConfigRecovery, RomajiRule};
-use std::{path::PathBuf, sync::Mutex, time::Duration};
-use windows::{
-    core::w,
-    Win32::{
-        Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0},
-        System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject, INFINITE},
-    },
+use shared::{
+    AppConfig, AppConfigLoadResult, ConfigError, ConfigRecovery, ConfigWriteGuard, RomajiRule,
 };
+use std::{path::PathBuf, sync::Mutex, time::Duration};
 
 use anyhow::Context as _;
 
@@ -73,33 +68,6 @@ struct UpdateConfigResponse {
     changed: bool,
     config: AppConfig,
     message: Option<String>,
-}
-
-struct CrossProcessConfigGuard(HANDLE);
-
-impl CrossProcessConfigGuard {
-    fn acquire() -> Result<Self, String> {
-        let handle = unsafe { CreateMutexW(None, false, w!("Local\\AzookeyWindowsConfigUpdate")) }
-            .map_err(|error| format!("failed to create config update mutex: {error}"))?;
-
-        let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
-        if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
-            Ok(Self(handle))
-        } else {
-            let _ = unsafe { CloseHandle(handle) };
-            Err(format!(
-                "failed to acquire config update mutex: wait={}",
-                wait.0
-            ))
-        }
-    }
-}
-
-impl Drop for CrossProcessConfigGuard {
-    fn drop(&mut self) {
-        let _ = unsafe { ReleaseMutex(self.0) };
-        let _ = unsafe { CloseHandle(self.0) };
-    }
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -259,7 +227,7 @@ fn update_config_impl(
     new_config: AppConfig,
 ) -> Result<UpdateConfigResponse, String> {
     let _update_guard = state.config_update_lock.lock().unwrap();
-    let _cross_process_guard = CrossProcessConfigGuard::acquire()?;
+    let _cross_process_guard = ConfigWriteGuard::acquire().map_err(|error| error.to_string())?;
     let current_config = match AppConfig::read() {
         Ok(config) => config,
         Err(error) if error.is_version_compatibility_error() => {
@@ -369,15 +337,25 @@ fn restart_server(state: tauri::State<AppState>) -> Result<(), String> {
 }
 
 fn restart_server_impl(state: &AppState) -> Result<(), anyhow::Error> {
-    let _update_guard = state.config_update_lock.lock().unwrap();
-    let _cross_process_guard = CrossProcessConfigGuard::acquire().map_err(anyhow::Error::msg)?;
-    let config = AppConfig::read().unwrap_or_else(|error| {
-        eprintln!("Failed to refresh settings before server restart: {error}");
-        state.settings.lock().unwrap().clone()
-    });
-    *state.settings.lock().unwrap() = config.clone();
+    restart_server_impl_with(state, server_process::restart_server)
+}
 
-    server_process::restart_server(&config)?;
+fn restart_server_impl_with(
+    state: &AppState,
+    restart_process: impl FnOnce(&AppConfig) -> Result<(), anyhow::Error>,
+) -> Result<(), anyhow::Error> {
+    let _update_guard = state.config_update_lock.lock().unwrap();
+    let config = {
+        let _cross_process_guard = ConfigWriteGuard::acquire()?;
+        let config = AppConfig::read().unwrap_or_else(|error| {
+            eprintln!("Failed to refresh settings before server restart: {error}");
+            state.settings.lock().unwrap().clone()
+        });
+        *state.settings.lock().unwrap() = config.clone();
+        config
+    };
+
+    restart_process(&config)?;
 
     let ipc = ipc::IPCService::new_with_timeout(Duration::from_secs(10))
         .context("Server restarted, but IPC reconnect failed")?;
@@ -717,6 +695,31 @@ mod tests {
 
         assert!(error.to_string().contains("Server executable not found"));
         assert!(state.ipc.lock().unwrap().is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restart_server_releases_config_guard_before_process_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let _appdata = AppDataGuard::set(temp.path());
+        let state = test_state();
+
+        let error = restart_server_impl_with(&state, |_| {
+            let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                let _guard = ConfigWriteGuard::acquire().unwrap();
+                acquired_tx.send(()).unwrap();
+            });
+
+            acquired_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("launcher-side config load must not wait for the frontend restart lock");
+            waiter.join().unwrap();
+            Err(anyhow::anyhow!("stop after lock-scope assertion"))
+        })
+        .expect_err("injected restart failure should be returned");
+
+        assert!(error.to_string().contains("lock-scope assertion"));
     }
 
     #[test]

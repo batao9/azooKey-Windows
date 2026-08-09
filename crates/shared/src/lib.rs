@@ -147,6 +147,9 @@ pub enum ConfigError {
         stored: String,
         current: String,
     },
+    Lock {
+        message: String,
+    },
     Backup {
         from: PathBuf,
         to: PathBuf,
@@ -202,6 +205,9 @@ impl fmt::Display for ConfigError {
                 "settings version {stored} in {} is newer than supported version {current}; refusing to rewrite it",
                 path.display()
             ),
+            ConfigError::Lock { message } => {
+                write!(f, "failed to acquire config write lock: {message}")
+            }
             ConfigError::Backup { from, to, source } => write!(
                 f,
                 "failed to back up corrupted config {} to {}: {}",
@@ -234,7 +240,9 @@ impl fmt::Display for ConfigError {
 impl error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
-            ConfigError::MissingAppData | ConfigError::FutureVersion { .. } => None,
+            ConfigError::MissingAppData
+            | ConfigError::FutureVersion { .. }
+            | ConfigError::Lock { .. } => None,
             ConfigError::CreateDir { source, .. }
             | ConfigError::Read { source, .. }
             | ConfigError::Backup { source, .. }
@@ -252,6 +260,62 @@ impl ConfigError {
             self,
             ConfigError::InvalidVersion { .. } | ConfigError::FutureVersion { .. }
         )
+    }
+}
+
+/// Serializes settings read-modify-write operations across azooKey processes.
+///
+/// `AppConfig::write` acquires this guard before checking the on-disk version,
+/// so a future-version process cannot replace the file between that check and
+/// the atomic file replacement. Callers that read before writing can acquire
+/// the same guard around the whole transaction; Windows mutexes are reentrant
+/// for their owning thread.
+pub struct ConfigWriteGuard {
+    #[cfg(windows)]
+    handle: windows::Win32::Foundation::HANDLE,
+}
+
+impl ConfigWriteGuard {
+    #[cfg(windows)]
+    pub fn acquire() -> Result<Self, ConfigError> {
+        use windows::{
+            core::w,
+            Win32::{
+                Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0},
+                System::Threading::{CreateMutexW, WaitForSingleObject, INFINITE},
+            },
+        };
+
+        let handle = unsafe { CreateMutexW(None, false, w!("Local\\AzookeyWindowsConfigUpdate")) }
+            .map_err(|error| ConfigError::Lock {
+                message: format!("failed to create mutex: {error}"),
+            })?;
+        let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
+        if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+            Ok(Self { handle })
+        } else {
+            let _ = unsafe { CloseHandle(handle) };
+            Err(ConfigError::Lock {
+                message: format!("unexpected wait result: {}", wait.0),
+            })
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub fn acquire() -> Result<Self, ConfigError> {
+        Ok(Self {})
+    }
+}
+
+impl Drop for ConfigWriteGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            use windows::Win32::{Foundation::CloseHandle, System::Threading::ReleaseMutex};
+
+            let _ = unsafe { ReleaseMutex(self.handle) };
+            let _ = unsafe { CloseHandle(self.handle) };
+        }
     }
 }
 
@@ -595,6 +659,8 @@ pub fn zenzai_cpu_backend_supported() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::ConfigWriteGuard;
     use super::{
         AppConfig, ConfigError, DebugConfig, GeneralConfig, LearningConfig, LearningMode,
         NumpadInputMode, ShortcutConfig, CONFIG_VERSION,
@@ -1027,6 +1093,18 @@ mod tests {
         assert_eq!(temp_files, 0);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn write_reenters_the_cross_process_config_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let _appdata = AppDataGuard::set(temp.path());
+        let _transaction_guard = ConfigWriteGuard::acquire().unwrap();
+
+        AppConfig::default().write().unwrap();
+
+        assert!(temp.path().join("Azookey").join(SETTINGS_FILENAME).exists());
+    }
+
     #[test]
     fn missing_appdata_returns_config_error() {
         let _appdata = AppDataGuard::unset();
@@ -1211,6 +1289,7 @@ impl AppConfig {
     }
 
     pub fn write(&self) -> Result<(), ConfigError> {
+        let _write_guard = ConfigWriteGuard::acquire()?;
         let config_root = get_config_root()?;
         ensure_config_dir(&config_root)?;
         let config_path = config_root.join(SETTINGS_FILENAME);
