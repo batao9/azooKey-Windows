@@ -4,15 +4,10 @@ mod updater;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use shared::{AppConfig, AppConfigLoadResult, ConfigError, ConfigRecovery, RomajiRule};
-use std::{path::PathBuf, sync::Mutex, time::Duration};
-use windows::{
-    core::w,
-    Win32::{
-        Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0},
-        System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject, INFINITE},
-    },
+use shared::{
+    AppConfig, AppConfigLoadResult, ConfigError, ConfigRecovery, ConfigWriteGuard, RomajiRule,
 };
+use std::{path::PathBuf, sync::Mutex, time::Duration};
 
 use anyhow::Context as _;
 
@@ -37,16 +32,7 @@ impl AppState {
             }
             Err(error) => {
                 eprintln!("Failed to load settings; using defaults: {}", error);
-                (
-                    AppConfig::default(),
-                    Some(ConfigStartupNotice {
-                        kind: "load_error".to_string(),
-                        message: format!(
-                            "設定の読み込みに失敗したため、既定値で起動しました: {error}"
-                        ),
-                        backup_path: None,
-                    }),
-                )
+                (AppConfig::default(), Some(notice_from_load_error(&error)))
             }
         };
 
@@ -84,33 +70,6 @@ struct UpdateConfigResponse {
     message: Option<String>,
 }
 
-struct CrossProcessConfigGuard(HANDLE);
-
-impl CrossProcessConfigGuard {
-    fn acquire() -> Result<Self, String> {
-        let handle = unsafe { CreateMutexW(None, false, w!("Local\\AzookeyWindowsConfigUpdate")) }
-            .map_err(|error| format!("failed to create config update mutex: {error}"))?;
-
-        let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
-        if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
-            Ok(Self(handle))
-        } else {
-            let _ = unsafe { CloseHandle(handle) };
-            Err(format!(
-                "failed to acquire config update mutex: wait={}",
-                wait.0
-            ))
-        }
-    }
-}
-
-impl Drop for CrossProcessConfigGuard {
-    fn drop(&mut self) {
-        let _ = unsafe { ReleaseMutex(self.0) };
-        let _ = unsafe { CloseHandle(self.0) };
-    }
-}
-
 #[derive(Debug, Serialize, Clone)]
 struct ResetLearningHistoryResponse {
     reset: bool,
@@ -144,6 +103,25 @@ fn notice_from_recovered_rewrite_error(
             "壊れた設定ファイルを退避しましたが、既定値設定の保存に失敗しました: {error}"
         ),
         backup_path: Some(recovery.backup_path.display().to_string()),
+    }
+}
+
+fn notice_from_load_error(error: &ConfigError) -> ConfigStartupNotice {
+    match error {
+        ConfigError::FutureVersion {
+            stored, current, ..
+        } => ConfigStartupNotice {
+            kind: "future_version".to_string(),
+            message: format!(
+                "このアプリより新しい設定ファイル（version {stored}、対応 version {current}）を検出しました。設定ファイルは書き換えず、既定値で起動しました。設定を変更するには新しいバージョンのアプリを使用してください。"
+            ),
+            backup_path: None,
+        },
+        _ => ConfigStartupNotice {
+            kind: "load_error".to_string(),
+            message: format!("設定の読み込みに失敗したため、既定値で起動しました: {error}"),
+            backup_path: None,
+        },
     }
 }
 
@@ -249,11 +227,18 @@ fn update_config_impl(
     new_config: AppConfig,
 ) -> Result<UpdateConfigResponse, String> {
     let _update_guard = state.config_update_lock.lock().unwrap();
-    let _cross_process_guard = CrossProcessConfigGuard::acquire()?;
-    let current_config = AppConfig::read().unwrap_or_else(|error| {
-        eprintln!("Failed to read latest settings before update: {error}");
-        state.settings.lock().unwrap().clone()
-    });
+    let _cross_process_guard = ConfigWriteGuard::acquire().map_err(|error| error.to_string())?;
+    let current_config = match AppConfig::read() {
+        Ok(config) => config,
+        Err(error) if error.is_version_compatibility_error() => {
+            eprintln!("Refusing to update incompatible settings: {error}");
+            return Err(error.to_string());
+        }
+        Err(error) => {
+            eprintln!("Failed to read latest settings before update: {error}");
+            state.settings.lock().unwrap().clone()
+        }
+    };
     let new_config = merge_config_update(current_config.clone(), base_config, new_config)?;
     let changed = current_config != new_config;
     if changed {
@@ -352,15 +337,25 @@ fn restart_server(state: tauri::State<AppState>) -> Result<(), String> {
 }
 
 fn restart_server_impl(state: &AppState) -> Result<(), anyhow::Error> {
-    let _update_guard = state.config_update_lock.lock().unwrap();
-    let _cross_process_guard = CrossProcessConfigGuard::acquire().map_err(anyhow::Error::msg)?;
-    let config = AppConfig::read().unwrap_or_else(|error| {
-        eprintln!("Failed to refresh settings before server restart: {error}");
-        state.settings.lock().unwrap().clone()
-    });
-    *state.settings.lock().unwrap() = config.clone();
+    restart_server_impl_with(state, server_process::restart_server)
+}
 
-    server_process::restart_server(&config)?;
+fn restart_server_impl_with(
+    state: &AppState,
+    restart_process: impl FnOnce(&AppConfig) -> Result<(), anyhow::Error>,
+) -> Result<(), anyhow::Error> {
+    let _update_guard = state.config_update_lock.lock().unwrap();
+    let config = {
+        let _cross_process_guard = ConfigWriteGuard::acquire()?;
+        let config = AppConfig::read().unwrap_or_else(|error| {
+            eprintln!("Failed to refresh settings before server restart: {error}");
+            state.settings.lock().unwrap().clone()
+        });
+        *state.settings.lock().unwrap() = config.clone();
+        config
+    };
+
+    restart_process(&config)?;
 
     let ipc = ipc::IPCService::new_with_timeout(Duration::from_secs(10))
         .context("Server restarted, but IPC reconnect failed")?;
@@ -508,7 +503,7 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{env, ffi::OsString, io, path::Path, sync::MutexGuard};
+    use std::{env, ffi::OsString, fs, io, path::Path, sync::MutexGuard};
 
     fn env_lock() -> MutexGuard<'static, ()> {
         crate::test_env_lock()
@@ -653,6 +648,31 @@ mod tests {
     }
 
     #[test]
+    fn update_config_rejects_future_version_without_modifying_the_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let _appdata = AppDataGuard::set(temp.path());
+        let config_root = temp.path().join("Azookey");
+        fs::create_dir_all(&config_root).unwrap();
+        let config_path = config_root.join("settings.json");
+        let future_settings = r#"{
+            "version": "0.1.3",
+            "zenzai": "future-schema",
+            "future_only": { "must_be_preserved": true }
+        }"#;
+        fs::write(&config_path, future_settings).unwrap();
+        let state = test_state();
+        let mut update = AppConfig::default();
+        update.zenzai.enable = true;
+
+        let error = update_config_impl(&state, AppConfig::default(), update)
+            .expect_err("future-version settings must be read-only");
+
+        assert!(error.contains("newer than supported"));
+        assert_eq!(fs::read_to_string(config_path).unwrap(), future_settings);
+        assert!(!state.settings.lock().unwrap().zenzai.enable);
+    }
+
+    #[test]
     fn reset_learning_history_reports_unavailable_server() {
         let state = test_state();
 
@@ -675,6 +695,31 @@ mod tests {
 
         assert!(error.to_string().contains("Server executable not found"));
         assert!(state.ipc.lock().unwrap().is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restart_server_releases_config_guard_before_process_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let _appdata = AppDataGuard::set(temp.path());
+        let state = test_state();
+
+        let error = restart_server_impl_with(&state, |_| {
+            let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                let _guard = ConfigWriteGuard::acquire().unwrap();
+                acquired_tx.send(()).unwrap();
+            });
+
+            acquired_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("launcher-side config load must not wait for the frontend restart lock");
+            waiter.join().unwrap();
+            Err(anyhow::anyhow!("stop after lock-scope assertion"))
+        })
+        .expect_err("injected restart failure should be returned");
+
+        assert!(error.to_string().contains("lock-scope assertion"));
     }
 
     #[test]
@@ -708,6 +753,23 @@ mod tests {
 
         assert_eq!(notice.kind, "rewrite_error");
         assert!(notice.message.contains("設定は読み込めました"));
+        assert!(notice.backup_path.is_none());
+    }
+
+    #[test]
+    fn future_version_notice_explains_read_only_fallback() {
+        let error = ConfigError::FutureVersion {
+            path: PathBuf::from("settings.json"),
+            stored: "0.1.3".to_string(),
+            current: "0.1.2".to_string(),
+        };
+
+        let notice = notice_from_load_error(&error);
+
+        assert_eq!(notice.kind, "future_version");
+        assert!(notice.message.contains("version 0.1.3"));
+        assert!(notice.message.contains("書き換えず"));
+        assert!(notice.message.contains("新しいバージョン"));
         assert!(notice.backup_path.is_none());
     }
 }
