@@ -335,12 +335,14 @@ private func testCandidate(
     let firstBatchId = cache.appendBatch([first, alternate])!
     let firstId = cache.candidateId(at: 0, batchFirstId: firstBatchId)
     let alternateId = cache.candidateId(at: 1, batchFirstId: firstBatchId)
-    #expect(cache.pin(firstId))
+    let pinnedFirst = cache.pin(firstId)
+    #expect(pinnedFirst)
     #expect(cache.protectedSlotCount == 2)
 
     let laterBatchId = cache.appendBatch([later])!
     let laterId = cache.candidateId(at: 0, batchFirstId: laterBatchId)
-    #expect(cache.pin(laterId))
+    let pinnedLater = cache.pin(laterId)
+    #expect(pinnedLater)
     #expect(cache.slotCount == 3)
     #expect(cache.protectedSlotCount == 3)
     #expect(cache.appendBatch([later]) == nil)
@@ -509,7 +511,8 @@ private func testCandidate(
     let protectedBatchId = cache.appendBatch([candidate, alternate])!
     let selectedId = cache.candidateId(at: 0, batchFirstId: protectedBatchId)
     let alternateId = cache.candidateId(at: 1, batchFirstId: protectedBatchId)
-    #expect(cache.pin(selectedId))
+    let pinnedSelected = cache.pin(selectedId)
+    #expect(pinnedSelected)
     var newestId: UInt64 = 0
 
     // More than 40 high-water candidate generations exceed the 8,192-slot
