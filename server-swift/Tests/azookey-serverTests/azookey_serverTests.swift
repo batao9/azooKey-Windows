@@ -306,10 +306,52 @@ private func testCandidate(
 
     #expect(cache.batchCount == 2)
     #expect(cache.slotCount == 2)
-    #expect(cache.pinnedCandidateCount == 1)
+    #expect(cache.protectedSlotCount == 1)
     #expect(cache.consume(firstId)?.text == "今日")
     #expect(cache.consume(firstId) == nil)
-    #expect(cache.pinnedCandidateCount == 0)
+    #expect(cache.protectedSlotCount == 1)
+    cache.removeAllPins()
+    #expect(cache.protectedSlotCount == 0)
+}
+
+@Test func protectedLearningCandidateBatchesShareTheExplicitSlotLimit() {
+    var cache = LearningCandidateCache(maxBatchCount: 4, maxSlotCount: 3)
+    let first = testCandidate(
+        word: "今日",
+        ruby: "きょう",
+        composingCount: .inputCount(3)
+    )
+    let alternate = testCandidate(
+        word: "教",
+        ruby: "きょう",
+        composingCount: .inputCount(3)
+    )
+    let later = testCandidate(
+        word: "京",
+        ruby: "きょう",
+        composingCount: .inputCount(3)
+    )
+
+    let firstBatchId = cache.appendBatch([first, alternate])!
+    let firstId = cache.candidateId(at: 0, batchFirstId: firstBatchId)
+    let alternateId = cache.candidateId(at: 1, batchFirstId: firstBatchId)
+    #expect(cache.pin(firstId))
+    #expect(cache.protectedSlotCount == 2)
+
+    let laterBatchId = cache.appendBatch([later])!
+    let laterId = cache.candidateId(at: 0, batchFirstId: laterBatchId)
+    #expect(cache.pin(laterId))
+    #expect(cache.slotCount == 3)
+    #expect(cache.protectedSlotCount == 3)
+    #expect(cache.appendBatch([later]) == nil)
+
+    // Protecting one selection preserves alternate nonzero IDs from the same
+    // client snapshot instead of copying only the selected candidate.
+    #expect(cache.consume(alternateId)?.text == "教")
+    #expect(cache.consume(laterId)?.text == "京")
+    cache.removeAllPins()
+    #expect(cache.protectedSlotCount == 0)
+    #expect(cache.appendBatch([later]) != nil)
 }
 
 @Test func compositionEditDiscardsFutureOnlyPinsWithoutExtraRPC() async {
@@ -342,7 +384,8 @@ private func testCandidate(
         composingTextSnapshots.removeAll()
         discardPinnedLearningCandidatesBeforeCompositionEdit()
 
-        #expect(learningCandidateCache.pinnedCandidateCount == 0)
+        #expect(learningCandidateCache.protectedSlotCount == 0)
+        _ = learningCandidateCache.appendBatch([candidate])
         #expect(learningCandidateCache.consume(candidateId) == nil)
 
         learningCandidateCache.removeAll()
@@ -355,7 +398,7 @@ private func testCandidate(
         #expect(pinnedActive)
         composingTextSnapshots = [ComposingText()]
         discardPinnedLearningCandidatesBeforeCompositionEdit()
-        #expect(learningCandidateCache.pinnedCandidateCount == 1)
+        #expect(learningCandidateCache.protectedSlotCount == 1)
     }
 }
 
@@ -450,32 +493,37 @@ private func testCandidate(
     #expect(cache.consume(newestId)?.text == "今日")
 }
 
-@Test func selectedPastClauseCandidatesSurviveBulkCacheEviction() {
+@Test func protectedClauseCandidateBatchSurvivesBulkCacheEviction() {
     var cache = LearningCandidateCache()
     let candidate = testCandidate(
         word: "今日",
         ruby: "きょう",
         composingCount: .inputCount(3)
     )
+    let alternate = testCandidate(
+        word: "教",
+        ruby: "きょう",
+        composingCount: .inputCount(3)
+    )
     let candidates = Array(repeating: candidate, count: 201)
-    var selectedIds: [UInt64] = []
+    let protectedBatchId = cache.appendBatch([candidate, alternate])!
+    let selectedId = cache.candidateId(at: 0, batchFirstId: protectedBatchId)
+    let alternateId = cache.candidateId(at: 1, batchFirstId: protectedBatchId)
+    #expect(cache.pin(selectedId))
+    var newestId: UInt64 = 0
 
     // More than 40 high-water candidate generations exceed the 8,192-slot
-    // ring. Each past clause keeps only its selected candidate alive.
+    // ring. Unprotected batches are evicted around the protected source batch.
     for _ in 0..<48 {
         let batchFirstId = cache.appendBatch(candidates)!
-        let selectedId = cache.candidateId(at: 0, batchFirstId: batchFirstId)
-        let pinnedSelected = cache.pin(selectedId)
-        #expect(pinnedSelected)
-        selectedIds.append(selectedId)
+        newestId = cache.candidateId(at: 0, batchFirstId: batchFirstId)
     }
 
     #expect(cache.slotCount <= maxLearningCandidateCacheSlotCount)
-    #expect(cache.pinnedCandidateCount == selectedIds.count)
-    for selectedId in selectedIds {
-        #expect(cache.consume(selectedId)?.text == "今日")
-    }
-    #expect(cache.pinnedCandidateCount == 0)
+    #expect(cache.protectedSlotCount == 2)
+    #expect(cache.consume(selectedId)?.text == "今日")
+    #expect(cache.consume(alternateId)?.text == "教")
+    #expect(cache.consume(newestId)?.text == "今日")
 }
 
 @Test func learningCandidateCacheIsSkippedWhenLearningDoesNotAcceptInput() async throws {

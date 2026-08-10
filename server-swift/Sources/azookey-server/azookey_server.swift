@@ -520,6 +520,7 @@ struct LearningCandidateCache {
         let firstId: UInt64
         let candidates: [Candidate]
         var consumedOffsets: Set<Int> = []
+        var isProtected = false
     }
 
     private let maxBatchCount: Int
@@ -528,10 +529,9 @@ struct LearningCandidateCache {
     private var firstBatchIndex = 0
     private var nextCandidateId: UInt64 = 1
     private var idSpaceExhausted = false
-    private var pinnedCandidates: [UInt64: Candidate] = [:]
     private(set) var slotCount = 0
     private(set) var batchCount = 0
-    var pinnedCandidateCount: Int { pinnedCandidates.count }
+    private(set) var protectedSlotCount = 0
 
     init(
         maxBatchCount: Int = maxLearningCandidateCacheBatchCount,
@@ -549,8 +549,12 @@ struct LearningCandidateCache {
             return nil
         }
 
-        let retainedCandidates = if candidates.count > maxSlotCount {
-            Array(candidates.prefix(maxSlotCount))
+        let availableBatchSlotCount = maxSlotCount - protectedSlotCount
+        guard availableBatchSlotCount > 0 else {
+            return nil
+        }
+        let retainedCandidates = if candidates.count > availableBatchSlotCount {
+            Array(candidates.prefix(availableBatchSlotCount))
         } else {
             candidates
         }
@@ -564,7 +568,9 @@ struct LearningCandidateCache {
         while batchCount == maxBatchCount
             || slotCount > maxSlotCount - retainedCandidates.count
         {
-            evictOldestBatch()
+            guard evictOldestUnprotectedBatch() else {
+                return nil
+            }
         }
 
         let firstId = nextCandidateId
@@ -595,17 +601,20 @@ struct LearningCandidateCache {
         guard candidateId > 0 else {
             return false
         }
-        if pinnedCandidates[candidateId] != nil {
-            return true
-        }
         guard let location = candidateLocation(for: candidateId),
               !batches[location.batchIndex]!.consumedOffsets.contains(location.candidateIndex)
         else {
             return false
         }
+        if batches[location.batchIndex]!.isProtected {
+            return true
+        }
 
-        pinnedCandidates[candidateId] =
-            batches[location.batchIndex]!.candidates[location.candidateIndex]
+        // A client snapshot can later select any candidate from this batch.
+        // Protect the complete batch so every issued nonzero ID stays valid.
+        let candidateCount = batches[location.batchIndex]!.candidates.count
+        batches[location.batchIndex]!.isProtected = true
+        protectedSlotCount += candidateCount
         return true
     }
 
@@ -613,17 +622,15 @@ struct LearningCandidateCache {
         guard candidateId > 0 else {
             return nil
         }
-        let pinnedCandidate = pinnedCandidates.removeValue(forKey: candidateId)
         guard let location = candidateLocation(for: candidateId) else {
-            return pinnedCandidate
+            return nil
         }
         guard batches[location.batchIndex]!.consumedOffsets
             .insert(location.candidateIndex).inserted else {
             return nil
         }
 
-        return pinnedCandidate
-            ?? batches[location.batchIndex]!.candidates[location.candidateIndex]
+        return batches[location.batchIndex]!.candidates[location.candidateIndex]
     }
 
     mutating func removeAll() {
@@ -633,11 +640,17 @@ struct LearningCandidateCache {
         firstBatchIndex = 0
         batchCount = 0
         slotCount = 0
-        pinnedCandidates.removeAll(keepingCapacity: false)
+        protectedSlotCount = 0
     }
 
     mutating func removeAllPins() {
-        pinnedCandidates.removeAll(keepingCapacity: false)
+        guard protectedSlotCount > 0 else {
+            return
+        }
+        for logicalIndex in 0..<batchCount {
+            batches[physicalIndex(forLogicalIndex: logicalIndex)]!.isProtected = false
+        }
+        protectedSlotCount = 0
     }
 
     private func physicalIndex(forLogicalIndex logicalIndex: Int) -> Int {
@@ -671,16 +684,38 @@ struct LearningCandidateCache {
         return (batchIndex, Int(offset))
     }
 
-    private mutating func evictOldestBatch() {
-        guard batchCount > 0,
-              let oldestBatch = batches[firstBatchIndex] else {
-            return
+    private mutating func evictOldestUnprotectedBatch() -> Bool {
+        guard batchCount > 0 else {
+            return false
         }
 
-        slotCount -= oldestBatch.candidates.count
-        batches[firstBatchIndex] = nil
-        firstBatchIndex = (firstBatchIndex + 1) % maxBatchCount
+        var victimLogicalIndex: Int?
+        for logicalIndex in 0..<batchCount {
+            let batchIndex = physicalIndex(forLogicalIndex: logicalIndex)
+            if !batches[batchIndex]!.isProtected {
+                victimLogicalIndex = logicalIndex
+                break
+            }
+        }
+        guard let victimLogicalIndex else {
+            return false
+        }
+
+        let victimBatchIndex = physicalIndex(forLogicalIndex: victimLogicalIndex)
+        slotCount -= batches[victimBatchIndex]!.candidates.count
+        if victimLogicalIndex == 0 {
+            batches[victimBatchIndex] = nil
+            firstBatchIndex = (firstBatchIndex + 1) % maxBatchCount
+        } else {
+            for logicalIndex in victimLogicalIndex..<(batchCount - 1) {
+                let destination = physicalIndex(forLogicalIndex: logicalIndex)
+                let source = physicalIndex(forLogicalIndex: logicalIndex + 1)
+                batches[destination] = batches[source]
+            }
+            batches[physicalIndex(forLogicalIndex: batchCount - 1)] = nil
+        }
         batchCount -= 1
+        return true
     }
 }
 
@@ -718,7 +753,7 @@ struct LearningCandidateCache {
 // so release their selected candidates without adding another IPC round trip.
 @MainActor func discardPinnedLearningCandidatesBeforeCompositionEdit() {
     guard composingTextSnapshots.isEmpty,
-          learningCandidateCache.pinnedCandidateCount > 0 else {
+          learningCandidateCache.protectedSlotCount > 0 else {
         return
     }
     learningCandidateCache.removeAllPins()
@@ -1719,7 +1754,7 @@ private struct WarmupExecutionSnapshot: Sendable {
     let useZenzai: Bool
     let learningCacheBatchCount: Int
     let learningCacheSlotCount: Int
-    let learningCachePinnedCount: Int
+    let learningCacheProtectedSlotCount: Int
     let diagnosticDetails: String
 }
 
@@ -1794,7 +1829,7 @@ private final class BackgroundWarmupRunner: @unchecked Sendable {
             operation: "warmup_resources",
             stage: "before_request_candidates",
             elapsedMs: 0,
-            details: "foreground_converter_count=2;background_converter_count=\(converter == nil ? 0 : 1);background_converter_reused=\(reusedConverter);background_preload_dictionary=\(snapshot.preloadDictionary);background_use_zenzai=\(snapshot.useZenzai);learning_cache_batches=\(snapshot.learningCacheBatchCount);learning_cache_slots=\(snapshot.learningCacheSlotCount);learning_cache_pinned=\(snapshot.learningCachePinnedCount)"
+            details: "foreground_converter_count=2;background_converter_count=\(converter == nil ? 0 : 1);background_converter_reused=\(reusedConverter);background_preload_dictionary=\(snapshot.preloadDictionary);background_use_zenzai=\(snapshot.useZenzai);learning_cache_batches=\(snapshot.learningCacheBatchCount);learning_cache_slots=\(snapshot.learningCacheSlotCount);learning_cache_protected_slots=\(snapshot.learningCacheProtectedSlotCount)"
         )
         if converterKey != key || converter == nil {
             converter = KanaKanjiConverter(
@@ -1823,7 +1858,7 @@ private final class BackgroundWarmupRunner: @unchecked Sendable {
             operation: "warmup",
             stage: "request_candidates",
             elapsedMs: requestMs,
-            details: "candidate_count=\(converted.mainResults.count);foreground_converter_count=2;background_converter_count=1;background_converter_reused=\(reusedConverter);learning_cache_batches=\(snapshot.learningCacheBatchCount);learning_cache_slots=\(snapshot.learningCacheSlotCount);learning_cache_pinned=\(snapshot.learningCachePinnedCount);\(snapshot.diagnosticDetails)"
+            details: "candidate_count=\(converted.mainResults.count);foreground_converter_count=2;background_converter_count=1;background_converter_reused=\(reusedConverter);learning_cache_batches=\(snapshot.learningCacheBatchCount);learning_cache_slots=\(snapshot.learningCacheSlotCount);learning_cache_protected_slots=\(snapshot.learningCacheProtectedSlotCount);\(snapshot.diagnosticDetails)"
         )
         crashTrace(
             requestId: snapshot.requestId,
@@ -1895,7 +1930,7 @@ private let backgroundWarmupRunner = BackgroundWarmupRunner()
         useZenzai: useZenzai,
         learningCacheBatchCount: learningCandidateCache.batchCount,
         learningCacheSlotCount: learningCandidateCache.slotCount,
-        learningCachePinnedCount: learningCandidateCache.pinnedCandidateCount,
+        learningCacheProtectedSlotCount: learningCandidateCache.protectedSlotCount,
         diagnosticDetails: diagnosticDetails
     )
 }
@@ -2495,7 +2530,7 @@ func cursorPrefixBoundaryFirstClauseResults(
     composingTextSnapshots.append(composingText)
     serverLog(
         "DEBUG",
-        "PushComposingTextSnapshot: completed count=\(composingTextSnapshots.count) pinnedLearningCandidates=\(learningCandidateCache.pinnedCandidateCount)"
+        "PushComposingTextSnapshot: completed count=\(composingTextSnapshots.count) protectedLearningCandidateSlots=\(learningCandidateCache.protectedSlotCount)"
     )
 }
 
@@ -2879,7 +2914,7 @@ public func free_candidate_list(
             operation: "get_composed_text",
             stage: "build_ffi_candidates_total",
             elapsedMs: elapsedPerformanceMilliseconds(since: buildStart),
-            details: "candidate_count=\(result.count);main_candidate_count=\(mainResults.count);zenzai_candidate_count=\(converted.mainResults.count);normal_nbest_candidate_count=\(normalNBestConverted?.mainResults.count ?? 0);cache_entries=\(resolutionCache.count);string_allocations=\(stringAllocationCount);learning_cache_batches=\(learningCandidateCache.batchCount);learning_cache_slots=\(learningCandidateCache.slotCount);learning_cache_pinned=\(learningCandidateCache.pinnedCandidateCount);\(diagnosticDetails)"
+            details: "candidate_count=\(result.count);main_candidate_count=\(mainResults.count);zenzai_candidate_count=\(converted.mainResults.count);normal_nbest_candidate_count=\(normalNBestConverted?.mainResults.count ?? 0);cache_entries=\(resolutionCache.count);string_allocations=\(stringAllocationCount);learning_cache_batches=\(learningCandidateCache.batchCount);learning_cache_slots=\(learningCandidateCache.slotCount);learning_cache_protected_slots=\(learningCandidateCache.protectedSlotCount);\(diagnosticDetails)"
         )
     }
     candidateCrashTrace(
@@ -3210,7 +3245,7 @@ public func free_candidate_list(
             operation: "get_composed_text_for_cursor_prefix",
             stage: "build_ffi_candidates_total",
             elapsedMs: elapsedPerformanceMilliseconds(since: buildStart),
-            details: "candidate_count=\(result.count);first_clause_candidate_count=\(cursorPrefixFirstClauseResults.count);main_candidate_count=\(cursorPrefixMainResults.count);zenzai_first_clause_candidate_count=\(converted.firstClauseResults.count);zenzai_main_candidate_count=\(converted.mainResults.count);normal_nbest_first_clause_candidate_count=\(normalNBestConverted?.firstClauseResults.count ?? 0);normal_nbest_main_candidate_count=\(normalNBestConverted?.mainResults.count ?? 0);exact_clause_candidate_count=\(exactClauseResults.count);cache_entries=\(cursorPrefixResolutionCache.count);string_allocations=\(stringAllocationCount);learning_cache_batches=\(learningCandidateCache.batchCount);learning_cache_slots=\(learningCandidateCache.slotCount);learning_cache_pinned=\(learningCandidateCache.pinnedCandidateCount);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
+            details: "candidate_count=\(result.count);first_clause_candidate_count=\(cursorPrefixFirstClauseResults.count);main_candidate_count=\(cursorPrefixMainResults.count);zenzai_first_clause_candidate_count=\(converted.firstClauseResults.count);zenzai_main_candidate_count=\(converted.mainResults.count);normal_nbest_first_clause_candidate_count=\(normalNBestConverted?.firstClauseResults.count ?? 0);normal_nbest_main_candidate_count=\(normalNBestConverted?.mainResults.count ?? 0);exact_clause_candidate_count=\(exactClauseResults.count);cache_entries=\(cursorPrefixResolutionCache.count);string_allocations=\(stringAllocationCount);learning_cache_batches=\(learningCandidateCache.batchCount);learning_cache_slots=\(learningCandidateCache.slotCount);learning_cache_protected_slots=\(learningCandidateCache.protectedSlotCount);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
         )
     }
     candidateCrashTrace(
