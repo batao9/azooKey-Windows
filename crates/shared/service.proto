@@ -109,6 +109,10 @@ enum CompositionSnapshotOperation {
 message UpdateCompositionSnapshotRequest {
   CompositionSnapshotOperation operation = 1;
   uint64 request_id = 2;
+  // Candidate selected by the client when pushing or popping a clause
+  // snapshot. The server keeps only this still-referenced learning candidate
+  // when bounded candidate batches are evicted.
+  uint64 selected_candidate_id = 3;
 }
 
 message UpdateCompositionSnapshotResponse {
@@ -131,6 +135,7 @@ message ShrinkTextResponse {
 message AdvanceClauseRequest {
   int32 offset = 1;
   uint64 request_id = 2;
+  uint64 selected_candidate_id = 3;
 }
 
 message AdvanceClauseResponse {
@@ -154,6 +159,7 @@ message PrepareFutureClausesRequest {
   // prepared clause. Used by initial left-arrow navigation so the client can
   // move to the last clause without replaying one RPC per clause.
   bool leave_at_last = 3;
+  uint64 initial_selected_candidate_id = 4;
 }
 
 message PrepareFutureClausesResponse {

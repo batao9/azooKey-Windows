@@ -153,6 +153,7 @@ impl ClauseActionBackend for RichNavigationAfterShrinkBackend {
         &mut self,
         _offset: i32,
         _previous_candidates: &Candidates,
+        _selected_candidate_id: u64,
     ) -> anyhow::Result<ClauseAdvance> {
         Ok(ClauseAdvance {
             shrunk: self.shrink_candidates.clone(),
@@ -190,6 +191,7 @@ impl ClauseActionBackend for DesynchronizedFutureRestoreBackend {
         &mut self,
         _offset: i32,
         _previous_candidates: &Candidates,
+        _selected_candidate_id: u64,
     ) -> anyhow::Result<ClauseAdvance> {
         self.snapshot_depth += 1;
         Ok(ClauseAdvance {
@@ -203,6 +205,7 @@ impl ClauseActionBackend for DesynchronizedFutureRestoreBackend {
         &mut self,
         operation: ClauseSnapshotOperation,
         _previous_candidates: &Candidates,
+        _selected_candidate_id: u64,
     ) -> anyhow::Result<()> {
         if operation == ClauseSnapshotOperation::Pop {
             assert!(self.snapshot_depth > 0, "server snapshot stack underflow");

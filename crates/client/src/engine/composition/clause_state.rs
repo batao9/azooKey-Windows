@@ -123,8 +123,13 @@ pub(crate) trait ClauseActionBackend {
         &mut self,
         offset: i32,
         previous_candidates: &Candidates,
+        selected_candidate_id: u64,
     ) -> Result<ClauseAdvance> {
-        self.update_composition_snapshot(ClauseSnapshotOperation::Push, previous_candidates)?;
+        self.update_composition_snapshot(
+            ClauseSnapshotOperation::Push,
+            previous_candidates,
+            selected_candidate_id,
+        )?;
         let shrunk = self.shrink_text_with_context(offset, previous_candidates)?;
         let navigation = self.move_cursor(0)?;
         Ok(ClauseAdvance {
@@ -138,6 +143,7 @@ pub(crate) trait ClauseActionBackend {
         &mut self,
         initial_offset: i32,
         previous_candidates: &Candidates,
+        initial_selected_candidate_id: u64,
         leave_at_last: bool,
     ) -> Result<(Vec<ClauseAdvance>, bool)> {
         let mut offset = initial_offset;
@@ -146,6 +152,7 @@ pub(crate) trait ClauseActionBackend {
         let mut last_signature = None;
         let mut snapshot_count = 0;
         let mut completed = false;
+        let mut selected_candidate_id = initial_selected_candidate_id;
         let max_steps = previous
             .hiragana
             .chars()
@@ -153,7 +160,7 @@ pub(crate) trait ClauseActionBackend {
             .clamp(1, shared::MAX_PREPARED_CLAUSE_ADVANCES);
 
         for _ in 0..max_steps {
-            let advance = self.advance_clause(offset, &previous)?;
+            let advance = self.advance_clause(offset, &previous, selected_candidate_id)?;
             snapshot_count += 1;
             let Some(selected) = TextServiceFactory::select_candidate(&advance.navigation, 0)
             else {
@@ -171,6 +178,7 @@ pub(crate) trait ClauseActionBackend {
             advances.push(advance.clone());
             last_signature = Some(signature);
             offset = selected.corresponding_count;
+            selected_candidate_id = selected.candidate_id;
             previous = advance.navigation;
             if is_last {
                 completed = true;
@@ -184,7 +192,7 @@ pub(crate) trait ClauseActionBackend {
             0
         };
         for _ in retained_snapshot_count..snapshot_count {
-            self.update_composition_snapshot(ClauseSnapshotOperation::Pop, &previous)?;
+            self.update_composition_snapshot(ClauseSnapshotOperation::Pop, &previous, 0)?;
         }
         Ok((advances, completed))
     }
@@ -209,6 +217,7 @@ pub(crate) trait ClauseActionBackend {
         &mut self,
         _operation: ClauseSnapshotOperation,
         _previous_candidates: &Candidates,
+        _selected_candidate_id: u64,
     ) -> Result<()> {
         Ok(())
     }
@@ -245,17 +254,25 @@ impl ClauseActionBackend for IPCService {
         &mut self,
         offset: i32,
         previous_candidates: &Candidates,
+        selected_candidate_id: u64,
     ) -> Result<ClauseAdvance> {
-        IPCService::advance_clause(self, offset, previous_candidates)
+        IPCService::advance_clause(self, offset, previous_candidates, selected_candidate_id)
     }
 
     fn prepare_future_clauses(
         &mut self,
         initial_offset: i32,
         previous_candidates: &Candidates,
+        initial_selected_candidate_id: u64,
         leave_at_last: bool,
     ) -> Result<(Vec<ClauseAdvance>, bool)> {
-        IPCService::prepare_future_clauses(self, initial_offset, previous_candidates, leave_at_last)
+        IPCService::prepare_future_clauses(
+            self,
+            initial_offset,
+            previous_candidates,
+            initial_selected_candidate_id,
+            leave_at_last,
+        )
     }
 
     fn move_cursor_with_context(
@@ -278,8 +295,14 @@ impl ClauseActionBackend for IPCService {
         &mut self,
         operation: ClauseSnapshotOperation,
         previous_candidates: &Candidates,
+        selected_candidate_id: u64,
     ) -> Result<()> {
-        IPCService::update_composition_snapshot(self, operation, previous_candidates)
+        IPCService::update_composition_snapshot(
+            self,
+            operation,
+            previous_candidates,
+            selected_candidate_id,
+        )
     }
 }
 
@@ -657,6 +680,7 @@ impl ClauseState {
             let (prepared, _) = backend.prepare_future_clauses(
                 selected.corresponding_count,
                 state.candidates,
+                selected.candidate_id,
                 false,
             )?;
             TextServiceFactory::rebuild_future_clause_snapshots_from_prepared(state, prepared)?;
@@ -714,9 +738,16 @@ impl ClauseState {
         direction: i32,
     ) -> Result<ClauseActionEffect> {
         if direction == TextServiceFactory::MOVE_CLAUSE_TO_LAST {
+            let selected_candidate_id = state
+                .candidates
+                .candidate_ids
+                .get((*state.selection_index).max(0) as usize)
+                .copied()
+                .unwrap_or(0);
             let (prepared, completed) = backend.prepare_future_clauses(
                 *state.corresponding_count,
                 state.candidates,
+                selected_candidate_id,
                 true,
             )?;
             if !completed {
@@ -825,8 +856,16 @@ impl ClauseState {
 
             state.clause_snapshots.push(snapshot.clone());
 
-            let advance =
-                backend.advance_clause(current_corresponding_count, &previous_candidates)?;
+            let selected_candidate_id = previous_candidates
+                .candidate_ids
+                .get((*state.selection_index).max(0) as usize)
+                .copied()
+                .unwrap_or(0);
+            let advance = backend.advance_clause(
+                current_corresponding_count,
+                &previous_candidates,
+                selected_candidate_id,
+            )?;
             let navigation_candidates = advance.navigation;
             let raw_input_identity = advance.raw_input;
             *state.candidates = advance.shrunk;
@@ -881,6 +920,7 @@ impl ClauseState {
                             backend.update_composition_snapshot(
                                 ClauseSnapshotOperation::Pop,
                                 &rollback_candidates,
+                                0,
                             )?;
                             state.future_clause_snapshots.push(restored_future);
                             let restored = state.clause_snapshots.pop().unwrap_or(snapshot);
@@ -987,6 +1027,7 @@ impl ClauseState {
                     backend.update_composition_snapshot(
                         ClauseSnapshotOperation::Pop,
                         &previous_candidates,
+                        0,
                     )?;
                     if let Some(restored) = state.clause_snapshots.pop() {
                         Self::restore_current_clause_snapshot(state, restored);
@@ -1048,9 +1089,15 @@ impl ClauseState {
                     state.candidates,
                 );
                 let previous_candidates = state.candidates.clone();
+                let selected_candidate_id = previous_candidates
+                    .candidate_ids
+                    .get((*state.selection_index).max(0) as usize)
+                    .copied()
+                    .unwrap_or(0);
                 backend.update_composition_snapshot(
                     ClauseSnapshotOperation::Pop,
                     &previous_candidates,
+                    selected_candidate_id,
                 )?;
 
                 Self::restore_current_clause_snapshot(state, restored);

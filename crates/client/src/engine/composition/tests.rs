@@ -1609,6 +1609,8 @@ struct NonProgressEnsureBackend {
 
 struct BatchedClauseAdvanceBackend {
     advance_calls: usize,
+    selected_candidate_id: u64,
+    popped_candidate_id: u64,
 }
 
 impl ClauseActionBackend for BatchedClauseAdvanceBackend {
@@ -1624,15 +1626,30 @@ impl ClauseActionBackend for BatchedClauseAdvanceBackend {
         &mut self,
         offset: i32,
         _previous_candidates: &Candidates,
+        selected_candidate_id: u64,
     ) -> anyhow::Result<ClauseAdvance> {
         self.advance_calls += 1;
+        self.selected_candidate_id = selected_candidate_id;
         assert_eq!(offset, 7);
-        let next = candidates(&["統一"], &[""], "とういつ", &[6]);
+        let mut next = candidates(&["統一"], &[""], "とういつ", &[6]);
+        next.candidate_ids = vec![84];
         Ok(ClauseAdvance {
             shrunk: next.clone(),
             navigation: next,
             raw_input: ClauseAdvanceRawInput::Unverified,
         })
+    }
+
+    fn update_composition_snapshot(
+        &mut self,
+        operation: ClauseSnapshotOperation,
+        _previous_candidates: &Candidates,
+        selected_candidate_id: u64,
+    ) -> anyhow::Result<()> {
+        if operation == ClauseSnapshotOperation::Pop {
+            self.popped_candidate_id = selected_candidate_id;
+        }
+        Ok(())
     }
 }
 
@@ -1646,6 +1663,7 @@ fn move_clause_right_uses_one_batched_backend_operation() {
     let mut corresponding_count = 7;
     let mut selection_index = 0;
     let mut current_candidates = candidates(&["いい加減"], &["統一"], "いいかげんとういつ", &[7]);
+    current_candidates.candidate_ids = vec![41];
     let mut clause_snapshots = Vec::new();
     let mut future_clause_snapshots = Vec::new();
     let mut current_clause_is_split_derived = true;
@@ -1654,7 +1672,11 @@ fn move_clause_right_uses_one_batched_backend_operation() {
     let mut current_clause_split_group_id = None;
     let mut current_clause_consumed_prefix_restore = None;
     let mut next_split_group_id = 1;
-    let mut backend = BatchedClauseAdvanceBackend { advance_calls: 0 };
+    let mut backend = BatchedClauseAdvanceBackend {
+        advance_calls: 0,
+        selected_candidate_id: 0,
+        popped_candidate_id: 0,
+    };
 
     let mut state = ClauseActionStateMut {
         preview: &mut preview,
@@ -1684,8 +1706,14 @@ fn move_clause_right_uses_one_batched_backend_operation() {
 
     assert!(effect.applied);
     assert_eq!(backend.advance_calls, 1);
-    assert_eq!(preview, "いい加減統一");
-    assert_eq!(suffix, "");
+    assert_eq!(backend.selected_candidate_id, 41);
+    assert_eq!(state.preview.as_str(), "いい加減統一");
+    assert_eq!(state.suffix.as_str(), "");
+
+    let effect = TextServiceFactory::apply_move_clause(&mut state, &mut backend, -1)
+        .expect("left move should preserve the selected future candidate");
+    assert!(effect.applied);
+    assert_eq!(backend.popped_candidate_id, 84);
 }
 
 struct MoveToLastPreparationBackend {
@@ -1706,6 +1734,7 @@ impl ClauseActionBackend for MoveToLastPreparationBackend {
         &mut self,
         _offset: i32,
         _previous_candidates: &Candidates,
+        _selected_candidate_id: u64,
     ) -> anyhow::Result<ClauseAdvance> {
         self.direct_advance_calls += 1;
         panic!("move-to-last must not replay a direct clause advance")
@@ -1715,6 +1744,7 @@ impl ClauseActionBackend for MoveToLastPreparationBackend {
         &mut self,
         initial_offset: i32,
         _previous_candidates: &Candidates,
+        _initial_selected_candidate_id: u64,
         leave_at_last: bool,
     ) -> anyhow::Result<(Vec<ClauseAdvance>, bool)> {
         self.prepare_calls += 1;
@@ -1832,6 +1862,7 @@ impl ClauseActionBackend for IncompleteMoveToLastBackend {
         &mut self,
         offset: i32,
         _previous_candidates: &Candidates,
+        _selected_candidate_id: u64,
     ) -> anyhow::Result<ClauseAdvance> {
         self.direct_advance_calls += 1;
         assert_eq!(offset, 1);
@@ -1846,6 +1877,7 @@ impl ClauseActionBackend for IncompleteMoveToLastBackend {
         &mut self,
         initial_offset: i32,
         _previous_candidates: &Candidates,
+        _initial_selected_candidate_id: u64,
         leave_at_last: bool,
     ) -> anyhow::Result<(Vec<ClauseAdvance>, bool)> {
         self.prepare_calls += 1;
@@ -1941,6 +1973,7 @@ impl ClauseActionBackend for NonProgressEnsureBackend {
         &mut self,
         initial_offset: i32,
         _previous_candidates: &Candidates,
+        _initial_selected_candidate_id: u64,
         leave_at_last: bool,
     ) -> anyhow::Result<(Vec<ClauseAdvance>, bool)> {
         self.prepare_calls += 1;
@@ -1977,6 +2010,7 @@ impl ClauseActionBackend for BoundedPrepareBackend {
         &mut self,
         operation: ClauseSnapshotOperation,
         _previous_candidates: &Candidates,
+        _selected_candidate_id: u64,
     ) -> anyhow::Result<()> {
         match operation {
             ClauseSnapshotOperation::Push => self.pushes += 1,
@@ -1993,7 +2027,7 @@ fn prepare_future_clauses_bounds_suffix_clone_work() {
     let mut backend = BoundedPrepareBackend::default();
 
     let (prepared, completed) = backend
-        .prepare_future_clauses(1, &previous, false)
+        .prepare_future_clauses(1, &previous, 0, false)
         .expect("bounded preparation should succeed");
 
     assert_eq!(prepared.len(), shared::MAX_PREPARED_CLAUSE_ADVANCES);
@@ -2741,6 +2775,7 @@ impl ClauseActionBackend for InitialSplitSingleNBoundaryBackend {
         &mut self,
         operation: ClauseSnapshotOperation,
         _previous_candidates: &Candidates,
+        _selected_candidate_id: u64,
     ) -> anyhow::Result<()> {
         match operation {
             ClauseSnapshotOperation::Push => {
