@@ -160,6 +160,7 @@ impl ClauseActionBackend for PreparedClauseBackend {
         &mut self,
         _offset: i32,
         _previous_candidates: &Candidates,
+        _selected_candidate_id: u64,
     ) -> Result<ClauseAdvance> {
         self.advances
             .pop_front()
@@ -1765,33 +1766,19 @@ impl TextServiceFactory {
         ));
     }
 
-    fn clear_clause_snapshots(
-        clause_snapshots: &mut Vec<ClauseSnapshot>,
-        ipc_service: &mut IPCService,
-        candidates: &Candidates,
-    ) -> Result<()> {
-        if clause_snapshots.is_empty() {
-            return Ok(());
-        }
-
-        clause_snapshots.clear();
-        ipc_service.update_composition_snapshot(ClauseSnapshotOperation::Clear, candidates)
-    }
-
-    #[inline]
-    fn clear_future_clause_snapshots(future_clause_snapshots: &mut Vec<FutureClauseSnapshot>) {
-        future_clause_snapshots.clear();
-    }
-
-    #[inline]
     fn clear_clause_caches(
         clause_snapshots: &mut Vec<ClauseSnapshot>,
         future_clause_snapshots: &mut Vec<FutureClauseSnapshot>,
         ipc_service: &mut IPCService,
         candidates: &Candidates,
     ) -> Result<()> {
-        Self::clear_future_clause_snapshots(future_clause_snapshots);
-        Self::clear_clause_snapshots(clause_snapshots, ipc_service, candidates)
+        future_clause_snapshots.clear();
+        if clause_snapshots.is_empty() {
+            return Ok(());
+        }
+
+        clause_snapshots.clear();
+        ipc_service.update_composition_snapshot(ClauseSnapshotOperation::Clear, candidates, 0)
     }
 
     #[cfg(test)]

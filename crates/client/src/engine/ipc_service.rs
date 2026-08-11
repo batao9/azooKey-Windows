@@ -1162,10 +1162,14 @@ impl IPCService {
     fn send_advance_clause(
         &mut self,
         offset: i32,
+        selected_candidate_id: u64,
         request_id: u64,
     ) -> anyhow::Result<super::composition::ClauseAdvance> {
-        let mut request =
-            tonic::Request::new(shared::proto::AdvanceClauseRequest { offset, request_id });
+        let mut request = tonic::Request::new(shared::proto::AdvanceClauseRequest {
+            offset,
+            request_id,
+            selected_candidate_id,
+        });
         request.set_timeout(INPUT_RPC_DEADLINE);
         let response = Self::block_on_server_rpc(
             self.runtime.as_ref(),
@@ -1194,6 +1198,7 @@ impl IPCService {
     fn send_prepare_future_clauses(
         &mut self,
         initial_offset: i32,
+        initial_selected_candidate_id: u64,
         request_id: u64,
         leave_at_last: bool,
     ) -> anyhow::Result<(Vec<super::composition::ClauseAdvance>, bool)> {
@@ -1201,6 +1206,7 @@ impl IPCService {
             initial_offset,
             request_id,
             leave_at_last,
+            initial_selected_candidate_id,
         });
         request.set_timeout(INPUT_RPC_DEADLINE);
         let response = Self::block_on_server_rpc(
@@ -1310,11 +1316,13 @@ impl IPCService {
     fn send_update_composition_snapshot(
         &mut self,
         operation: ClauseSnapshotOperation,
+        selected_candidate_id: u64,
         request_id: u64,
     ) -> anyhow::Result<()> {
         let mut request = tonic::Request::new(shared::proto::UpdateCompositionSnapshotRequest {
             operation: operation.proto_value(),
             request_id,
+            selected_candidate_id,
         });
         request.set_timeout(INPUT_RPC_DEADLINE);
         let response = Self::block_on_server_rpc(
@@ -1924,6 +1932,7 @@ impl IPCService {
         &mut self,
         offset: i32,
         previous_candidates: &Candidates,
+        selected_candidate_id: u64,
     ) -> anyhow::Result<super::composition::ClauseAdvance> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
@@ -1934,7 +1943,8 @@ impl IPCService {
             Some(previous_candidates),
             None,
             |this| {
-                let advance = this.send_advance_clause(offset, request_id)?;
+                let advance =
+                    this.send_advance_clause(offset, selected_candidate_id, request_id)?;
                 let navigation = advance.navigation.clone();
                 completed_advance = Some(advance);
                 Ok(navigation)
@@ -1970,39 +1980,50 @@ impl IPCService {
         &mut self,
         initial_offset: i32,
         previous_candidates: &Candidates,
+        initial_selected_candidate_id: u64,
         leave_at_last: bool,
     ) -> anyhow::Result<(Vec<super::composition::ClauseAdvance>, bool)> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
         let result = if leave_at_last {
-            self.send_prepare_future_clauses(initial_offset, request_id, true)
-                .map_err(|error| {
-                    if Self::should_reconnect_rpc_error(&error) {
-                        Self::mark_server_recovery_required(
-                            &self.recovery,
-                            "prepare_future_clauses_to_last_failed",
-                        );
-                        preserve_recovery_error(error)
-                    } else {
-                        error
-                    }
-                })
-                .and_then(|prepared| {
-                    if self.take_server_reset_recovered() {
-                        Self::mark_server_recovery_required(
-                            &self.recovery,
-                            "prepare_future_clauses_to_last_session_change",
-                        );
-                        Err(preserve_recovery_error(anyhow::anyhow!(
-                            "prepare_future_clauses_to_last reached a different server session"
-                        )))
-                    } else {
-                        Ok(prepared)
-                    }
-                })
+            self.send_prepare_future_clauses(
+                initial_offset,
+                initial_selected_candidate_id,
+                request_id,
+                true,
+            )
+            .map_err(|error| {
+                if Self::should_reconnect_rpc_error(&error) {
+                    Self::mark_server_recovery_required(
+                        &self.recovery,
+                        "prepare_future_clauses_to_last_failed",
+                    );
+                    preserve_recovery_error(error)
+                } else {
+                    error
+                }
+            })
+            .and_then(|prepared| {
+                if self.take_server_reset_recovered() {
+                    Self::mark_server_recovery_required(
+                        &self.recovery,
+                        "prepare_future_clauses_to_last_session_change",
+                    );
+                    Err(preserve_recovery_error(anyhow::anyhow!(
+                        "prepare_future_clauses_to_last reached a different server session"
+                    )))
+                } else {
+                    Ok(prepared)
+                }
+            })
         } else {
             self.run_rpc_with_reconnect("prepare_future_clauses", |this| {
-                this.send_prepare_future_clauses(initial_offset, request_id, false)
+                this.send_prepare_future_clauses(
+                    initial_offset,
+                    initial_selected_candidate_id,
+                    request_id,
+                    false,
+                )
             })
             .map_err(|error| {
                 if Self::should_reconnect_rpc_error(&error) {
@@ -2170,10 +2191,12 @@ impl IPCService {
         &mut self,
         operation: ClauseSnapshotOperation,
         previous_candidates: &Candidates,
+        selected_candidate_id: u64,
     ) -> anyhow::Result<()> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let first_attempt = self.send_update_composition_snapshot(operation, request_id);
+        let first_attempt =
+            self.send_update_composition_snapshot(operation, selected_candidate_id, request_id);
         let result: anyhow::Result<NonIdempotentEditRecovery> =
             (|| match Self::classify_non_idempotent_edit_attempt(
                 "update_composition_snapshot",
@@ -2197,7 +2220,11 @@ impl IPCService {
                         None,
                         None,
                     ) {
-                        self.send_update_composition_snapshot(operation, request_id)?;
+                        self.send_update_composition_snapshot(
+                            operation,
+                            selected_candidate_id,
+                            request_id,
+                        )?;
                         Ok(NonIdempotentEditRecovery::RetriedAfterUnchangedRefresh)
                     } else {
                         Ok(NonIdempotentEditRecovery::RefreshedAfterReconnect)

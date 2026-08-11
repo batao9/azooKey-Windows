@@ -421,8 +421,9 @@ unsafe extern "C" {
         cursorOffsetPtr: *mut c_int,
     ) -> *mut c_char;
     fn ClearComposingTextSnapshots();
-    fn PushComposingTextSnapshot();
-    fn PopComposingTextSnapshot();
+    fn PushComposingTextSnapshot(selectedCandidateId: u64);
+    fn PopComposingTextSnapshot(selectedCandidateId: u64);
+    fn PinLearningCandidate(candidateId: u64) -> bool;
     fn ShrinkText(offset: c_int) -> *mut c_char;
     fn ClearText();
     fn Warmup() -> bool;
@@ -1488,9 +1489,9 @@ struct CompositionSnapshotRollback {
 }
 
 impl CompositionSnapshotRollback {
-    fn push() -> Self {
+    fn push(selected_candidate_id: u64) -> Self {
         unsafe {
-            PushComposingTextSnapshot();
+            PushComposingTextSnapshot(selected_candidate_id);
         }
         Self { armed: true }
     }
@@ -1504,7 +1505,7 @@ impl Drop for CompositionSnapshotRollback {
     fn drop(&mut self) {
         if self.armed {
             unsafe {
-                PopComposingTextSnapshot();
+                PopComposingTextSnapshot(0);
             }
         }
     }
@@ -1941,8 +1942,12 @@ impl AzookeyService for MyAzookeyService {
                     ));
                 }
                 CompositionSnapshotOperation::Clear => ClearComposingTextSnapshots(),
-                CompositionSnapshotOperation::Push => PushComposingTextSnapshot(),
-                CompositionSnapshotOperation::Pop => PopComposingTextSnapshot(),
+                CompositionSnapshotOperation::Push => {
+                    PushComposingTextSnapshot(request.selected_candidate_id)
+                }
+                CompositionSnapshotOperation::Pop => {
+                    PopComposingTextSnapshot(request.selected_candidate_id)
+                }
             }
         }
         performance_event_lazy!(
@@ -2056,7 +2061,7 @@ impl AzookeyService for MyAzookeyService {
         let handler_start = Instant::now();
         let raw_offset = validate_shrink_offset(request.offset)?;
 
-        let snapshot_rollback = CompositionSnapshotRollback::push();
+        let snapshot_rollback = CompositionSnapshotRollback::push(request.selected_candidate_id);
 
         let shrink_start = Instant::now();
         let shrunk_text =
@@ -2128,11 +2133,12 @@ impl AzookeyService for MyAzookeyService {
         let mut snapshot_count = 0usize;
         let mut last_signature = None;
         let mut completed = false;
+        let mut selected_candidate_id = request.initial_selected_candidate_id;
 
         let result = (|| -> Result<(), Box<Status>> {
             for _ in 0..shared::MAX_PREPARED_CLAUSE_ADVANCES {
                 unsafe {
-                    PushComposingTextSnapshot();
+                    PushComposingTextSnapshot(selected_candidate_id);
                 }
                 snapshot_count += 1;
 
@@ -2150,6 +2156,10 @@ impl AzookeyService for MyAzookeyService {
                 let Some(selected) = navigation_composed.suggestions.first() else {
                     break;
                 };
+                selected_candidate_id = selected.candidate_id;
+                unsafe {
+                    PinLearningCandidate(selected_candidate_id);
+                }
                 let is_last = selected.subtext.is_empty();
                 let signature = (
                     navigation_composed
@@ -2192,7 +2202,7 @@ impl AzookeyService for MyAzookeyService {
         );
         for _ in retained_snapshot_count..snapshot_count {
             unsafe {
-                PopComposingTextSnapshot();
+                PopComposingTextSnapshot(0);
             }
         }
         result.map_err(|status| *status)?;
@@ -2465,7 +2475,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     register_server_log_callbacks();
 
-    // プロセス優先度を HIGH_PRIORITY_CLASS に引き上げ（放置後のOSスケジューリング遅延を抑制）
+    // Keep IME RPC latency predictable when other applications saturate the CPU.
     unsafe {
         match SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS) {
             Ok(()) => log_event_lazy!(ServerLogLevel::Info, "process priority set to HIGH"),

@@ -150,7 +150,21 @@ fn setup_logger() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::contain_logger_initialization;
+    use std::cell::Cell;
+
+    use super::{contain_logger_initialization, diagnostic_log_lazy};
+
+    #[test]
+    fn disabled_diagnostic_log_does_not_build_message() {
+        let called = Cell::new(false);
+
+        diagnostic_log_lazy(|| {
+            called.set(true);
+            "candidate and snapshot details".to_owned()
+        });
+
+        assert!(!called.get());
+    }
 
     #[test]
     fn logger_initialization_error_is_contained() {

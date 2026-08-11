@@ -23,14 +23,6 @@
 
 # 設定
 
-## 設定ファイルの互換性とダウングレード
-
-設定は `%APPDATA%\Azookey\settings.json` に保存され、`version` を Semantic Versioning として比較します。現在のアプリより古い version の設定だけを migration します。
-
-新しい version の設定ファイルを古いアプリで検出した場合、未知の設定項目を失わないように元ファイルを変更せず、既定値で起動します。この状態では設定画面に通知を表示し、古いアプリからの設定保存を拒否します。新しいアプリを試した後にダウングレードした場合は、設定を変更せずに新しいアプリへ戻してください。古いアプリ用の設定を作り直す場合は、先に `settings.json` を手動でバックアップしてから削除し、古いアプリを起動します。
-
-JSON または `version` が不正な設定は破損設定として扱い、元ファイルを `settings.json.broken-*` に退避してから既定値を生成します。
-
 ## 全般設定
 
 ### 基本設定
@@ -43,19 +35,9 @@ JSON または `version` が不正な設定は破損設定として扱い、元�
 ### キー設定
 - ローマ字テーブル:
   - 設定画面から Google IME 型の行テーブル（入力 / 出力 / 次の入力）を編集できます。
-  - `次の入力` により、`tt -> っ + t` のような継続入力ルールを設定できます。
-  - モーダルの「テーブルを初期化」はドラフトのみ更新し、`保存` で初めて反映されます。
 
 ### 半角全角設定
 日本語入力時の文字幅はカテゴリごとに `半角 / 全角` を設定できます。
-
-### 変換の優先順位
-記号・句読点の変換は次の優先順位で適用されます。
-
-1. ローマ字テーブル（Google IME 型、`next_input` 対応）
-2. 基本設定（句読点 / 記号）と半角全角設定（カテゴリ設定）のフォールバック
-
-`z/` のような複合入力はローマ字テーブルを優先し、テーブル文脈に当たらない単体記号入力のみフォールバック設定を適用します。
 
 ### 句読点確定
 基本設定の「句読点確定」を有効にすると、変換中に対象記号を入力した時点で現在の変換結果を確定し、続けて対象記号を入力します。対象は句読点、`！`、`？` から個別に選択できます。
@@ -71,9 +53,6 @@ JSON または `version` が不正な設定は破損設定として扱い、元�
 - `半角/全角`: 入力モード切り替え（英数/ひらがな）
 - `VK_IME_ON` (`0x16`): ひらがな入力へ切替
 - `VK_IME_OFF` (`0x1A`): 英数入力へ切替
-- 言語バーの `あ/A` アイコン:
-  - 左クリックで入力モードを切り替えます。
-  - 右クリックで設定画面を開けます。
 
 英語キーボードでは以下のショートカットも設定可能です。
 - `Ctrl + Space`: 入力モード切替（英数/ひらがなかな）
@@ -136,8 +115,6 @@ cargo make build [--debug/--release]
 `--debug`オプションを付けるとデバッグビルド、`--release`オプションを付けるとリリースビルドになります。必ずどちらかを指定してください。
 
 `build`フォルダーが作成され、ビルドされた実行ファイルが格納されます。
-
-通常の branch、PR、`master`、VM、ローカル build で作る installer は検証版として、直近の release を基準に `0.1.0-batao.11.dev.<build-number>.g<short-sha>` のような一意の版数を自動生成します。直近の release が stable 版なら、次 patch の prerelease（例: `1.0.1-dev.<build-number>.g<short-sha>`）を使います。正式版は `app-version.json` と一致する `v<version>` tag の CI だけが build channel を明示して生成します。実際の build channel、commit、installer generation は `build/build-info.json` に出力され、installer にも同梱されます。正式リリース版数を変更するときは `app-version.json` を編集後、`node scripts/sync-version.mjs --sync-release` で追従ファイルを同期します。
 
 配布用インストーラーは Inno Setup で作成する `build/azookey-setup.exe` の 1 種類です。Tauri は設定アプリ `frontend.exe` のビルドにのみ使用し、Tauri/NSIS インストーラーは生成・同梱しません。`frontend.exe` を含むアプリ本体、IME DLL、サーバー、UI、ランチャー、辞書、Zenzai model、llama backend は Inno installer が `{autopf}\Azookey`（通常は `C:\Program Files\Azookey`）に配置します。設定・学習・ログ・`EngineRuntime` は `%APPDATA%\Azookey`、候補 UI の WebView2 data は `%LOCALAPPDATA%\Azookey\ui-webview` に保存します。
 

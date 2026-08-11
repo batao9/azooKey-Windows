@@ -1545,6 +1545,7 @@ impl ClauseActionBackend for ScenarioBackend {
         &mut self,
         operation: ClauseSnapshotOperation,
         _previous_candidates: &Candidates,
+        _selected_candidate_id: u64,
     ) -> anyhow::Result<()> {
         match operation {
             ClauseSnapshotOperation::Clear => {

@@ -45,8 +45,16 @@ let zenzaiWarmupRomanInput = "nihongo"
 let warmupRequestCandidatesWarningMs = 5_000
 // Request exact-clause supplements only when boundary-matched candidates are sparse.
 let cursorPrefixExactClauseSupplementCandidateThreshold = 5
+// Bound bulk candidate generations while retaining the current clause plus at
+// most 16 prepared future clauses with more than 2x slot headroom at the
+// observed high-water mark of 201 candidates per generation. Past clauses can
+// outlive this ring, so their one selected candidate is pinned separately until
+// the composition is cleared.
+let maxLearningCandidateCacheBatchCount = 64
+let maxLearningCandidateCacheSlotCount = 8_192
 let maxLearningSelectionOverrideCount = 4_096
 let learningSelectionOverridesFilename = "selection-overrides.json"
+let backgroundWarmupPreloadsDictionary = false
 
 @MainActor var currentRequestId: UInt64 = 0
 
@@ -511,19 +519,29 @@ struct LearningCandidateCache {
     private struct Batch {
         let firstId: UInt64
         let candidates: [Candidate]
+        var consumedOffsets: Set<Int> = []
+        var isProtected = false
     }
 
-    private var batches: [Batch] = []
+    private let maxBatchCount: Int
+    private let maxSlotCount: Int
+    private var batches: [Batch?]
+    private var firstBatchIndex = 0
     private var nextCandidateId: UInt64 = 1
     private var idSpaceExhausted = false
-    private var consumedCandidateIds: Set<UInt64> = []
+    private(set) var slotCount = 0
+    private(set) var batchCount = 0
+    private(set) var protectedSlotCount = 0
 
-    var slotCount: Int {
-        batches.reduce(into: 0) { $0 += $1.candidates.count }
-    }
-
-    var batchCount: Int {
-        batches.count
+    init(
+        maxBatchCount: Int = maxLearningCandidateCacheBatchCount,
+        maxSlotCount: Int = maxLearningCandidateCacheSlotCount
+    ) {
+        precondition(maxBatchCount > 0)
+        precondition(maxSlotCount > 0)
+        self.maxBatchCount = maxBatchCount
+        self.maxSlotCount = maxSlotCount
+        self.batches = Array(repeating: nil, count: maxBatchCount)
     }
 
     mutating func appendBatch(_ candidates: [Candidate]) -> UInt64? {
@@ -531,22 +549,46 @@ struct LearningCandidateCache {
             return nil
         }
 
-        let candidateCount = UInt64(candidates.count)
+        let availableBatchSlotCount = maxSlotCount - protectedSlotCount
+        guard availableBatchSlotCount > 0 else {
+            return nil
+        }
+        let retainedCandidates = if candidates.count > availableBatchSlotCount {
+            Array(candidates.prefix(availableBatchSlotCount))
+        } else {
+            candidates
+        }
+        let candidateCount = UInt64(retainedCandidates.count)
         let (nextId, overflow) = nextCandidateId.addingReportingOverflow(candidateCount)
         if overflow {
             idSpaceExhausted = true
             return nil
         }
 
+        while batchCount == maxBatchCount
+            || slotCount > maxSlotCount - retainedCandidates.count
+        {
+            guard evictOldestUnprotectedBatch() else {
+                return nil
+            }
+        }
+
         let firstId = nextCandidateId
-        batches.append(Batch(firstId: firstId, candidates: candidates))
+        let insertionIndex = physicalIndex(forLogicalIndex: batchCount)
+        batches[insertionIndex] = Batch(
+            firstId: firstId,
+            candidates: retainedCandidates
+        )
+        batchCount += 1
+        slotCount += retainedCandidates.count
         nextCandidateId = nextId
         return firstId
     }
 
     func candidateId(at index: Int, batchFirstId: UInt64) -> UInt64 {
         guard index >= 0,
-              let batch = batches.last,
+              batchCount > 0,
+              let batch = batches[physicalIndex(forLogicalIndex: batchCount - 1)],
               batch.firstId == batchFirstId,
               index < batch.candidates.count else {
             return 0
@@ -555,17 +597,75 @@ struct LearningCandidateCache {
         return batchFirstId + UInt64(index)
     }
 
+    mutating func pin(_ candidateId: UInt64) -> Bool {
+        guard candidateId > 0 else {
+            return false
+        }
+        guard let location = candidateLocation(for: candidateId),
+              !batches[location.batchIndex]!.consumedOffsets.contains(location.candidateIndex)
+        else {
+            return false
+        }
+        if batches[location.batchIndex]!.isProtected {
+            return true
+        }
+
+        // A client snapshot can later select any candidate from this batch.
+        // Protect the complete batch so every issued nonzero ID stays valid.
+        let candidateCount = batches[location.batchIndex]!.candidates.count
+        batches[location.batchIndex]!.isProtected = true
+        protectedSlotCount += candidateCount
+        return true
+    }
+
     mutating func consume(_ candidateId: UInt64) -> Candidate? {
-        guard candidateId > 0,
-              consumedCandidateIds.insert(candidateId).inserted else {
+        guard candidateId > 0 else {
+            return nil
+        }
+        guard let location = candidateLocation(for: candidateId) else {
+            return nil
+        }
+        guard batches[location.batchIndex]!.consumedOffsets
+            .insert(location.candidateIndex).inserted else {
             return nil
         }
 
+        return batches[location.batchIndex]!.candidates[location.candidateIndex]
+    }
+
+    mutating func removeAll() {
+        for index in batches.indices {
+            batches[index] = nil
+        }
+        firstBatchIndex = 0
+        batchCount = 0
+        slotCount = 0
+        protectedSlotCount = 0
+    }
+
+    mutating func removeAllPins() {
+        guard protectedSlotCount > 0 else {
+            return
+        }
+        for logicalIndex in 0..<batchCount {
+            batches[physicalIndex(forLogicalIndex: logicalIndex)]!.isProtected = false
+        }
+        protectedSlotCount = 0
+    }
+
+    private func physicalIndex(forLogicalIndex logicalIndex: Int) -> Int {
+        (firstBatchIndex + logicalIndex) % maxBatchCount
+    }
+
+    private func candidateLocation(
+        for candidateId: UInt64
+    ) -> (batchIndex: Int, candidateIndex: Int)? {
         var lowerBound = 0
-        var upperBound = batches.count
+        var upperBound = batchCount
         while lowerBound < upperBound {
             let middle = lowerBound + (upperBound - lowerBound) / 2
-            if batches[middle].firstId <= candidateId {
+            let batch = batches[physicalIndex(forLogicalIndex: middle)]!
+            if batch.firstId <= candidateId {
                 lowerBound = middle + 1
             } else {
                 upperBound = middle
@@ -573,22 +673,49 @@ struct LearningCandidateCache {
         }
 
         guard lowerBound > 0 else {
-            consumedCandidateIds.remove(candidateId)
             return nil
         }
-        let batch = batches[lowerBound - 1]
+        let batchIndex = physicalIndex(forLogicalIndex: lowerBound - 1)
+        let batch = batches[batchIndex]!
         let offset = candidateId - batch.firstId
         guard offset < UInt64(batch.candidates.count) else {
-            consumedCandidateIds.remove(candidateId)
             return nil
         }
-
-        return batch.candidates[Int(offset)]
+        return (batchIndex, Int(offset))
     }
 
-    mutating func removeAll() {
-        batches.removeAll(keepingCapacity: false)
-        consumedCandidateIds.removeAll(keepingCapacity: true)
+    private mutating func evictOldestUnprotectedBatch() -> Bool {
+        guard batchCount > 0 else {
+            return false
+        }
+
+        var victimLogicalIndex: Int?
+        for logicalIndex in 0..<batchCount {
+            let batchIndex = physicalIndex(forLogicalIndex: logicalIndex)
+            if !batches[batchIndex]!.isProtected {
+                victimLogicalIndex = logicalIndex
+                break
+            }
+        }
+        guard let victimLogicalIndex else {
+            return false
+        }
+
+        let victimBatchIndex = physicalIndex(forLogicalIndex: victimLogicalIndex)
+        slotCount -= batches[victimBatchIndex]!.candidates.count
+        if victimLogicalIndex == 0 {
+            batches[victimBatchIndex] = nil
+            firstBatchIndex = (firstBatchIndex + 1) % maxBatchCount
+        } else {
+            for logicalIndex in victimLogicalIndex..<(batchCount - 1) {
+                let destination = physicalIndex(forLogicalIndex: logicalIndex)
+                let source = physicalIndex(forLogicalIndex: logicalIndex + 1)
+                batches[destination] = batches[source]
+            }
+            batches[physicalIndex(forLogicalIndex: batchCount - 1)] = nil
+        }
+        batchCount -= 1
+        return true
     }
 }
 
@@ -614,6 +741,22 @@ struct LearningCandidateCache {
 
 @MainActor func consumeLearningCandidate(_ candidateId: UInt64) -> Candidate? {
     learningCandidateCache.consume(candidateId)
+}
+
+@_silgen_name("PinLearningCandidate")
+@MainActor public func pin_learning_candidate(candidateId: UInt64) -> Bool {
+    learningCandidateCache.pin(candidateId)
+}
+
+// Client-side future snapshots do not have matching server composition
+// snapshots. The first subsequent composition edit invalidates those futures,
+// so release their selected candidates without adding another IPC round trip.
+@MainActor func discardPinnedLearningCandidatesBeforeCompositionEdit() {
+    guard composingTextSnapshots.isEmpty,
+          learningCandidateCache.protectedSlotCount > 0 else {
+        return
+    }
+    learningCandidateCache.removeAllPins()
 }
 
 private func normalizedLearningRuby(_ ruby: String) -> String {
@@ -1609,6 +1752,9 @@ private struct WarmupExecutionSnapshot: Sendable {
     let context: String
     let input: String
     let useZenzai: Bool
+    let learningCacheBatchCount: Int
+    let learningCacheSlotCount: Int
+    let learningCacheProtectedSlotCount: Int
     let diagnosticDetails: String
 }
 
@@ -1677,6 +1823,14 @@ private final class BackgroundWarmupRunner: @unchecked Sendable {
             dictionaryURL: snapshot.dictionaryURL,
             preloadDictionary: snapshot.preloadDictionary
         )
+        let reusedConverter = converterKey == key && converter != nil
+        performanceLog(
+            requestId: snapshot.requestId,
+            operation: "warmup_resources",
+            stage: "before_request_candidates",
+            elapsedMs: 0,
+            details: "foreground_converter_count=2;background_converter_count=\(converter == nil ? 0 : 1);background_converter_reused=\(reusedConverter);background_preload_dictionary=\(snapshot.preloadDictionary);background_use_zenzai=\(snapshot.useZenzai);learning_cache_batches=\(snapshot.learningCacheBatchCount);learning_cache_slots=\(snapshot.learningCacheSlotCount);learning_cache_protected_slots=\(snapshot.learningCacheProtectedSlotCount)"
+        )
         if converterKey != key || converter == nil {
             converter = KanaKanjiConverter(
                 dictionaryURL: snapshot.dictionaryURL,
@@ -1704,7 +1858,7 @@ private final class BackgroundWarmupRunner: @unchecked Sendable {
             operation: "warmup",
             stage: "request_candidates",
             elapsedMs: requestMs,
-            details: "candidate_count=\(converted.mainResults.count);\(snapshot.diagnosticDetails)"
+            details: "candidate_count=\(converted.mainResults.count);foreground_converter_count=2;background_converter_count=1;background_converter_reused=\(reusedConverter);learning_cache_batches=\(snapshot.learningCacheBatchCount);learning_cache_slots=\(snapshot.learningCacheSlotCount);learning_cache_protected_slots=\(snapshot.learningCacheProtectedSlotCount);\(snapshot.diagnosticDetails)"
         )
         crashTrace(
             requestId: snapshot.requestId,
@@ -1764,7 +1918,7 @@ private let backgroundWarmupRunner = BackgroundWarmupRunner()
     return WarmupExecutionSnapshot(
         requestId: currentRequestId,
         dictionaryURL: converterDictionaryURL,
-        preloadDictionary: converterPreloadDictionary,
+        preloadDictionary: backgroundWarmupPreloadsDictionary,
         runtimeDirectoryURL: converterRuntimeDirectoryURL(),
         emojiDictionaryURL: execURL
             .appendingPathComponent("EmojiDictionary")
@@ -1774,6 +1928,9 @@ private let backgroundWarmupRunner = BackgroundWarmupRunner()
         context: contextString,
         input: input,
         useZenzai: useZenzai,
+        learningCacheBatchCount: learningCandidateCache.batchCount,
+        learningCacheSlotCount: learningCandidateCache.slotCount,
+        learningCacheProtectedSlotCount: learningCandidateCache.protectedSlotCount,
         diagnosticDetails: diagnosticDetails
     )
 }
@@ -2033,6 +2190,7 @@ func cursorPrefixBoundaryFirstClauseResults(
         }
         composingText = ComposingText()
         composingTextSnapshots.removeAll()
+        clearLearningCandidateCache()
     }
     if previousLearningType != currentLearningType
         || previousLearningMemoryDirectoryURL != currentLearningMemoryDirectoryURL
@@ -2132,6 +2290,7 @@ func cursorPrefixBoundaryFirstClauseResults(
     input: UnsafePointer<CChar>,
     cursorPtr: UnsafeMutablePointer<CInt>
 ) -> UnsafeMutablePointer<CChar> {
+    discardPinnedLearningCandidatesBeforeCompositionEdit()
     let inputString = String(cString: input)
     serverLog("DEBUG", "AppendText: start inputLength=\(inputString.count) inputStyle=\(String(describing: currentInputStyle))")
     composingText.insertAtCursorPosition(inputString, inputStyle: currentInputStyle)
@@ -2149,6 +2308,7 @@ func cursorPrefixBoundaryFirstClauseResults(
     input: UnsafePointer<CChar>,
     cursorPtr: UnsafeMutablePointer<CInt>
 ) -> UnsafeMutablePointer<CChar> {
+    discardPinnedLearningCandidatesBeforeCompositionEdit()
     let inputString = String(cString: input)
     serverLog("DEBUG", "AppendTextDirect: start inputLength=\(inputString.count)")
     composingText.insertAtCursorPosition(inputString, inputStyle: .direct)
@@ -2165,6 +2325,7 @@ func cursorPrefixBoundaryFirstClauseResults(
 @MainActor public func remove_text(
     cursorPtr: UnsafeMutablePointer<CInt>
 ) -> UnsafeMutablePointer<CChar> {
+    discardPinnedLearningCandidatesBeforeCompositionEdit()
     serverLog("DEBUG", "RemoveText: start")
     composingText.deleteBackwardFromCursorPosition(count: 1)
 
@@ -2354,20 +2515,33 @@ func cursorPrefixBoundaryFirstClauseResults(
 @_silgen_name("ClearComposingTextSnapshots")
 @MainActor public func clear_composing_text_snapshots() {
     composingTextSnapshots.removeAll()
+    learningCandidateCache.removeAllPins()
     serverLog("DEBUG", "ClearComposingTextSnapshots: completed")
 }
 
 @_silgen_name("PushComposingTextSnapshot")
-@MainActor public func push_composing_text_snapshot() {
+@MainActor public func push_composing_text_snapshot(selectedCandidateId: UInt64) {
+    if selectedCandidateId != 0 && !pin_learning_candidate(candidateId: selectedCandidateId) {
+        serverLog(
+            "DEBUG",
+            "PushComposingTextSnapshot: learning candidate unavailable id=\(selectedCandidateId)"
+        )
+    }
     composingTextSnapshots.append(composingText)
     serverLog(
         "DEBUG",
-        "PushComposingTextSnapshot: completed count=\(composingTextSnapshots.count)"
+        "PushComposingTextSnapshot: completed count=\(composingTextSnapshots.count) protectedLearningCandidateSlots=\(learningCandidateCache.protectedSlotCount)"
     )
 }
 
 @_silgen_name("PopComposingTextSnapshot")
-@MainActor public func pop_composing_text_snapshot() {
+@MainActor public func pop_composing_text_snapshot(selectedCandidateId: UInt64) {
+    if selectedCandidateId != 0 && !pin_learning_candidate(candidateId: selectedCandidateId) {
+        serverLog(
+            "DEBUG",
+            "PopComposingTextSnapshot: learning candidate unavailable id=\(selectedCandidateId)"
+        )
+    }
     if let restored = composingTextSnapshots.popLast() {
         composingText = restored
     }
@@ -2740,7 +2914,7 @@ public func free_candidate_list(
             operation: "get_composed_text",
             stage: "build_ffi_candidates_total",
             elapsedMs: elapsedPerformanceMilliseconds(since: buildStart),
-            details: "candidate_count=\(result.count);main_candidate_count=\(mainResults.count);zenzai_candidate_count=\(converted.mainResults.count);normal_nbest_candidate_count=\(normalNBestConverted?.mainResults.count ?? 0);cache_entries=\(resolutionCache.count);string_allocations=\(stringAllocationCount);\(diagnosticDetails)"
+            details: "candidate_count=\(result.count);main_candidate_count=\(mainResults.count);zenzai_candidate_count=\(converted.mainResults.count);normal_nbest_candidate_count=\(normalNBestConverted?.mainResults.count ?? 0);cache_entries=\(resolutionCache.count);string_allocations=\(stringAllocationCount);learning_cache_batches=\(learningCandidateCache.batchCount);learning_cache_slots=\(learningCandidateCache.slotCount);learning_cache_protected_slots=\(learningCandidateCache.protectedSlotCount);\(diagnosticDetails)"
         )
     }
     candidateCrashTrace(
@@ -3071,7 +3245,7 @@ public func free_candidate_list(
             operation: "get_composed_text_for_cursor_prefix",
             stage: "build_ffi_candidates_total",
             elapsedMs: elapsedPerformanceMilliseconds(since: buildStart),
-            details: "candidate_count=\(result.count);first_clause_candidate_count=\(cursorPrefixFirstClauseResults.count);main_candidate_count=\(cursorPrefixMainResults.count);zenzai_first_clause_candidate_count=\(converted.firstClauseResults.count);zenzai_main_candidate_count=\(converted.mainResults.count);normal_nbest_first_clause_candidate_count=\(normalNBestConverted?.firstClauseResults.count ?? 0);normal_nbest_main_candidate_count=\(normalNBestConverted?.mainResults.count ?? 0);exact_clause_candidate_count=\(exactClauseResults.count);cache_entries=\(cursorPrefixResolutionCache.count);string_allocations=\(stringAllocationCount);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
+            details: "candidate_count=\(result.count);first_clause_candidate_count=\(cursorPrefixFirstClauseResults.count);main_candidate_count=\(cursorPrefixMainResults.count);zenzai_first_clause_candidate_count=\(converted.firstClauseResults.count);zenzai_main_candidate_count=\(converted.mainResults.count);normal_nbest_first_clause_candidate_count=\(normalNBestConverted?.firstClauseResults.count ?? 0);normal_nbest_main_candidate_count=\(normalNBestConverted?.mainResults.count ?? 0);exact_clause_candidate_count=\(exactClauseResults.count);cache_entries=\(cursorPrefixResolutionCache.count);string_allocations=\(stringAllocationCount);learning_cache_batches=\(learningCandidateCache.batchCount);learning_cache_slots=\(learningCandidateCache.slotCount);learning_cache_protected_slots=\(learningCandidateCache.protectedSlotCount);suffix_len=\(suffixAfterCursor.count);\(diagnosticDetails)"
         )
     }
     candidateCrashTrace(
@@ -3091,6 +3265,7 @@ public func free_candidate_list(
 @MainActor public func shrink_text(
     offset: Int32
 ) -> UnsafeMutablePointer<CChar>  {
+    discardPinnedLearningCandidatesBeforeCompositionEdit()
     serverLog("DEBUG", "ShrinkText: start offset=\(offset)")
     var afterComposingText = composingText
     let boundedOffset = min(max(Int(offset), 0), afterComposingText.input.count)
