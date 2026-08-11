@@ -1,5 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 
 const {
     MAX_RENDERED_ITEM_COUNT,
@@ -92,4 +94,36 @@ test("selection scrolling keeps visible rows and reveals hidden pages", () => {
     assert.equal(isSelectionFullyVisible(11, 5 * 32, 30, 32), false);
     assert.equal(selectionPageScrollTop(11, 30, 32), 10 * 32);
     assert.equal(selectionPageScrollTop(29, 30, 32), 25 * 32);
+});
+
+test("candidate spacing declarations use explicit CSS length units", () => {
+    const source = fs.readFileSync(
+        path.join(__dirname, "../src/candidate.rs"),
+        "utf8"
+    );
+    const style = source.match(/<style>([\s\S]*?)<\/style>/)?.[1];
+
+    assert.ok(style, "candidate HTML must contain a style element");
+    for (const line of style.split(/\r?\n/)) {
+        const declaration = line.trim().match(
+            /^(margin(?:-[a-z]+)?|padding(?:-[a-z]+)?):\s*(.*?)\s*;$/
+        );
+        if (!declaration) {
+            continue;
+        }
+
+        for (const component of declaration[2].split(/\s+/)) {
+            if (Number(component) === 0) {
+                continue;
+            }
+            assert.match(
+                component,
+                /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)[a-zA-Z%]+$/,
+                `non-zero CSS length must include a unit: ${component}`
+            );
+        }
+    }
+
+    assert.match(style, /&::before\s*\{[^}]*margin:\s*0 0\.75rem 0 2px;/);
+    assert.match(style, /footer\s*\{[^}]*padding:\s*8px 10px 5px 10px;/);
 });
