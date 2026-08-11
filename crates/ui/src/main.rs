@@ -932,8 +932,10 @@ mod tests {
 
     #[test]
     fn candidate_window_resize_preserves_physical_width_at_high_dpi() {
+        assert_eq!(logical_width_for_physical_width(300, 1.0), 300.0);
         assert_eq!(logical_width_for_physical_width(300, 1.25), 240.0);
         assert_eq!(logical_width_for_physical_width(300, 1.5), 200.0);
+        assert_eq!(logical_width_for_physical_width(300, 2.0), 150.0);
     }
 
     #[test]

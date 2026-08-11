@@ -44,8 +44,8 @@ pub fn create_candidate_window(event_loop: &EventLoop<UserEvent>) -> Result<Wind
     Ok(window)
 }
 
-pub fn create_candidate_webview<'a>(web_context: &'a mut WebContext) -> Result<WebViewBuilder<'a>> {
-    let html = r##"
+fn candidate_html() -> String {
+    r##"
         <html>
             <head>
                 <style>
@@ -103,7 +103,7 @@ pub fn create_candidate_webview<'a>(web_context: &'a mut WebContext) -> Result<W
                             color: #636363;
                             font-weight: bold;
                             font-size: 0.75rem;
-                            margin: 0 0.75rem 0 2;
+                            margin: 0 0.75rem 0 2px;
                             width: 0.75rem;
                         }
 
@@ -135,7 +135,7 @@ pub fn create_candidate_webview<'a>(web_context: &'a mut WebContext) -> Result<W
                         display: flex;
                         justify-content: space-between;
                         align-items: center;
-                        padding: 8 10 5 10;
+                        padding: 8px 10px 5px 10px;
                         border-top: 1px solid #E4E4E4;
                         font-size: 0.8rem;
                         user-select: none;
@@ -431,11 +431,77 @@ pub fn create_candidate_webview<'a>(web_context: &'a mut WebContext) -> Result<W
                 </main>
             </body>
         </html>"##
-        .replace("__CANDIDATE_SCROLLER_SCRIPT__", CANDIDATE_SCROLLER_SCRIPT);
+        .replace("__CANDIDATE_SCROLLER_SCRIPT__", CANDIDATE_SCROLLER_SCRIPT)
+}
+
+pub fn create_candidate_webview<'a>(web_context: &'a mut WebContext) -> Result<WebViewBuilder<'a>> {
+    let html = candidate_html();
 
     let webview_builder = WebViewBuilder::with_web_context(web_context)
         .with_transparent(true)
         .with_html(html);
 
     Ok(webview_builder)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::candidate_html;
+
+    fn style_contents(html: &str) -> &str {
+        html.split_once("<style>")
+            .and_then(|(_, rest)| rest.split_once("</style>"))
+            .map(|(style, _)| style)
+            .expect("candidate HTML must contain a style element")
+    }
+
+    fn assert_nonzero_lengths_have_units(value: &str) {
+        for component in value.split_ascii_whitespace() {
+            if let Ok(number) = component.parse::<f64>() {
+                if number == 0.0 {
+                    continue;
+                }
+            }
+
+            let unit_start = component
+                .find(|character: char| {
+                    !character.is_ascii_digit()
+                        && character != '.'
+                        && character != '-'
+                        && character != '+'
+                })
+                .unwrap_or(component.len());
+            let (number, unit) = component.split_at(unit_start);
+
+            assert!(
+                number.parse::<f64>().is_ok() && !unit.is_empty(),
+                "non-zero CSS length must include a unit: {component}"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_spacing_lengths_have_explicit_units() {
+        let html = candidate_html();
+        let style = style_contents(&html);
+
+        for declaration in style.lines().map(str::trim) {
+            let Some((property, value)) = declaration
+                .strip_suffix(';')
+                .and_then(|declaration| declaration.split_once(':'))
+            else {
+                continue;
+            };
+            if property == "margin"
+                || property == "padding"
+                || property.starts_with("margin-")
+                || property.starts_with("padding-")
+            {
+                assert_nonzero_lengths_have_units(value.trim());
+            }
+        }
+
+        assert!(style.contains("margin: 0 0.75rem 0 2px;"));
+        assert!(style.contains("padding: 8px 10px 5px 10px;"));
+    }
 }
