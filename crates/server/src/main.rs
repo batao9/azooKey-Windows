@@ -13,8 +13,8 @@ use shared::proto::{
     MoveCursorRequest, MoveCursorResponse, PerformanceLogRequest, PerformanceLogResponse,
     PrepareFutureClausesRequest, PrepareFutureClausesResponse, PreparedClauseAdvance,
     RemoveTextRequest, RemoveTextResponse, ReplaceCompositionRequest, ReplaceCompositionResponse,
-    ShrinkTextRequest, ShrinkTextResponse, Suggestion, UpdateCompositionSnapshotRequest,
-    UpdateCompositionSnapshotResponse,
+    ShrinkTextRequest, ShrinkTextResponse, StartReconversionRequest, StartReconversionResponse,
+    Suggestion, UpdateCompositionSnapshotRequest, UpdateCompositionSnapshotResponse,
 };
 use shared::{AppConfig, SERVER_PIPE_PATH};
 
@@ -47,6 +47,9 @@ const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 const LOG_FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const WARMUP_INTERVAL_SECS: u64 = 30;
 const WARMUP_RECENT_INPUT_SKIP_MS: u64 = 2_000;
+const MAX_RECONVERSION_SURFACE_COUNT: usize = 128;
+const MAX_RECONVERSION_READINGS: usize = 4;
+const MAX_RECONVERSION_SUGGESTIONS: usize = 100;
 
 static SERVER_LOG_WORKER: OnceLock<ServerLogWorker> = OnceLock::new();
 static SERVER_LOG_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -428,7 +431,9 @@ unsafe extern "C" {
     fn ClearText();
     fn Warmup() -> bool;
     fn HasActiveComposition() -> bool;
+    fn InferReconversionReadings(surface: *const c_char) -> *mut c_char;
     fn GetComposedText(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
+    fn GetComposedTextForReconversion(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
     fn GetComposedTextForCursorPrefix(
         requiredInputCount: c_int,
         lengthPtr: *mut c_int,
@@ -1136,6 +1141,64 @@ fn validate_shrink_offset(offset: i32) -> Result<i32, Status> {
     }
 }
 
+#[allow(clippy::result_large_err)]
+fn validate_reconversion_surface(surface: &str) -> Result<usize, Status> {
+    let surface_count = surface.chars().count();
+    if surface_count == 0 || surface_count > MAX_RECONVERSION_SURFACE_COUNT {
+        Err(Status::invalid_argument(
+            "reconversion surface must contain between 1 and 128 characters",
+        ))
+    } else {
+        Ok(surface_count)
+    }
+}
+
+fn reconversion_surface_rank(suggestions: &[Suggestion], surface: &str) -> Option<usize> {
+    suggestions
+        .iter()
+        .position(|suggestion| suggestion.text == surface)
+}
+
+fn merge_reconversion_suggestions(
+    surface: &str,
+    hiragana: &str,
+    suggestion_groups: &[Vec<Suggestion>],
+) -> Vec<Suggestion> {
+    let corresponding_count = i32::try_from(hiragana.chars().count()).unwrap_or(i32::MAX);
+    let mut merged = Vec::with_capacity(MAX_RECONVERSION_SUGGESTIONS);
+    let mut seen_texts = HashSet::with_capacity(MAX_RECONVERSION_SUGGESTIONS);
+    seen_texts.insert(surface.to_string());
+    merged.push(Suggestion {
+        text: surface.to_string(),
+        subtext: String::new(),
+        corresponding_count,
+        candidate_id: 0,
+    });
+
+    let max_group_len = suggestion_groups.iter().map(Vec::len).max().unwrap_or(0);
+    'rank: for rank in 0..max_group_len {
+        for group in suggestion_groups {
+            let Some(suggestion) = group.get(rank) else {
+                continue;
+            };
+            if !seen_texts.insert(suggestion.text.clone()) {
+                continue;
+            }
+            let mut suggestion = suggestion.clone();
+            suggestion.corresponding_count = corresponding_count;
+            // Candidate identifiers are scoped to the converter's current state. Candidate
+            // groups from alternate readings are no longer valid for learning after the
+            // chosen reading is restored, so reconversion candidates are deliberately neutral.
+            suggestion.candidate_id = 0;
+            merged.push(suggestion);
+            if merged.len() == MAX_RECONVERSION_SUGGESTIONS {
+                break 'rank;
+            }
+        }
+    }
+    merged
+}
+
 #[inline]
 fn retained_prepared_snapshot_count(
     request_succeeded: bool,
@@ -1180,6 +1243,25 @@ fn add_text_direct(input: &str) -> Result<RawComposingText, String> {
 
         Ok(RawComposingText { text, cursor })
     }
+}
+
+fn infer_reconversion_readings(surface: &str) -> Result<Vec<String>, String> {
+    let surface = cstring_from_input("InferReconversionReadings.surface", surface)?;
+    let result = unsafe { InferReconversionReadings(surface.as_ptr()) };
+    if result.is_null() {
+        return Ok(Vec::new());
+    }
+    let result = unsafe { OwnedFfiString::from_raw("InferReconversionReadings", result)? };
+    decode_reconversion_readings(&result.to_string_lossy())
+}
+
+fn decode_reconversion_readings(encoded: &str) -> Result<Vec<String>, String> {
+    let readings: Vec<String> = serde_json::from_str(encoded)
+        .map_err(|error| format!("InferReconversionReadings returned invalid JSON: {error}"))?;
+    if readings.iter().any(String::is_empty) {
+        return Err("InferReconversionReadings returned an empty reading".to_string());
+    }
+    Ok(readings)
 }
 
 fn move_cursor(offset: i32) -> Result<RawComposingText, String> {
@@ -1346,15 +1428,37 @@ fn get_composed_text(
     required_cursor_prefix_input_count: Option<i32>,
     request_id: u64,
 ) -> Result<ComposedText, String> {
+    get_composed_text_from_ffi(
+        use_cursor_prefix,
+        required_cursor_prefix_input_count,
+        false,
+        request_id,
+    )
+}
+
+fn get_reconversion_composed_text(request_id: u64) -> Result<ComposedText, String> {
+    get_composed_text_from_ffi(false, None, true, request_id)
+}
+
+fn get_composed_text_from_ffi(
+    use_cursor_prefix: bool,
+    required_cursor_prefix_input_count: Option<i32>,
+    reconversion: bool,
+    request_id: u64,
+) -> Result<ComposedText, String> {
     let mut length: c_int = 0;
-    let operation = if use_cursor_prefix {
+    let operation = if reconversion {
+        "get_composed_text_for_reconversion"
+    } else if use_cursor_prefix {
         "get_composed_text_for_cursor_prefix"
     } else {
         "get_composed_text"
     };
     let ffi_call_start = Instant::now();
     let result = unsafe {
-        if use_cursor_prefix {
+        if reconversion {
+            GetComposedTextForReconversion(&mut length)
+        } else if use_cursor_prefix {
             GetComposedTextForCursorPrefix(
                 required_cursor_prefix_input_count.unwrap_or(-1),
                 &mut length,
@@ -1363,7 +1467,9 @@ fn get_composed_text(
             GetComposedText(&mut length)
         }
     };
-    let call_name = if use_cursor_prefix {
+    let call_name = if reconversion {
+        "GetComposedTextForReconversion"
+    } else if use_cursor_prefix {
         "GetComposedTextForCursorPrefix"
     } else {
         "GetComposedText"
@@ -1375,7 +1481,7 @@ fn get_composed_text(
         operation,
         "ffi_call",
         elapsed_ms(ffi_call_start),
-        "candidate_count={length};use_cursor_prefix={use_cursor_prefix}"
+        "candidate_count={length};use_cursor_prefix={use_cursor_prefix};reconversion={reconversion}"
     );
 
     let mut suggestions = Vec::with_capacity(length);
@@ -1652,6 +1758,132 @@ impl AzookeyService for MyAzookeyService {
                 suggestions: composed_text.suggestions,
             }),
             server_session_id: server_session_id(),
+        }))
+    }
+
+    async fn start_reconversion(
+        &self,
+        request: Request<StartReconversionRequest>,
+    ) -> Result<Response<StartReconversionResponse>, Status> {
+        let _mutation_guard = self.mutation_lock.lock().await;
+        let request = request.into_inner();
+        let _request_guard = ServerRequestGuard::begin(true);
+        let request_id = request_id_or_next(request.request_id);
+        set_request_id(request_id);
+        let handler_start = Instant::now();
+        let surface = request.surface;
+        let surface_len = validate_reconversion_surface(&surface)?;
+
+        let mut readings = infer_reconversion_readings(&surface)
+            .map_err(|error| status_from_error("start_reconversion", error))?;
+        readings.truncate(MAX_RECONVERSION_READINGS);
+        if readings.is_empty() {
+            performance_event_lazy!(
+                request_id,
+                "start_reconversion",
+                "total",
+                elapsed_ms(handler_start),
+                "status=unsupported;surface_len={surface_len}"
+            );
+            return Ok(Response::new(StartReconversionResponse {
+                composing_text: None,
+                server_session_id: server_session_id(),
+                selection_index: 0,
+                applied: false,
+            }));
+        }
+
+        // Reading inference is non-mutating. Only replace the converter state after it
+        // succeeds, so unsupported text cannot disturb an existing composition.
+        let mut chosen_index = 0;
+        let mut best_surface_rank = usize::MAX;
+        let mut conversions = Vec::with_capacity(readings.len());
+        let mut last_composing_text = None;
+        for (reading_index, reading) in readings.iter().enumerate() {
+            clear_text();
+            let composing = match add_text_direct(reading) {
+                Ok(text) => text,
+                Err(error) => {
+                    clear_text();
+                    update_active_composition_state("");
+                    return Err(status_from_error("start_reconversion", error));
+                }
+            };
+            let composed = match get_reconversion_composed_text(request_id) {
+                Ok(text) => text,
+                Err(error) => {
+                    clear_text();
+                    update_active_composition_state("");
+                    return Err(status_from_error("start_reconversion", error));
+                }
+            };
+            let surface_rank =
+                reconversion_surface_rank(&composed.suggestions, &surface).unwrap_or(usize::MAX);
+            if surface_rank < best_surface_rank {
+                best_surface_rank = surface_rank;
+                chosen_index = reading_index;
+            }
+            last_composing_text = Some(composing);
+            conversions.push((reading.clone(), composed));
+        }
+
+        let chosen_reading = readings[chosen_index].clone();
+        let last_index = conversions.len() - 1;
+        let (composing_text, mut composed_text) = if chosen_index == last_index {
+            let (_, composed) = conversions.pop().expect("readings are non-empty");
+            (
+                last_composing_text.expect("readings are non-empty"),
+                composed,
+            )
+        } else {
+            clear_text();
+            let composing = add_text_direct(&chosen_reading).map_err(|error| {
+                clear_text();
+                update_active_composition_state("");
+                status_from_error("start_reconversion", error)
+            })?;
+            let composed = get_reconversion_composed_text(request_id).map_err(|error| {
+                clear_text();
+                update_active_composition_state("");
+                status_from_error("start_reconversion", error)
+            })?;
+            (composing, composed)
+        };
+        let hiragana = composed_text
+            .hiragana
+            .clone()
+            .unwrap_or_else(|| composing_text.text.clone());
+        let mut suggestion_groups = vec![std::mem::take(&mut composed_text.suggestions)];
+        suggestion_groups.extend(
+            conversions
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| *index != chosen_index)
+                .map(|(_, (_, composed))| composed.suggestions),
+        );
+        composed_text.suggestions =
+            merge_reconversion_suggestions(&surface, &hiragana, &suggestion_groups);
+        let selection_index = 0;
+        update_active_composition_state(&composing_text.text);
+        performance_event_lazy!(
+            request_id,
+            "start_reconversion",
+            "total",
+            elapsed_ms(handler_start),
+            "status=success;surface_len={surface_len};reading_count={};chosen_reading_len={};surface_rank={best_surface_rank};suggestions={};selection_index={selection_index}",
+            readings.len(),
+            chosen_reading.chars().count(),
+            composed_text.suggestions.len()
+        );
+
+        Ok(Response::new(StartReconversionResponse {
+            composing_text: Some(ComposingText {
+                hiragana,
+                suggestions: composed_text.suggestions,
+            }),
+            server_session_id: server_session_id(),
+            selection_index,
+            applied: true,
         }))
     }
 
@@ -2596,9 +2828,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod path_tests {
     use super::{
-        hiragana_boundary_fallback, resolve_log_path_from_roots, retained_prepared_snapshot_count,
-        validate_shrink_offset, MyAzookeyService,
+        decode_reconversion_readings, hiragana_boundary_fallback, merge_reconversion_suggestions,
+        resolve_log_path_from_roots, retained_prepared_snapshot_count,
+        validate_reconversion_surface, validate_shrink_offset, MyAzookeyService,
+        MAX_RECONVERSION_SUGGESTIONS,
     };
+    use shared::proto::Suggestion;
     use std::{ffi::OsStr, path::Path};
 
     #[tokio::test]
@@ -2636,6 +2871,81 @@ mod path_tests {
     fn shrink_offset_rejects_negative_values_before_swift_ffi() {
         let status = validate_shrink_offset(-1).expect_err("negative offset must fail");
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn reconversion_surface_bounds_are_checked_before_swift_ffi() {
+        assert_eq!(validate_reconversion_surface("日本語").unwrap(), 3);
+        assert!(validate_reconversion_surface("").is_err());
+        assert!(validate_reconversion_surface(&"あ".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn reconversion_reading_transport_preserves_embedded_newlines() {
+        let readings = decode_reconversion_readings(r#"["キョウ\nニホン","コンニチ"]"#)
+            .expect("valid reading JSON");
+
+        assert_eq!(readings, ["キョウ\nニホン", "コンニチ"]);
+        assert!(decode_reconversion_readings(r#"["valid",""]"#).is_err());
+        assert!(decode_reconversion_readings("not-json").is_err());
+    }
+
+    #[test]
+    fn reconversion_merges_ambiguous_readings_while_preserving_the_surface() {
+        let groups = vec![
+            vec![
+                Suggestion {
+                    text: "感じ".to_string(),
+                    corresponding_count: 9,
+                    candidate_id: 42,
+                    ..Suggestion::default()
+                },
+                Suggestion {
+                    text: "漢字".to_string(),
+                    ..Suggestion::default()
+                },
+            ],
+            vec![
+                Suggestion {
+                    text: "幹事".to_string(),
+                    candidate_id: 84,
+                    ..Suggestion::default()
+                },
+                Suggestion {
+                    text: "感じ".to_string(),
+                    ..Suggestion::default()
+                },
+            ],
+        ];
+
+        let suggestions = merge_reconversion_suggestions("漢字", "かんじ", &groups);
+        let texts = suggestions
+            .iter()
+            .map(|suggestion| suggestion.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(texts, ["漢字", "感じ", "幹事"]);
+        assert!(suggestions
+            .iter()
+            .all(|suggestion| suggestion.corresponding_count == 3));
+        assert!(suggestions
+            .iter()
+            .all(|suggestion| suggestion.candidate_id == 0));
+    }
+
+    #[test]
+    fn reconversion_candidate_merge_is_bounded() {
+        let group = (0..(MAX_RECONVERSION_SUGGESTIONS + 20))
+            .map(|index| Suggestion {
+                text: format!("候補{index}"),
+                ..Suggestion::default()
+            })
+            .collect::<Vec<_>>();
+
+        let suggestions = merge_reconversion_suggestions("元表記", "もとひょうき", &[group]);
+
+        assert_eq!(suggestions.len(), MAX_RECONVERSION_SUGGESTIONS);
+        assert_eq!(suggestions[0].text, "元表記");
     }
 
     #[test]

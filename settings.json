@@ -10,7 +10,8 @@
     },
     "shortcuts": {
         "ctrl_space_toggle": true,
-        "alt_backquote_toggle": true
+        "alt_backquote_toggle": true,
+        "reconversion_key": "win_slash"
     },
     "general": {
         "punctuation_style": "touten_kuten",

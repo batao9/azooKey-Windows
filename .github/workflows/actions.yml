@@ -81,6 +81,9 @@ jobs:
     - name: Test candidate scroller
       run: node --test crates/ui/tests/candidate_scroller.test.cjs
 
+    - name: Test reverse dictionary generator
+      run: node --test scripts/generate-reverse-dictionary.test.mjs
+
   windows-tests:
     name: Windows Rust and Swift tests
     runs-on: windows-2022

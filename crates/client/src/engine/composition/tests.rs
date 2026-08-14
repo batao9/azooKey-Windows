@@ -1,12 +1,14 @@
 use super::{
     deferred_action_suffix, idle_mode_switch_request_is_current, language_bar_deferred_action,
     language_bar_toggle_requires_deferred_replay, mode_switch_request_is_current,
-    requires_action_recovery, requires_server_resynchronization, Candidates,
-    CapsLockKeyboardLayout, ClauseActionBackend, ClauseActionEffect, ClauseActionStateMut,
-    ClauseAdvance, ClauseAdvanceRawInput, ClauseBoundaryAdjustment, ClauseBoundarySync,
-    ClauseNavigationReadyUiSync, ClauseSnapshot, ClauseState, Composition, CompositionReducer,
-    CompositionState, ConsumedPrefixRestore, DeferredClientAction, DeferredInputEvent,
-    DeferredProjection, DeferredUserAction, FutureClauseSnapshot, TextServiceFactory,
+    reconversion_action_requires_reading_state, reconversion_shortcut_matches,
+    requires_action_recovery, requires_server_resynchronization, standard_reconversion_available,
+    Candidates, CapsLockKeyboardLayout, ClauseActionBackend, ClauseActionEffect,
+    ClauseActionStateMut, ClauseAdvance, ClauseAdvanceRawInput, ClauseBoundaryAdjustment,
+    ClauseBoundarySync, ClauseNavigationReadyUiSync, ClauseSnapshot, ClauseState, Composition,
+    CompositionReducer, CompositionState, ConsumedPrefixRestore, DeferredClientAction,
+    DeferredInputEvent, DeferredProjection, DeferredUserAction, FutureClauseSnapshot,
+    ModifierState, TextServiceFactory,
 };
 use crate::engine::{
     client_action::{
@@ -17,7 +19,9 @@ use crate::engine::{
     user_action::{Function, Navigation, UserAction},
 };
 use crate::tsf::edit_session::EditSessionFailure;
-use shared::{get_default_romaji_rows, AppConfig, PunctuationStyle, RomajiRule, WidthMode};
+use shared::{
+    get_default_romaji_rows, AppConfig, PunctuationStyle, ReconversionKey, RomajiRule, WidthMode,
+};
 use windows::Win32::{Foundation::LPARAM, UI::TextServices::TF_E_LOCKED};
 
 #[test]
@@ -638,6 +642,210 @@ fn reducer_plans_composition_start_without_tsf_or_ipc_state() {
             ClientAction::AppendText("a".to_string())
         ]
     );
+}
+
+#[test]
+fn reconversion_shortcuts_require_the_exact_configured_modifiers() {
+    let none = ModifierState {
+        shift: false,
+        ctrl: false,
+        alt: false,
+        win: false,
+    };
+    assert!(reconversion_shortcut_matches(
+        ReconversionKey::Convert,
+        0x1c,
+        none
+    ));
+    assert!(reconversion_shortcut_matches(
+        ReconversionKey::ShiftConvert,
+        0x1c,
+        ModifierState {
+            shift: true,
+            ..none
+        }
+    ));
+    assert!(reconversion_shortcut_matches(
+        ReconversionKey::Space,
+        0x20,
+        none
+    ));
+    assert!(reconversion_shortcut_matches(
+        ReconversionKey::WinSlash,
+        0xbf,
+        ModifierState { win: true, ..none }
+    ));
+
+    assert!(!reconversion_shortcut_matches(
+        ReconversionKey::Convert,
+        0x1c,
+        ModifierState {
+            shift: true,
+            ..none
+        }
+    ));
+    assert!(!reconversion_shortcut_matches(
+        ReconversionKey::Space,
+        0x20,
+        ModifierState { ctrl: true, ..none }
+    ));
+    assert!(!reconversion_shortcut_matches(
+        ReconversionKey::WinSlash,
+        0xbf,
+        ModifierState {
+            ctrl: true,
+            win: true,
+            ..none
+        }
+    ));
+    assert!(!reconversion_shortcut_matches(
+        ReconversionKey::Disabled,
+        0x1c,
+        none
+    ));
+}
+
+#[test]
+fn standard_reconversion_is_only_exposed_for_idle_win_slash() {
+    assert!(standard_reconversion_available(
+        ReconversionKey::WinSlash,
+        &CompositionState::None
+    ));
+    assert!(!standard_reconversion_available(
+        ReconversionKey::Convert,
+        &CompositionState::None
+    ));
+    assert!(!standard_reconversion_available(
+        ReconversionKey::WinSlash,
+        &CompositionState::Previewing
+    ));
+}
+
+#[test]
+fn escape_restores_the_original_text_during_reconversion() {
+    for state in [CompositionState::Composing, CompositionState::Previewing] {
+        let composition = Composition {
+            state,
+            preview: "感じ".to_string(),
+            reconversion_original: Some("漢字".to_string()),
+            ..Composition::default()
+        };
+
+        let (transition, actions) = TextServiceFactory::plan_actions_for_user_action(
+            &composition,
+            &UserAction::Escape,
+            &InputMode::Kana,
+            false,
+            &AppConfig::default(),
+            false,
+        )
+        .expect("escape should cancel reconversion");
+
+        assert_eq!(transition, CompositionState::None);
+        assert_eq!(
+            actions,
+            vec![
+                ClientAction::RestoreReconversionOriginal,
+                ClientAction::EndComposition
+            ]
+        );
+    }
+}
+
+#[test]
+fn escape_keeps_the_existing_removal_plan_outside_reconversion() {
+    let composition = Composition {
+        state: CompositionState::Previewing,
+        preview: "感じ".to_string(),
+        ..Composition::default()
+    };
+
+    let (_, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Escape,
+        &InputMode::Kana,
+        false,
+        &AppConfig::default(),
+        false,
+    )
+    .expect("escape should cancel ordinary conversion");
+
+    assert_eq!(
+        actions,
+        vec![ClientAction::RemoveText, ClientAction::EndComposition]
+    );
+}
+
+#[test]
+fn convert_key_cycles_candidates_in_an_active_composition() {
+    let composition = Composition {
+        state: CompositionState::Previewing,
+        raw_input: "kanji".to_string(),
+        ..Composition::default()
+    };
+    let app_config = AppConfig::default();
+
+    let reconvert = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Reconvert,
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    );
+    let space = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Space,
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    );
+
+    assert_eq!(reconvert, space);
+}
+
+#[test]
+fn reconversion_consumes_edits_that_require_an_ambiguous_server_reading() {
+    let composition = Composition {
+        state: CompositionState::Previewing,
+        raw_input: "きょう".to_string(),
+        reconversion_original: Some("橋".to_string()),
+        ..Composition::default()
+    };
+    let app_config = AppConfig::default();
+
+    for action in [
+        UserAction::Backspace,
+        UserAction::Delete,
+        UserAction::Navigation(Navigation::Left),
+        UserAction::Function(Function::Six),
+        UserAction::AdjustClauseBoundary(1),
+    ] {
+        assert!(reconversion_action_requires_reading_state(&action));
+        assert_eq!(
+            TextServiceFactory::plan_actions_for_user_action(
+                &composition,
+                &action,
+                &InputMode::Kana,
+                false,
+                &app_config,
+                false,
+            ),
+            Some((CompositionState::Previewing, Vec::new()))
+        );
+    }
+
+    let safe_candidate_cycle = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Space,
+        &InputMode::Kana,
+        false,
+        &app_config,
+        false,
+    )
+    .expect("candidate cycling remains available");
+    assert!(!safe_candidate_cycle.1.is_empty());
 }
 
 #[test]

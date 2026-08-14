@@ -13,10 +13,11 @@ use windows::{
         Foundation::BOOL,
         System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER},
         UI::TextServices::{
-            CLSID_TF_CategoryMgr, ITfCategoryMgr, ITfKeyEventSink, ITfKeystrokeMgr,
-            ITfLangBarItemButton, ITfLangBarItemMgr, ITfSource, ITfTextInputProcessorEx_Impl,
-            ITfTextInputProcessor_Impl, ITfThreadFocusSink, ITfThreadMgr, ITfThreadMgrEventSink,
-            TF_MOD_IGNORE_ALL_MODIFIER, TF_MOD_SHIFT, TF_PRESERVEDKEY,
+            CLSID_TF_CategoryMgr, ITfCategoryMgr, ITfFunctionProvider, ITfKeyEventSink,
+            ITfKeystrokeMgr, ITfLangBarItemButton, ITfLangBarItemMgr, ITfSource, ITfSourceSingle,
+            ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfThreadFocusSink,
+            ITfThreadMgr, ITfThreadMgrEventSink, TF_MOD_IGNORE_ALL_MODIFIER, TF_MOD_SHIFT,
+            TF_PRESERVEDKEY,
         },
     },
 };
@@ -55,6 +56,16 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
             )?;
         };
         preserve_eisu_keys(&keystroke_mgr, tid);
+
+        // Windows routes its standard Win+/ reconversion shortcut through a
+        // function provider rather than the raw key event sink.
+        unsafe {
+            thread_mgr.cast::<ITfSourceSingle>()?.AdviseSingleSink(
+                tid,
+                &ITfFunctionProvider::IID,
+                &text_service.this::<ITfFunctionProvider>()?,
+            )?;
+        }
 
         // initialize thread manager event sink
         tracing::debug!("AdviseThreadMgrEventSink");
@@ -152,6 +163,12 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
             unsafe {
                 keystroke_mgr.UnadviseKeyEventSink(text_service.tid)?;
             };
+
+            unsafe {
+                thread_mgr
+                    .cast::<ITfSourceSingle>()?
+                    .UnadviseSingleSink(text_service.tid, &ITfFunctionProvider::IID)?;
+            }
 
             tracing::debug!("Remove langbar");
             unsafe {

@@ -63,6 +63,123 @@ private func defaultWindowsRomajiRows() throws -> [RomajiTableRow] {
     }
 }
 
+private struct ReverseDictionaryFixtureEntry {
+    let surface: String
+    let reading: String
+    let score: Float
+}
+
+private func appendUInt16LE(_ value: UInt16, to data: inout Data) {
+    var value = value.littleEndian
+    withUnsafeBytes(of: &value) { data.append(contentsOf: $0) }
+}
+
+private func appendUInt32LE(_ value: UInt32, to data: inout Data) {
+    var value = value.littleEndian
+    withUnsafeBytes(of: &value) { data.append(contentsOf: $0) }
+}
+
+private func makeReverseDictionaryFixture(_ entries: [ReverseDictionaryFixtureEntry]) -> Data {
+    let records = entries.sorted {
+        Array($0.surface.utf8).lexicographicallyPrecedes(Array($1.surface.utf8))
+    }.map { entry in
+        let surface = Data(entry.surface.utf8)
+        let reading = Data(entry.reading.utf8)
+        var record = Data()
+        appendUInt16LE(UInt16(surface.count), to: &record)
+        appendUInt16LE(UInt16(reading.count), to: &record)
+        appendUInt32LE(entry.score.bitPattern, to: &record)
+        record.append(surface)
+        record.append(reading)
+        return record
+    }
+
+    let headerSize = 8 + (records.count + 1) * 4
+    var data = Data("AZR2".utf8)
+    appendUInt32LE(UInt32(records.count), to: &data)
+    var offset = headerSize
+    for record in records {
+        appendUInt32LE(UInt32(offset), to: &data)
+        offset += record.count
+    }
+    appendUInt32LE(UInt32(offset), to: &data)
+    for record in records {
+        data.append(record)
+    }
+    return data
+}
+
+private func writeReverseDictionaryFixture(
+    _ data: Data,
+    under temporaryDirectory: URL
+) throws -> URL {
+    let dictionaryURL = temporaryDirectory.appendingPathComponent("Dictionary", isDirectory: true)
+    let reverseURL = dictionaryURL.appendingPathComponent("Reverse", isDirectory: true)
+    try FileManager.default.createDirectory(at: reverseURL, withIntermediateDirectories: true)
+    try data.write(to: reverseURL.appendingPathComponent("reverse-v2.bin"))
+    return dictionaryURL
+}
+
+@Test func reconversionDictionaryPrefersExactReadingsOverSegmentedReadings() throws {
+    let temporaryDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("azookey-reconversion-test-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+    let dictionaryURL = try writeReverseDictionaryFixture(
+        makeReverseDictionaryFixture([
+            .init(surface: "今日", reading: "キョウ", score: -1),
+            .init(surface: "加", reading: "カ", score: -1),
+            .init(surface: "減", reading: "ヘ", score: -1),
+            .init(surface: "減", reading: "ゲン", score: -2),
+            .init(surface: "加減", reading: "カゲン", score: -3),
+            .init(surface: "統", reading: "ミツル", score: -1),
+            .init(surface: "一", reading: "ハジメ", score: -1),
+            .init(surface: "統一", reading: "トウイツ", score: -3),
+            .init(surface: "日本", reading: "ニッポン", score: -1),
+            .init(surface: "日本", reading: "ニホン", score: -2),
+            .init(surface: "日本語", reading: "ニホンゴ", score: -0.5),
+            .init(surface: "語", reading: "ゴ", score: -1),
+        ]),
+        under: temporaryDirectory
+    )
+    var dictionary = ReconversionDictionary()
+    try dictionary.load(from: dictionaryURL)
+
+    #expect(dictionary.recordCount == 12)
+    #expect(dictionary.inferReadings(for: "加減") == ["カゲン"])
+    #expect(dictionary.inferReadings(for: "統一") == ["トウイツ"])
+    #expect(dictionary.inferReadings(for: "日本") == ["ニッポン", "ニホン"])
+    #expect(dictionary.inferReadings(for: "日本", limit: 1) == ["ニッポン"])
+    #expect(dictionary.inferReadings(for: "日本語") == ["ニホンゴ"])
+    #expect(dictionary.inferReadings(for: "今日は") == ["キョウハ"])
+    #expect(
+        dictionary.inferReadings(for: "今日\n日本")
+            == ["キョウ\nニッポン", "キョウ\nニホン"]
+    )
+    #expect(dictionary.inferReadings(for: "😀") == ["😀"])
+    #expect(dictionary.inferReadings(for: "龘").isEmpty)
+}
+
+@Test func reconversionDictionaryRejectsTruncatedIndex() throws {
+    let temporaryDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("azookey-reconversion-corrupt-test-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+    var data = Data("AZR2".utf8)
+    appendUInt32LE(1, to: &data)
+    appendUInt32LE(12, to: &data)
+    let dictionaryURL = try writeReverseDictionaryFixture(data, under: temporaryDirectory)
+    var dictionary = ReconversionDictionary()
+    var rejected = false
+
+    do {
+        try dictionary.load(from: dictionaryURL)
+    } catch {
+        rejected = true
+    }
+
+    #expect(rejected)
+    #expect(dictionary.recordCount == 0)
+}
+
 @Test func engineRuntimeDirectoryUsesAppData() {
     let directory = engineRuntimeDirectoryURL(
         appDataPath: #"C:\Users\test\AppData\Roaming"#,

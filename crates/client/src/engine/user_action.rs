@@ -24,6 +24,7 @@ pub enum UserAction {
     ToggleInputMode,
     InputModeOn,
     InputModeOff,
+    Reconvert,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -188,6 +189,7 @@ impl TryFrom<usize> for UserAction {
             0x6F => UserAction::NumpadSymbol('/'),       // VK_DIVIDE
             0x16 => UserAction::InputModeOn,             // VK_IME_ON
             0x1A => UserAction::InputModeOff,            // VK_IME_OFF
+            0x1C => UserAction::Reconvert,               // VK_CONVERT
 
             0xF3 | 0xF4 => UserAction::ToggleInputMode, // Zenkaku/Hankaku
 
@@ -255,5 +257,12 @@ mod tests {
         let action = UserAction::try_from(0x2E).expect("VK_DELETE should map");
 
         assert!(matches!(action, UserAction::Delete));
+    }
+
+    #[test]
+    fn convert_key_maps_to_reconvert_action() {
+        let action = UserAction::try_from(0x1C).expect("VK_CONVERT should map");
+
+        assert!(matches!(action, UserAction::Reconvert));
     }
 }

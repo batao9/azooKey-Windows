@@ -315,6 +315,7 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "futures-core",
+ "serde_json",
  "shared",
  "tokio",
  "tonic",

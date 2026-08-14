@@ -59,6 +59,22 @@ message ReplaceCompositionResponse {
   uint64 server_session_id = 2;
 }
 
+// Starts reverse conversion from a finalized surface string. The operation is
+// absolute and idempotent: a successful request replaces the server's current
+// composition with the inferred reading, while an unsupported surface leaves
+// the current server state untouched.
+message StartReconversionRequest {
+  string surface = 1;
+  uint64 request_id = 2;
+}
+
+message StartReconversionResponse {
+  ComposingText composing_text = 1;
+  uint64 server_session_id = 2;
+  int32 selection_index = 3;
+  bool applied = 4;
+}
+
 // Request message for RemoveText.
 message RemoveTextRequest {
   uint64 request_id = 1;
@@ -262,6 +278,7 @@ message PerformanceLogResponse {}
 service AzookeyService {
   rpc AppendText (AppendTextRequest) returns (AppendTextResponse);
   rpc ReplaceComposition (ReplaceCompositionRequest) returns (ReplaceCompositionResponse);
+  rpc StartReconversion (StartReconversionRequest) returns (StartReconversionResponse);
   rpc RemoveText (RemoveTextRequest) returns (RemoveTextResponse);
   rpc ShrinkText (ShrinkTextRequest) returns (ShrinkTextResponse);
   rpc AdvanceClause (AdvanceClauseRequest) returns (AdvanceClauseResponse);

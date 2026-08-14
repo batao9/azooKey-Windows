@@ -3,7 +3,7 @@ use hyper_util::rt::TokioIo;
 use shared::{
     proto::{
         azookey_service_client::AzookeyServiceClient, window_service_client::WindowServiceClient,
-        PerformanceLogRequest,
+        PerformanceLogRequest, StartReconversionRequest,
     },
     AppConfig,
 };
@@ -117,6 +117,12 @@ pub(crate) struct RecoveredComposition {
 pub(crate) struct TextRemoval {
     pub(crate) candidates: Candidates,
     pub(crate) raw_input: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReconversionResult {
+    pub(crate) candidates: Candidates,
+    pub(crate) selection_index: i32,
 }
 
 #[derive(Debug)]
@@ -1088,6 +1094,40 @@ impl IPCService {
         Ok(())
     }
 
+    fn send_start_reconversion(
+        &mut self,
+        surface: &str,
+        request_id: u64,
+    ) -> anyhow::Result<Option<ReconversionResult>> {
+        let mut request = tonic::Request::new(StartReconversionRequest {
+            surface: surface.to_string(),
+            request_id,
+        });
+        request.set_timeout(INPUT_RPC_DEADLINE);
+        let response = Self::block_on_server_rpc(
+            self.runtime.as_ref(),
+            &self.recovery,
+            "start_reconversion",
+            INPUT_RPC_DEADLINE,
+            self.azookey_client.start_reconversion(request),
+        )?
+        .into_inner();
+        self.observe_server_session("start_reconversion", response.server_session_id);
+        if !response.applied {
+            return Ok(None);
+        }
+        let candidates = Self::candidates_from_composing_text(response.composing_text)?;
+        self.replace_input_ledger_direct(&candidates.hiragana);
+        // This absolute response fully describes the composition on the observed
+        // server session, so an older idle-session change must not cancel the new
+        // reconversion when its first backend-dependent action is processed.
+        self.server_reset_recovered = false;
+        Ok(Some(ReconversionResult {
+            candidates,
+            selection_index: response.selection_index,
+        }))
+    }
+
     fn send_commit_learning_candidate(
         &mut self,
         candidate_id: u64,
@@ -1806,6 +1846,40 @@ impl IPCService {
             }
             Err(error) => Err(error),
         }
+    }
+
+    #[tracing::instrument(skip(self, surface))]
+    pub(crate) fn start_reconversion(
+        &mut self,
+        surface: &str,
+    ) -> anyhow::Result<Option<ReconversionResult>> {
+        let request_id = current_or_next_request_id();
+        let performance_start = client_performance_start();
+        let result = self.run_rpc_with_reconnect("start_reconversion", |this| {
+            this.send_start_reconversion(surface, request_id)
+        });
+        self.log_client_performance_from_start(
+            performance_start,
+            request_id,
+            "start_reconversion",
+            "rpc_total",
+            || match &result {
+                Ok((Some(reconversion), retried)) => format!(
+                    "status=success;retry={retried};surface_len={};suggestions={}",
+                    surface.chars().count(),
+                    reconversion.candidates.texts.len()
+                ),
+                Ok((None, retried)) => format!(
+                    "status=unsupported;retry={retried};surface_len={}",
+                    surface.chars().count()
+                ),
+                Err(error) => format!(
+                    "status=error;surface_len={};error={error:?}",
+                    surface.chars().count()
+                ),
+            },
+        );
+        result.map(|(value, _)| value)
     }
 
     #[tracing::instrument]

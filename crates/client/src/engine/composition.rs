@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::tsf::edit_session::SelectedText;
 use crate::tsf::edit_session::{
     is_edit_session_error, is_non_destructive_edit_session_error, read_edit_session,
 };
@@ -34,7 +35,7 @@ use super::{
 #[cfg(test)]
 use shared::RomajiRule;
 use shared::{
-    zenzai_cpu_backend_supported, AppConfig, NumpadInputMode, SpaceInputMode,
+    zenzai_cpu_backend_supported, AppConfig, NumpadInputMode, ReconversionKey, SpaceInputMode,
     LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MAX,
     LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MIN,
 };
@@ -46,10 +47,10 @@ use windows::Win32::{
     UI::{
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, GetKeyboardType, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT,
-            VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
+            VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
         },
         TextServices::{
-            ITfComposition, ITfCompositionSink_Impl, ITfContext, ITfInputScope,
+            ITfComposition, ITfCompositionSink_Impl, ITfContext, ITfInputScope, ITfRange,
             ITfTextInputProcessor, InputScope, GUID_PROP_INPUTSCOPE, IS_NUMERIC_PASSWORD,
             IS_PASSWORD, IS_PRIVATE, TF_DEFAULT_SELECTION, TF_SELECTION,
         },
@@ -70,6 +71,85 @@ const VK_TRANSLATED_CAPSLOCK_KEY_CODE: usize = 0xF0;
 const CAPSLOCK_SCAN_CODE: isize = 0x3A;
 const KEYBOARD_TYPE_ENHANCED_101_OR_102: i32 = 0x4;
 const KEYBOARD_TYPE_JAPANESE: i32 = 0x7;
+const VK_CONVERT_KEY_CODE: usize = 0x1C;
+const VK_SPACE_KEY_CODE: usize = 0x20;
+const VK_OEM_SLASH_KEY_CODE: usize = 0xBF;
+const MAX_RECONVERSION_SURFACE_COUNT: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ModifierState {
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    win: bool,
+}
+
+fn reconversion_shortcut_matches(
+    preset: ReconversionKey,
+    key_code: usize,
+    modifiers: ModifierState,
+) -> bool {
+    match preset {
+        ReconversionKey::Convert => {
+            key_code == VK_CONVERT_KEY_CODE
+                && modifiers
+                    == (ModifierState {
+                        shift: false,
+                        ctrl: false,
+                        alt: false,
+                        win: false,
+                    })
+        }
+        ReconversionKey::ShiftConvert => {
+            key_code == VK_CONVERT_KEY_CODE
+                && modifiers
+                    == (ModifierState {
+                        shift: true,
+                        ctrl: false,
+                        alt: false,
+                        win: false,
+                    })
+        }
+        ReconversionKey::Space => {
+            key_code == VK_SPACE_KEY_CODE
+                && modifiers
+                    == (ModifierState {
+                        shift: false,
+                        ctrl: false,
+                        alt: false,
+                        win: false,
+                    })
+        }
+        ReconversionKey::WinSlash => {
+            key_code == VK_OEM_SLASH_KEY_CODE
+                && modifiers
+                    == (ModifierState {
+                        shift: false,
+                        ctrl: false,
+                        alt: false,
+                        win: true,
+                    })
+        }
+        ReconversionKey::Disabled => false,
+    }
+}
+
+fn standard_reconversion_available(preset: ReconversionKey, state: &CompositionState) -> bool {
+    preset == ReconversionKey::WinSlash && *state == CompositionState::None
+}
+
+fn reconversion_action_requires_reading_state(action: &UserAction) -> bool {
+    matches!(
+        action,
+        UserAction::Backspace
+            | UserAction::Delete
+            | UserAction::CommitAndNextClause
+            | UserAction::CommitFirstClause
+            | UserAction::AdjustClauseBoundary(_)
+            | UserAction::Navigation(Navigation::Left | Navigation::Right)
+            | UserAction::Function(_)
+    )
+}
 
 fn deferred_action_suffix(
     actions: &[DeferredClientAction],
@@ -205,6 +285,14 @@ pub enum CompositionState {
 
 pub(crate) type ProcessKeyResult = Option<(Vec<ClientAction>, CompositionState, AppConfigSnapshot)>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReconversionKeyTestResult {
+    Unrelated,
+    Owned,
+    MatchedEmpty,
+    NotHandled,
+}
+
 #[derive(Default, Clone, Debug)]
 pub struct Composition {
     pub preview: String, // text to be previewed
@@ -233,6 +321,7 @@ pub struct Composition {
     pub state: CompositionState,
     pub temporary_latin: bool,
     pub temporary_latin_shift_pending: bool,
+    pub reconversion_original: Option<String>,
     pub tip_composition: Option<ITfComposition>,
     deferred_actions: Vec<DeferredClientAction>,
     deferred_inputs: VecDeque<DeferredInputEvent>,
@@ -415,6 +504,17 @@ impl TextServiceFactory {
     #[inline]
     pub(crate) fn is_alt_pressed() -> bool {
         VK_MENU.is_pressed() || VK_LMENU.is_pressed() || VK_RMENU.is_pressed()
+    }
+
+    #[inline]
+    pub(crate) fn is_win_pressed() -> bool {
+        VK_LWIN.is_pressed()
+            || VK_RWIN.is_pressed()
+            || unsafe {
+                [VK_LWIN, VK_RWIN]
+                    .iter()
+                    .any(|key| GetAsyncKeyState(key.0 as i32) as u16 & 0x8000 != 0)
+            }
     }
 
     #[inline]
@@ -1687,6 +1787,7 @@ impl TextServiceFactory {
             ClientAction::AppendTextRaw(_) => "AppendTextRaw",
             ClientAction::AppendTextDirect(_) => "AppendTextDirect",
             ClientAction::CommitTextDirect(_) => "CommitTextDirect",
+            ClientAction::RestoreReconversionOriginal => "RestoreReconversionOriginal",
             ClientAction::RemoveText => "RemoveText",
             ClientAction::MoveCursor(_) => "MoveCursor",
             ClientAction::EnsureClauseNavigationReady { .. } => "EnsureClauseNavigationReady",
@@ -4596,6 +4697,15 @@ impl TextServiceFactory {
         romaji_lookup: &RomajiLookup,
         start_temporary_latin: bool,
     ) -> Option<(CompositionState, Vec<ClientAction>)> {
+        if composition.reconversion_original.is_some()
+            && reconversion_action_requires_reading_state(action)
+        {
+            // Candidates can come from several inferred readings, while the converter keeps
+            // only one active reading. Consume reading-edit operations instead of applying
+            // them to a different candidate's state. Candidate selection, commit, Escape,
+            // mode changes, and commit-then-append input remain safe.
+            return Some((composition.state.clone(), Vec::new()));
+        }
         let result = match composition.state {
             CompositionState::None => match action {
                 _ if (composition.temporary_latin || start_temporary_latin)
@@ -4777,7 +4887,14 @@ impl TextServiceFactory {
                 )),
                 UserAction::Escape => Some((
                     CompositionState::None,
-                    vec![ClientAction::RemoveText, ClientAction::EndComposition],
+                    if composition.reconversion_original.is_some() {
+                        vec![
+                            ClientAction::RestoreReconversionOriginal,
+                            ClientAction::EndComposition,
+                        ]
+                    } else {
+                        vec![ClientAction::RemoveText, ClientAction::EndComposition]
+                    },
                 )),
                 UserAction::Navigation(direction) => match direction {
                     Navigation::Right => Some((
@@ -4818,7 +4935,7 @@ impl TextServiceFactory {
                         ClientAction::SetIMEMode(InputMode::Latin),
                     ],
                 )),
-                UserAction::Space | UserAction::Tab => Some((
+                UserAction::Space | UserAction::Tab | UserAction::Reconvert => Some((
                     CompositionState::Previewing,
                     Self::candidate_preview_actions(app_config),
                 )),
@@ -4912,7 +5029,14 @@ impl TextServiceFactory {
                 )),
                 UserAction::Escape => Some((
                     CompositionState::None,
-                    vec![ClientAction::RemoveText, ClientAction::EndComposition],
+                    if composition.reconversion_original.is_some() {
+                        vec![
+                            ClientAction::RestoreReconversionOriginal,
+                            ClientAction::EndComposition,
+                        ]
+                    } else {
+                        vec![ClientAction::RemoveText, ClientAction::EndComposition]
+                    },
                 )),
                 UserAction::Navigation(direction) => match direction {
                     Navigation::Right => Some((
@@ -4953,7 +5077,7 @@ impl TextServiceFactory {
                         ClientAction::SetIMEMode(InputMode::Latin),
                     ],
                 )),
-                UserAction::Space | UserAction::Tab => Some((
+                UserAction::Space | UserAction::Tab | UserAction::Reconvert => Some((
                     CompositionState::Previewing,
                     Self::candidate_preview_actions(app_config),
                 )),
@@ -5177,6 +5301,275 @@ impl TextServiceFactory {
         Ok(())
     }
 
+    fn matching_idle_reconversion_preset(
+        &self,
+        key_code: usize,
+    ) -> Result<Option<ReconversionKey>> {
+        if !matches!(
+            key_code,
+            VK_CONVERT_KEY_CODE | VK_SPACE_KEY_CODE | VK_OEM_SLASH_KEY_CODE
+        ) {
+            return Ok(None);
+        }
+        let composition_state = self.borrow()?.borrow_composition()?.state.clone();
+        if composition_state != CompositionState::None {
+            return Ok(None);
+        }
+        let preset = IMEState::app_config_snapshot()?
+            .app_config()
+            .shortcuts
+            .reconversion_key;
+        let modifiers = ModifierState {
+            shift: {
+                let tracked = self
+                    .borrow()
+                    .map(|text_service| text_service.shift_key_down)
+                    .unwrap_or(false);
+                tracked || Self::is_shift_pressed()
+            },
+            ctrl: Self::is_ctrl_pressed(),
+            alt: Self::is_alt_pressed(),
+            win: Self::is_win_pressed(),
+        };
+        Ok(reconversion_shortcut_matches(preset, key_code, modifiers).then_some(preset))
+    }
+
+    pub(crate) fn test_reconversion_key(
+        &self,
+        context: Option<&ITfContext>,
+        wparam: WPARAM,
+    ) -> Result<ReconversionKeyTestResult> {
+        if context.is_some_and(keyboard_disabled_from_context) {
+            return Ok(ReconversionKeyTestResult::Unrelated);
+        }
+        let Some(preset) = self.matching_idle_reconversion_preset(wparam.0)? else {
+            return Ok(ReconversionKeyTestResult::Unrelated);
+        };
+        let Some(context) = context else {
+            return Ok(ReconversionKeyTestResult::NotHandled);
+        };
+        // OnTest runs synchronously in the key hot path. Probe only the range
+        // shape here; the bounded text is read once in OnKeyDown.
+        let has_selection = self.has_nonempty_selection(context)?;
+        if has_selection {
+            Ok(ReconversionKeyTestResult::Owned)
+        } else if preset == ReconversionKey::Space {
+            Ok(ReconversionKeyTestResult::MatchedEmpty)
+        } else {
+            Ok(ReconversionKeyTestResult::NotHandled)
+        }
+    }
+
+    pub(crate) fn handle_reconversion_key(
+        &self,
+        context: Option<&ITfContext>,
+        wparam: WPARAM,
+    ) -> Result<Option<bool>> {
+        if context.is_some_and(keyboard_disabled_from_context) {
+            return Ok(None);
+        }
+        let Some(preset) = self.matching_idle_reconversion_preset(wparam.0)? else {
+            return Ok(None);
+        };
+        let Some(context) = context else {
+            return Ok(Some(false));
+        };
+        self.start_reconversion_from_selection(context, preset)
+    }
+
+    pub(crate) fn handle_standard_reconversion(
+        &self,
+        context: &ITfContext,
+        range: &ITfRange,
+    ) -> Result<bool> {
+        if !self.standard_reconversion_is_enabled() {
+            return Ok(false);
+        }
+        self.start_reconversion_from_range(context, range, ReconversionKey::WinSlash)
+            .map(|handled| handled.unwrap_or(false))
+    }
+
+    pub(crate) fn standard_reconversion_is_enabled(&self) -> bool {
+        let Ok(config_snapshot) = IMEState::app_config_snapshot() else {
+            return false;
+        };
+        let Ok(text_service) = self.borrow() else {
+            return false;
+        };
+        let Ok(composition) = text_service.borrow_composition() else {
+            return false;
+        };
+        standard_reconversion_available(
+            config_snapshot.app_config().shortcuts.reconversion_key,
+            &composition.state,
+        )
+    }
+
+    fn start_reconversion_from_selection(
+        &self,
+        context: &ITfContext,
+        preset: ReconversionKey,
+    ) -> Result<Option<bool>> {
+        self.start_reconversion(context, None, preset)
+    }
+
+    fn start_reconversion_from_range(
+        &self,
+        context: &ITfContext,
+        range: &ITfRange,
+        preset: ReconversionKey,
+    ) -> Result<Option<bool>> {
+        self.start_reconversion(context, Some(range), preset)
+    }
+
+    fn start_reconversion(
+        &self,
+        context: &ITfContext,
+        range: Option<&ITfRange>,
+        preset: ReconversionKey,
+    ) -> Result<Option<bool>> {
+        self.borrow_mut()?.context = Some(context.clone());
+        let selected_text = match range {
+            Some(range) => self.reconversion_text_for_range(context, range)?,
+            None => self.selected_text(context)?,
+        };
+        let original = match selected_text {
+            SelectedText::Text(original) => original,
+            SelectedText::Unsupported => return Ok(Some(true)),
+            SelectedText::Empty => {
+                return if preset == ReconversionKey::Space {
+                    Ok(None)
+                } else {
+                    Ok(Some(false))
+                };
+            }
+        };
+
+        // A matched shortcut owns the selected text. Unsupported or sensitive text is
+        // intentionally left untouched instead of falling back to Space and replacing it.
+        if original.chars().count() > MAX_RECONVERSION_SURFACE_COUNT
+            || self.current_context_has_sensitive_input_scope()
+        {
+            return Ok(Some(true));
+        }
+        // Acquire the configuration snapshot before replacing the selected
+        // document range, so a settings read failure remains non-destructive.
+        let app_config_snapshot = IMEState::app_config_snapshot()?;
+        if !Self::ensure_ipc_service_for_key_event("start_reconversion") {
+            return Ok(Some(true));
+        }
+        let mut ipc_service = IMEState::ipc_service()?.context("ipc_service is None")?;
+        let reconversion = match ipc_service.start_reconversion(&original) {
+            Ok(Some(reconversion)) => reconversion,
+            Ok(None) => {
+                let _ = IMEState::set_ipc_service(ipc_service);
+                return Ok(Some(true));
+            }
+            Err(error) => {
+                tracing::warn!(?error, "Failed to start server-side reconversion");
+                let _ = IMEState::set_ipc_service(ipc_service);
+                return Ok(Some(true));
+            }
+        };
+        let Some(selected) =
+            Self::select_candidate(&reconversion.candidates, reconversion.selection_index)
+        else {
+            let _ = ipc_service.clear_text();
+            let _ = IMEState::set_ipc_service(ipc_service);
+            return Ok(Some(true));
+        };
+
+        let composition_start = match range {
+            Some(range) => self.start_composition_on_reconversion_range(context, range, &original),
+            None => self.start_composition_on_selected_text(context, &original),
+        };
+        match composition_start {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = ipc_service.clear_text();
+                let _ = IMEState::set_ipc_service(ipc_service);
+                return Ok(Some(true));
+            }
+            Err(error) => {
+                tracing::warn!(?error, "Host rejected reconversion composition start");
+                let _ = ipc_service.clear_text();
+                let _ = IMEState::set_ipc_service(ipc_service);
+                return Ok(Some(true));
+            }
+        }
+
+        let initialize_result: Result<()> = (|| {
+            let text_service = self.borrow()?;
+            let mut composition = text_service.borrow_mut_composition()?;
+            let tip_composition = composition.tip_composition.take();
+            *composition = Composition::default();
+            composition.tip_composition = tip_composition;
+            composition.preview = selected.text.clone();
+            composition.suffix = selected.sub_text.clone();
+            composition.raw_input = reconversion.candidates.hiragana.clone();
+            composition.raw_hiragana = reconversion.candidates.hiragana.clone();
+            composition.corresponding_count = selected.corresponding_count;
+            composition.selection_index = selected.index;
+            composition.candidates = reconversion.candidates.clone();
+            composition.state = CompositionState::Previewing;
+            composition.reconversion_original = Some(original.clone());
+            Ok(())
+        })();
+        if let Err(error) = initialize_result {
+            tracing::warn!(
+                ?error,
+                "Failed to initialize reconversion composition state"
+            );
+            let _ = self.end_composition();
+            let _ = ipc_service.clear_text();
+            let _ = IMEState::set_ipc_service(ipc_service);
+            return Ok(Some(true));
+        }
+
+        if let Err(error) = self.set_text(&selected.text, &selected.sub_text) {
+            tracing::warn!(?error, "Failed to materialize reconversion candidate");
+            let _ = self.set_text(&original, "");
+            let _ = self.end_composition();
+            if let Ok(text_service) = self.borrow() {
+                if let Ok(mut composition) = text_service.borrow_mut_composition() {
+                    *composition = Composition::default();
+                }
+            }
+            let _ = ipc_service.clear_text();
+            let _ = IMEState::set_ipc_service(ipc_service);
+            return Ok(Some(true));
+        }
+        if let Err(error) = IMEState::set_input_mode(InputMode::Kana) {
+            tracing::warn!(?error, "Failed to switch to Kana mode after reconversion");
+        }
+        if let Err(error) = self.update_lang_bar() {
+            tracing::warn!(?error, "Failed to update language bar after reconversion");
+        }
+        let app_config = app_config_snapshot.app_config();
+        if let Err(error) = self.sync_candidate_window_update(
+            &mut ipc_service,
+            &reconversion.candidates,
+            selected.index,
+            Some(true),
+            true,
+            Self::live_conversion_reading_update(
+                app_config,
+                &reconversion.candidates,
+                &CompositionState::Previewing,
+            ),
+            Some(true),
+            Self::live_conversion_reading_vertical_adjustment_for_update(
+                app_config,
+                &reconversion.candidates,
+                &CompositionState::Previewing,
+            ),
+        ) {
+            tracing::warn!(?error, "Failed to show reconversion candidates");
+        }
+        let _ = IMEState::set_ipc_service(ipc_service);
+        Ok(Some(true))
+    }
+
     #[tracing::instrument]
     pub fn process_key(
         &self,
@@ -5207,6 +5600,7 @@ impl TextServiceFactory {
 
             let is_ctrl_pressed = Self::is_ctrl_pressed();
             let is_alt_pressed = Self::is_alt_pressed();
+            let is_win_pressed = Self::is_win_pressed();
             let is_shift_pressed = {
                 let tracked_shift = self
                     .borrow()
@@ -5258,6 +5652,12 @@ impl TextServiceFactory {
                         wparam.0
                     ),
                 );
+            }
+
+            // Windows-key chords belong to the shell. The configured Win+/ path is
+            // intercepted before process_key by the key-event sink.
+            if is_win_pressed {
+                return Ok(None);
             }
 
             // check shortcut keys
@@ -5866,7 +6266,18 @@ impl TextServiceFactory {
     }
 
     fn cancel_composition_for_disabled_context(&self) {
-        let _ = self.abort_composition();
+        let reconversion_original = self.borrow().ok().and_then(|text_service| {
+            text_service
+                .borrow_composition()
+                .ok()
+                .and_then(|composition| composition.reconversion_original.clone())
+        });
+        if let Some(original) = reconversion_original {
+            let _ = self.set_text(&original, "");
+            let _ = self.end_composition();
+        } else {
+            let _ = self.abort_composition();
+        }
 
         if let Ok(text_service) = self.borrow() {
             if let Ok(mut composition) = text_service.borrow_mut_composition() {
@@ -6229,6 +6640,7 @@ impl TextServiceFactory {
             let mut selection_index = composition.selection_index;
             let mut temporary_latin = composition.temporary_latin;
             let mut temporary_latin_shift_pending = composition.temporary_latin_shift_pending;
+            let mut reconversion_original = composition.reconversion_original.clone();
             let mut ipc_service;
             let mut transition = transition;
             let mut deferred_clause_navigation_ready_ui_sync = None;
@@ -6275,6 +6687,7 @@ impl TextServiceFactory {
                     persisted.corresponding_count = corresponding_count;
                     persisted.temporary_latin = temporary_latin;
                     persisted.temporary_latin_shift_pending = temporary_latin_shift_pending;
+                    persisted.reconversion_original = reconversion_original.clone();
                 }};
             }
 
@@ -6313,7 +6726,12 @@ impl TextServiceFactory {
                     // edit-session failure can leave stale ruby and candidates visible
                     // after the document text has already disappeared.
                     self.hide_candidate_window_ui(&mut ipc_service)?;
-                    self.discard_composition_text()?;
+                    if let Some(original) = reconversion_original.take() {
+                        self.set_text(&original, "")?;
+                        self.end_composition()?;
+                    } else {
+                        self.discard_composition_text()?;
+                    }
                     ipc_service.clear_text()?;
                 }};
             }
@@ -6347,7 +6765,12 @@ impl TextServiceFactory {
                     current_clause_remainder_origin = None;
                     next_split_group_id = 0;
 
-                    self.discard_composition_text()?;
+                    if let Some(original) = reconversion_original.take() {
+                        self.set_text(&original, "")?;
+                        self.end_composition()?;
+                    } else {
+                        self.discard_composition_text()?;
+                    }
                     self.start_composition()?;
                 }};
             }
@@ -6503,6 +6926,7 @@ impl TextServiceFactory {
                         corresponding_count = 0;
                         temporary_latin = false;
                         temporary_latin_shift_pending = false;
+                        reconversion_original = None;
                         preview.clear();
                         suffix.clear();
                         raw_input.clear();
@@ -6739,6 +7163,13 @@ impl TextServiceFactory {
                         self.start_composition()?;
                         self.set_text(text, "")?;
                         self.end_composition()?;
+                    }
+                    ClientAction::RestoreReconversionOriginal => {
+                        if let Some(original) = reconversion_original.as_deref() {
+                            self.set_text(original, "")?;
+                            preview = original.to_string();
+                            suffix.clear();
+                        }
                     }
                     ClientAction::RemoveText => {
                         Self::clear_clause_caches(
