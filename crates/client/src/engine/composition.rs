@@ -1089,13 +1089,24 @@ impl TextServiceFactory {
     }
 
     #[inline]
-    fn run_terminal_end_cleanup<T>(
-        ui_cleanup_already_sent: bool,
-        end_composition: impl FnOnce() -> Result<()>,
+    fn followup_owns_terminal_ui_cleanup(
+        actions: &[DeferredClientAction],
+        action_index: usize,
+    ) -> bool {
+        actions.get(action_index + 1).is_some_and(|next| {
+            next.transition == CompositionState::None
+                && matches!(next.action, ClientAction::CommitTextDirect(_))
+        })
+    }
+
+    #[inline]
+    fn run_terminal_action_cleanup<T>(
+        skip_ui_cleanup: bool,
+        terminal_action: impl FnOnce() -> Result<()>,
         hide_candidate_window: impl FnOnce() -> Result<T>,
     ) -> Result<()> {
-        let end_result = end_composition();
-        if !ui_cleanup_already_sent {
+        let terminal_result = terminal_action();
+        if !skip_ui_cleanup {
             if let Err(error) = hide_candidate_window() {
                 tracing::warn!(
                     ?error,
@@ -1104,10 +1115,18 @@ impl TextServiceFactory {
             }
         }
 
-        // EndComposition is irreversible once it succeeds. UI cleanup remains
-        // best-effort so a transient window RPC failure cannot replay the
-        // terminal action over the next composition.
-        end_result
+        // A terminal TSF edit is irreversible once it succeeds. UI cleanup remains
+        // best-effort so a transient window RPC failure cannot replay the action
+        // over the next composition.
+        terminal_result
+    }
+
+    #[inline]
+    fn terminal_ui_cleanup_required_after_failure(
+        requested_transition: &CompositionState,
+        delegated_to_followup: bool,
+    ) -> bool {
+        *requested_transition == CompositionState::None || delegated_to_followup
     }
 
     #[inline]
@@ -6589,6 +6608,7 @@ impl TextServiceFactory {
         let mut retry_actions = None;
         let mut failed_action_index = 0usize;
         let mut failed_ledger_snapshot = None;
+        let mut terminal_ui_cleanup_delegated_to_followup = false;
         let result: Result<()> = (|| {
             #[allow(clippy::let_and_return)]
             let (composition, mode) = {
@@ -6911,14 +6931,18 @@ impl TextServiceFactory {
                     ClientAction::EndComposition => {
                         // Let TSF commit the document before waiting for the synchronous UI
                         // RPC. UI cleanup is still attempted after a TSF error, and terminal
-                        // RemoveText can own the cleanup before its fallible final edit.
-                        let ui_cleanup_already_sent =
-                            Self::preceding_action_sent_terminal_ui_cleanup(
-                                terminal_ui_cleanup_sent_at,
-                                action_index,
-                            );
-                        Self::run_terminal_end_cleanup(
-                            ui_cleanup_already_sent,
+                        // RemoveText can own the cleanup before its fallible final edit. A
+                        // following standalone direct commit owns cleanup after its own TSF
+                        // composition, so the logical terminal operation is reconciled once.
+                        let followup_owns_ui_cleanup =
+                            Self::followup_owns_terminal_ui_cleanup(actions, action_index);
+                        terminal_ui_cleanup_delegated_to_followup = followup_owns_ui_cleanup;
+                        let skip_ui_cleanup = Self::preceding_action_sent_terminal_ui_cleanup(
+                            terminal_ui_cleanup_sent_at,
+                            action_index,
+                        ) || followup_owns_ui_cleanup;
+                        Self::run_terminal_action_cleanup(
+                            skip_ui_cleanup,
                             || self.end_composition(),
                             || self.hide_candidate_window_ui(&mut ipc_service),
                         )?;
@@ -7160,9 +7184,22 @@ impl TextServiceFactory {
                         }
                     }
                     ClientAction::CommitTextDirect(text) => {
-                        self.start_composition()?;
-                        self.set_text(text, "")?;
-                        self.end_composition()?;
+                        // This action creates and ends a standalone TSF composition while the
+                        // logical state is already terminal. It must therefore own the final UI
+                        // reconciliation instead of relying on an earlier EndComposition.
+                        let direct_commit_result = Self::run_terminal_action_cleanup(
+                            false,
+                            || {
+                                self.start_composition()?;
+                                self.set_text(text, "")?;
+                                self.end_composition()
+                            },
+                            || self.hide_candidate_window_ui(&mut ipc_service),
+                        );
+                        // The direct commit attempts cleanup on both success and failure, so
+                        // the postamble no longer needs to recover the delegated ownership.
+                        terminal_ui_cleanup_delegated_to_followup = false;
+                        direct_commit_result?;
                     }
                     ClientAction::RestoreReconversionOriginal => {
                         if let Some(original) = reconversion_original.as_deref() {
@@ -8398,10 +8435,16 @@ impl TextServiceFactory {
             Ok(())
         })();
 
-        if result.is_err() && requested_transition == CompositionState::None {
+        if result.is_err()
+            && Self::terminal_ui_cleanup_required_after_failure(
+                &requested_transition,
+                terminal_ui_cleanup_delegated_to_followup,
+            )
+        {
             // The requested state is authoritative even when a TSF callback fails
-            // midway through the edit. Repeat the cheap best-effort UI cleanup so
-            // deferred action replay is never required merely to hide stale UI.
+            // midway through the edit. A deferred replay can carry the old persisted
+            // state, so also reclaim cleanup delegated to a follow-up action that was
+            // never reached. UI cleanup must not require terminal action replay.
             if let Ok(Some(mut ipc_service)) = IMEState::ipc_service() {
                 let _ = self.hide_candidate_window_ui(&mut ipc_service);
                 let _ = IMEState::set_ipc_service(ipc_service);
