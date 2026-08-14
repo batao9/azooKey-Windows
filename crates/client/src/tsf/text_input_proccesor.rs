@@ -143,6 +143,7 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
     #[tracing::instrument]
     fn Deactivate(&self) -> Result<()> {
         tracing::debug!("Deactivated");
+        self.clear_tracked_modifier_key_state();
 
         // remove reference to the dll instance
         let mut dll_instance = DllModule::get()?;
@@ -206,7 +207,6 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         // clear display attribute
         text_service.display_attribute_atom.clear();
 
-        text_service.shift_key_down = false;
         text_service.tid = 0;
         text_service.thread_mgr = None;
 

@@ -84,6 +84,24 @@ struct ModifierState {
     win: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ShiftKeyState {
+    physical: bool,
+    tracked: bool,
+}
+
+impl ShiftKeyState {
+    #[inline]
+    fn for_regular_key(self) -> bool {
+        self.physical
+    }
+
+    #[inline]
+    fn for_eisu_shortcut(self) -> bool {
+        self.physical || self.tracked
+    }
+}
+
 fn reconversion_shortcut_matches(
     preset: ReconversionKey,
     key_code: usize,
@@ -527,6 +545,18 @@ impl TextServiceFactory {
                     .iter()
                     .any(|key| GetAsyncKeyState(key.0 as i32) as u16 & 0x8000 != 0)
             }
+    }
+
+    #[inline]
+    fn shift_key_state(&self) -> ShiftKeyState {
+        let tracked = self
+            .borrow()
+            .map(|text_service| text_service.shift_key_down)
+            .unwrap_or(false);
+        ShiftKeyState {
+            physical: Self::is_shift_pressed(),
+            tracked,
+        }
     }
 
     #[inline]
@@ -5339,13 +5369,7 @@ impl TextServiceFactory {
             .shortcuts
             .reconversion_key;
         let modifiers = ModifierState {
-            shift: {
-                let tracked = self
-                    .borrow()
-                    .map(|text_service| text_service.shift_key_down)
-                    .unwrap_or(false);
-                tracked || Self::is_shift_pressed()
-            },
+            shift: self.shift_key_state().for_regular_key(),
             ctrl: Self::is_ctrl_pressed(),
             alt: Self::is_alt_pressed(),
             win: Self::is_win_pressed(),
@@ -5620,13 +5644,8 @@ impl TextServiceFactory {
             let is_ctrl_pressed = Self::is_ctrl_pressed();
             let is_alt_pressed = Self::is_alt_pressed();
             let is_win_pressed = Self::is_win_pressed();
-            let is_shift_pressed = {
-                let tracked_shift = self
-                    .borrow()
-                    .map(|text_service| text_service.shift_key_down)
-                    .unwrap_or(false);
-                tracked_shift || Self::is_shift_pressed()
-            };
+            let shift_key_state = self.shift_key_state();
+            let is_shift_pressed = shift_key_state.for_regular_key();
             let is_ctrl_space = is_ctrl_pressed && wparam.0 == 0x20;
             let is_capslock_key = wparam.0 == VK_CAPITAL_KEY_CODE
                 || Self::is_translated_capslock_key(wparam.0, lparam);
@@ -5635,7 +5654,7 @@ impl TextServiceFactory {
                 Self::is_eisu_shortcut(
                     wparam.0,
                     lparam,
-                    is_shift_pressed,
+                    shift_key_state.for_eisu_shortcut(),
                     is_ctrl_pressed,
                     is_alt_pressed,
                     keyboard_layout,
@@ -6146,20 +6165,14 @@ impl TextServiceFactory {
                 return Ok(false);
             }
 
-            let is_shift_pressed = {
-                let tracked_shift = self
-                    .borrow()
-                    .map(|text_service| text_service.shift_key_down)
-                    .unwrap_or(false);
-                tracked_shift || Self::is_shift_pressed()
-            };
+            let shift_key_state = self.shift_key_state();
             let is_ctrl_pressed = Self::is_ctrl_pressed();
             let is_alt_pressed = Self::is_alt_pressed();
             let keyboard_layout = Self::current_caps_lock_keyboard_layout();
             if !Self::is_eisu_shortcut(
                 VK_CAPITAL_KEY_CODE,
                 LPARAM(0),
-                is_shift_pressed,
+                shift_key_state.for_eisu_shortcut(),
                 is_ctrl_pressed,
                 is_alt_pressed,
                 keyboard_layout,
@@ -6183,7 +6196,7 @@ impl TextServiceFactory {
 
             let deferred = DeferredUserAction {
                 action: UserAction::ToggleInputMode,
-                is_shift_pressed,
+                is_shift_pressed: shift_key_state.for_regular_key(),
                 is_shift_key: false,
                 shift_alphabet_shortcut: false,
             };

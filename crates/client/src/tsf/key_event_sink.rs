@@ -112,15 +112,17 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<BOOL> {
-        let result = self.process_key_up(pic, wparam, lparam)?.is_some();
+        // Release the tracked modifier before fallible composition work so an
+        // error cannot leave later ordinary keys looking Shift-modified.
         self.update_shift_key_state(wparam, false);
+        let result = self.process_key_up(pic, wparam, lparam)?.is_some();
         Ok(result.into())
     }
 
     #[macros::anyhow]
     fn OnKeyUp(&self, pic: Option<&ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
-        let result = self.handle_key_up(pic, wparam, lparam)?;
         self.update_shift_key_state(wparam, false);
+        let result = self.handle_key_up(pic, wparam, lparam)?;
         Ok(result.into())
     }
 
@@ -185,7 +187,7 @@ impl TextServiceFactory_Impl {
         }
     }
 
-    fn clear_tracked_modifier_key_state(&self) {
+    pub(crate) fn clear_tracked_modifier_key_state(&self) {
         if let Ok(mut text_service) = self.borrow_mut() {
             text_service.shift_key_down = false;
         }
