@@ -144,10 +144,132 @@ fn terminal_end_reuses_only_a_delivered_preceding_ui_cleanup() {
 }
 
 #[test]
+fn direct_commit_followup_owns_terminal_ui_cleanup_only_for_terminal_transition() {
+    let terminal_direct_commit = vec![
+        DeferredClientAction {
+            action: ClientAction::EndComposition,
+            transition: CompositionState::None,
+        },
+        DeferredClientAction {
+            action: ClientAction::CommitTextDirect("、".to_string()),
+            transition: CompositionState::None,
+        },
+    ];
+    assert!(TextServiceFactory::followup_owns_terminal_ui_cleanup(
+        &terminal_direct_commit,
+        0,
+    ));
+
+    let composing_direct_commit = vec![
+        terminal_direct_commit[0].clone(),
+        DeferredClientAction {
+            action: ClientAction::CommitTextDirect("、".to_string()),
+            transition: CompositionState::Composing,
+        },
+    ];
+    assert!(!TextServiceFactory::followup_owns_terminal_ui_cleanup(
+        &composing_direct_commit,
+        0,
+    ));
+
+    let ordinary_followup = vec![
+        terminal_direct_commit[0].clone(),
+        DeferredClientAction {
+            action: ClientAction::SetIMEMode(InputMode::Latin),
+            transition: CompositionState::None,
+        },
+    ];
+    assert!(!TextServiceFactory::followup_owns_terminal_ui_cleanup(
+        &ordinary_followup,
+        0,
+    ));
+    assert!(!TextServiceFactory::followup_owns_terminal_ui_cleanup(
+        &terminal_direct_commit,
+        1,
+    ));
+}
+
+#[test]
+fn punctuation_terminal_cleanup_runs_once_after_direct_commit() {
+    let actions = vec![
+        DeferredClientAction {
+            action: ClientAction::EndComposition,
+            transition: CompositionState::None,
+        },
+        DeferredClientAction {
+            action: ClientAction::CommitTextDirect("、".to_string()),
+            transition: CompositionState::None,
+        },
+    ];
+    let order = std::cell::RefCell::new(Vec::new());
+
+    TextServiceFactory::run_terminal_action_cleanup(
+        TextServiceFactory::followup_owns_terminal_ui_cleanup(&actions, 0),
+        || {
+            order.borrow_mut().push("end-current");
+            Ok(())
+        },
+        || {
+            order.borrow_mut().push("hide");
+            Ok(WindowRpcDelivery::Sent)
+        },
+    )
+    .expect("the current composition should end");
+    TextServiceFactory::run_terminal_action_cleanup(
+        false,
+        || {
+            order
+                .borrow_mut()
+                .extend(["start-direct", "set-direct", "end-direct"]);
+            Ok(())
+        },
+        || {
+            order.borrow_mut().push("hide");
+            Ok(WindowRpcDelivery::Sent)
+        },
+    )
+    .expect("the standalone punctuation composition should commit");
+
+    assert_eq!(
+        *order.borrow(),
+        [
+            "end-current",
+            "start-direct",
+            "set-direct",
+            "end-direct",
+            "hide"
+        ]
+    );
+}
+
+#[test]
+fn delegated_terminal_ui_cleanup_is_reclaimed_after_sequence_failure() {
+    assert!(
+        TextServiceFactory::terminal_ui_cleanup_required_after_failure(
+            &CompositionState::Composing,
+            true,
+        )
+    );
+    assert!(
+        TextServiceFactory::terminal_ui_cleanup_required_after_failure(
+            &CompositionState::None,
+            false,
+        )
+    );
+    assert!(
+        !TextServiceFactory::terminal_ui_cleanup_required_after_failure(
+            &CompositionState::Composing,
+            false,
+        ),
+        "a non-terminal failure without delegated ownership must preserve its UI"
+    );
+}
+
+#[test]
 fn terminal_end_commits_tsf_before_waiting_for_ui_cleanup() {
     let order = std::cell::RefCell::new(Vec::new());
 
-    TextServiceFactory::run_terminal_end_cleanup(
+    TextServiceFactory::run_terminal_action_cleanup(
         false,
         || {
             order.borrow_mut().push("end");
@@ -167,7 +289,7 @@ fn terminal_end_commits_tsf_before_waiting_for_ui_cleanup() {
 fn terminal_end_still_hides_ui_after_tsf_failure_and_preserves_the_tsf_error() {
     let order = std::cell::RefCell::new(Vec::new());
 
-    let error = TextServiceFactory::run_terminal_end_cleanup(
+    let error = TextServiceFactory::run_terminal_action_cleanup(
         false,
         || {
             order.borrow_mut().push("end");
@@ -185,10 +307,31 @@ fn terminal_end_still_hides_ui_after_tsf_failure_and_preserves_the_tsf_error() {
 }
 
 #[test]
+fn terminal_direct_commit_still_hides_ui_after_tsf_failure() {
+    let order = std::cell::RefCell::new(Vec::new());
+
+    let error = TextServiceFactory::run_terminal_action_cleanup(
+        false,
+        || {
+            order.borrow_mut().extend(["start-direct", "set-direct"]);
+            anyhow::bail!("direct set failed")
+        },
+        || {
+            order.borrow_mut().push("hide");
+            Ok(WindowRpcDelivery::Sent)
+        },
+    )
+    .expect_err("the TSF failure must remain visible to recovery");
+
+    assert_eq!(*order.borrow(), ["start-direct", "set-direct", "hide"]);
+    assert!(error.to_string().contains("direct set failed"));
+}
+
+#[test]
 fn terminal_end_skips_duplicate_ui_cleanup_after_terminal_remove() {
     let order = std::cell::RefCell::new(Vec::new());
 
-    TextServiceFactory::run_terminal_end_cleanup(
+    TextServiceFactory::run_terminal_action_cleanup(
         true,
         || {
             order.borrow_mut().push("end");
@@ -208,7 +351,7 @@ fn terminal_end_skips_duplicate_ui_cleanup_after_terminal_remove() {
 fn terminal_end_does_not_replay_after_ui_cleanup_failure() {
     let order = std::cell::RefCell::new(Vec::new());
 
-    TextServiceFactory::run_terminal_end_cleanup(
+    TextServiceFactory::run_terminal_action_cleanup(
         false,
         || {
             order.borrow_mut().push("end");
