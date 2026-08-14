@@ -8,7 +8,7 @@ use super::{
     ClauseBoundarySync, ClauseNavigationReadyUiSync, ClauseSnapshot, ClauseState, Composition,
     CompositionReducer, CompositionState, ConsumedPrefixRestore, DeferredClientAction,
     DeferredInputEvent, DeferredProjection, DeferredUserAction, FutureClauseSnapshot,
-    ModifierState, TextServiceFactory,
+    ModifierState, ShiftKeyState, TextServiceFactory,
 };
 use crate::engine::{
     client_action::{
@@ -22,7 +22,10 @@ use crate::tsf::edit_session::EditSessionFailure;
 use shared::{
     get_default_romaji_rows, AppConfig, PunctuationStyle, ReconversionKey, RomajiRule, WidthMode,
 };
-use windows::Win32::{Foundation::LPARAM, UI::TextServices::TF_E_LOCKED};
+use windows::Win32::{
+    Foundation::{LPARAM, WPARAM},
+    UI::TextServices::TF_E_LOCKED,
+};
 
 #[test]
 fn deadline_recovery_defers_all_actions_from_failure_point() {
@@ -1574,6 +1577,59 @@ fn eisu_shortcut_matches_ms_ime_capslock_rules_by_keyboard_layout() {
         false,
         false,
         CapsLockKeyboardLayout::Japanese
+    ));
+}
+
+#[test]
+fn stale_tracked_shift_is_limited_to_eisu_shortcut_fallback() {
+    let stale_state = ShiftKeyState {
+        physical: false,
+        tracked: true,
+    };
+
+    let shift_alphabet_shortcut =
+        TextServiceFactory::is_shift_alphabet_shortcut(WPARAM(0x41), stale_state.for_regular_key());
+    assert!(!shift_alphabet_shortcut);
+
+    let app_config = AppConfig::default();
+    let romaji_lookup = super::RomajiLookup::from_rows(&app_config.romaji_table.rows);
+    let (_, actions) = TextServiceFactory::plan_deferred_user_action(
+        &Composition::default(),
+        &DeferredUserAction {
+            action: UserAction::Input('a'),
+            is_shift_pressed: stale_state.for_regular_key(),
+            is_shift_key: false,
+            shift_alphabet_shortcut,
+        },
+        &InputMode::Kana,
+        &app_config,
+        &romaji_lookup,
+    )
+    .expect("ordinary alphabet input should remain plannable after a stale tracked Shift");
+    assert_eq!(
+        actions,
+        vec![
+            ClientAction::StartComposition,
+            ClientAction::AppendText("a".to_string())
+        ]
+    );
+
+    assert!(TextServiceFactory::is_eisu_shortcut(
+        0x14,
+        LPARAM(0),
+        stale_state.for_eisu_shortcut(),
+        false,
+        false,
+        CapsLockKeyboardLayout::English
+    ));
+
+    let pressed_state = ShiftKeyState {
+        physical: true,
+        tracked: false,
+    };
+    assert!(TextServiceFactory::is_shift_alphabet_shortcut(
+        WPARAM(0x41),
+        pressed_state.for_regular_key()
     ));
 }
 

@@ -72,6 +72,10 @@ impl ITfThreadMgrEventSink_Impl for TextServiceFactory_Impl {
         focus: Option<&ITfDocumentMgr>,
         _prevfocus: Option<&ITfDocumentMgr>,
     ) -> Result<()> {
+        // A modifier key-up can be delivered to the newly focused thread or
+        // document instead of this text service.
+        self.clear_tracked_modifier_key_state();
+
         // if focus is changed, the text layout sink should be updated
         if let Some(focus) = focus {
             self.borrow_mut()?.advise_text_layout_sink(focus.clone())?;
@@ -104,6 +108,7 @@ impl ITfThreadMgrEventSink_Impl for TextServiceFactory_Impl {
 impl ITfThreadFocusSink_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     fn OnSetThreadFocus(&self) -> Result<()> {
+        self.clear_tracked_modifier_key_state();
         let focus = {
             let text_service = self.borrow()?;
             let thread_mgr = text_service.thread_mgr()?;
@@ -117,6 +122,7 @@ impl ITfThreadFocusSink_Impl for TextServiceFactory_Impl {
 
     #[macros::anyhow]
     fn OnKillThreadFocus(&self) -> Result<()> {
+        self.clear_tracked_modifier_key_state();
         self.set_keyboard_disabled_state(true)?;
 
         Ok(())
