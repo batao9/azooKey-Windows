@@ -29,6 +29,7 @@ import { saveConfigWithToast } from "@/lib/config";
 
 type WidthMode = "half" | "full";
 type LearningMode = "enabled" | "read_only" | "disabled";
+type ReconversionKey = "convert" | "shift_convert" | "space" | "win_slash" | "disabled";
 
 type GeneralConfigState = {
     punctuation_style: string;
@@ -140,6 +141,19 @@ const PUNCTUATION_OPTIONS = [
     { value: "touten_fullwidth_period", label: "、．" },
     { value: "fullwidth_comma_kuten", label: "，。" },
 ];
+
+const RECONVERSION_KEY_OPTIONS: { value: ReconversionKey; label: string }[] = [
+    { value: "convert", label: "変換" },
+    { value: "shift_convert", label: "Shift + 変換" },
+    { value: "space", label: "Space" },
+    { value: "win_slash", label: "Win + /" },
+    { value: "disabled", label: "無効" },
+];
+
+const normalizeReconversionKey = (value: unknown): ReconversionKey =>
+    RECONVERSION_KEY_OPTIONS.some((option) => option.value === value)
+        ? (value as ReconversionKey)
+        : "win_slash";
 
 const SYMBOL_OPTIONS = [
     { value: "corner_bracket_middle_dot", label: "「」・" },
@@ -304,6 +318,7 @@ export const General = () => {
         ctrlSpaceToggle: true,
         altBackquoteToggle: true,
         eisuToggle: false,
+        reconversionKey: "win_slash" as ReconversionKey,
     });
     const [generalValue, setGeneralValue] = useState<GeneralConfigState>(
         DEFAULT_GENERAL_CONFIG,
@@ -336,6 +351,7 @@ export const General = () => {
                     ctrlSpaceToggle: shortcuts.ctrl_space_toggle ?? true,
                     altBackquoteToggle: shortcuts.alt_backquote_toggle ?? true,
                     eisuToggle: shortcuts.eisu_toggle ?? false,
+                    reconversionKey: normalizeReconversionKey(shortcuts.reconversion_key),
                 });
 
                 setGeneralValue(normalizeGeneralConfig(data.general));
@@ -504,6 +520,17 @@ export const General = () => {
 
         if (data) {
             setShortcutValue((prev) => ({ ...prev, eisuToggle: nextValue }));
+        }
+    };
+
+    const handleReconversionKey = async (nextValue: ReconversionKey) => {
+        const data = await updateConfig((config) => {
+            config.shortcuts = config.shortcuts ?? {};
+            config.shortcuts.reconversion_key = nextValue;
+        });
+
+        if (data) {
+            setShortcutValue((prev) => ({ ...prev, reconversionKey: nextValue }));
         }
     };
 
@@ -838,6 +865,27 @@ export const General = () => {
                                     </SelectTrigger>
                                     <SelectContent>
                                         {NUMPAD_OPTIONS.map((option) => (
+                                            <SelectItem key={option.value} value={option.value}>
+                                                {option.label}
+                                            </SelectItem>
+                                        ))}
+                                    </SelectContent>
+                                </Select>
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-[1fr_220px] items-center gap-4">
+                            <p className="text-sm font-medium">再変換</p>
+                            <div className="flex justify-end">
+                                <Select
+                                    value={shortcutValue.reconversionKey}
+                                    onValueChange={(value: ReconversionKey) => void handleReconversionKey(value)}
+                                >
+                                    <SelectTrigger>
+                                        <SelectValue placeholder="再変換キーを選択" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        {RECONVERSION_KEY_OPTIONS.map((option) => (
                                             <SelectItem key={option.value} value={option.value}>
                                                 {option.label}
                                             </SelectItem>

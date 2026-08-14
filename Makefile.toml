@@ -36,6 +36,11 @@ description = "Sync app version into generated metadata"
 command = "node"
 args = ["scripts/sync-version.mjs"]
 
+[tasks.generate_reverse_dictionary]
+description = "Generate the compact surface-to-reading index"
+command = "node"
+args = ["scripts/generate-reverse-dictionary.mjs"]
+
 [tasks.build_installer]
 command = "iscc"
 args = ["./installer/Installer.iss"]
@@ -75,6 +80,8 @@ cp $env:APPDATA/../Local/Programs/Swift/Runtimes/*/usr/bin/* build
 
 cp -Recurse -Force server-swift/azooKey_emoji_dictionary_storage/EmojiDictionary build
 cp -Recurse -Force server-swift/azooKey_dictionary_storage/Dictionary build
+mkdir build/Dictionary/Reverse -Force
+cp target/azookey-reverse-dictionary/reverse-v2.bin build/Dictionary/Reverse
 
 cp zenz.gguf build
 
@@ -89,6 +96,7 @@ description = "Run the flow"
 dependencies = [
     "format",
     "sync_version",
+    "generate_reverse_dictionary",
     "build_swift",
     "build_x64",
     "build_x86",

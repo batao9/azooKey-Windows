@@ -1,6 +1,7 @@
 pub(super) mod display_attribute;
 pub(super) mod edit_session;
 pub(super) mod factory;
+pub(super) mod function_provider;
 pub(super) mod key_event_sink;
 pub(super) mod language_bar;
 pub(super) mod surrounded_text;

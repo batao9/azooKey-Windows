@@ -663,7 +663,7 @@ mod tests {
     use super::ConfigWriteGuard;
     use super::{
         AppConfig, ConfigError, DebugConfig, GeneralConfig, LearningConfig, LearningMode,
-        NumpadInputMode, ShortcutConfig, CONFIG_VERSION,
+        NumpadInputMode, ReconversionKey, ShortcutConfig, CONFIG_VERSION,
         LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_DEFAULT, SETTINGS_FILENAME,
     };
     use std::{
@@ -803,11 +803,30 @@ mod tests {
         assert!(default_config.ctrl_space_toggle);
         assert!(default_config.alt_backquote_toggle);
         assert!(!default_config.eisu_toggle);
+        assert_eq!(default_config.reconversion_key, ReconversionKey::WinSlash);
 
         let deserialized: ShortcutConfig = serde_json::from_str("{}").unwrap();
         assert!(deserialized.ctrl_space_toggle);
         assert!(deserialized.alt_backquote_toggle);
         assert!(!deserialized.eisu_toggle);
+        assert_eq!(deserialized.reconversion_key, ReconversionKey::WinSlash);
+    }
+
+    #[test]
+    fn reconversion_key_serializes_as_a_preset() {
+        let config = ShortcutConfig {
+            reconversion_key: ReconversionKey::WinSlash,
+            ..ShortcutConfig::default()
+        };
+
+        let serialized = serde_json::to_value(config).unwrap();
+        assert_eq!(serialized["reconversion_key"], "win_slash");
+
+        let deserialized: ShortcutConfig = serde_json::from_value(serde_json::json!({
+            "reconversion_key": "shift_convert"
+        }))
+        .unwrap();
+        assert_eq!(deserialized.reconversion_key, ReconversionKey::ShiftConvert);
     }
 
     #[test]
@@ -1136,6 +1155,17 @@ pub struct ZenzaiConfig {
     pub backend: String,
 }
 
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconversionKey {
+    Convert,
+    ShiftConvert,
+    Space,
+    #[default]
+    WinSlash,
+    Disabled,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct ShortcutConfig {
     #[serde(default = "default_shortcut_enabled")]
@@ -1144,6 +1174,8 @@ pub struct ShortcutConfig {
     pub alt_backquote_toggle: bool,
     #[serde(default)]
     pub eisu_toggle: bool,
+    #[serde(default)]
+    pub reconversion_key: ReconversionKey,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -1239,6 +1271,7 @@ impl Default for ShortcutConfig {
             ctrl_space_toggle: true,
             alt_backquote_toggle: true,
             eisu_toggle: false,
+            reconversion_key: ReconversionKey::default(),
         }
     }
 }

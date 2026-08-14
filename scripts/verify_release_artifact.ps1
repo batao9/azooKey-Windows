@@ -81,6 +81,7 @@ function Assert-InstallPayload {
         "build-info.json",
         "zenz.gguf",
         "Dictionary",
+        "Dictionary\Reverse\reverse-v2.bin",
         "EmojiDictionary",
         "llama_cpu",
         "llama_cuda",

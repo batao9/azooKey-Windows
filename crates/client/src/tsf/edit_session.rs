@@ -6,8 +6,8 @@ use windows::{
         UI::TextServices::{
             ITfComposition, ITfCompositionSink, ITfContext, ITfContextComposition, ITfEditSession,
             ITfEditSession_Impl, ITfInsertAtSelection, ITfRange, ITfTextInputProcessor,
-            GUID_PROP_ATTRIBUTE, TF_AE_NONE, TF_ANCHOR_END, TF_ANCHOR_START, TF_ES_ASYNC,
-            TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_QUERYONLY, TF_SELECTION,
+            GUID_PROP_ATTRIBUTE, TF_AE_NONE, TF_ANCHOR_END, TF_ANCHOR_START, TF_DEFAULT_SELECTION,
+            TF_ES_ASYNC, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_QUERYONLY, TF_SELECTION,
             TF_SELECTIONSTYLE, TF_ST_CORRECTION, TF_S_ASYNC, TF_TF_MOVESTART,
         },
     },
@@ -317,6 +317,13 @@ fn close_composition_callback_with_progress(
 }
 
 const RANGE_TEXT_CHUNK_CODE_UNITS: usize = 1024;
+const MAX_RECONVERSION_UTF16_CODE_UNITS: usize = 256;
+
+pub(crate) enum SelectedText {
+    Empty,
+    Text(String),
+    Unsupported,
+}
 
 fn collect_range_text(
     mut read: impl FnMut(&mut [u16]) -> anyhow::Result<usize>,
@@ -344,6 +351,85 @@ fn read_all_range_text(cookie: u32, range: &ITfRange) -> anyhow::Result<Vec<u16>
         range.GetText(cookie, TF_TF_MOVESTART, chunk, &mut length)?;
         usize::try_from(length)
             .map_err(|_| anyhow::anyhow!("ITfRange::GetText returned a negative length"))
+    })
+}
+
+fn collect_range_text_prefix(
+    max_code_units: usize,
+    mut read: impl FnMut(&mut [u16]) -> anyhow::Result<usize>,
+) -> anyhow::Result<Vec<u16>> {
+    let mut text = Vec::new();
+    while text.len() <= max_code_units {
+        let remaining = max_code_units + 1 - text.len();
+        let mut chunk = vec![0u16; remaining.min(RANGE_TEXT_CHUNK_CODE_UNITS)];
+        let length = read(&mut chunk)?;
+        if length > chunk.len() {
+            anyhow::bail!(
+                "ITfRange::GetText returned {length} UTF-16 code units for a {}-unit buffer",
+                chunk.len()
+            );
+        }
+        if length == 0 {
+            break;
+        }
+        text.extend_from_slice(&chunk[..length]);
+    }
+    Ok(text)
+}
+
+fn read_range_text_prefix(
+    cookie: u32,
+    range: &ITfRange,
+    max_code_units: usize,
+) -> anyhow::Result<Vec<u16>> {
+    collect_range_text_prefix(max_code_units, |chunk| unsafe {
+        let mut length = 0;
+        range.GetText(cookie, TF_TF_MOVESTART, chunk, &mut length)?;
+        usize::try_from(length)
+            .map_err(|_| anyhow::anyhow!("ITfRange::GetText returned a negative length"))
+    })
+}
+
+fn selected_text_for_cookie(cookie: u32, context: &ITfContext) -> anyhow::Result<SelectedText> {
+    let mut selection: [TF_SELECTION; 1] = [TF_SELECTION::default()];
+    let mut fetched = 0;
+    unsafe {
+        context.GetSelection(cookie, TF_DEFAULT_SELECTION, &mut selection, &mut fetched)?;
+    }
+    let Some(range) = (fetched > 0).then(|| selection[0].range.as_ref()).flatten() else {
+        return Ok(SelectedText::Empty);
+    };
+    reconversion_text_for_cookie(cookie, range)
+}
+
+fn reconversion_text_for_cookie(cookie: u32, range: &ITfRange) -> anyhow::Result<SelectedText> {
+    let readable_range = unsafe { range.Clone()? };
+    let text = read_range_text_prefix(cookie, &readable_range, MAX_RECONVERSION_UTF16_CODE_UNITS)?;
+    decode_selected_text(&text)
+}
+
+fn has_nonempty_selection_for_cookie(cookie: u32, context: &ITfContext) -> anyhow::Result<bool> {
+    let mut selection: [TF_SELECTION; 1] = [TF_SELECTION::default()];
+    let mut fetched = 0;
+    unsafe {
+        context.GetSelection(cookie, TF_DEFAULT_SELECTION, &mut selection, &mut fetched)?;
+    }
+    let Some(range) = (fetched > 0).then(|| selection[0].range.as_ref()).flatten() else {
+        return Ok(false);
+    };
+    Ok(!unsafe { range.IsEmpty(cookie)? }.as_bool())
+}
+
+fn decode_selected_text(text: &[u16]) -> anyhow::Result<SelectedText> {
+    if text.is_empty() {
+        return Ok(SelectedText::Empty);
+    }
+    if text.len() > MAX_RECONVERSION_UTF16_CODE_UNITS {
+        return Ok(SelectedText::Unsupported);
+    }
+    Ok(match String::from_utf16(text) {
+        Ok(text) => SelectedText::Text(text),
+        Err(_) => SelectedText::Unsupported,
     })
 }
 
@@ -454,6 +540,145 @@ fn caret_position_or_none(result: Result<Option<WindowPosition>>) -> Option<Wind
 }
 
 impl TextServiceFactory {
+    pub(crate) fn has_nonempty_selection(&self, context: &ITfContext) -> Result<bool> {
+        let tid = self.borrow()?.tid;
+        let context = context.clone();
+        read_edit_session(
+            tid,
+            context.clone(),
+            Rc::new(move |cookie| has_nonempty_selection_for_cookie(cookie, &context)),
+        )
+    }
+
+    pub(crate) fn selected_text(&self, context: &ITfContext) -> Result<SelectedText> {
+        let tid = self.borrow()?.tid;
+        let context = context.clone();
+        read_edit_session(
+            tid,
+            context.clone(),
+            Rc::new(move |cookie| selected_text_for_cookie(cookie, &context)),
+        )
+    }
+
+    pub(crate) fn reconversion_text_for_range(
+        &self,
+        context: &ITfContext,
+        range: &ITfRange,
+    ) -> Result<SelectedText> {
+        let range_context = unsafe { range.GetContext()? };
+        if !has_same_com_identity(context, &range_context) {
+            anyhow::bail!("Reconversion range belongs to a different TSF context");
+        }
+        let tid = self.borrow()?.tid;
+        let context = context.clone();
+        let range = unsafe { range.Clone()? };
+        read_edit_session(
+            tid,
+            context,
+            Rc::new(move |cookie| reconversion_text_for_cookie(cookie, &range)),
+        )
+    }
+
+    pub(crate) fn start_composition_on_selected_text(
+        &self,
+        context: &ITfContext,
+        expected_text: &str,
+    ) -> Result<bool> {
+        let (tid, sink) = {
+            let text_service = self.borrow()?;
+            (text_service.tid, text_service.this::<ITfCompositionSink>()?)
+        };
+        let context = context.clone();
+        let context_composition = context.cast::<ITfContextComposition>()?;
+        let expected_text = expected_text.to_string();
+        let composition = write_edit_session(
+            tid,
+            context.clone(),
+            Rc::new(move |cookie| {
+                let mut selection: [TF_SELECTION; 1] = [TF_SELECTION::default()];
+                let mut fetched = 0;
+                unsafe {
+                    context.GetSelection(
+                        cookie,
+                        TF_DEFAULT_SELECTION,
+                        &mut selection,
+                        &mut fetched,
+                    )?;
+                }
+                let Some(range) = (fetched > 0).then(|| selection[0].range.as_ref()).flatten()
+                else {
+                    return Ok(None);
+                };
+                let readable_range = unsafe { range.Clone()? };
+                let current_text = read_range_text_prefix(
+                    cookie,
+                    &readable_range,
+                    MAX_RECONVERSION_UTF16_CODE_UNITS,
+                )?;
+                if String::from_utf16(&current_text).ok().as_deref() != Some(&expected_text) {
+                    return Ok(None);
+                }
+                let composition =
+                    unsafe { context_composition.StartComposition(cookie, range, &sink)? };
+                Ok(Some(composition))
+            }),
+        )?;
+
+        let Some(composition) = composition else {
+            return Ok(false);
+        };
+        let mut text_service = self.borrow_mut()?;
+        text_service.borrow_mut_composition()?.tip_composition = Some(composition);
+        text_service.invalidate_mode_switch_requests();
+        Ok(true)
+    }
+
+    pub(crate) fn start_composition_on_reconversion_range(
+        &self,
+        context: &ITfContext,
+        range: &ITfRange,
+        expected_text: &str,
+    ) -> Result<bool> {
+        let range_context = unsafe { range.GetContext()? };
+        if !has_same_com_identity(context, &range_context) {
+            anyhow::bail!("Reconversion range belongs to a different TSF context");
+        }
+        let (tid, sink) = {
+            let text_service = self.borrow()?;
+            (text_service.tid, text_service.this::<ITfCompositionSink>()?)
+        };
+        let context = context.clone();
+        let context_composition = context.cast::<ITfContextComposition>()?;
+        let range = unsafe { range.Clone()? };
+        let expected_text = expected_text.to_string();
+        let composition = write_edit_session(
+            tid,
+            context,
+            Rc::new(move |cookie| {
+                let readable_range = unsafe { range.Clone()? };
+                let current_text = read_range_text_prefix(
+                    cookie,
+                    &readable_range,
+                    MAX_RECONVERSION_UTF16_CODE_UNITS,
+                )?;
+                if String::from_utf16(&current_text).ok().as_deref() != Some(&expected_text) {
+                    return Ok(None);
+                }
+                let composition =
+                    unsafe { context_composition.StartComposition(cookie, &range, &sink)? };
+                Ok(Some(composition))
+            }),
+        )?;
+
+        let Some(composition) = composition else {
+            return Ok(false);
+        };
+        let mut text_service = self.borrow_mut()?;
+        text_service.borrow_mut_composition()?.tip_composition = Some(composition);
+        text_service.invalidate_mode_switch_requests();
+        Ok(true)
+    }
+
     fn log_candidate_window_position_performance(
         request_id: u64,
         stage: &str,
@@ -1149,12 +1374,13 @@ impl TextServiceFactory {
 #[cfg(test)]
 mod tests {
     use super::{
-        caret_position_or_none, collect_range_text, commit_shift_start_after_prepare,
-        complete_async_edit_session_request, complete_async_position_request,
-        complete_sync_edit_session, is_non_destructive_edit_session_error, prepare_set_text,
-        should_apply_display_attribute, should_clear_display_attribute,
-        should_restore_detached_composition, AsyncEditSession, CloseCompositionProgress,
-        EditSessionFailure,
+        caret_position_or_none, collect_range_text, collect_range_text_prefix,
+        commit_shift_start_after_prepare, complete_async_edit_session_request,
+        complete_async_position_request, complete_sync_edit_session, decode_selected_text,
+        is_non_destructive_edit_session_error, prepare_set_text, should_apply_display_attribute,
+        should_clear_display_attribute, should_restore_detached_composition, AsyncEditSession,
+        CloseCompositionProgress, EditSessionFailure, SelectedText,
+        MAX_RECONVERSION_UTF16_CODE_UNITS,
     };
     use std::{cell::Cell, rc::Rc};
     use windows::{
@@ -1194,6 +1420,47 @@ mod tests {
             String::from_utf16(&actual).unwrap(),
             format!("{}😀末尾", "a".repeat(1023))
         );
+    }
+
+    #[test]
+    fn selected_text_decoding_distinguishes_empty_valid_and_invalid_utf16() {
+        assert!(matches!(
+            decode_selected_text(&[]).unwrap(),
+            SelectedText::Empty
+        ));
+        assert!(matches!(
+            decode_selected_text(&"日本😀".encode_utf16().collect::<Vec<_>>()).unwrap(),
+            SelectedText::Text(text) if text == "日本😀"
+        ));
+        assert!(matches!(
+            decode_selected_text(&[0xd800]).unwrap(),
+            SelectedText::Unsupported
+        ));
+        assert!(matches!(
+            decode_selected_text(&vec![b'a' as u16; MAX_RECONVERSION_UTF16_CODE_UNITS + 1])
+                .unwrap(),
+            SelectedText::Unsupported
+        ));
+    }
+
+    #[test]
+    fn reconversion_selection_reader_stops_after_the_limit_sentinel() {
+        let source = vec![b'a' as u16; MAX_RECONVERSION_UTF16_CODE_UNITS * 4];
+        let mut cursor = 0;
+        let mut calls = 0;
+
+        let actual = collect_range_text_prefix(MAX_RECONVERSION_UTF16_CODE_UNITS, |buffer| {
+            calls += 1;
+            let length = (source.len() - cursor).min(buffer.len());
+            buffer[..length].copy_from_slice(&source[cursor..cursor + length]);
+            cursor += length;
+            Ok(length)
+        })
+        .unwrap();
+
+        assert_eq!(actual.len(), MAX_RECONVERSION_UTF16_CODE_UNITS + 1);
+        assert_eq!(cursor, MAX_RECONVERSION_UTF16_CODE_UNITS + 1);
+        assert_eq!(calls, 1);
     }
 
     #[test]

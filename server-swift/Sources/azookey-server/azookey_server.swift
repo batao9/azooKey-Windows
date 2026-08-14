@@ -31,6 +31,7 @@ private let fallbackDictionaryURL =
 @MainActor var currentLearningMemoryDirectoryURL: URL?
 @MainActor var learningCandidateCache = LearningCandidateCache()
 @MainActor var learningSelectionOverrides: [String: String] = [:]
+@MainActor var reconversionDictionary = ReconversionDictionary()
 
 @MainActor var execURL = URL(filePath: "")
 @MainActor var config: [String : Any] = [
@@ -55,8 +56,247 @@ let maxLearningCandidateCacheSlotCount = 8_192
 let maxLearningSelectionOverrideCount = 4_096
 let learningSelectionOverridesFilename = "selection-overrides.json"
 let backgroundWarmupPreloadsDictionary = false
+let maxReconversionSurfaceCount = 128
+let maxReconversionDictionarySpan = 40
+let maxReconversionReadingCount = 4
 
 @MainActor var currentRequestId: UInt64 = 0
+
+struct ReconversionDictionaryEntry: Equatable {
+    let reading: String
+    let score: Float
+}
+
+struct ReconversionDictionary {
+    private static let magic = Array("AZR2".utf8)
+    private var data = Data()
+    private(set) var recordCount = 0
+    private var userEntries: [String: [ReconversionDictionaryEntry]] = [:]
+
+    mutating func load(from dictionaryURL: URL) throws {
+        let url = dictionaryURL
+            .appendingPathComponent("Reverse", isDirectory: true)
+            .appendingPathComponent("reverse-v2.bin", isDirectory: false)
+        let loaded = try Data(contentsOf: url, options: [.mappedIfSafe])
+        guard loaded.count >= 12,
+              Array(loaded.prefix(4)) == Self.magic else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let count = Int(Self.readUInt32LE(loaded, at: 4))
+        let headerEnd = 8 + (count + 1) * 4
+        guard count > 0, headerEnd <= loaded.count,
+              Int(Self.readUInt32LE(loaded, at: 8)) == headerEnd,
+              Int(Self.readUInt32LE(loaded, at: 8 + count * 4)) == loaded.count else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        data = loaded
+        recordCount = count
+    }
+
+    mutating func replaceUserEntries(_ dictionaryEntries: [DicdataElement]) {
+        userEntries = Dictionary(grouping: dictionaryEntries, by: \.word).mapValues { entries in
+            Dictionary(
+                entries.map {
+                    ($0.ruby, ReconversionDictionaryEntry(reading: $0.ruby, score: -4))
+                },
+                uniquingKeysWith: { first, _ in first }
+            ).values.sorted { $0.reading < $1.reading }
+        }
+    }
+
+    func inferReadings(
+        for surface: String,
+        limit: Int = maxReconversionReadingCount
+    ) -> [String] {
+        let characters = Array(surface)
+        guard !characters.isEmpty,
+              characters.count <= maxReconversionSurfaceCount,
+              limit > 0 else {
+            return []
+        }
+
+        let exactEntries = entries(for: surface)
+        if !exactEntries.isEmpty {
+            return exactEntries
+                .sorted {
+                    if $0.score != $1.score {
+                        return $0.score > $1.score
+                    }
+                    return $0.reading < $1.reading
+                }
+                .prefix(limit)
+                .map(\.reading)
+        }
+
+        struct Path {
+            var score: Float
+            var reading: String
+        }
+
+        var paths: [[Path]] = Array(repeating: [], count: characters.count + 1)
+        paths[0] = [Path(score: 0, reading: "")]
+        func insert(_ candidate: Path, at index: Int) {
+            if let existing = paths[index].firstIndex(where: { $0.reading == candidate.reading }) {
+                if candidate.score > paths[index][existing].score {
+                    paths[index][existing] = candidate
+                }
+            } else {
+                paths[index].append(candidate)
+            }
+            paths[index].sort {
+                if $0.score != $1.score {
+                    return $0.score > $1.score
+                }
+                return $0.reading < $1.reading
+            }
+            if paths[index].count > limit {
+                paths[index].removeLast(paths[index].count - limit)
+            }
+        }
+
+        for start in characters.indices {
+            guard !paths[start].isEmpty else {
+                continue
+            }
+
+            let sourcePaths = paths[start]
+            for path in sourcePaths {
+                if Self.canPassThrough(characters[start]) {
+                    insert(
+                        Path(
+                            score: path.score - 0.05,
+                            reading: path.reading + Self.normalizedLiteral(characters[start])
+                        ),
+                        at: start + 1
+                    )
+                }
+
+                let upperBound = min(characters.count, start + maxReconversionDictionarySpan)
+                guard start < upperBound else {
+                    continue
+                }
+                var word = ""
+                for end in (start + 1)...upperBound {
+                    word.append(characters[end - 1])
+                    for entry in entries(for: word) {
+                        insert(
+                            Path(
+                                score: path.score + entry.score - 0.2,
+                                reading: path.reading + entry.reading
+                            ),
+                            at: end
+                        )
+                    }
+                }
+            }
+        }
+        return paths[characters.count].map(\.reading)
+    }
+
+    private static func canPassThrough(_ character: Character) -> Bool {
+        !character.unicodeScalars.contains { scalar in
+            switch scalar.value {
+            case 0x3005...0x3007, 0x303b,
+                 0x3400...0x4dbf, 0x4e00...0x9fff, 0xf900...0xfaff,
+                 0x20000...0x2fa1f:
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
+    private static func normalizedLiteral(_ character: Character) -> String {
+        hiraganaToKatakana(String(character))
+    }
+
+    private func entries(for surface: String) -> [ReconversionDictionaryEntry] {
+        var result = userEntries[surface] ?? []
+        guard recordCount > 0 else {
+            return result
+        }
+        let target = Array(surface.utf8)
+        var lowerBound = 0
+        var upperBound = recordCount
+        while lowerBound < upperBound {
+            let middle = lowerBound + (upperBound - lowerBound) / 2
+            guard let record = record(at: middle) else {
+                return result
+            }
+            let comparison = compareBytes(record.surface, target)
+            if comparison < 0 {
+                lowerBound = middle + 1
+            } else {
+                upperBound = middle
+            }
+        }
+        var index = lowerBound
+        while index < recordCount, let record = record(at: index), compareBytes(record.surface, target) == 0 {
+            let reading = String(decoding: record.reading, as: UTF8.self)
+            if !result.contains(where: { $0.reading == reading }) {
+                result.append(ReconversionDictionaryEntry(reading: reading, score: record.score))
+            }
+            index += 1
+        }
+        return result
+    }
+
+    private func record(at index: Int) -> (surface: Data.SubSequence, reading: Data.SubSequence, score: Float)? {
+        guard (0..<recordCount).contains(index) else {
+            return nil
+        }
+        let start = Int(Self.readUInt32LE(data, at: 8 + index * 4))
+        let end = Int(Self.readUInt32LE(data, at: 8 + (index + 1) * 4))
+        guard start >= 8 + (recordCount + 1) * 4,
+              end >= start + 8,
+              end <= data.count else {
+            return nil
+        }
+        let surfaceLength = Int(Self.readUInt16LE(data, at: start))
+        let readingLength = Int(Self.readUInt16LE(data, at: start + 2))
+        let surfaceStart = start + 8
+        let readingStart = surfaceStart + surfaceLength
+        guard readingStart + readingLength == end else {
+            return nil
+        }
+        return (
+            data[surfaceStart..<readingStart],
+            data[readingStart..<end],
+            Self.readFloat32LE(data, at: start + 4)
+        )
+    }
+
+    private func compareBytes(_ left: Data.SubSequence, _ right: [UInt8]) -> Int {
+        let commonCount = min(left.count, right.count)
+        for index in 0..<commonCount {
+            let leftByte = left[left.startIndex + index]
+            let rightByte = right[index]
+            if leftByte != rightByte {
+                return leftByte < rightByte ? -1 : 1
+            }
+        }
+        if left.count == right.count {
+            return 0
+        }
+        return left.count < right.count ? -1 : 1
+    }
+
+    private static func readUInt16LE(_ data: Data, at offset: Int) -> UInt16 {
+        UInt16(data[data.startIndex + offset])
+            | (UInt16(data[data.startIndex + offset + 1]) << 8)
+    }
+
+    private static func readUInt32LE(_ data: Data, at offset: Int) -> UInt32 {
+        UInt32(data[data.startIndex + offset])
+            | (UInt32(data[data.startIndex + offset + 1]) << 8)
+            | (UInt32(data[data.startIndex + offset + 2]) << 16)
+            | (UInt32(data[data.startIndex + offset + 3]) << 24)
+    }
+
+    private static func readFloat32LE(_ data: Data, at offset: Int) -> Float {
+        Float(bitPattern: readUInt32LE(data, at: offset))
+    }
+}
 
 public typealias ServerLogEnabledCallback = @convention(c) () -> Bool
 public typealias ServerLogLevelEnabledCallback = @convention(c) (
@@ -2095,6 +2335,7 @@ func cursorPrefixBoundaryFirstClauseResults(
     defer {
         converter.importDynamicUserDictionary(dynamicUserDictionary)
         normalNBestSupplementConverter.importDynamicUserDictionary(dynamicUserDictionary)
+        reconversionDictionary.replaceUserEntries(dynamicUserDictionary)
     }
 
     config["enable"] = false
@@ -2217,6 +2458,17 @@ func cursorPrefixBoundaryFirstClauseResults(
     converterDictionaryURL = execURL.appendingPathComponent("Dictionary")
     converterPreloadDictionary = true
     ensureConverterRuntimeDirectory()
+    let reverseIndexStart = performanceNow()
+    do {
+        try reconversionDictionary.load(from: converterDictionaryURL)
+        serverLog(
+            "INFO",
+            "Initialize: reconversion dictionary loaded entries=\(reconversionDictionary.recordCount) elapsed_ms=\(elapsedPerformanceMilliseconds(since: reverseIndexStart))"
+        )
+    } catch {
+        reconversionDictionary = ReconversionDictionary()
+        serverLog("ERROR", "Initialize: failed to load reconversion dictionary: \(error)")
+    }
     rebuildConverter()
     clearLearningCandidateCache()
 
@@ -2283,6 +2535,29 @@ func cursorPrefixBoundaryFirstClauseResults(
 @_silgen_name("HasActiveComposition")
 @MainActor public func has_active_composition() -> Bool {
     !composingText.input.isEmpty
+}
+
+@_silgen_name("InferReconversionReadings")
+@MainActor public func infer_reconversion_readings(
+    surface: UnsafePointer<CChar>
+) -> UnsafeMutablePointer<CChar>? {
+    let surfaceString = String(cString: surface)
+    let readings = reconversionDictionary.inferReadings(for: surfaceString)
+    guard !readings.isEmpty else {
+        serverLog("DEBUG", "InferReconversionReading: unsupported surfaceLength=\(surfaceString.count)")
+        return nil
+    }
+    guard JSONSerialization.isValidJSONObject(readings),
+          let data = try? JSONSerialization.data(withJSONObject: readings),
+          let encodedReadings = String(data: data, encoding: .utf8) else {
+        serverLog("ERROR", "InferReconversionReading: failed to encode readings")
+        return nil
+    }
+    serverLog(
+        "DEBUG",
+        "InferReconversionReading: completed surfaceLength=\(surfaceString.count) readingCount=\(readings.count)"
+    )
+    return _strdup(encodedReadings)
 }
 
 @_silgen_name("AppendText")
@@ -2743,12 +3018,24 @@ public func free_candidate_list(
 
 @_silgen_name("GetComposedText")
 @MainActor public func get_composed_text(lengthPtr: UnsafeMutablePointer<CInt>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
+    get_composed_text_impl(lengthPtr: lengthPtr, allowZenzai: true)
+}
+
+@_silgen_name("GetComposedTextForReconversion")
+@MainActor public func get_composed_text_for_reconversion(lengthPtr: UnsafeMutablePointer<CInt>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
+    get_composed_text_impl(lengthPtr: lengthPtr, allowZenzai: false)
+}
+
+@MainActor private func get_composed_text_impl(
+    lengthPtr: UnsafeMutablePointer<CInt>,
+    allowZenzai: Bool
+) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
     let functionStart = performanceNow()
     let performanceEnabled = serverLogCallbacks.isPerformanceLogEnabled()
     let originalHiragana = composingText.convertTarget
     let contextString = (config["context"] as? String) ?? ""
     let diagnosticSnapshot = zenzaiDiagnosticSnapshot()
-    let runtimeZenzaiEnabled = diagnosticSnapshot.runtimeEnabled
+    let runtimeZenzaiEnabled = diagnosticSnapshot.runtimeEnabled && allowZenzai
     let previewState = makeCandidatePreviewComposingText(from: composingText)
     let previewComposingText = previewState.composingText
     let previewHiragana = previewComposingText.convertTarget
