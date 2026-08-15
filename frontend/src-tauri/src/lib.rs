@@ -655,7 +655,7 @@ mod tests {
         fs::create_dir_all(&config_root).unwrap();
         let config_path = config_root.join("settings.json");
         let future_settings = r#"{
-            "version": "0.1.3",
+            "version": "0.1.4",
             "zenzai": "future-schema",
             "future_only": { "must_be_preserved": true }
         }"#;
@@ -760,14 +760,14 @@ mod tests {
     fn future_version_notice_explains_read_only_fallback() {
         let error = ConfigError::FutureVersion {
             path: PathBuf::from("settings.json"),
-            stored: "0.1.3".to_string(),
-            current: "0.1.2".to_string(),
+            stored: "0.1.4".to_string(),
+            current: "0.1.3".to_string(),
         };
 
         let notice = notice_from_load_error(&error);
 
         assert_eq!(notice.kind, "future_version");
-        assert!(notice.message.contains("version 0.1.3"));
+        assert!(notice.message.contains("version 0.1.4"));
         assert!(notice.message.contains("書き換えず"));
         assert!(notice.message.contains("新しいバージョン"));
         assert!(notice.backup_path.is_none());

@@ -4,5 +4,44 @@
     "enable": true,
     "profile": "current-version-profile",
     "backend": "cpu"
+  },
+  "general": {
+    "numpad_input": "always_half"
+  },
+  "romaji_table": {
+    "rows": [
+      {
+        "input": "~",
+        "output": "〜",
+        "next_input": ""
+      }
+    ]
+  },
+  "character_width": {
+    "groups": {
+      "alphabet": "half",
+      "number": "full",
+      "bracket": "full",
+      "comma_period": "full",
+      "middle_dot_corner_bracket": "full",
+      "quote": "full",
+      "colon_semicolon": "full",
+      "hash_group": "half",
+      "tilde": "full",
+      "math_symbol": "full",
+      "question_exclamation": "full"
+    },
+    "symbol_fullwidth": {
+      "0": true,
+      "1": true,
+      "2": true,
+      "3": true,
+      "4": true,
+      "5": true,
+      "6": true,
+      "7": true,
+      "8": true,
+      "9": true
+    }
   }
 }
