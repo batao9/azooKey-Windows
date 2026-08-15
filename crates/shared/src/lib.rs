@@ -117,7 +117,8 @@ fn get_config_root() -> Result<PathBuf, ConfigError> {
 }
 
 const SETTINGS_FILENAME: &str = "settings.json";
-const CONFIG_VERSION: &str = "0.1.2";
+const CONFIG_VERSION: &str = "0.1.3";
+const LEGACY_MIGRATION_TARGET_VERSION: &str = "0.1.2";
 pub const LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MIN: i32 = -12;
 pub const LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MAX: i32 = 12;
 pub const LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_DEFAULT: i32 = 4;
@@ -663,7 +664,7 @@ mod tests {
     use super::ConfigWriteGuard;
     use super::{
         AppConfig, ConfigError, DebugConfig, GeneralConfig, LearningConfig, LearningMode,
-        NumpadInputMode, ReconversionKey, ShortcutConfig, CONFIG_VERSION,
+        NumpadInputMode, ReconversionKey, ShortcutConfig, WidthMode, CONFIG_VERSION,
         LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_DEFAULT, SETTINGS_FILENAME,
     };
     use std::{
@@ -937,17 +938,47 @@ mod tests {
     }
 
     #[test]
-    fn current_version_fixture_loads_without_legacy_migration() {
+    fn previous_release_fixture_updates_schema_without_reapplying_legacy_migrations() {
         let temp = tempfile::tempdir().unwrap();
         let _appdata = AppDataGuard::set(temp.path());
         let config_root = temp.path().join("Azookey");
-        write_settings_fixture(&config_root, CURRENT_SETTINGS_FIXTURE);
+        let config_path = write_settings_fixture(&config_root, CURRENT_SETTINGS_FIXTURE);
 
-        let config = AppConfig::read().unwrap();
+        let result = AppConfig::new_with_recovery().unwrap();
 
-        assert_eq!(config.version, CONFIG_VERSION);
-        assert!(config.zenzai.enable);
-        assert_eq!(config.zenzai.profile, "current-version-profile");
+        assert_eq!(CONFIG_VERSION, "0.1.3");
+        assert_eq!(result.config.version, CONFIG_VERSION);
+        assert!(result.config.zenzai.enable);
+        assert_eq!(result.config.zenzai.profile, "current-version-profile");
+        assert_eq!(
+            result.config.general.numpad_input,
+            NumpadInputMode::AlwaysHalf
+        );
+        assert_eq!(result.config.character_width.groups.number, WidthMode::Full);
+        assert!(result
+            .config
+            .romaji_table
+            .rows
+            .iter()
+            .any(|row| row.input == "~" && row.output == "〜"));
+        assert_eq!(
+            result.config.shortcuts.reconversion_key,
+            ReconversionKey::WinSlash
+        );
+
+        let saved_str = fs::read_to_string(config_path).unwrap();
+        let saved: AppConfig =
+            serde_json::from_str(&saved_str).expect("schema-updated settings should be valid JSON");
+        assert_eq!(saved.version, CONFIG_VERSION);
+        assert_eq!(saved.general.numpad_input, NumpadInputMode::AlwaysHalf);
+        assert_eq!(saved.character_width.groups.number, WidthMode::Full);
+        assert!(saved
+            .romaji_table
+            .rows
+            .iter()
+            .any(|row| row.input == "~" && row.output == "〜"));
+        let saved_json: serde_json::Value = serde_json::from_str(&saved_str).unwrap();
+        assert_eq!(saved_json["shortcuts"]["reconversion_key"], "win_slash");
     }
 
     #[test]
@@ -1414,10 +1445,15 @@ struct ConfigVersionHeader {
     version: String,
 }
 
+struct ConfigVersionComparison {
+    stored: semver::Version,
+    ordering: std::cmp::Ordering,
+}
+
 fn compare_config_version(
     config_path: &Path,
     config_str: &str,
-) -> Result<std::cmp::Ordering, ConfigError> {
+) -> Result<ConfigVersionComparison, ConfigError> {
     let header: ConfigVersionHeader =
         serde_json::from_str(config_str).map_err(|source| ConfigError::Parse {
             path: config_path.to_path_buf(),
@@ -1438,7 +1474,7 @@ fn compare_config_version(
             stored: stored.to_string(),
             current: current.to_string(),
         }),
-        ordering => Ok(ordering),
+        ordering => Ok(ConfigVersionComparison { stored, ordering }),
     }
 }
 
@@ -1458,14 +1494,20 @@ fn ensure_existing_config_is_writable(config_path: &Path) -> Result<(), ConfigEr
 }
 
 fn parse_config(config_path: &Path, config_str: &str) -> Result<AppConfig, ConfigError> {
-    let version_ordering = compare_config_version(config_path, config_str)?;
+    let version_comparison = compare_config_version(config_path, config_str)?;
     let mut config: AppConfig =
         serde_json::from_str(config_str).map_err(|source| ConfigError::Parse {
             path: config_path.to_path_buf(),
             source,
         })?;
+    let legacy_migration_target = semver::Version::parse(LEGACY_MIGRATION_TARGET_VERSION)
+        .expect("LEGACY_MIGRATION_TARGET_VERSION must be a valid semantic version");
 
-    if version_ordering == std::cmp::Ordering::Less {
+    if version_comparison
+        .stored
+        .cmp_precedence(&legacy_migration_target)
+        == std::cmp::Ordering::Less
+    {
         config.general.numpad_input = match config.general.numpad_input {
             // 旧仕様との互換: always_half(直接入力) -> direct_input
             NumpadInputMode::AlwaysHalf => NumpadInputMode::DirectInput,
@@ -1493,6 +1535,9 @@ fn parse_config(config_path: &Path, config_str: &str) -> Result<AppConfig, Confi
             .romaji_table
             .rows
             .retain(|row| !is_legacy_removed_default_row(row));
+    }
+
+    if version_comparison.ordering == std::cmp::Ordering::Less {
         config.version = CONFIG_VERSION.to_string();
     }
 

@@ -1,5 +1,5 @@
 {
-  "version": "0.1.3",
+  "version": "0.1.4",
   "zenzai": "schema-changed-in-a-future-version",
   "future_only": {
     "must_be_preserved": true
