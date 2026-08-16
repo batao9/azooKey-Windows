@@ -4,8 +4,11 @@ use shared::{
 };
 use tao::window::Window;
 use windows::Win32::{
-    Foundation::RECT,
-    Graphics::Gdi::{GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST},
+    Foundation::{POINT, RECT},
+    Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MonitorFromRect, HMONITOR, MONITORINFO,
+        MONITOR_DEFAULTTONEAREST,
+    },
     UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
 };
 
@@ -56,6 +59,20 @@ const CANDIDATE_X_OFFSET: i32 = 15;
 const CANDIDATE_Y_GAP: i32 = 6;
 const RUBY_Y_GAP: i32 = 2;
 const RUBY_AUTO_ANCHOR_MAX_OFFSET: i32 = 18;
+// body left padding (7px) + main border (1px) + main left padding (12px).
+const RUBY_READING_LEFT_INSET_LOGICAL: f64 = 20.0;
+
+fn monitor_from_target_start(target_rect: CandidateRect) -> HMONITOR {
+    unsafe {
+        MonitorFromPoint(
+            POINT {
+                x: target_rect.left,
+                y: target_rect.top,
+            },
+            MONITOR_DEFAULTTONEAREST,
+        )
+    }
+}
 
 pub fn get_candidate_window_position(
     top: i32,
@@ -105,7 +122,7 @@ pub fn get_candidate_window_position_with_ruby_clearance(
     vertical_adjustment: i32,
 ) -> (f64, f64) {
     let target_rect = CandidateRect::new(top, left, bottom, right);
-    let monitor = unsafe {
+    let candidate_monitor = unsafe {
         MonitorFromRect(
             &RECT {
                 left,
@@ -116,6 +133,7 @@ pub fn get_candidate_window_position_with_ruby_clearance(
             MONITOR_DEFAULTTONEAREST,
         )
     };
+    let ruby_monitor = monitor_from_target_start(target_rect);
 
     let mut monitor_info = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -123,7 +141,7 @@ pub fn get_candidate_window_position_with_ruby_clearance(
     };
 
     unsafe {
-        let _ = GetMonitorInfoW(monitor, &mut monitor_info);
+        let _ = GetMonitorInfoW(candidate_monitor, &mut monitor_info);
     }
 
     let candidate_size = CandidateWindowSize::new(
@@ -134,13 +152,17 @@ pub fn get_candidate_window_position_with_ruby_clearance(
         ruby_window.inner_size().width as i32,
         ruby_window.inner_size().height as i32,
     );
-    let (x, y) = candidate_window_position_with_ruby_clearance(
-        target_rect,
-        candidate_size,
-        ruby_size,
-        monitor_info.rcWork,
-        vertical_adjustment,
-    );
+    let (x, y) = if candidate_monitor == ruby_monitor {
+        candidate_window_position_with_ruby_clearance(
+            target_rect,
+            candidate_size,
+            ruby_size,
+            monitor_info.rcWork,
+            vertical_adjustment,
+        )
+    } else {
+        candidate_window_position(target_rect, candidate_size, monitor_info.rcWork)
+    };
 
     (x as f64, y as f64)
 }
@@ -154,17 +176,7 @@ pub fn get_ruby_window_position(
     vertical_adjustment: i32,
 ) -> (f64, f64) {
     let target_rect = CandidateRect::new(top, left, bottom, right);
-    let monitor = unsafe {
-        MonitorFromRect(
-            &RECT {
-                left,
-                top,
-                right,
-                bottom,
-            } as *const _,
-            MONITOR_DEFAULTTONEAREST,
-        )
-    };
+    let monitor = monitor_from_target_start(target_rect);
 
     let mut monitor_info = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -179,7 +191,14 @@ pub fn get_ruby_window_position(
         window.inner_size().width as i32,
         window.inner_size().height as i32,
     );
-    let (x, y) = ruby_window_position(target_rect, size, monitor_info.rcWork, vertical_adjustment);
+    let reading_left_inset = ruby_reading_left_inset(monitor_scale_factor(monitor));
+    let (x, y) = ruby_window_position(
+        target_rect,
+        size,
+        monitor_info.rcWork,
+        reading_left_inset,
+        vertical_adjustment,
+    );
 
     (x as f64, y as f64)
 }
@@ -189,17 +208,7 @@ pub fn get_ruby_window_size_for_rect(
     measured_width: f64,
     measured_height: f64,
 ) -> RubyWindowSize {
-    let monitor = unsafe {
-        MonitorFromRect(
-            &RECT {
-                left: rect.left,
-                top: rect.top,
-                right: rect.right,
-                bottom: rect.bottom,
-            } as *const _,
-            MONITOR_DEFAULTTONEAREST,
-        )
-    };
+    let monitor = monitor_from_target_start(rect);
 
     let mut monitor_info = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -229,6 +238,10 @@ fn monitor_scale_factor(monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> f64
     } else {
         1.0
     }
+}
+
+fn ruby_reading_left_inset(scale_factor: f64) -> i32 {
+    (RUBY_READING_LEFT_INSET_LOGICAL * scale_factor).round() as i32
 }
 
 pub fn ruby_window_size_for_work_area(
@@ -312,6 +325,7 @@ pub fn candidate_window_position_with_ruby_clearance(
         target_rect,
         ruby_window_size,
         work_area,
+        0,
         vertical_adjustment,
     );
     let ruby_bottom = ruby_y.saturating_add(ruby_window_size.height);
@@ -368,15 +382,11 @@ pub fn ruby_window_position(
     target_rect: CandidateRect,
     window_size: CandidateWindowSize,
     work_area: RECT,
+    reading_left_inset: i32,
     vertical_adjustment: i32,
 ) -> (i32, i32) {
-    let target_width = target_rect
-        .right
-        .saturating_sub(target_rect.left)
-        .min(window_size.width);
-    let target_center = target_rect.left + target_width / 2;
     let x = clamp_start(
-        target_center - window_size.width / 2,
+        target_rect.left.saturating_sub(reading_left_inset.max(0)),
         window_size.width,
         work_area.left,
         work_area.right,
@@ -412,10 +422,12 @@ fn clamp_start(preferred: i32, length: i32, min: i32, max: i32) -> i32 {
 mod tests {
     use super::{
         candidate_window_position, candidate_window_position_with_ruby_clearance,
-        ruby_window_position, ruby_window_size_for_work_area, CandidateRect, CandidateWindowSize,
-        RubyWindowSize,
+        ruby_reading_left_inset, ruby_window_position, ruby_window_size_for_work_area,
+        CandidateRect, CandidateWindowSize, RubyWindowSize,
     };
     use windows::Win32::Foundation::RECT;
+
+    const READING_LEFT_INSET: i32 = 20;
 
     fn work_area() -> RECT {
         RECT {
@@ -471,15 +483,23 @@ mod tests {
     }
 
     #[test]
-    fn places_ruby_window_above_input_centered() {
+    fn places_ruby_window_above_input_with_reading_start_aligned() {
         let pos = ruby_window_position(
             CandidateRect::new(100, 100, 120, 180),
             CandidateWindowSize::new(80, 48),
             work_area(),
+            READING_LEFT_INSET,
             0,
         );
 
-        assert_eq!(pos, (100, 60));
+        assert_eq!(pos, (80, 60));
+    }
+
+    #[test]
+    fn scales_ruby_reading_left_inset_for_monitor_dpi() {
+        assert_eq!(ruby_reading_left_inset(1.0), 20);
+        assert_eq!(ruby_reading_left_inset(1.25), 25);
+        assert_eq!(ruby_reading_left_inset(1.5), 30);
     }
 
     #[test]
@@ -488,10 +508,11 @@ mod tests {
             CandidateRect::new(20, 100, 40, 180),
             CandidateWindowSize::new(80, 48),
             work_area(),
+            READING_LEFT_INSET,
             0,
         );
 
-        assert_eq!(pos, (100, 42));
+        assert_eq!(pos, (80, 42));
     }
 
     #[test]
@@ -500,6 +521,7 @@ mod tests {
             CandidateRect::new(100, 4, 120, 20),
             CandidateWindowSize::new(80, 48),
             work_area(),
+            READING_LEFT_INSET,
             0,
         );
 
@@ -512,10 +534,46 @@ mod tests {
             CandidateRect::new(100, 100, 120, 760),
             CandidateWindowSize::new(80, 48),
             work_area(),
+            READING_LEFT_INSET,
             0,
         );
 
-        assert_eq!(pos, (100, 60));
+        assert_eq!(pos, (80, 60));
+    }
+
+    #[test]
+    fn keeps_ruby_window_horizontally_stable_when_target_width_changes() {
+        let window_size = CandidateWindowSize::new(320, 48);
+        let narrow = ruby_window_position(
+            CandidateRect::new(100, 200, 120, 240),
+            window_size,
+            work_area(),
+            READING_LEFT_INSET,
+            0,
+        );
+        let wide = ruby_window_position(
+            CandidateRect::new(100, 200, 120, 600),
+            window_size,
+            work_area(),
+            READING_LEFT_INSET,
+            0,
+        );
+
+        assert_eq!(narrow, (180, 60));
+        assert_eq!(wide, (180, 60));
+    }
+
+    #[test]
+    fn clamps_left_anchored_ruby_window_to_right_work_area_edge() {
+        let pos = ruby_window_position(
+            CandidateRect::new(100, 700, 120, 740),
+            CandidateWindowSize::new(320, 48),
+            work_area(),
+            READING_LEFT_INSET,
+            0,
+        );
+
+        assert_eq!(pos, (480, 60));
     }
 
     #[test]
@@ -524,10 +582,11 @@ mod tests {
             CandidateRect::new(100, 100, 120, 180),
             CandidateWindowSize::new(80, 48),
             work_area(),
+            READING_LEFT_INSET,
             8,
         );
 
-        assert_eq!(pos, (100, 52));
+        assert_eq!(pos, (80, 52));
     }
 
     #[test]
@@ -536,10 +595,11 @@ mod tests {
             CandidateRect::new(100, 100, 120, 180),
             CandidateWindowSize::new(80, 48),
             work_area(),
+            READING_LEFT_INSET,
             -8,
         );
 
-        assert_eq!(pos, (100, 68));
+        assert_eq!(pos, (80, 68));
     }
 
     #[test]
