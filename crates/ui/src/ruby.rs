@@ -54,6 +54,7 @@ pub fn create_ruby_webview<'a>(web_context: &'a mut WebContext) -> Result<WebVie
                     }
                     body {
                         margin: 0;
+                        /* Keep the left inset in sync with RUBY_READING_LEFT_INSET_LOGICAL. */
                         padding: 5px 7px 4px 7px;
                         filter: drop-shadow(2px 2px 3px rgba(0, 0, 0, 0.16));
                         box-sizing: border-box;
@@ -77,7 +78,7 @@ pub fn create_ruby_webview<'a>(web_context: &'a mut WebContext) -> Result<WebVie
                         font-family: "Yu Gothic UI", "Meiryo", sans-serif;
                         font-size: 16px;
                         line-height: 1.35;
-                        text-align: center;
+                        text-align: left;
                         white-space: nowrap;
                         overflow: visible;
                         user-select: none;
