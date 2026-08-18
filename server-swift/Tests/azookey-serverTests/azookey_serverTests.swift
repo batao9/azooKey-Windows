@@ -1723,6 +1723,76 @@ private func testCandidate(
     )
 }
 
+@Test func zenzaiMergePromotesConfidentDictionaryCorrectionOverRawTypoSpan() async throws {
+    let hiragana = "しますた"
+    let typoEntry = makeKeyboardTypoDictionaryEntries()[0]
+    let correction = Candidate(
+        text: typoEntry.word,
+        value: -1,
+        composingCount: .surfaceCount(typoEntry.ruby.count),
+        lastMid: typoEntry.mid,
+        data: [typoEntry]
+    )
+    let zenzaiRaw = testCandidate(
+        word: hiragana,
+        ruby: typoEntry.ruby,
+        composingCount: .surfaceCount(typoEntry.ruby.count)
+    )
+    var normalRaw = zenzaiRaw
+    normalRaw.value = -2
+
+    let merged = mergeZenzaiMainResultsWithNormalNBest(
+        zenzaiResults: [zenzaiRaw],
+        normalNBestResults: [correction, normalRaw],
+        hiragana: hiragana
+    )
+
+    #expect(
+        merged.map { constructCandidateString(candidate: $0, hiragana: hiragana) } == [
+            "しました",
+            "しますた",
+        ]
+    )
+}
+
+@Test func zenzaiMergeKeepsModelTopWhenCorrectionIsNotNormalTopOrIsConvertedAlternative() async throws {
+    let hiragana = "しますた"
+    let typoEntry = makeKeyboardTypoDictionaryEntries()[0]
+    let correction = Candidate(
+        text: typoEntry.word,
+        value: -1,
+        composingCount: .surfaceCount(typoEntry.ruby.count),
+        lastMid: typoEntry.mid,
+        data: [typoEntry]
+    )
+    let zenzaiRaw = testCandidate(
+        word: hiragana,
+        ruby: typoEntry.ruby,
+        composingCount: .surfaceCount(typoEntry.ruby.count)
+    )
+    var normalRawTop = zenzaiRaw
+    normalRawTop.value = -0.5
+    let convertedAlternative = testCandidate(
+        word: "済ました",
+        ruby: typoEntry.ruby,
+        composingCount: .surfaceCount(typoEntry.ruby.count)
+    )
+
+    let nonTopCorrectionMerged = mergeZenzaiMainResultsWithNormalNBest(
+        zenzaiResults: [zenzaiRaw],
+        normalNBestResults: [normalRawTop, correction],
+        hiragana: hiragana
+    )
+    let convertedMerged = mergeZenzaiMainResultsWithNormalNBest(
+        zenzaiResults: [convertedAlternative],
+        normalNBestResults: [correction, zenzaiRaw],
+        hiragana: hiragana
+    )
+
+    #expect(constructCandidateString(candidate: nonTopCorrectionMerged[0], hiragana: hiragana) == "しますた")
+    #expect(constructCandidateString(candidate: convertedMerged[0], hiragana: hiragana) == "済ました")
+}
+
 @Test func zenzaiNormalNBestSupplementFiltersWeakRichCandidates() async throws {
     let hiragana = "ここではきものをぬいでください"
     let zenzaiTop = testCandidate(
@@ -2066,10 +2136,19 @@ private func testCandidate(
 @Test func keyboardTypoCorrectionDictionaryIsOnlyMergedWhenEnabled() {
     let entries = makeKeyboardTypoDictionaryEntries()
     #expect(entries.count == keyboardTypoDictionaryEntryCount)
-    #expect(entries.count == 96)
+    #expect(keyboardTypoDictionarySelectionCount == 92)
+    #expect(entries.count == 104)
     #expect(entries.contains { $0.ruby == "シマスタ" && $0.word == "しました" })
     #expect(entries.contains { $0.ruby == "ゴカクニ" && $0.word == "ご確認" })
     #expect(Set(entries.map { $0.ruby + "\u{0}" + $0.word }).count == entries.count)
+    #expect(entries[0].lcid == 610)
+    #expect(entries[0].rcid == 435)
+    #expect(entries[0].mid == 17)
+    #expect(abs(entries[0].value() - (-8.4169)) < 0.0001)
+    #expect(entries[1].lcid == 560)
+    #expect(entries[1].rcid == 1283)
+    #expect(entries[1].mid == 17)
+    #expect(abs(entries[1].value() - (-11.0794)) < 0.0001)
 
     let userEntry = DicdataElement(
         word: "ユーザー語",
@@ -2087,7 +2166,7 @@ private func testCandidate(
         experimentalTypoCorrectionEnabled: true
     )
     #expect(disabled.count == 1)
-    #expect(enabled.count == 97)
+    #expect(enabled.count == 105)
 }
 
 @Test func keyboardTypoCorrectionDictionaryCandidatesAreNotLearnedWhileEnabled() {
@@ -2136,6 +2215,16 @@ private func testCandidate(
                 enabled: true,
                 memoryURL: memoryURL
             ),
+            sentenceShimasuta: keyboardTypoCandidateTexts(
+                keys: "iikagentouitusimasuta",
+                enabled: true,
+                memoryURL: memoryURL
+            ),
+            sentenceGokakuni: keyboardTypoCandidateTexts(
+                keys: "syoruinogokakunionegaisimasu",
+                enabled: true,
+                memoryURL: memoryURL
+            ),
             unresolvedN: keyboardTypoCandidateTexts(
                 keys: "fashon",
                 enabled: true,
@@ -2156,6 +2245,8 @@ private func testCandidate(
 
     #expect(results.dictionary.contains("しました"), "candidates: \(results.dictionary)")
     #expect(results.phrase.contains("ご確認お願いします"), "candidates: \(results.phrase)")
+    #expect(results.sentenceShimasuta.first == "いい加減統一しました", "candidates: \(results.sentenceShimasuta)")
+    #expect(results.sentenceGokakuni.first == "書類のご確認お願いします", "candidates: \(results.sentenceGokakuni)")
     #expect(results.unresolvedN.contains("ファッション"), "candidates: \(results.unresolvedN)")
     #expect(results.smallTsu.contains("切って"), "candidates: \(results.smallTsu)")
     #expect(results.doubleNn.contains("こんにちは"), "candidates: \(results.doubleNn)")

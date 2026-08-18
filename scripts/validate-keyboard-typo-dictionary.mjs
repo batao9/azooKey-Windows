@@ -24,6 +24,10 @@ const EXPECTED_COLUMNS = [
   "test_count",
   "match_policy",
   "builtin_collision_count",
+  "reference_lcid",
+  "reference_rcid",
+  "reference_mid",
+  "reference_value",
 ];
 
 const REWRITE_COLUMNS = [
@@ -56,8 +60,16 @@ const MECHANISMS = new Set([
 
 const SOURCES = new Set(["JWTD_v2_train", "curated_seed", "product_seed"]);
 const SELECTION_TIERS = new Set(["candidate", "core", "required"]);
+const TIER_PENALTIES = new Map([
+  ["required", 1],
+  ["core", 1.5],
+  ["candidate", 2.5],
+]);
+// DicdataStore.shouldBeRemoved drops dictionary nodes below this value.
+const KKC_DICTIONARY_VALUE_THRESHOLD = -17;
 const ORIGIN_RULES = new Set(["none", "NN", "M", "Yu", "NI"]);
 const COUNT_COLUMNS = ["train_count", "page_count", "reverse_count", "test_count"];
+const REFERENCE_ID_COLUMNS = ["reference_lcid", "reference_rcid", "reference_mid"];
 const REWRITE_COUNT_COLUMNS = [
   "jwtd_exact",
   "jwtd_different",
@@ -94,6 +106,16 @@ function parseTsv(contents) {
 
 function parseRewriteTsv(contents) {
   return parseTable(contents, REWRITE_COLUMNS, "rewrite manifest");
+}
+
+function keyboardTypoScore(row) {
+  const penalty = TIER_PENALTIES.get(row.selection_tier);
+  if (penalty === undefined) throw new Error(`unsupported tier: ${row.selection_tier}`);
+  const referenceValue = Number(row.reference_value);
+  if (!Number.isFinite(referenceValue)) {
+    throw new Error(`invalid reference_value: ${row.id}`);
+  }
+  return referenceValue - penalty;
 }
 
 function katakana(reading) {
@@ -384,6 +406,24 @@ function validateRows(rows, rewriteRules = []) {
     if (!/^\d+$/u.test(row.builtin_collision_count)) {
       errors.push(`line ${line}: builtin_collision_count must be an integer`);
     }
+    for (const column of REFERENCE_ID_COLUMNS) {
+      if (!/^\d+$/u.test(row[column])) errors.push(`line ${line}: ${column} must be an integer`);
+    }
+    if (!/^-?\d+(?:\.\d+)?$/u.test(row.reference_value)
+        || !Number.isFinite(Number(row.reference_value))) {
+      errors.push(`line ${line}: reference_value must be a finite decimal`);
+    } else if (SELECTION_TIERS.has(row.selection_tier)
+        && keyboardTypoScore(row) < KKC_DICTIONARY_VALUE_THRESHOLD) {
+      errors.push(
+        `line ${line}: generated value is below the KKC dictionary pruning threshold`,
+      );
+    }
+    if (Number(row.reference_lcid) > 1319 || Number(row.reference_rcid) > 1319) {
+      errors.push(`line ${line}: reference CID is out of range`);
+    }
+    if (Number(row.reference_mid) > 501) {
+      errors.push(`line ${line}: reference MID is out of range`);
+    }
     const trainCount = Number(row.train_count);
     const pageCount = Number(row.page_count);
     const reverseCount = Number(row.reverse_count);
@@ -446,6 +486,54 @@ async function findBundledReadingCollisions(rows, dictionaryDirectory) {
   return collisions;
 }
 
+async function findBundledReferenceEntries(rows, dictionaryDirectory) {
+  const wanted = new Map();
+  for (const row of rows) {
+    const key = `${katakana(row.corrected_reading)}\0${row.expected_candidate}`;
+    const ids = wanted.get(key) ?? [];
+    ids.push(row.id);
+    wanted.set(key, ids);
+  }
+  const references = new Map(rows.map((row) => [row.id, []]));
+  const files = (await readdir(dictionaryDirectory))
+    .filter((file) => file.endsWith(".loudstxt3"))
+    .sort();
+  for (const file of files) {
+    const binary = await readFile(join(dictionaryDirectory, file));
+    const slotCount = binary.readUInt16LE(0);
+    const headerEnd = 2 + slotCount * 4;
+    for (let slot = 0; slot < slotCount; slot += 1) {
+      const start = binary.readUInt32LE(2 + slot * 4);
+      const end = slot === slotCount - 1
+        ? binary.length
+        : binary.readUInt32LE(2 + (slot + 1) * 4);
+      if (start < headerEnd || end < start + 2 || end > binary.length) continue;
+      const rowCount = binary.readUInt16LE(start);
+      if (rowCount === 0) continue;
+      const textStart = start + 2 + rowCount * 10;
+      if (textStart > end) continue;
+      const fields = new TextDecoder("utf-8", { fatal: true })
+        .decode(binary.subarray(textStart, end))
+        .split("\t");
+      const reading = fields[0];
+      for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+        const word = fields[rowIndex + 1] || reading;
+        const ids = wanted.get(`${reading}\0${word}`) ?? [];
+        if (ids.length === 0) continue;
+        const offset = start + 2 + rowIndex * 10;
+        const reference = {
+          lcid: binary.readUInt16LE(offset),
+          rcid: binary.readUInt16LE(offset + 2),
+          mid: binary.readUInt16LE(offset + 4),
+          value: binary.readFloatLE(offset + 6),
+        };
+        for (const id of ids) references.get(id).push(reference);
+      }
+    }
+  }
+  return references;
+}
+
 async function main() {
   const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
   const dictionaryFile = resolve(process.argv[2] ?? join(repoRoot, "data", "keyboard-typo-dictionary.tsv"));
@@ -455,11 +543,24 @@ async function main() {
   const errors = [...validateRewriteRules(rewriteRules), ...validateRows(rows, rewriteRules)];
   const bundledDirectory = join(repoRoot, "server-swift", "azooKey_dictionary_storage", "Dictionary", "louds");
   const collisions = await findBundledReadingCollisions(rows, bundledDirectory);
+  const references = await findBundledReferenceEntries(rows, bundledDirectory);
   for (const row of rows) {
     const actualCount = collisions.get(row.typed_reading)?.size ?? 0;
     if (actualCount !== Number(row.builtin_collision_count)) {
       errors.push(
         `${row.typed_reading}: declared bundled collisions=${row.builtin_collision_count}, actual=${actualCount}`,
+      );
+    }
+    const referenceMatches = references.get(row.id) ?? [];
+    const hasDeclaredReference = referenceMatches.some((entry) => (
+      entry.lcid === Number(row.reference_lcid)
+      && entry.rcid === Number(row.reference_rcid)
+      && entry.mid === Number(row.reference_mid)
+      && Math.abs(entry.value - Number(row.reference_value)) < 0.0001
+    ));
+    if (!hasDeclaredReference) {
+      errors.push(
+        `${row.id}: declared reference dictionary metadata does not match the bundled entry`,
       );
     }
   }
@@ -483,6 +584,7 @@ export {
   applyEnabledRewrites,
   findBundledReadingCollisions,
   hiragana,
+  keyboardTypoScore,
   katakana,
   mechanismMatchesKeys,
   parseRewriteTsv,

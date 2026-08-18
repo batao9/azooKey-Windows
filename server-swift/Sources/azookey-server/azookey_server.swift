@@ -2257,6 +2257,41 @@ func shouldKeepZenzaiAlternativeCandidate(candidate: Candidate, hiragana: String
     return text != hiragana && text != hiraganaToKatakana(hiragana)
 }
 
+private func displayRubyForKeyboardTypoLookup(_ ruby: String) -> String {
+    var displayRuby = ruby.replacingOccurrences(of: "-", with: "ー")
+    if displayRuby.last == "n" {
+        displayRuby.removeLast()
+        displayRuby.append("ン")
+    }
+    return displayRuby
+}
+
+func confidentKeyboardTypoCorrectionForZenzaiMerge(
+    zenzaiResults: [Candidate],
+    normalNBestResults: [Candidate]
+) -> Candidate? {
+    guard let zenzaiTop = zenzaiResults.first,
+          let normalTop = normalNBestResults.first,
+          let correctionEntry = keyboardTypoDictionaryEntry(in: normalTop)
+    else {
+        return nil
+    }
+
+    let rawTypoSpan = displayRubyForKeyboardTypoLookup(correctionEntry.ruby)
+    let hasWholeSpanLexicalAlternative = zenzaiTop.data.contains { element in
+        guard !element.metadata.contains(.isKeyboardTypoCorrection),
+              displayRubyForKeyboardTypoLookup(element.ruby) == rawTypoSpan
+        else {
+            return false
+        }
+        return hiraganaToKatakana(element.word) != rawTypoSpan
+    }
+    guard !rawTypoSpan.isEmpty, !hasWholeSpanLexicalAlternative else {
+        return nil
+    }
+    return normalTop
+}
+
 func mergeZenzaiMainResultsWithNormalNBest(
     zenzaiResults: [Candidate],
     normalNBestResults: [Candidate],
@@ -2274,6 +2309,12 @@ func mergeZenzaiMainResultsWithNormalNBest(
         results.append(candidate)
     }
 
+    if let correction = confidentKeyboardTypoCorrectionForZenzaiMerge(
+        zenzaiResults: zenzaiResults,
+        normalNBestResults: normalNBestResults
+    ) {
+        appendIfNeeded(correction)
+    }
     if let topCandidate = zenzaiResults.first {
         appendIfNeeded(topCandidate)
     }

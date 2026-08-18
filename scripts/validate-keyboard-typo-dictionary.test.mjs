@@ -16,7 +16,7 @@ import {
 } from "./validate-keyboard-typo-dictionary.mjs";
 import {
   generateSwift,
-  lookupReading,
+  lookupReadings,
   scoreFor,
 } from "./generate-keyboard-typo-dictionary-swift.mjs";
 
@@ -46,10 +46,10 @@ test("curated keyboard typo dictionary satisfies its rewrite-aware contract", as
 
   assert.deepEqual(validateRewriteRules(rewriteRules), []);
   assert.deepEqual(validateRows(rows, rewriteRules), []);
-  assert.equal(rows.length, 96);
+  assert.equal(rows.length, 92);
   assert.equal(rows.filter((row) => row.source === "product_seed").length, 2);
-  assert.equal(rows.filter((row) => row.source === "JWTD_v2_train").length, 55);
-  assert.equal(rows.filter((row) => row.source === "curated_seed").length, 39);
+  assert.equal(rows.filter((row) => row.source === "JWTD_v2_train").length, 52);
+  assert.equal(rows.filter((row) => row.source === "curated_seed").length, 38);
   assert.ok(rows.every(mechanismMatchesKeys));
 
   const originCounts = new Map();
@@ -57,39 +57,50 @@ test("curated keyboard typo dictionary satisfies its rewrite-aware contract", as
     originCounts.set(row.origin_rule, (originCounts.get(row.origin_rule) ?? 0) + 1);
   }
   assert.equal(originCounts.get("none"), 39);
-  assert.equal(originCounts.get("NN"), 10);
+  assert.equal(originCounts.get("NN"), 9);
   assert.equal(originCounts.get("M"), 10);
-  assert.equal(originCounts.get("Yu"), 28);
-  assert.equal(originCounts.get("NI"), 9);
+  assert.equal(originCounts.get("Yu"), 26);
+  assert.equal(originCounts.get("NI"), 8);
 });
 
 test("generated Swift dictionary stays synchronized with the reviewed TSV", async () => {
   const { rows } = await loadSelection();
   const generated = generateSwift(rows);
   assert.equal(await readFile(generatedSwiftFile, "utf8"), generated);
-  assert.match(generated, /let keyboardTypoDictionaryEntryCount = 96/u);
+  assert.match(generated, /let keyboardTypoDictionarySelectionCount = 92/u);
+  assert.match(generated, /let keyboardTypoDictionaryEntryCount = 104/u);
   assert.match(generated, /word: "しました",\n\s+ruby: "シマスタ"/u);
   assert.match(generated, /word: "ご確認",\n\s+ruby: "ゴカクニ"/u);
   assert.match(generated, /word: "ファッション",\n\s+ruby: "ファショn"/u);
+  assert.match(generated, /ruby: "シマスタ",\n\s+lcid: 610,\n\s+rcid: 435,\n\s+mid: 17,\n\s+value: -8\.4169/u);
   assert.match(generated, /func disableLearningForKeyboardTypoDictionaryCandidates/u);
-  assert.equal(scoreFor({ selection_tier: "required" }, 0), "-6.00");
-  assert.equal(scoreFor({ selection_tier: "core" }, 0), "-8.00");
-  assert.equal(scoreFor({ selection_tier: "candidate" }, 0), "-10.00");
+  assert.equal(scoreFor({ selection_tier: "required", reference_value: "-7.4169" }), "-8.4169");
+  assert.equal(scoreFor({ selection_tier: "core", reference_value: "-8.2538" }), "-9.7538");
+  assert.equal(scoreFor({ selection_tier: "candidate", reference_value: "-11.2573" }), "-13.7573");
 });
 
 test("terminal n entries use the unresolved roman-composer surface", () => {
-  assert.equal(lookupReading({ id: "test", typed_reading: "しんぶん", typed_keys: "sinbun" }), "シンブn");
-  assert.equal(lookupReading({ id: "test", typed_reading: "ところ", typed_keys: "tokoro" }), "トコロ");
+  assert.deepEqual(
+    lookupReadings({ id: "test", typed_reading: "しんぶん", typed_keys: "sinbun" }),
+    ["シンブン", "シンブn"],
+  );
+  assert.deepEqual(
+    lookupReadings({ id: "test", typed_reading: "ところ", typed_keys: "tokoro" }),
+    ["トコロ"],
+  );
   assert.throws(
-    () => lookupReading({ id: "test", typed_reading: "ところ", typed_keys: "tokoron" }),
+    () => lookupReadings({ id: "test", typed_reading: "ところ", typed_keys: "tokoron" }),
     /terminal n key must correspond to a terminal ん/u,
   );
 });
 
 test("long-vowel entries use the unresolved physical key", () => {
-  assert.equal(lookupReading({ id: "test", typed_reading: "ヨーロパ", typed_keys: "yo-ropa" }), "ヨ-ロパ");
+  assert.deepEqual(
+    lookupReadings({ id: "test", typed_reading: "ヨーロパ", typed_keys: "yo-ropa" }),
+    ["ヨーロパ", "ヨ-ロパ"],
+  );
   assert.throws(
-    () => lookupReading({ id: "test", typed_reading: "ヨロパ", typed_keys: "yo-ropa" }),
+    () => lookupReadings({ id: "test", typed_reading: "ヨロパ", typed_keys: "yo-ropa" }),
     /long-vowel keys must correspond to long-vowel marks/u,
   );
 });
@@ -159,13 +170,13 @@ test("bundled reading collisions are explicit and high-risk entries are excluded
       row.typed_reading,
     );
   }
-  assert.deepEqual([...collisions.get("ちゅおう")].sort(), ["中欧"]);
+  assert.equal(collisions.has("ちゅおう"), false);
   assert.deepEqual(
     [...collisions.get("いすれ")].sort(),
     ["いすれ", "医すれ", "委すれ", "慰すれ"].sort(),
   );
   const readings = new Set(rows.map((row) => row.typed_reading));
-  for (const excluded of ["タクス", "ちゅもん", "しゅちゅう", "しにゅう", "せにゅう"]) {
+  for (const excluded of ["タクス", "ちゅおう", "ちゅもん", "しゅちゅう", "しにゅう", "せにゅう"]) {
     assert.equal(readings.has(excluded), false, `${excluded} has a valid bundled reading`);
   }
 });
@@ -176,16 +187,18 @@ test("kana readings are normalized for rewrite and bundled dictionary comparison
   assert.equal(hiragana("オープニンング"), "おーぷにんんぐ");
 });
 
-test("validator rejects duplicate readings and unsupported matching", async () => {
+test("validator rejects duplicate, unsupported, and unreachable entries", async () => {
   const { dictionaryContents, rewriteRules } = await loadSelection();
   const [header, firstRow] = dictionaryContents.trimEnd().split("\n");
   const columns = header.split("\t");
   const values = firstRow.split("\t");
   values[columns.indexOf("match_policy")] = "prefix";
+  values[columns.indexOf("reference_value")] = "-20";
   const invalidRow = values.join("\t");
   const rows = parseTsv(`${header}\n${invalidRow}\n${invalidRow}\n`);
 
   const errors = validateRows(rows, rewriteRules);
   assert.ok(errors.some((error) => error.includes("duplicate typed_reading")));
   assert.ok(errors.some((error) => error.includes("match_policy must be lattice_span_exact")));
+  assert.ok(errors.some((error) => error.includes("below the KKC dictionary pruning threshold")));
 });
