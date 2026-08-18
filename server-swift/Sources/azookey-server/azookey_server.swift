@@ -38,6 +38,7 @@ private let fallbackDictionaryURL =
     "enable": false,
     "profile": "",
     "backend": "cpu",
+    "experimentalTypoCorrection": false,
 ]
 let maxUserDictionaryEntryCount = 50
 let minInputCountForZenzaiCandidates = 4
@@ -968,7 +969,13 @@ struct LearningCandidateCache {
         return nil
     }
 
-    return learningCandidateCache.appendBatch(candidates)
+    return learningCandidateCache.appendBatch(
+        disableLearningForKeyboardTypoDictionaryCandidates(
+            candidates,
+            experimentalTypoCorrectionEnabled:
+                (config["experimentalTypoCorrection"] as? Bool) ?? false
+        )
+    )
 }
 
 @MainActor func learningCandidateId(at index: Int, batchFirstId: UInt64?) -> UInt64 {
@@ -1146,7 +1153,8 @@ private func makeConvertRequestOptions(
     zenzaiWeightURL: URL,
     profile: String,
     learningType: LearningType = .nothing,
-    learningMemoryDirectoryURL: URL? = nil
+    learningMemoryDirectoryURL: URL? = nil,
+    experimentalKeyboardTypoCorrection: Bool = false
 ) -> ConvertRequestOptions {
     return ConvertRequestOptions(
         requireJapanesePrediction: .disabled,
@@ -1171,6 +1179,7 @@ private func makeConvertRequestOptions(
                 )
             )
         ) : .off,
+        experimentalKeyboardTypoCorrection: experimentalKeyboardTypoCorrection,
         metadata: .init(versionString: "Azookey for Windows")
     )
 }
@@ -1180,6 +1189,11 @@ private struct AppSettings: Decodable {
     let learning: LearningSettings?
     let user_dictionary: UserDictionarySettings?
     let romaji_table: RomajiTableSettings?
+    let general: GeneralSettings?
+}
+
+private struct GeneralSettings: Decodable {
+    let experimental_typo_correction: Bool?
 }
 
 private struct LearningSettings: Decodable {
@@ -1874,7 +1888,9 @@ private func preferCursorPrefixBoundary(
         zenzaiWeightURL: execURL.appendingPathComponent("zenz.gguf"),
         profile: (config["profile"] as? String) ?? "",
         learningType: currentLearningType,
-        learningMemoryDirectoryURL: currentLearningMemoryDirectoryURL
+        learningMemoryDirectoryURL: currentLearningMemoryDirectoryURL,
+        experimentalKeyboardTypoCorrection:
+            (config["experimentalTypoCorrection"] as? Bool) ?? false
     )
 }
 
@@ -2323,6 +2339,8 @@ func cursorPrefixBoundaryFirstClauseResults(
     let previousZenzaiEnabled = (config["enable"] as? Bool) ?? false
     let previousProfile = (config["profile"] as? String) ?? ""
     let previousBackend = (config["backend"] as? String) ?? "cpu"
+    let previousExperimentalTypoCorrection =
+        (config["experimentalTypoCorrection"] as? Bool) ?? false
     let previousEffectiveZenzaiEnabled = effectiveZenzaiRuntimeEnabled(
         isConfigured: previousZenzaiEnabled,
         backend: previousBackend,
@@ -2333,14 +2351,20 @@ func cursorPrefixBoundaryFirstClauseResults(
     let previousLearningMemoryDirectoryURL = currentLearningMemoryDirectoryURL
     var dynamicUserDictionary: [DicdataElement] = []
     defer {
-        converter.importDynamicUserDictionary(dynamicUserDictionary)
-        normalNBestSupplementConverter.importDynamicUserDictionary(dynamicUserDictionary)
+        let conversionDictionary = makeConversionDictionaryEntries(
+            userEntries: dynamicUserDictionary,
+            experimentalTypoCorrectionEnabled:
+                (config["experimentalTypoCorrection"] as? Bool) ?? false
+        )
+        converter.importDynamicUserDictionary(conversionDictionary)
+        normalNBestSupplementConverter.importDynamicUserDictionary(conversionDictionary)
         reconversionDictionary.replaceUserEntries(dynamicUserDictionary)
     }
 
     config["enable"] = false
     config["profile"] = ""
     config["backend"] = "cpu"
+    config["experimentalTypoCorrection"] = false
     setRoman2KanaInputStyle()
     currentLearningType = .inputAndOutput
     currentLearningMemoryDirectoryURL = learningMemoryDirectoryURL(settingsPath: loadedSettingsPath)
@@ -2364,6 +2388,8 @@ func cursorPrefixBoundaryFirstClauseResults(
 
         applyRomajiInputStyle(rows: settings.romaji_table?.rows)
         currentLearningType = learningType(for: settings.learning?.mode)
+        config["experimentalTypoCorrection"] =
+            settings.general?.experimental_typo_correction ?? false
 
         let sourceEntries = settings.user_dictionary?.entries ?? []
         var seen: Set<String> = []
@@ -2411,6 +2437,8 @@ func cursorPrefixBoundaryFirstClauseResults(
     let currentZenzaiEnabled = (config["enable"] as? Bool) ?? false
     let currentProfile = (config["profile"] as? String) ?? ""
     let currentBackend = (config["backend"] as? String) ?? "cpu"
+    let currentExperimentalTypoCorrection =
+        (config["experimentalTypoCorrection"] as? Bool) ?? false
     let currentEffectiveZenzaiEnabled = effectiveZenzaiRuntimeEnabled(
         isConfigured: currentZenzaiEnabled,
         backend: currentBackend,
@@ -2422,6 +2450,7 @@ func cursorPrefixBoundaryFirstClauseResults(
         || previousProfile != currentProfile
         || backendChanged
         || previousUsedCustomRomajiTable != currentUsedCustomRomajiTable
+        || previousExperimentalTypoCorrection != currentExperimentalTypoCorrection
     {
         if backendChanged {
             rebuildConverter()
@@ -2443,7 +2472,7 @@ func cursorPrefixBoundaryFirstClauseResults(
 
     serverLog(
         "INFO",
-        "LoadConfig: completed enable=\(currentZenzaiEnabled) backend=\(currentBackend) effectiveEnable=\(currentEffectiveZenzaiEnabled) customRomaji=\(currentUsedCustomRomajiTable) learningType=\(currentLearningType)"
+        "LoadConfig: completed enable=\(currentZenzaiEnabled) backend=\(currentBackend) effectiveEnable=\(currentEffectiveZenzaiEnabled) customRomaji=\(currentUsedCustomRomajiTable) learningType=\(currentLearningType) experimentalTypoCorrection=\(currentExperimentalTypoCorrection)"
     )
 }
 

@@ -79,6 +79,8 @@ function Assert-InstallPayload {
         "launcher.exe",
         "ui.exe",
         "build-info.json",
+        "keyboard-typo-dictionary-NOTICE.md",
+        "keyboard-typo-rewrite-NOTICE.md",
         "zenz.gguf",
         "Dictionary",
         "Dictionary\Reverse\reverse-v2.bin",

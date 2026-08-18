@@ -52,7 +52,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_DIR="$REPO_ROOT/.local/logs"
 SWIFT_VENDOR_CACHE_DIR="${SWIFT_VENDOR_CACHE_DIR:-$REPO_ROOT/.local/cache/AzooKeyKanaKanjiConverter}"
 SWIFT_VENDOR_REPO_URL="${SWIFT_VENDOR_REPO_URL:-https://github.com/batao9/AzooKeyKanaKanjiConverter}"
-SWIFT_VENDOR_REVISION="${SWIFT_VENDOR_REVISION:-56268957b81b004ca8231ffc3491a4af684d0e20}"
+SWIFT_VENDOR_REVISION="${SWIFT_VENDOR_REVISION:-d5e9ffa1be372be488ab74f736662897835d397c}"
 mkdir -p "$LOG_DIR"
 
 DEFAULT_GATEWAY_IP="$(ip route | awk '/default/ {print $3; exit}' || true)"

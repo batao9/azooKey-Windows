@@ -59,6 +59,8 @@ Source: "../build/x86/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey
 Source: "../build/{#MySettingsAppName}"; DestDir: "{app}"; Flags: ignoreversion restartreplace uninsrestartdelete
 Source: "../build/{#MySettingsAppName}"; DestDir: "{app}"; DestName: "azookey-updater-helper.exe"; Flags: ignoreversion restartreplace uninsrestartdelete
 Source: "../build/*"; DestDir: "{app}"; Excludes: "{#MySettingsAppName},azookey-updater-helper.exe,azookey-setup*.exe,SHA256SUMS.txt"; Flags: ignoreversion recursesubdirs createallsubdirs restartreplace uninsrestartdelete
+Source: "../data/keyboard-typo-dictionary-NOTICE.md"; DestDir: "{app}"; Flags: ignoreversion restartreplace uninsrestartdelete
+Source: "../data/keyboard-typo-rewrite-NOTICE.md"; DestDir: "{app}"; Flags: ignoreversion restartreplace uninsrestartdelete
 Source: "./Azookey Startup.xml"; DestDir: "{app}"; DestName: ".azookey-startup-task.xml"; Flags: ignoreversion deleteafterinstall
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
@@ -84,6 +86,8 @@ Type: files; Name: "{app}\*.dll"
 Type: files; Name: "{app}\*.exe"
 Type: files; Name: "{app}\*.vbs"
 Type: files; Name: "{app}\*.gguf"
+Type: files; Name: "{app}\keyboard-typo-dictionary-NOTICE.md"
+Type: files; Name: "{app}\keyboard-typo-rewrite-NOTICE.md"
 Type: filesandordirs; Name: "{app}\Dictionary"
 Type: filesandordirs; Name: "{app}\EmojiDictionary"
 Type: filesandordirs; Name: "{app}\llama_cpu"
