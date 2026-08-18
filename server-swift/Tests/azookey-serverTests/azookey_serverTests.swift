@@ -2245,6 +2245,120 @@ private func testCandidate(
     #expect(!candidates.3.contains("切って"), "mixed typo candidates: \(candidates.3)")
 }
 
+@Test func keyboardTypoCorrectionRewriteEditHistoryBackspace() async throws {
+    let memoryURL = FileManager.default.temporaryDirectory
+        .appending(path: "azookey-typo-backspace-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: memoryURL) }
+    let packageRoot = packageRootURL()
+    let dictionaryURL = packageRoot
+        .appending(path: "azooKey_dictionary_storage")
+        .appending(path: "Dictionary")
+
+    let results = await MainActor.run {
+        let testConverter = KanaKanjiConverter(
+            dictionaryURL: dictionaryURL,
+            preloadDictionary: true
+        )
+        testConverter.importDynamicUserDictionary(makeKeyboardTypoDictionaryEntries())
+        let options = testConvertRequestOptions(
+            memoryURL: memoryURL,
+            experimentalKeyboardTypoCorrection: true
+        )
+
+        func candidateTexts(_ composingText: ComposingText) -> [String] {
+            testConverter.requestCandidates(
+                composingText,
+                options: options
+            ).mainResults.map(\.text)
+        }
+
+        var smallTsu = ComposingText()
+        for key in "kixtuxtute" {
+            smallTsu.insertAtCursorPosition(String(key), inputStyle: .roman2kana)
+        }
+        let smallTsuBefore = candidateTexts(smallTsu)
+        smallTsu.deleteBackwardFromCursorPosition(count: 1)
+        let smallTsuAfter = candidateTexts(smallTsu)
+        return (smallTsuBefore, smallTsuAfter, smallTsu)
+    }
+
+    #expect(results.0.contains("切って"), "before Backspace: \(results.0)")
+    #expect(results.2.convertTarget == "きっっ")
+    #expect(results.2.convertTargetCursorPosition == 3)
+    #expect(results.2.input.count == 8)
+    #expect(
+        results.2.input == "kixtuxtu".map {
+            ComposingText.InputElement(character: $0, inputStyle: .roman2kana)
+        }
+    )
+    #expect(!results.1.contains("切って"), "after Backspace: \(results.1)")
+}
+
+@Test func keyboardTypoCorrectionRewriteEditHistoryCursorDelete() async throws {
+    let memoryURL = FileManager.default.temporaryDirectory
+        .appending(path: "azookey-typo-cursor-delete-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: memoryURL) }
+    let packageRoot = packageRootURL()
+    let dictionaryURL = packageRoot
+        .appending(path: "azooKey_dictionary_storage")
+        .appending(path: "Dictionary")
+
+    let results = await MainActor.run {
+        let testConverter = KanaKanjiConverter(
+            dictionaryURL: dictionaryURL,
+            preloadDictionary: true
+        )
+        testConverter.importDynamicUserDictionary(makeKeyboardTypoDictionaryEntries())
+        let options = testConvertRequestOptions(
+            memoryURL: memoryURL,
+            experimentalKeyboardTypoCorrection: true
+        )
+
+        func candidateTexts(_ composingText: ComposingText) -> [String] {
+            testConverter.requestCandidates(
+                composingText,
+                options: options
+            ).mainResults.map(\.text)
+        }
+
+        var doubleNn = ComposingText()
+        for key in "konnnnitiha" {
+            doubleNn.insertAtCursorPosition(String(key), inputStyle: .roman2kana)
+        }
+        let before = candidateTexts(doubleNn)
+        let cursorDelta = doubleNn.moveCursorFromCursorPosition(count: -4)
+        doubleNn.deleteForwardFromCursorPosition(count: 1)
+        // Cursor-prefix conversion is the production path while the caret is
+        // inside the composition; the suffix remains visible but unconverted.
+        let after = candidateTexts(doubleNn.prefixToCursorPosition())
+        return (before, after, doubleNn, cursorDelta)
+    }
+
+    #expect(results.0.contains("こんにちは"), "before cursor Delete: \(results.0)")
+    #expect(results.3 == -4)
+    #expect(results.2.convertTarget == "こんいちは")
+    #expect(results.2.convertTargetCursorPosition == 2)
+    #expect(results.2.input.count == 10)
+    #expect(
+        results.2.input == [
+            ComposingText.InputElement(character: "k", inputStyle: .roman2kana),
+            ComposingText.InputElement(character: "o", inputStyle: .roman2kana),
+            ComposingText.InputElement(character: "n", inputStyle: .roman2kana),
+            ComposingText.InputElement(character: "n", inputStyle: .roman2kana),
+            ComposingText.InputElement(
+                piece: .compositionSeparator,
+                inputStyle: .mapped(id: .empty)
+            ),
+            ComposingText.InputElement(character: "i", inputStyle: .roman2kana),
+            ComposingText.InputElement(character: "t", inputStyle: .roman2kana),
+            ComposingText.InputElement(character: "i", inputStyle: .roman2kana),
+            ComposingText.InputElement(character: "h", inputStyle: .roman2kana),
+            ComposingText.InputElement(character: "a", inputStyle: .roman2kana),
+        ]
+    )
+    #expect(!results.1.contains("こんにちは"), "after cursor Delete: \(results.1)")
+}
+
 @Test func surfaceCountTracksUnderlyingRomanInputLength() async throws {
     let resolved = await MainActor.run {
         var composingText = ComposingText()
