@@ -1,6 +1,6 @@
 # 誤入力補正・文中順位評価
 
-計測日: 2026-08-18
+計測日: 2026-08-18（rewrite provenanceによる統合順位は2026-08-19に再計測）
 
 対象: 92選定行（104 lookup entry）の誤入力辞書 + `SmallTSU` + `DoubleNN`
 
@@ -10,14 +10,14 @@
 
 辞書補正17ケースは、Zenzai OFFでは17/17件が1位だった。Zenzai ONの直接出力では2/17件だけが1位で、残り15件はZenzai候補の直後となる2位だった。製品の候補統合時に後述のconfidence判定を適用すると、17/17件が1位になった。
 
-`SmallTSU` と `DoubleNN` はZenzai OFFでは1位、Zenzai ONでは直接出力・統合後とも2位だった。rewrite由来であることを`Candidate`から判別できないため、辞書補正と同じ昇格処理は適用していない。
+`SmallTSU` と `DoubleNN` はZenzai OFFでは1位、Zenzai ONの直接出力ではともに2位だった。KKCから候補が通過したrewrite種別と元入力範囲を返すようにした結果、`SmallTSU` は製品統合後に1位へ上がった。`DoubleNN` はZenzaiの1位「今日はという」も同じ補正経路を通っており、モデルによる表記選択を保つため期待候補「こんにちはという」は2位のままとした。
 
 正しい入力との衝突を確認する負例8ケースは、Zenzai OFF、Zenzai ON直接出力、統合後のすべてで期待候補が1位だった。誤入力辞書由来の候補は8/8件で生成されなかった。
 
 | 対象 | 件数 | Zenzai OFF 1位 | Zenzai ON直接 1位 / 2位以内 | 製品統合後 1位 / 2位以内 |
 |---|---:|---:|---:|---:|
 | 辞書補正 | 17 | 17 | 2 / 17 | 17 / 17 |
-| SmallTSU・DoubleNN | 2 | 2 | 0 / 2 | 0 / 2 |
+| SmallTSU・DoubleNN | 2 | 2 | 0 / 2 | 1 / 2 |
 | 負例（自然候補） | 8 | 8 | 8 / 8 | 8 / 8 |
 
 ## スコアリングと統合方針
@@ -33,6 +33,10 @@ Zenzaiの `Candidate.value` は通常KKCと同じ比較可能なスコアでは�
 3. 元のZenzai 1位は削除せず2位以降へ残す。
 
 2の判定により、正しい「中欧」のような語を固定補正で上書きしない。実測中に `ちゅおう→中央` が「中欧」と衝突したため、この辞書項目自体も採用候補から除外した。
+
+`SmallTSU`・`DoubleNN` は辞書metadataではなく、KKCのlattice nodeから最終 `Candidate` までrewrite provenanceを保持する。製品統合では、Zenzai 1位がrewriteを使っておらず、候補がちょうど1回のrewriteだけを使い、その元入力spanに正規語彙の衝突がない場合に限って、最初のrewrite候補を1位へ移す。Zenzai 1位自身がrewriteを使っている場合は、補正の必要性をモデルも認識したものとして表記選択を維持する。複数rewriteを含む候補も自動昇格しない。
+
+rewrite候補を確定しても、誤入力そのものをユーザー学習へ記録しない。辞書補正候補と同様に、機能が有効な間はrewrite provenanceを持つ候補を学習対象外にする。
 
 ## 文中接続ケース
 
@@ -57,7 +61,7 @@ Zenzaiの `Candidate.value` は通常KKCと同じ比較可能なスコアでは�
 | Yu候補 | `kyukeiwotoru` | 休憩を取る | 1 | 1 | 1 |
 | NI候補 | `renyoukeiwotukau` | 連用形を使う | 1 | 2 | 1 |
 | NI候補 | `senyousyawotukau` | 専用車を使う | 1 | 2 | 1 |
-| SmallTSU | `panwokixtuxtutekureru` | パンを切ってくれる | 1 | 2 | 2 |
+| SmallTSU | `panwokixtuxtutekureru` | パンを切ってくれる | 1 | 2 | 1 |
 | DoubleNN | `konnnnitihatoiu` | こんにちはという | 1 | 2 | 2 |
 
 必須例の候補上位は次のようになった。
@@ -90,6 +94,7 @@ Zenzaiの `Candidate.value` は通常KKCと同じ比較可能なスコアでは�
 - learningと日本語・英語predictionは無効。ケースごとに `stopComposition()` し、同一の辞書、入力列、左文脈をOFF/ONで使用した。
 - Zenzai ONは `inferenceLimit=1`、rich candidates有効、実配布モデル、CPU inferenceで実行した。
 - 27ケース × 3経路の81結果を取得し、VMテストは約29.2秒で完走した。この時間は順位確認用test全体であり、レイテンシ指標ではない。
+- provenance実装後は実配布モデルでrewrite 2ケースを再計測した。`SmallTSU` は直接2位・統合後1位、`DoubleNN` は直接2位・統合後2位で、最終実装の2ケースprobeはモデル読込を含め約13.6秒だった。既存のZenzai推論結果と通常N-bestを並べ替えるだけで、追加推論は行わない。
 - 計測時に残っていた `ちゅげん→中原` は生成スコアがKKCの枝刈り閾値未満で、全経路でlookup前に除外されていた。最終選定から削除し、validatorで同種の到達不能entryを拒否する。評価ケースの候補集合と順位には影響しない。
 - 本評価は選定した文例に対する順位回帰で、実利用コーパス全体のTop-1精度や誤補正率を推定するものではない。
-- SmallTSU・DoubleNNをZenzai ONでも1位へ昇格させるには、KKCからrewrite由来metadataを返す必要がある。出自を判別せず通常N-best 1位を常に優先すると、Zenzaiが選んだ自然な候補まで上書きするため現時点では行わない。
+- 本評価では単一rewriteだけを自動昇格の対象とした。複数の誤入力を含む文や、補正経路上でZenzaiが別の自然な表記を選ぶケースを1位へ固定することはしない。

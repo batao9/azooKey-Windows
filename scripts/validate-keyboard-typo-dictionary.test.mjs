@@ -73,7 +73,8 @@ test("generated Swift dictionary stays synchronized with the reviewed TSV", asyn
   assert.match(generated, /word: "ご確認",\n\s+ruby: "ゴカクニ"/u);
   assert.match(generated, /word: "ファッション",\n\s+ruby: "ファショn"/u);
   assert.match(generated, /ruby: "シマスタ",\n\s+lcid: 610,\n\s+rcid: 435,\n\s+mid: 17,\n\s+value: -8\.4169/u);
-  assert.match(generated, /func disableLearningForKeyboardTypoDictionaryCandidates/u);
+  assert.match(generated, /func disableLearningForKeyboardTypoCorrectionCandidates/u);
+  assert.match(generated, /\|\| !candidate\.keyboardTypoCorrections\.isEmpty/u);
   assert.equal(scoreFor({ selection_tier: "required", reference_value: "-7.4169" }), "-8.4169");
   assert.equal(scoreFor({ selection_tier: "core", reference_value: "-8.2538" }), "-9.7538");
   assert.equal(scoreFor({ selection_tier: "candidate", reference_value: "-11.2573" }), "-13.7573");

@@ -970,7 +970,7 @@ struct LearningCandidateCache {
     }
 
     return learningCandidateCache.appendBatch(
-        disableLearningForKeyboardTypoDictionaryCandidates(
+        disableLearningForKeyboardTypoCorrectionCandidates(
             candidates,
             experimentalTypoCorrectionEnabled:
                 (config["experimentalTypoCorrection"] as? Bool) ?? false
@@ -2266,26 +2266,120 @@ private func displayRubyForKeyboardTypoLookup(_ ruby: String) -> String {
     return displayRuby
 }
 
+private func hasLexicalAlternativeAcrossWholeSpan(
+    candidate: Candidate,
+    rawTypoSpan: String,
+    originalSurfaceRange: Range<Int>? = nil
+) -> Bool {
+    guard !rawTypoSpan.isEmpty else {
+        return false
+    }
+
+    let elements = candidate.data.map { element in
+        (
+            ruby: displayRubyForKeyboardTypoLookup(element.ruby),
+            word: element.word,
+            isKeyboardTypoCorrection: element.metadata.contains(.isKeyboardTypoCorrection)
+        )
+    }
+    var elementStartOffsets: [Int] = []
+    elementStartOffsets.reserveCapacity(elements.count)
+    var offset = 0
+    for element in elements {
+        elementStartOffsets.append(offset)
+        offset += element.ruby.count
+    }
+
+    for startIndex in elements.indices {
+        let startOffset = elementStartOffsets[startIndex]
+        if let originalSurfaceRange, startOffset != originalSurfaceRange.lowerBound {
+            continue
+        }
+
+        var ruby = ""
+        var word = ""
+        for endIndex in startIndex ..< elements.endIndex {
+            let element = elements[endIndex]
+            if element.isKeyboardTypoCorrection {
+                break
+            }
+            ruby += element.ruby
+            word += element.word
+
+            guard rawTypoSpan.hasPrefix(ruby) else {
+                break
+            }
+            guard ruby == rawTypoSpan else {
+                continue
+            }
+
+            let endOffset = elementStartOffsets[endIndex]
+                + element.ruby.count
+            if let originalSurfaceRange, endOffset != originalSurfaceRange.upperBound {
+                break
+            }
+            return hiraganaToKatakana(word) != rawTypoSpan
+        }
+    }
+    return false
+}
+
 func confidentKeyboardTypoCorrectionForZenzaiMerge(
     zenzaiResults: [Candidate],
-    normalNBestResults: [Candidate]
+    normalNBestResults: [Candidate],
+    hiragana: String
 ) -> Candidate? {
-    guard let zenzaiTop = zenzaiResults.first,
-          let normalTop = normalNBestResults.first,
+    guard let zenzaiTop = zenzaiResults.first else {
+        return nil
+    }
+
+    // Zenzai already selected a path through the bounded rewrite. Preserve its
+    // semantic/surface decision (for example, こんにちは vs 今日は).
+    guard zenzaiTop.keyboardTypoCorrections.isEmpty else {
+        return nil
+    }
+
+    let hiraganaCharacters = Array(hiragana)
+    func canPromoteRewriteCandidate(_ candidate: Candidate) -> Bool {
+        guard candidate.keyboardTypoCorrections.count == 1,
+              let correction = candidate.keyboardTypoCorrections.first,
+              correction.originalSurfaceRange.lowerBound >= 0,
+              correction.originalSurfaceRange.upperBound <= hiraganaCharacters.count
+        else {
+            return false
+        }
+
+        let rawTypoSpan = hiraganaToKatakana(
+            String(hiraganaCharacters[correction.originalSurfaceRange])
+        )
+        let hasWholeSpanLexicalAlternative = hasLexicalAlternativeAcrossWholeSpan(
+            candidate: zenzaiTop,
+            rawTypoSpan: rawTypoSpan,
+            originalSurfaceRange: correction.originalSurfaceRange
+        )
+        return !rawTypoSpan.isEmpty && !hasWholeSpanLexicalAlternative
+    }
+
+    if let correctedZenzaiCandidate = zenzaiResults.dropFirst().first(where: canPromoteRewriteCandidate) {
+        return correctedZenzaiCandidate
+    }
+    if let normalTop = normalNBestResults.first,
+       canPromoteRewriteCandidate(normalTop)
+    {
+        return normalTop
+    }
+
+    guard let normalTop = normalNBestResults.first,
           let correctionEntry = keyboardTypoDictionaryEntry(in: normalTop)
     else {
         return nil
     }
 
     let rawTypoSpan = displayRubyForKeyboardTypoLookup(correctionEntry.ruby)
-    let hasWholeSpanLexicalAlternative = zenzaiTop.data.contains { element in
-        guard !element.metadata.contains(.isKeyboardTypoCorrection),
-              displayRubyForKeyboardTypoLookup(element.ruby) == rawTypoSpan
-        else {
-            return false
-        }
-        return hiraganaToKatakana(element.word) != rawTypoSpan
-    }
+    let hasWholeSpanLexicalAlternative = hasLexicalAlternativeAcrossWholeSpan(
+        candidate: zenzaiTop,
+        rawTypoSpan: rawTypoSpan
+    )
     guard !rawTypoSpan.isEmpty, !hasWholeSpanLexicalAlternative else {
         return nil
     }
@@ -2311,7 +2405,8 @@ func mergeZenzaiMainResultsWithNormalNBest(
 
     if let correction = confidentKeyboardTypoCorrectionForZenzaiMerge(
         zenzaiResults: zenzaiResults,
-        normalNBestResults: normalNBestResults
+        normalNBestResults: normalNBestResults,
+        hiragana: hiragana
     ) {
         appendIfNeeded(correction)
     }

@@ -976,7 +976,7 @@ func keyboardTypoDictionaryEntry(in candidate: Candidate) -> DicdataElement? {
     }
 }
 
-func disableLearningForKeyboardTypoDictionaryCandidates(
+func disableLearningForKeyboardTypoCorrectionCandidates(
     _ candidates: [Candidate],
     experimentalTypoCorrectionEnabled: Bool
 ) -> [Candidate] {
@@ -985,7 +985,9 @@ func disableLearningForKeyboardTypoDictionaryCandidates(
     }
     return candidates.map { source in
         var candidate = source
-        if keyboardTypoDictionaryEntry(in: candidate) != nil {
+        if keyboardTypoDictionaryEntry(in: candidate) != nil
+            || !candidate.keyboardTypoCorrections.isEmpty
+        {
             candidate.isLearningTarget = false
         }
         return candidate
