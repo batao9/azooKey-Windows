@@ -607,6 +607,8 @@ function Assert-RequiredInstallFiles {
     "azookey.dll",
     "azookey32.dll",
     "build-info.json",
+    "keyboard-typo-dictionary-NOTICE.md",
+    "keyboard-typo-rewrite-NOTICE.md",
     "Dictionary",
     "EmojiDictionary",
     "zenz.gguf",

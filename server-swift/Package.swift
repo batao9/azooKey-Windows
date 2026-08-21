@@ -23,7 +23,7 @@ let package = Package(
         // .package(url: /* package url */, from: "1.0.0"),
         .package(
             url: "https://github.com/batao9/AzooKeyKanaKanjiConverter",
-            revision: "56268957b81b004ca8231ffc3491a4af684d0e20",
+            revision: "c228776b0b869f81ee2a1031ff9dbd679f4b3cd9",
             traits: ["Zenzai"]
         )
     ],

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
-import { Download, Keyboard, RefreshCcw, Table2, Trash2 } from "lucide-react";
+import { Download, FlaskConical, Keyboard, RefreshCcw, Table2, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -43,6 +43,7 @@ type GeneralConfigState = {
     show_candidate_window_after_space: boolean;
     show_live_conversion_reading: boolean;
     live_conversion_reading_vertical_adjustment: number;
+    experimental_typo_correction: boolean;
 };
 
 type CharacterWidthGroupsState = {
@@ -100,6 +101,7 @@ const DEFAULT_GENERAL_CONFIG: GeneralConfigState = {
     show_candidate_window_after_space: false,
     show_live_conversion_reading: true,
     live_conversion_reading_vertical_adjustment: 4,
+    experimental_typo_correction: false,
 };
 
 const LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MIN = -12;
@@ -251,6 +253,10 @@ const normalizeGeneralConfig = (value?: Record<string, unknown>): GeneralConfigS
         clampLiveConversionReadingVerticalAdjustment(
             value?.live_conversion_reading_vertical_adjustment,
         ),
+    experimental_typo_correction:
+        typeof value?.experimental_typo_correction === "boolean"
+            ? value.experimental_typo_correction
+            : DEFAULT_GENERAL_CONFIG.experimental_typo_correction,
 });
 
 const normalizeLearningMode = (value?: unknown): LearningMode => {
@@ -544,6 +550,7 @@ export const General = () => {
             | "show_candidate_window_after_space"
             | "show_live_conversion_reading"
             | "live_conversion_reading_vertical_adjustment"
+            | "experimental_typo_correction"
         >,
         nextValue: string,
     ) => {
@@ -564,7 +571,8 @@ export const General = () => {
             | "punctuation_commit_exclamation"
             | "punctuation_commit_question"
             | "show_candidate_window_after_space"
-            | "show_live_conversion_reading",
+            | "show_live_conversion_reading"
+            | "experimental_typo_correction",
         nextValue: boolean,
     ) => {
         const data = await updateConfig((config) => {
@@ -1215,6 +1223,27 @@ export const General = () => {
                     </div>
                 </section>
 
+                <section className="space-y-3">
+                    <h1 className="text-sm font-bold text-foreground">実験的機能</h1>
+                    <div className="rounded-md border">
+                        <div className="flex items-center gap-4 p-4">
+                            <FlaskConical className="h-4 w-4 shrink-0" />
+                            <div className="flex-1 space-y-1">
+                                <p className="text-sm font-medium leading-none">誤入力の補正機能</p>
+                                <p className="text-xs text-muted-foreground">
+                                    キーボードの打ち間違いを補正候補として表示します。変換結果が意図しない内容になる場合があります。
+                                </p>
+                            </div>
+                            <Switch
+                                aria-label="誤入力の補正機能"
+                                checked={generalValue.experimental_typo_correction}
+                                onCheckedChange={(value) =>
+                                    void updateGeneralBooleanConfig("experimental_typo_correction", value)
+                                }
+                            />
+                        </div>
+                    </div>
+                </section>
             </div>
 
             {isRomajiEditorOpen && (

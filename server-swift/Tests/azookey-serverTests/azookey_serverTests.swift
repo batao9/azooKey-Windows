@@ -204,7 +204,10 @@ private func writeReverseDictionaryFixture(
     #expect(!directory.path.hasPrefix(installDirectory.path + "/"))
 }
 
-private func testConvertRequestOptions(memoryURL: URL) -> ConvertRequestOptions {
+private func testConvertRequestOptions(
+    memoryURL: URL,
+    experimentalKeyboardTypoCorrection: Bool = false
+) -> ConvertRequestOptions {
     let packageRoot = packageRootURL()
     return ConvertRequestOptions(
         requireJapanesePrediction: .disabled,
@@ -221,6 +224,7 @@ private func testConvertRequestOptions(memoryURL: URL) -> ConvertRequestOptions 
         },
         specialCandidateProviders: nil,
         zenzaiMode: .off,
+        experimentalKeyboardTypoCorrection: experimentalKeyboardTypoCorrection,
         metadata: .init(versionString: "Azookey for Windows test")
     )
 }
@@ -246,10 +250,68 @@ private func testLearningConvertRequestOptions(memoryURL: URL) -> ConvertRequest
     )
 }
 
+@MainActor private func keyboardTypoCandidateTexts(
+    keys: String,
+    inputStyle: InputStyle = .roman2kana,
+    enabled: Bool,
+    memoryURL: URL,
+    converter: KanaKanjiConverter? = nil
+) -> [String] {
+    var composingText = ComposingText()
+    for key in keys {
+        composingText.insertAtCursorPosition(String(key), inputStyle: inputStyle)
+    }
+    return keyboardTypoCandidateTexts(
+        composingText: composingText,
+        enabled: enabled,
+        memoryURL: memoryURL,
+        converter: converter
+    )
+}
+
+@MainActor private func keyboardTypoCandidateTexts(
+    composingText: ComposingText,
+    enabled: Bool,
+    memoryURL: URL,
+    converter: KanaKanjiConverter? = nil
+) -> [String] {
+    keyboardTypoCandidates(
+        composingText: composingText,
+        enabled: enabled,
+        memoryURL: memoryURL,
+        converter: converter
+    ).map(\.text)
+}
+
+@MainActor private func keyboardTypoCandidates(
+    composingText: ComposingText,
+    enabled: Bool,
+    memoryURL: URL,
+    converter: KanaKanjiConverter? = nil
+) -> [Candidate] {
+    let packageRoot = packageRootURL()
+    let dictionaryURL = packageRoot
+        .appending(path: "azooKey_dictionary_storage")
+        .appending(path: "Dictionary")
+    let converter = converter ?? KanaKanjiConverter(
+        dictionaryURL: dictionaryURL,
+        preloadDictionary: true
+    )
+    converter.importDynamicUserDictionary(makeKeyboardTypoDictionaryEntries())
+    return converter.requestCandidates(
+        composingText,
+        options: testConvertRequestOptions(
+            memoryURL: memoryURL,
+            experimentalKeyboardTypoCorrection: enabled
+        )
+    ).mainResults
+}
+
 private func testCandidate(
     word: String,
     ruby: String,
-    composingCount: ComposingCount
+    composingCount: ComposingCount,
+    keyboardTypoCorrections: [KeyboardTypoCorrectionProvenance] = []
 ) -> Candidate {
     Candidate(
         text: word,
@@ -264,7 +326,8 @@ private func testCandidate(
                 mid: MIDData.一般.mid,
                 value: -1
             )
-        ]
+        ],
+        keyboardTypoCorrections: keyboardTypoCorrections
     )
 }
 
@@ -1676,6 +1739,229 @@ private func testCandidate(
     )
 }
 
+@Test func zenzaiMergePromotesConfidentDictionaryCorrectionOverRawTypoSpan() async throws {
+    let hiragana = "しますた"
+    let typoEntry = makeKeyboardTypoDictionaryEntries()[0]
+    let correction = Candidate(
+        text: typoEntry.word,
+        value: -1,
+        composingCount: .surfaceCount(typoEntry.ruby.count),
+        lastMid: typoEntry.mid,
+        data: [typoEntry]
+    )
+    let zenzaiRaw = testCandidate(
+        word: hiragana,
+        ruby: typoEntry.ruby,
+        composingCount: .surfaceCount(typoEntry.ruby.count)
+    )
+    var normalRaw = zenzaiRaw
+    normalRaw.value = -2
+
+    let merged = mergeZenzaiMainResultsWithNormalNBest(
+        zenzaiResults: [zenzaiRaw],
+        normalNBestResults: [correction, normalRaw],
+        hiragana: hiragana
+    )
+
+    #expect(
+        merged.map { constructCandidateString(candidate: $0, hiragana: hiragana) } == [
+            "しました",
+            "しますた",
+        ]
+    )
+}
+
+@Test func zenzaiMergeKeepsModelTopWhenCorrectionIsNotNormalTopOrIsConvertedAlternative() async throws {
+    let hiragana = "しますた"
+    let typoEntry = makeKeyboardTypoDictionaryEntries()[0]
+    let correction = Candidate(
+        text: typoEntry.word,
+        value: -1,
+        composingCount: .surfaceCount(typoEntry.ruby.count),
+        lastMid: typoEntry.mid,
+        data: [typoEntry]
+    )
+    let zenzaiRaw = testCandidate(
+        word: hiragana,
+        ruby: typoEntry.ruby,
+        composingCount: .surfaceCount(typoEntry.ruby.count)
+    )
+    var normalRawTop = zenzaiRaw
+    normalRawTop.value = -0.5
+    let convertedAlternative = testCandidate(
+        word: "済ました",
+        ruby: typoEntry.ruby,
+        composingCount: .surfaceCount(typoEntry.ruby.count)
+    )
+
+    let nonTopCorrectionMerged = mergeZenzaiMainResultsWithNormalNBest(
+        zenzaiResults: [zenzaiRaw],
+        normalNBestResults: [normalRawTop, correction],
+        hiragana: hiragana
+    )
+    let convertedMerged = mergeZenzaiMainResultsWithNormalNBest(
+        zenzaiResults: [convertedAlternative],
+        normalNBestResults: [correction, zenzaiRaw],
+        hiragana: hiragana
+    )
+
+    #expect(constructCandidateString(candidate: nonTopCorrectionMerged[0], hiragana: hiragana) == "しますた")
+    #expect(constructCandidateString(candidate: convertedMerged[0], hiragana: hiragana) == "済ました")
+}
+
+@Test func zenzaiMergePromotesSingleRewritePathWhenModelTopIsUncorrected() async throws {
+    let hiragana = "ぱんをきっってくれる"
+    let rewrite = KeyboardTypoCorrectionProvenance(
+        kind: .smallTsu,
+        originalSurfaceRange: 3 ..< 7
+    )
+    let uncorrected = testCandidate(
+        word: hiragana,
+        ruby: hiraganaToKatakana(hiragana),
+        composingCount: .surfaceCount(hiragana.count)
+    )
+    let corrected = testCandidate(
+        word: "パンを切ってくれる",
+        ruby: hiraganaToKatakana(hiragana),
+        composingCount: .surfaceCount(hiragana.count),
+        keyboardTypoCorrections: [rewrite]
+    )
+
+    let merged = mergeZenzaiMainResultsWithNormalNBest(
+        zenzaiResults: [uncorrected, corrected],
+        normalNBestResults: [],
+        hiragana: hiragana
+    )
+
+    #expect(Array(merged.map(\.text).prefix(2)) == ["パンを切ってくれる", hiragana])
+}
+
+@Test func zenzaiMergePreservesModelSurfaceWhenTopAlreadyUsesRewritePath() async throws {
+    let hiragana = "こんんいちはという"
+    let rewrite = KeyboardTypoCorrectionProvenance(
+        kind: .doubleNn,
+        originalSurfaceRange: 0 ..< 6
+    )
+    let modelTop = testCandidate(
+        word: "今日はという",
+        ruby: hiraganaToKatakana(hiragana),
+        composingCount: .surfaceCount(hiragana.count),
+        keyboardTypoCorrections: [rewrite]
+    )
+    let literalSurface = testCandidate(
+        word: "こんにちはという",
+        ruby: hiraganaToKatakana(hiragana),
+        composingCount: .surfaceCount(hiragana.count),
+        keyboardTypoCorrections: [rewrite]
+    )
+
+    let merged = mergeZenzaiMainResultsWithNormalNBest(
+        zenzaiResults: [modelTop, literalSurface],
+        normalNBestResults: [literalSurface],
+        hiragana: hiragana
+    )
+
+    #expect(Array(merged.map(\.text).prefix(2)) == ["今日はという", "こんにちはという"])
+}
+
+@Test func zenzaiMergeDoesNotPromoteRewriteAcrossWholeSpanLexicalCollision() async throws {
+    let hiragana = "ほんっっと"
+    let rewrite = KeyboardTypoCorrectionProvenance(
+        kind: .smallTsu,
+        originalSurfaceRange: 0 ..< hiragana.count
+    )
+    let lexicalTop = testCandidate(
+        word: "本っっと",
+        ruby: hiraganaToKatakana(hiragana),
+        composingCount: .surfaceCount(hiragana.count)
+    )
+    let corrected = testCandidate(
+        word: "ほんっと",
+        ruby: hiraganaToKatakana(hiragana),
+        composingCount: .surfaceCount(hiragana.count),
+        keyboardTypoCorrections: [rewrite]
+    )
+
+    let merged = mergeZenzaiMainResultsWithNormalNBest(
+        zenzaiResults: [lexicalTop, corrected],
+        normalNBestResults: [],
+        hiragana: hiragana
+    )
+
+    #expect(merged.first?.text == "本っっと")
+}
+
+@Test func zenzaiMergeDoesNotPromoteRewriteAcrossSegmentedLexicalCollision() async throws {
+    let hiragana = "えっっと"
+    let rewrite = KeyboardTypoCorrectionProvenance(
+        kind: .smallTsu,
+        originalSurfaceRange: 0 ..< hiragana.count
+    )
+    let lexicalTop = Candidate(
+        text: "絵っっと",
+        value: -1,
+        composingCount: .surfaceCount(hiragana.count),
+        lastMid: MIDData.一般.mid,
+        data: [
+            DicdataElement(
+                word: "絵っ",
+                ruby: "エッ",
+                cid: CIDData.一般名詞.cid,
+                mid: MIDData.一般.mid,
+                value: -1
+            ),
+            DicdataElement(
+                word: "っと",
+                ruby: "ット",
+                cid: CIDData.一般名詞.cid,
+                mid: MIDData.一般.mid,
+                value: -1
+            )
+        ]
+    )
+    let corrected = testCandidate(
+        word: "えっと",
+        ruby: hiraganaToKatakana(hiragana),
+        composingCount: .surfaceCount(hiragana.count),
+        keyboardTypoCorrections: [rewrite]
+    )
+
+    let merged = mergeZenzaiMainResultsWithNormalNBest(
+        zenzaiResults: [lexicalTop, corrected],
+        normalNBestResults: [],
+        hiragana: hiragana
+    )
+
+    #expect(merged.first?.text == "絵っっと")
+}
+
+@Test func zenzaiMergeDoesNotPromoteCandidateWithMultipleRewrites() async throws {
+    let hiragana = "きっってこんんいちは"
+    let rewrites = [
+        KeyboardTypoCorrectionProvenance(kind: .smallTsu, originalSurfaceRange: 0 ..< 4),
+        KeyboardTypoCorrectionProvenance(kind: .doubleNn, originalSurfaceRange: 4 ..< 10),
+    ]
+    let uncorrected = testCandidate(
+        word: hiragana,
+        ruby: hiraganaToKatakana(hiragana),
+        composingCount: .surfaceCount(hiragana.count)
+    )
+    let corrected = testCandidate(
+        word: "切ってこんにちは",
+        ruby: hiraganaToKatakana(hiragana),
+        composingCount: .surfaceCount(hiragana.count),
+        keyboardTypoCorrections: rewrites
+    )
+
+    let merged = mergeZenzaiMainResultsWithNormalNBest(
+        zenzaiResults: [uncorrected, corrected],
+        normalNBestResults: [],
+        hiragana: hiragana
+    )
+
+    #expect(merged.first?.text == hiragana)
+}
+
 @Test func zenzaiNormalNBestSupplementFiltersWeakRichCandidates() async throws {
     let hiragana = "ここではきものをぬいでください"
     let zenzaiTop = testCandidate(
@@ -1996,6 +2282,384 @@ private func testCandidate(
     }
 
     #expect(predictionMode == .disabled)
+}
+
+@Test func keyboardTypoCorrectionDefaultsOffAndFollowsRuntimeConfig() async throws {
+    let result = await MainActor.run {
+        let previous = config["experimentalTypoCorrection"]
+        defer {
+            config["experimentalTypoCorrection"] = previous
+        }
+
+        config["experimentalTypoCorrection"] = false
+        let disabled = getOptions(zenzaiEnabled: false).experimentalKeyboardTypoCorrection
+        config["experimentalTypoCorrection"] = true
+        let enabled = getOptions(zenzaiEnabled: false).experimentalKeyboardTypoCorrection
+        return (disabled, enabled)
+    }
+
+    #expect(result.0 == false)
+    #expect(result.1)
+}
+
+@Test func keyboardTypoCorrectionDictionaryIsOnlyMergedWhenEnabled() {
+    let entries = makeKeyboardTypoDictionaryEntries()
+    #expect(entries.count == keyboardTypoDictionaryEntryCount)
+    #expect(keyboardTypoDictionarySelectionCount == 92)
+    #expect(entries.count == 104)
+    #expect(entries.contains { $0.ruby == "シマスタ" && $0.word == "しました" })
+    #expect(entries.contains { $0.ruby == "ゴカクニ" && $0.word == "ご確認" })
+    #expect(Set(entries.map { $0.ruby + "\u{0}" + $0.word }).count == entries.count)
+    #expect(entries[0].lcid == 610)
+    #expect(entries[0].rcid == 435)
+    #expect(entries[0].mid == 17)
+    #expect(abs(entries[0].value() - (-8.4169)) < 0.0001)
+    #expect(entries[1].lcid == 560)
+    #expect(entries[1].rcid == 1283)
+    #expect(entries[1].mid == 17)
+    #expect(abs(entries[1].value() - (-11.0794)) < 0.0001)
+
+    let userEntry = DicdataElement(
+        word: "ユーザー語",
+        ruby: "ユーザーゴ",
+        cid: CIDData.固有名詞.cid,
+        mid: MIDData.一般.mid,
+        value: -5
+    )
+    let disabled = makeConversionDictionaryEntries(
+        userEntries: [userEntry],
+        experimentalTypoCorrectionEnabled: false
+    )
+    let enabled = makeConversionDictionaryEntries(
+        userEntries: [userEntry],
+        experimentalTypoCorrectionEnabled: true
+    )
+    #expect(disabled.count == 1)
+    #expect(enabled.count == 105)
+}
+
+@Test func keyboardTypoCorrectionDictionaryCandidatesAreNotLearnedWhileEnabled() {
+    let typoEntry = makeKeyboardTypoDictionaryEntries()[0]
+    let typoCandidate = Candidate(
+        text: typoEntry.word,
+        value: typoEntry.value(),
+        composingCount: .surfaceCount(typoEntry.ruby.count),
+        lastMid: typoEntry.mid,
+        data: [typoEntry]
+    )
+    let ordinaryCandidate = testCandidate(
+        word: "通常候補",
+        ruby: "ツウジョウコウホ",
+        composingCount: .surfaceCount(7)
+    )
+    let rewriteCandidate = testCandidate(
+        word: "切って",
+        ruby: "キッテ",
+        composingCount: .surfaceCount(4),
+        keyboardTypoCorrections: [
+            .init(kind: .smallTsu, originalSurfaceRange: 0 ..< 4)
+        ]
+    )
+
+    let disabled = disableLearningForKeyboardTypoCorrectionCandidates(
+        [typoCandidate],
+        experimentalTypoCorrectionEnabled: false
+    )
+    let enabled = disableLearningForKeyboardTypoCorrectionCandidates(
+        [typoCandidate, rewriteCandidate, ordinaryCandidate],
+        experimentalTypoCorrectionEnabled: true
+    )
+
+    #expect(disabled[0].isLearningTarget)
+    #expect(!enabled[0].isLearningTarget)
+    #expect(!enabled[1].isLearningTarget)
+    #expect(enabled[2].isLearningTarget)
+}
+
+@Test func keyboardTypoRewriteCandidatesExposeRuleAndOriginalSurfaceRange() async throws {
+    let memoryURL = FileManager.default.temporaryDirectory
+        .appending(path: "azookey-typo-provenance-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: memoryURL) }
+
+    let candidates = await MainActor.run {
+        @MainActor func candidates(_ keys: String) -> [Candidate] {
+            var composingText = ComposingText()
+            for key in keys {
+                composingText.insertAtCursorPosition(String(key), inputStyle: .roman2kana)
+            }
+            return keyboardTypoCandidates(
+                composingText: composingText,
+                enabled: true,
+                memoryURL: memoryURL
+            )
+        }
+        return (candidates("kixtuxtute"), candidates("konnnnitiha"))
+    }
+
+    let smallTsu = candidates.0.first { $0.text == "切って" }
+    let doubleNn = candidates.1.first { $0.text == "こんにちは" }
+    #expect(
+        smallTsu?.keyboardTypoCorrections == [
+            .init(kind: .smallTsu, originalSurfaceRange: 0 ..< 4)
+        ]
+    )
+    #expect(
+        doubleNn?.keyboardTypoCorrections == [
+            .init(kind: .doubleNn, originalSurfaceRange: 0 ..< 6)
+        ]
+    )
+}
+
+@Test func keyboardTypoCorrectionProducesDictionaryAndRewriteCandidates() async throws {
+    let memoryURL = FileManager.default.temporaryDirectory
+        .appending(path: "azookey-typo-correction-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: memoryURL) }
+
+    let results = await MainActor.run {
+        (
+            dictionary: keyboardTypoCandidateTexts(
+                keys: "simasuta",
+                enabled: true,
+                memoryURL: memoryURL
+            ),
+            phrase: keyboardTypoCandidateTexts(
+                keys: "gokakunionegaisimasu",
+                enabled: true,
+                memoryURL: memoryURL
+            ),
+            sentenceShimasuta: keyboardTypoCandidateTexts(
+                keys: "iikagentouitusimasuta",
+                enabled: true,
+                memoryURL: memoryURL
+            ),
+            sentenceGokakuni: keyboardTypoCandidateTexts(
+                keys: "syoruinogokakunionegaisimasu",
+                enabled: true,
+                memoryURL: memoryURL
+            ),
+            unresolvedN: keyboardTypoCandidateTexts(
+                keys: "fashon",
+                enabled: true,
+                memoryURL: memoryURL
+            ),
+            smallTsu: keyboardTypoCandidateTexts(
+                keys: "kixtuxtute",
+                enabled: true,
+                memoryURL: memoryURL
+            ),
+            doubleNn: keyboardTypoCandidateTexts(
+                keys: "konnnnitiha",
+                enabled: true,
+                memoryURL: memoryURL
+            )
+        )
+    }
+
+    #expect(results.dictionary.contains("しました"), "candidates: \(results.dictionary)")
+    #expect(results.phrase.contains("ご確認お願いします"), "candidates: \(results.phrase)")
+    #expect(results.sentenceShimasuta.first == "いい加減統一しました", "candidates: \(results.sentenceShimasuta)")
+    #expect(results.sentenceGokakuni.first == "書類のご確認お願いします", "candidates: \(results.sentenceGokakuni)")
+    #expect(results.unresolvedN.contains("ファッション"), "candidates: \(results.unresolvedN)")
+    #expect(results.smallTsu.contains("切って"), "candidates: \(results.smallTsu)")
+    #expect(results.doubleNn.contains("こんにちは"), "candidates: \(results.doubleNn)")
+}
+
+@Test func keyboardTypoCorrectionCanBeDisabledWithoutReusingEnabledLattice() async throws {
+    let memoryURL = FileManager.default.temporaryDirectory
+        .appending(path: "azookey-typo-toggle-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: memoryURL) }
+    let packageRoot = packageRootURL()
+    let dictionaryURL = packageRoot
+        .appending(path: "azooKey_dictionary_storage")
+        .appending(path: "Dictionary")
+
+    let results = await MainActor.run {
+        let testConverter = KanaKanjiConverter(
+            dictionaryURL: dictionaryURL,
+            preloadDictionary: true
+        )
+        let enabled = keyboardTypoCandidateTexts(
+            keys: "kixtuxtute",
+            enabled: true,
+            memoryURL: memoryURL,
+            converter: testConverter
+        )
+        let disabled = keyboardTypoCandidateTexts(
+            keys: "kixtuxtute",
+            enabled: false,
+            memoryURL: memoryURL,
+            converter: testConverter
+        )
+        return (enabled, disabled)
+    }
+
+    #expect(results.0.contains("切って"), "enabled: \(results.0)")
+    #expect(!results.1.contains("切って"), "disabled: \(results.1)")
+}
+
+@Test func keyboardTypoCorrectionDoesNotApplyToDirectKanaInput() async throws {
+    let memoryURL = FileManager.default.temporaryDirectory
+        .appending(path: "azookey-typo-direct-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: memoryURL) }
+
+    let candidates = await MainActor.run {
+        let direct = keyboardTypoCandidateTexts(
+            keys: "きっって",
+            inputStyle: .direct,
+            enabled: true,
+            memoryURL: memoryURL
+        )
+        let directDictionary = keyboardTypoCandidateTexts(
+            keys: "しますた",
+            inputStyle: .direct,
+            enabled: true,
+            memoryURL: memoryURL
+        )
+        var romanThenDirect = ComposingText()
+        for key in "kixtuxtute" {
+            romanThenDirect.insertAtCursorPosition(String(key), inputStyle: .roman2kana)
+        }
+        romanThenDirect.insertAtCursorPosition("。", inputStyle: .direct)
+
+        var mixedTypo = ComposingText()
+        for key in "ki" {
+            mixedTypo.insertAtCursorPosition(String(key), inputStyle: .roman2kana)
+        }
+        mixedTypo.insertAtCursorPosition("っって", inputStyle: .direct)
+        return (
+            direct,
+            directDictionary,
+            keyboardTypoCandidateTexts(
+                composingText: romanThenDirect,
+                enabled: true,
+                memoryURL: memoryURL
+            ),
+            keyboardTypoCandidateTexts(
+                composingText: mixedTypo,
+                enabled: true,
+                memoryURL: memoryURL
+            )
+        )
+    }
+
+    #expect(!candidates.0.contains("切って"), "direct candidates: \(candidates.0)")
+    #expect(!candidates.1.contains("しました"), "direct dictionary candidates: \(candidates.1)")
+    #expect(candidates.2.contains("切って。"), "mixed suffix candidates: \(candidates.2)")
+    #expect(!candidates.3.contains("切って"), "mixed typo candidates: \(candidates.3)")
+}
+
+@Test func keyboardTypoCorrectionRewriteEditHistoryBackspace() async throws {
+    let memoryURL = FileManager.default.temporaryDirectory
+        .appending(path: "azookey-typo-backspace-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: memoryURL) }
+    let packageRoot = packageRootURL()
+    let dictionaryURL = packageRoot
+        .appending(path: "azooKey_dictionary_storage")
+        .appending(path: "Dictionary")
+
+    let results = await MainActor.run {
+        let testConverter = KanaKanjiConverter(
+            dictionaryURL: dictionaryURL,
+            preloadDictionary: true
+        )
+        testConverter.importDynamicUserDictionary(makeKeyboardTypoDictionaryEntries())
+        let options = testConvertRequestOptions(
+            memoryURL: memoryURL,
+            experimentalKeyboardTypoCorrection: true
+        )
+
+        func candidateTexts(_ composingText: ComposingText) -> [String] {
+            testConverter.requestCandidates(
+                composingText,
+                options: options
+            ).mainResults.map(\.text)
+        }
+
+        var smallTsu = ComposingText()
+        for key in "kixtuxtute" {
+            smallTsu.insertAtCursorPosition(String(key), inputStyle: .roman2kana)
+        }
+        let smallTsuBefore = candidateTexts(smallTsu)
+        smallTsu.deleteBackwardFromCursorPosition(count: 1)
+        let smallTsuAfter = candidateTexts(smallTsu)
+        return (smallTsuBefore, smallTsuAfter, smallTsu)
+    }
+
+    #expect(results.0.contains("切って"), "before Backspace: \(results.0)")
+    #expect(results.2.convertTarget == "きっっ")
+    #expect(results.2.convertTargetCursorPosition == 3)
+    #expect(results.2.input.count == 8)
+    #expect(
+        results.2.input == "kixtuxtu".map {
+            ComposingText.InputElement(character: $0, inputStyle: .roman2kana)
+        }
+    )
+    #expect(!results.1.contains("切って"), "after Backspace: \(results.1)")
+}
+
+@Test func keyboardTypoCorrectionRewriteEditHistoryCursorDelete() async throws {
+    let memoryURL = FileManager.default.temporaryDirectory
+        .appending(path: "azookey-typo-cursor-delete-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: memoryURL) }
+    let packageRoot = packageRootURL()
+    let dictionaryURL = packageRoot
+        .appending(path: "azooKey_dictionary_storage")
+        .appending(path: "Dictionary")
+
+    let results = await MainActor.run {
+        let testConverter = KanaKanjiConverter(
+            dictionaryURL: dictionaryURL,
+            preloadDictionary: true
+        )
+        testConverter.importDynamicUserDictionary(makeKeyboardTypoDictionaryEntries())
+        let options = testConvertRequestOptions(
+            memoryURL: memoryURL,
+            experimentalKeyboardTypoCorrection: true
+        )
+
+        func candidateTexts(_ composingText: ComposingText) -> [String] {
+            testConverter.requestCandidates(
+                composingText,
+                options: options
+            ).mainResults.map(\.text)
+        }
+
+        var doubleNn = ComposingText()
+        for key in "konnnnitiha" {
+            doubleNn.insertAtCursorPosition(String(key), inputStyle: .roman2kana)
+        }
+        let before = candidateTexts(doubleNn)
+        let cursorDelta = doubleNn.moveCursorFromCursorPosition(count: -4)
+        doubleNn.deleteForwardFromCursorPosition(count: 1)
+        // Cursor-prefix conversion is the production path while the caret is
+        // inside the composition; the suffix remains visible but unconverted.
+        let after = candidateTexts(doubleNn.prefixToCursorPosition())
+        return (before, after, doubleNn, cursorDelta)
+    }
+
+    #expect(results.0.contains("こんにちは"), "before cursor Delete: \(results.0)")
+    #expect(results.3 == -4)
+    #expect(results.2.convertTarget == "こんいちは")
+    #expect(results.2.convertTargetCursorPosition == 2)
+    #expect(results.2.input.count == 10)
+    #expect(
+        results.2.input == [
+            ComposingText.InputElement(character: "k", inputStyle: .roman2kana),
+            ComposingText.InputElement(character: "o", inputStyle: .roman2kana),
+            ComposingText.InputElement(character: "n", inputStyle: .roman2kana),
+            ComposingText.InputElement(character: "n", inputStyle: .roman2kana),
+            ComposingText.InputElement(
+                piece: .compositionSeparator,
+                inputStyle: .mapped(id: .empty)
+            ),
+            ComposingText.InputElement(character: "i", inputStyle: .roman2kana),
+            ComposingText.InputElement(character: "t", inputStyle: .roman2kana),
+            ComposingText.InputElement(character: "i", inputStyle: .roman2kana),
+            ComposingText.InputElement(character: "h", inputStyle: .roman2kana),
+            ComposingText.InputElement(character: "a", inputStyle: .roman2kana),
+        ]
+    )
+    #expect(!results.1.contains("こんにちは"), "after cursor Delete: \(results.1)")
 }
 
 @Test func surfaceCountTracksUnderlyingRomanInputLength() async throws {

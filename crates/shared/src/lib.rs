@@ -570,6 +570,8 @@ pub struct GeneralConfig {
     pub show_live_conversion_reading: bool,
     #[serde(default = "default_live_conversion_reading_vertical_adjustment")]
     pub live_conversion_reading_vertical_adjustment: i32,
+    #[serde(default)]
+    pub experimental_typo_correction: bool,
 }
 
 impl Default for GeneralConfig {
@@ -587,6 +589,7 @@ impl Default for GeneralConfig {
             show_live_conversion_reading: true,
             live_conversion_reading_vertical_adjustment:
                 LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_DEFAULT,
+            experimental_typo_correction: false,
         }
     }
 }
@@ -768,6 +771,19 @@ mod tests {
             deserialized.live_conversion_reading_vertical_adjustment,
             LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_DEFAULT
         );
+    }
+
+    #[test]
+    fn experimental_typo_correction_defaults_to_off() {
+        let default_config = GeneralConfig::default();
+        assert!(!default_config.experimental_typo_correction);
+
+        let deserialized: GeneralConfig = serde_json::from_str("{}").unwrap();
+        assert!(!deserialized.experimental_typo_correction);
+
+        let enabled: GeneralConfig =
+            serde_json::from_str(r#"{"experimental_typo_correction":true}"#).unwrap();
+        assert!(enabled.experimental_typo_correction);
     }
 
     #[test]

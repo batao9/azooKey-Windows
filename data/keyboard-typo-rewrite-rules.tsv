@@ -1,0 +1,7 @@
+rule	status	input_scope	dictionary_policy	example_input	example_output	jwtd_exact	jwtd_different	post_triggered	builtin_collision_readings	required_negative_examples
+SmallTSU	enabled	roman2kana_only	exclude_exact_overlap	きっって	きって	449	20	11	3	きっっって;っっ;ほんっっと;direct-kana;Backspace解除
+DoubleNN	enabled	roman2kana_only	exclude_exact_overlap	こんんにちは	こんにちは	81	20	0	0	あんんんたい;末尾こんん;lookahead不足;direct-kana;Backspace解除
+NN	experiment	roman2kana_only	fixed_dictionary_candidates	みんあ	みんな	31	646	581	2572	原案;簡易;店員;運営;千円;BOSんあ
+M	experiment	roman2kana_only	raw_dictionary_candidates	しmばし	しんばし	0	4	2	0	10cmばかり;BOS mば;Mば;mは;末尾m;英数字混在
+Yu	deferred	roman2kana_only	fixed_dictionary_candidates	ちゅごく	ちゅうごく	56	599	582	5423	宿題;手術;キューバ;キュリー;末尾きゅ
+NI	deferred	roman2kana_only	fixed_dictionary_candidates	せにょう	せんよう	4	279	235	1671	ニュース;入院;にゃん;セニョリータ;Yu優先順位
