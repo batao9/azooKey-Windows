@@ -5,6 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+// Generated Tonic APIs prescribe tonic::Status as their error type.
+#[allow(clippy::result_large_err)]
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/azookey.rs"));
     include!(concat!(env!("OUT_DIR"), "/window.rs"));
