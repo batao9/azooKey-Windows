@@ -1378,7 +1378,7 @@ impl ScenarioBackend {
     }
 
     fn commit_spec_all_clauses(&mut self) {
-        let committed = self.spec.clauses.drain(..).collect::<Vec<_>>();
+        let committed = std::mem::take(&mut self.spec.clauses);
         self.spec
             .committed_clauses
             .extend(committed.into_iter().map(|clause| SimCommittedClause {
