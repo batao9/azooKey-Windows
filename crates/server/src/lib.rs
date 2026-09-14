@@ -1,4 +1,4 @@
-use async_stream::stream;
+use async_stream::try_stream;
 use futures_core::stream::Stream;
 use std::{ffi::c_void, pin::Pin, ptr::addr_of_mut};
 use tokio::{
@@ -15,12 +15,23 @@ use windows::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
                 SDDL_REVISION,
             },
-            GetTokenInformation, TokenLogonSid, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
-            TOKEN_GROUPS, TOKEN_QUERY,
+            FreeSid, GetTokenInformation,
+            Isolation::{
+                DeriveAppContainerSidFromAppContainerName, GetAppContainerNamedObjectPath,
+            },
+            TokenLogonSid, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_GROUPS,
+            TOKEN_QUERY,
         },
-        System::Threading::{GetCurrentProcess, OpenProcessToken},
+        System::{
+            RemoteDesktop::ProcessIdToSessionId,
+            Threading::{GetCurrentProcess, OpenProcessToken},
+        },
     },
 };
+
+const LOCAL_PIPE_PREFIX: &str = r"\\.\pipe\LOCAL\";
+const SEARCH_HOST_PACKAGE_FAMILY_NAME: &str = "MicrosoftWindows.Client.CBS_cw5n1h2txyewy";
+const APPCONTAINER_PIPE_ACCESS_MASK: u32 = 0x00100083;
 
 #[allow(dead_code)]
 struct UnsafeSecurityAttributes(SECURITY_ATTRIBUTES);
@@ -49,6 +60,16 @@ impl Drop for OwnedSecurityDescriptor {
     fn drop(&mut self) {
         unsafe {
             let _ = LocalFree(HLOCAL(self.as_ptr()));
+        }
+    }
+}
+
+struct OwnedSid(PSID);
+
+impl Drop for OwnedSid {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = FreeSid(self.0);
         }
     }
 }
@@ -110,51 +131,79 @@ impl TonicNamedPipeServer {
         F: FnOnce() + Send + 'static,
     {
         let name = path.to_string();
-        let security_descriptor = create_pipe_security_descriptor()?;
+        let (search_host_sid, search_host_namespace) = search_host_appcontainer()?;
+        let search_host_name = appcontainer_pipe_path(path, &search_host_namespace)?;
+        let security_descriptor = create_pipe_security_descriptor(None)?;
+        let search_host_security_descriptor =
+            create_pipe_security_descriptor(Some(&search_host_sid))?;
         let mut security_attributes = UnsafeSecurityAttributes(SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: security_descriptor.as_ptr(),
             bInheritHandle: false.into(),
         });
+        let mut search_host_security_attributes = UnsafeSecurityAttributes(SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: search_host_security_descriptor.as_ptr(),
+            bInheritHandle: false.into(),
+        });
 
-        Ok(stream! {
+        let mut server =
+            unsafe { create_named_pipe_server(&name, &mut security_attributes, true)? };
+        let mut search_host_server = unsafe {
+            create_named_pipe_server(
+                &search_host_name,
+                &mut search_host_security_attributes,
+                true,
+            )?
+        };
+        on_first_pipe_created();
+
+        Ok(try_stream! {
             // Keep the LocalAlloc-owned descriptor alive for every pipe instance.
             let _security_descriptor = security_descriptor;
-            unsafe {
-                let mut on_first_pipe_created = Some(on_first_pipe_created);
-                let mut server = ServerOptions::new()
-                    .first_pipe_instance(true)
-                    .create_with_security_attributes_raw(
-                        &name,
-                        security_attributes.as_mut_ptr()
-                    )?;
-                if let Some(on_first_pipe_created) = on_first_pipe_created.take() {
-                    on_first_pipe_created();
-                }
-
-                loop {
-                    server.connect().await?;
-
-                    let client = TonicNamedPipeServer {
-                        inner: server,
+            let _search_host_security_descriptor = search_host_security_descriptor;
+            loop {
+                let search_host_connected = tokio::select! {
+                    result = server.connect() => result.map(|_| false),
+                    result = search_host_server.connect() => result.map(|_| true),
+                }?;
+                let (connected, replacement) = if search_host_connected {
+                    let replacement = unsafe {
+                        create_named_pipe_server(
+                            &search_host_name,
+                            &mut search_host_security_attributes,
+                            false,
+                        )?
                     };
-
-                    yield Ok(client);
-
-                    server = ServerOptions::new()
-                        .create_with_security_attributes_raw(
-                            &name,
-                            security_attributes.as_mut_ptr()
-                        )?;
-                }
+                    (&mut search_host_server, replacement)
+                } else {
+                    let replacement = unsafe {
+                        create_named_pipe_server(&name, &mut security_attributes, false)?
+                    };
+                    (&mut server, replacement)
+                };
+                let client = std::mem::replace(connected, replacement);
+                yield TonicNamedPipeServer { inner: client };
             }
         })
     }
 }
 
-fn create_pipe_security_descriptor() -> io::Result<OwnedSecurityDescriptor> {
+unsafe fn create_named_pipe_server(
+    name: &str,
+    security_attributes: &mut UnsafeSecurityAttributes,
+    first_pipe_instance: bool,
+) -> io::Result<NamedPipeServer> {
+    ServerOptions::new()
+        .first_pipe_instance(first_pipe_instance)
+        .create_with_security_attributes_raw(name, security_attributes.as_mut_ptr())
+}
+
+fn create_pipe_security_descriptor(
+    search_host_sid: Option<&str>,
+) -> io::Result<OwnedSecurityDescriptor> {
     let logon_sid = current_logon_sid_string()?;
-    let sddl = pipe_sddl(&logon_sid);
+    let sddl = pipe_sddl(&logon_sid, search_host_sid);
     let sddl_wide = sddl.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
     let mut security_descriptor = PSECURITY_DESCRIPTOR::default();
 
@@ -175,16 +224,92 @@ fn create_pipe_security_descriptor() -> io::Result<OwnedSecurityDescriptor> {
     Ok(OwnedSecurityDescriptor(security_descriptor))
 }
 
-fn pipe_sddl(logon_sid: &str) -> String {
+fn pipe_sddl(logon_sid: &str, search_host_sid: Option<&str>) -> String {
     // AppContainer access checks use both the caller identity and restricted
-    // SID sets. The logon SID limits the normal identity to this login session
-    // and lets the trusted server process create subsequent pipe instances.
-    // AC/RC grant only read/write data plus synchronization (0x00100003), so a
-    // sandboxed client can connect but cannot create a competing pipe instance.
-    // Network access is explicitly denied.
-    format!(
-        "D:(D;;GA;;;NU)(A;;GA;;;SY)(A;;GRGW;;;{logon_sid})(A;;0x00100003;;;AC)(A;;0x00100003;;;RC)S:(ML;;NW;;;LW)"
-    )
+    // SID sets. Preserve desktop sandbox access on the existing LOCAL endpoint;
+    // the package endpoint grants only the exact SearchHost SID. Neither sandbox
+    // ACE grants FILE_CREATE_PIPE_INSTANCE (0x4). Network access is denied.
+    let sandbox_sids = match search_host_sid {
+        Some(sid) => vec![sid],
+        None => vec!["AC", "RC"],
+    };
+    let sandbox_aces = sandbox_sids
+        .iter()
+        .map(|sid| format!("(A;;{APPCONTAINER_PIPE_ACCESS_MASK:#010x};;;{sid})"))
+        .collect::<String>();
+    format!("D:(D;;GA;;;NU)(A;;GA;;;SY)(A;;GRGW;;;{logon_sid}){sandbox_aces}S:(ML;;NW;;;LW)")
+}
+
+fn search_host_appcontainer() -> io::Result<(String, String)> {
+    let package_family_name = SEARCH_HOST_PACKAGE_FAMILY_NAME
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let sid = OwnedSid(unsafe {
+        DeriveAppContainerSidFromAppContainerName(PCWSTR(package_family_name.as_ptr())).map_err(
+            |error| io::Error::other(format!("failed to derive SearchHost SID: {error}")),
+        )?
+    });
+    let sid_string = sid_string(sid.0)?;
+
+    let mut path_length = 0;
+    let _ = unsafe {
+        GetAppContainerNamedObjectPath(
+            windows::Win32::Foundation::HANDLE::default(),
+            sid.0,
+            None,
+            &mut path_length,
+        )
+    };
+    if path_length == 0 {
+        return Err(io::Error::other(
+            "failed to get SearchHost named-object path length",
+        ));
+    }
+
+    let mut path = vec![0_u16; path_length as usize];
+    unsafe {
+        GetAppContainerNamedObjectPath(
+            windows::Win32::Foundation::HANDLE::default(),
+            sid.0,
+            Some(&mut path),
+            &mut path_length,
+        )
+        .map_err(|error| {
+            io::Error::other(format!(
+                "failed to get SearchHost named-object path: {error}"
+            ))
+        })?;
+    }
+    let end = path
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(path.len());
+    let namespace = String::from_utf16(&path[..end]).map_err(|error| {
+        io::Error::other(format!(
+            "failed to decode SearchHost named-object path: {error}"
+        ))
+    })?;
+
+    // This API returns a session-relative object path, whereas desktop named
+    // pipes need the fully qualified session namespace used by AppContainers.
+    let mut session_id = 0;
+    unsafe { ProcessIdToSessionId(std::process::id(), &mut session_id) }
+        .map_err(|error| io::Error::other(format!("failed to get pipe session: {error}")))?;
+    Ok((sid_string, format!(r"Sessions\{session_id}\{namespace}")))
+}
+
+fn appcontainer_pipe_path(local_path: &str, namespace: &str) -> io::Result<String> {
+    let leaf = local_path.strip_prefix(LOCAL_PIPE_PREFIX).ok_or_else(|| {
+        io::Error::other(format!("expected LOCAL named-pipe path, got {local_path}"))
+    })?;
+    if leaf.is_empty() || leaf.contains('\\') {
+        return Err(io::Error::other(format!(
+            "expected named-pipe leaf after LOCAL prefix, got {local_path}"
+        )));
+    }
+
+    Ok(format!(r"\\.\pipe\{}\{leaf}", namespace.trim_matches('\\')))
 }
 
 fn current_logon_sid_string() -> io::Result<String> {
@@ -229,21 +354,30 @@ fn logon_sid_string_from_token(token: windows::Win32::Foundation::HANDLE) -> io:
             )));
         }
 
-        let mut sid_string = PWSTR::null();
-        ConvertSidToStringSidW(token_groups.Groups[0].Sid, &mut sid_string).map_err(|error| {
-            io::Error::other(format!("failed to convert current logon SID: {error}"))
-        })?;
-        let result = sid_string
+        sid_string(token_groups.Groups[0].Sid)
+    }
+}
+
+fn sid_string(sid: PSID) -> io::Result<String> {
+    unsafe {
+        let mut value = PWSTR::null();
+        ConvertSidToStringSidW(sid, &mut value)
+            .map_err(|error| io::Error::other(format!("failed to convert SID: {error}")))?;
+        let result = value
             .to_string()
-            .map_err(|error| io::Error::other(format!("failed to decode logon SID: {error}")));
-        let _ = LocalFree(HLOCAL(sid_string.as_ptr().cast()));
+            .map_err(|error| io::Error::other(format!("failed to decode SID: {error}")));
+        let _ = LocalFree(HLOCAL(value.as_ptr().cast()));
         result
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{create_pipe_security_descriptor, pipe_sddl, UnsafeSecurityAttributes};
+    use super::{
+        appcontainer_pipe_path, create_pipe_security_descriptor, pipe_sddl,
+        search_host_appcontainer, TonicNamedPipeServer, UnsafeSecurityAttributes,
+        APPCONTAINER_PIPE_ACCESS_MASK,
+    };
     use std::{
         os::windows::io::IntoRawHandle,
         time::{SystemTime, UNIX_EPOCH},
@@ -277,22 +411,81 @@ mod tests {
     }
 
     #[test]
-    fn pipe_sddl_is_limited_to_logon_session_and_sandboxed_clients() {
-        let sddl = pipe_sddl("S-1-5-5-42-99");
+    fn pipe_sddl_is_limited_to_logon_session_and_search_host() {
+        let search_host_sid = "S-1-15-2-42-99";
+        let sddl = pipe_sddl("S-1-5-5-42-99", Some(search_host_sid));
 
         assert!(sddl.contains("(D;;GA;;;NU)"));
         assert!(sddl.contains("(A;;GRGW;;;S-1-5-5-42-99)"));
-        assert!(sddl.contains("(A;;0x00100003;;;AC)"));
-        assert!(sddl.contains("(A;;0x00100003;;;RC)"));
+        assert!(sddl.contains("(A;;0x00100083;;;S-1-15-2-42-99)"));
+        assert_eq!(APPCONTAINER_PIPE_ACCESS_MASK & 0x4, 0);
         assert!(sddl.contains("S:(ML;;NW;;;LW)"));
+        assert!(!sddl.contains(";;;AC)"));
+        assert!(!sddl.contains(";;;RC)"));
         assert!(!sddl.contains(";;;BU)"));
         assert!(!sddl.contains(";;;BA)"));
         assert!(!sddl.contains(";;;WD)"));
     }
 
+    #[test]
+    fn desktop_pipe_sddl_preserves_restricted_client_access() {
+        let sddl = pipe_sddl("S-1-5-5-42-99", None);
+        assert!(sddl.contains("(A;;0x00100083;;;AC)"));
+        assert!(sddl.contains("(A;;0x00100083;;;RC)"));
+        assert!(sddl.contains("(A;;GRGW;;;S-1-5-5-42-99)"));
+        assert!(sddl.contains("(D;;GA;;;NU)"));
+    }
+
+    #[test]
+    fn appcontainer_pipe_path_uses_the_package_namespace_and_local_leaf() {
+        let path = appcontainer_pipe_path(
+            r"\\.\pipe\LOCAL\azookey_server",
+            r"\Sessions\7\AppContainerNamedObjects\S-1-15-2-42",
+        )
+        .unwrap();
+
+        assert_eq!(
+            path,
+            r"\\.\pipe\Sessions\7\AppContainerNamedObjects\S-1-15-2-42\azookey_server"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipe_listeners_reserve_both_names_and_release_them_on_shutdown() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let local_path = format!(
+            r"\\.\pipe\LOCAL\azookey_listener_test_{}_{nonce}",
+            std::process::id()
+        );
+        let (_, namespace) = search_host_appcontainer().unwrap();
+        let mut session_id = 0;
+        unsafe { super::ProcessIdToSessionId(std::process::id(), &mut session_id) }.unwrap();
+        assert!(namespace.starts_with(&format!(
+            r"Sessions\{session_id}\AppContainerNamedObjects\S-1-15-2-"
+        )));
+        let package_path = appcontainer_pipe_path(&local_path, &namespace).unwrap();
+
+        for _ in 0..2 {
+            let incoming = TonicNamedPipeServer::new(&local_path).unwrap();
+            for path in [&local_path, &package_path] {
+                assert!(
+                    ServerOptions::new()
+                        .first_pipe_instance(true)
+                        .create(path)
+                        .is_err(),
+                    "listener did not reserve {path}"
+                );
+            }
+            drop(incoming);
+        }
+    }
+
     #[tokio::test]
     async fn secured_session_local_pipe_enforces_network_and_logon_access() {
-        let security_descriptor = create_pipe_security_descriptor().unwrap();
+        let security_descriptor = create_pipe_security_descriptor(None).unwrap();
         let mut security_attributes = UnsafeSecurityAttributes(SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: security_descriptor.as_ptr(),
