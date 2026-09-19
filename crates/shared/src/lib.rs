@@ -5,6 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+// Generated Tonic APIs prescribe tonic::Status as their error type.
+#[allow(clippy::result_large_err)]
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/azookey.rs"));
     include!(concat!(env!("OUT_DIR"), "/window.rs"));
@@ -12,9 +14,9 @@ pub mod proto {
         tonic::include_file_descriptor_set!("azookey_service_descriptor");
 }
 
-// The LOCAL prefix gives packaged/AppContainer clients a logon-session-scoped
-// named-pipe namespace. Keep these paths centralized so every process uses the
-// same session-local endpoint.
+// AppContainer clients resolve LOCAL inside their package namespace. The
+// server publishes the same leaf names there as well as in the desktop LOCAL
+// namespace.
 pub const SERVER_PIPE_PATH: &str = r"\\.\pipe\LOCAL\azookey_server";
 pub const UI_PIPE_PATH: &str = r"\\.\pipe\LOCAL\azookey_ui";
 // Bounds the suffix-bearing candidate payload and snapshot cloning performed
@@ -31,15 +33,15 @@ pub fn open_named_pipe_client_handle(
         Win32::{
             Foundation::HANDLE,
             Storage::FileSystem::{
-                CreateFileW, FILE_FLAG_OVERLAPPED, FILE_READ_DATA, FILE_SHARE_MODE,
-                FILE_WRITE_DATA, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
-                SYNCHRONIZE,
+                CreateFileW, FILE_FLAG_OVERLAPPED, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+                FILE_SHARE_MODE, FILE_WRITE_DATA, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+                SECURITY_SQOS_PRESENT, SYNCHRONIZE,
             },
         },
     };
 
     let pipe_path_wide = pipe_path.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
-    let desired_access = (FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE).0;
+    let desired_access = (FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE).0;
     let flags = FILE_FLAG_OVERLAPPED | SECURITY_IDENTIFICATION | SECURITY_SQOS_PRESENT;
     let handle = unsafe {
         CreateFileW(

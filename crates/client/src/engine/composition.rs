@@ -4262,9 +4262,7 @@ impl TextServiceFactory {
 
     #[inline]
     fn clear_current_learning_candidate_ids(candidates: &mut Candidates) {
-        for candidate_id in &mut candidates.candidate_ids {
-            *candidate_id = 0;
-        }
+        candidates.candidate_ids.fill(0);
     }
 
     fn collect_learning_candidate_ids(

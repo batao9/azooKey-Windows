@@ -60,6 +60,8 @@ pub struct WindowService {
 }
 
 impl WindowService {
+    // Match the Tonic service methods that consume this helper's result.
+    #[allow(clippy::result_large_err)]
     async fn send_action(&self, action: WindowAction) -> Result<Response<EmptyResponse>, Status> {
         self.controller
             .sender
