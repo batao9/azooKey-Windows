@@ -274,8 +274,21 @@ message PerformanceLogRequest {
 message PerformanceLogResponse {}
 
 
+// Stateless selection over a client snapshot; never mutates server composition.
+message RerankCandidatesRequest {
+  string reading = 1;
+  string context = 2;
+  repeated string candidates = 3;
+  bool allow_remote = 4;
+  uint64 request_id = 5;
+}
+message RerankCandidatesResponse {
+  optional uint32 selected_index = 1;
+}
+
 // Service definition for text editing operations.
 service AzookeyService {
+  rpc RerankCandidates (RerankCandidatesRequest) returns (RerankCandidatesResponse);
   rpc AppendText (AppendTextRequest) returns (AppendTextResponse);
   rpc ReplaceComposition (ReplaceCompositionRequest) returns (ReplaceCompositionResponse);
   rpc StartReconversion (StartReconversionRequest) returns (StartReconversionResponse);

@@ -1,0 +1,286 @@
+{
+  "schema_version": 1,
+  "title": "Jev explicit-conversion exploratory evaluation set",
+  "cases": [
+    {
+      "id": "homophone-001-train",
+      "category": "contextual_homophone",
+      "reading": "きしゃにのった",
+      "external_context": "旅行の移動について話している。",
+      "acceptable_outputs": ["汽車に乗った"]
+    },
+    {
+      "id": "homophone-002-reporter",
+      "category": "contextual_homophone",
+      "reading": "きしゃがしつもんした",
+      "external_context": "記者会見について話している。",
+      "acceptable_outputs": ["記者が質問した"]
+    },
+    {
+      "id": "homophone-003-hair",
+      "category": "contextual_homophone",
+      "reading": "かみをきった",
+      "external_context": "美容院へ行った話をしている。",
+      "acceptable_outputs": ["髪を切った"]
+    },
+    {
+      "id": "homophone-004-paper",
+      "category": "contextual_homophone",
+      "reading": "かみをおった",
+      "external_context": "工作の手順を説明している。",
+      "acceptable_outputs": ["紙を折った"]
+    },
+    {
+      "id": "homophone-005-bridge",
+      "category": "contextual_homophone",
+      "reading": "はしをわたった",
+      "external_context": "川沿いを散歩した話をしている。",
+      "acceptable_outputs": ["橋を渡った"]
+    },
+    {
+      "id": "homophone-006-chopsticks",
+      "category": "contextual_homophone",
+      "reading": "はしをつかった",
+      "external_context": "食事の準備について話している。",
+      "acceptable_outputs": ["箸を使った"]
+    },
+    {
+      "id": "homophone-007-rain",
+      "category": "contextual_homophone",
+      "reading": "あめがふる",
+      "external_context": "天気予報を確認している。",
+      "acceptable_outputs": ["雨が降る"]
+    },
+    {
+      "id": "homophone-008-candy",
+      "category": "contextual_homophone",
+      "reading": "あめをなめる",
+      "external_context": "おやつについて話している。",
+      "acceptable_outputs": ["飴をなめる"]
+    },
+    {
+      "id": "homophone-009-doctor",
+      "category": "contextual_homophone",
+      "reading": "いしにそうだんした",
+      "external_context": "病院で診察を受けた話をしている。",
+      "acceptable_outputs": ["医師に相談した"]
+    },
+    {
+      "id": "homophone-010-stone",
+      "category": "contextual_homophone",
+      "reading": "いしをひろった",
+      "external_context": "海辺を歩いた話をしている。",
+      "acceptable_outputs": ["石を拾った"]
+    },
+    {
+      "id": "homophone-011-park",
+      "category": "contextual_homophone",
+      "reading": "こうえんであそんだ",
+      "external_context": "休日の外出について話している。",
+      "acceptable_outputs": ["公園で遊んだ"]
+    },
+    {
+      "id": "homophone-012-lecture",
+      "category": "contextual_homophone",
+      "reading": "こうえんをきいた",
+      "external_context": "講演会に参加した話をしている。",
+      "acceptable_outputs": ["講演を聞いた"]
+    },
+    {
+      "id": "common-001-document",
+      "category": "common_sentence",
+      "reading": "しりょうをかくにんする",
+      "external_context": "",
+      "acceptable_outputs": ["資料を確認する"]
+    },
+    {
+      "id": "common-002-schedule",
+      "category": "common_sentence",
+      "reading": "よていをへんこうする",
+      "external_context": "",
+      "acceptable_outputs": ["予定を変更する"]
+    },
+    {
+      "id": "common-003-train-delay",
+      "category": "common_sentence",
+      "reading": "でんしゃがおくれた",
+      "external_context": "",
+      "acceptable_outputs": ["電車が遅れた"]
+    },
+    {
+      "id": "common-004-meeting",
+      "category": "common_sentence",
+      "reading": "かいぎをはじめる",
+      "external_context": "",
+      "acceptable_outputs": ["会議を始める"]
+    },
+    {
+      "id": "common-005-weather",
+      "category": "common_sentence",
+      "reading": "きょうはてんきがよい",
+      "external_context": "",
+      "acceptable_outputs": ["今日は天気が良い", "今日は天気がよい"]
+    },
+    {
+      "id": "common-006-phone",
+      "category": "common_sentence",
+      "reading": "でんわをかけなおす",
+      "external_context": "",
+      "acceptable_outputs": ["電話をかけ直す", "電話を掛け直す"]
+    },
+    {
+      "id": "common-007-station",
+      "category": "common_sentence",
+      "reading": "えきでまちあわせる",
+      "external_context": "",
+      "acceptable_outputs": ["駅で待ち合わせる"]
+    },
+    {
+      "id": "common-008-homework",
+      "category": "common_sentence",
+      "reading": "しゅくだいをていしゅつする",
+      "external_context": "",
+      "acceptable_outputs": ["宿題を提出する"]
+    },
+    {
+      "id": "common-009-shopping",
+      "category": "common_sentence",
+      "reading": "かいものにいく",
+      "external_context": "",
+      "acceptable_outputs": ["買い物に行く"]
+    },
+    {
+      "id": "common-010-time",
+      "category": "common_sentence",
+      "reading": "じかんをかくにんする",
+      "external_context": "",
+      "acceptable_outputs": ["時間を確認する"]
+    },
+    {
+      "id": "common-011-cooking",
+      "category": "common_sentence",
+      "reading": "りょうりをつくる",
+      "external_context": "",
+      "acceptable_outputs": ["料理を作る"]
+    },
+    {
+      "id": "common-012-contact",
+      "category": "common_sentence",
+      "reading": "れんらくをまつ",
+      "external_context": "",
+      "acceptable_outputs": ["連絡を待つ"]
+    },
+    {
+      "id": "common-013-solve",
+      "category": "common_sentence",
+      "reading": "もんだいをかいけつする",
+      "external_context": "",
+      "acceptable_outputs": ["問題を解決する"]
+    },
+    {
+      "id": "common-014-work",
+      "category": "common_sentence",
+      "reading": "しごとをはじめた",
+      "external_context": "",
+      "acceptable_outputs": ["仕事を始めた"]
+    },
+    {
+      "id": "common-015-holiday",
+      "category": "common_sentence",
+      "reading": "あしたはやすみです",
+      "external_context": "",
+      "acceptable_outputs": ["明日は休みです"]
+    },
+    {
+      "id": "common-016-study",
+      "category": "common_sentence",
+      "reading": "にほんごをべんきょうする",
+      "external_context": "",
+      "acceptable_outputs": ["日本語を勉強する"]
+    },
+    {
+      "id": "context-001-duration",
+      "category": "external_context",
+      "reading": "きかんをへんこうする",
+      "external_context": "旅行の日程について相談している。",
+      "acceptable_outputs": ["期間を変更する"]
+    },
+    {
+      "id": "context-002-revision",
+      "category": "external_context",
+      "reading": "かいせいをおこなう",
+      "external_context": "社内規則の見直しについて話している。",
+      "acceptable_outputs": ["改正を行う", "改正を行なう"]
+    },
+    {
+      "id": "context-003-product",
+      "category": "external_context",
+      "reading": "せいひんをかいはつする",
+      "external_context": "新しい家電の企画について話している。",
+      "acceptable_outputs": ["製品を開発する"]
+    },
+    {
+      "id": "context-004-application",
+      "category": "external_context",
+      "reading": "しんせいをていしゅつする",
+      "external_context": "休暇の手続きを進めている。",
+      "acceptable_outputs": ["申請を提出する"]
+    },
+    {
+      "id": "context-005-proofreading",
+      "category": "external_context",
+      "reading": "こうせいをかくにんする",
+      "external_context": "印刷前の原稿を見直している。",
+      "acceptable_outputs": ["校正を確認する"]
+    },
+    {
+      "id": "context-006-fairness",
+      "category": "external_context",
+      "reading": "こうせいなひょうかをする",
+      "external_context": "選考基準について話している。",
+      "acceptable_outputs": ["公正な評価をする"]
+    },
+    {
+      "id": "context-007-results",
+      "category": "external_context",
+      "reading": "せいかをほうこくする",
+      "external_context": "研究の進捗について話している。",
+      "acceptable_outputs": ["成果を報告する"]
+    },
+    {
+      "id": "context-008-organ",
+      "category": "external_context",
+      "reading": "きかんしをよむ",
+      "external_context": "団体が発行した会報について話している。",
+      "acceptable_outputs": ["機関誌を読む"]
+    },
+    {
+      "id": "proper-name-001-tokyo-station",
+      "category": "public_proper_name",
+      "reading": "とうきょうえきにいく",
+      "external_context": "出張の集合場所について話している。",
+      "acceptable_outputs": ["東京駅に行く"]
+    },
+    {
+      "id": "proper-name-002-hokkaido",
+      "category": "public_proper_name",
+      "reading": "ほっかいどうにりょこうする",
+      "external_context": "国内旅行の行き先について話している。",
+      "acceptable_outputs": ["北海道に旅行する"]
+    },
+    {
+      "id": "proper-name-003-mount-fuji",
+      "category": "public_proper_name",
+      "reading": "ふじさんがみえる",
+      "external_context": "窓から見える景色について話している。",
+      "acceptable_outputs": ["富士山が見える"]
+    },
+    {
+      "id": "proper-name-004-kyoto",
+      "category": "public_proper_name",
+      "reading": "きょうとをおとずれる",
+      "external_context": "修学旅行の予定について話している。",
+      "acceptable_outputs": ["京都を訪れる"]
+    }
+  ]
+}
