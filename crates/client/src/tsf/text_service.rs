@@ -115,9 +115,6 @@ pub struct SurroundingTextContextState {
 }
 
 impl SurroundingTextContextState {
-    pub(crate) fn text(&self) -> &str {
-        &self.context
-    }
     pub fn should_send(&self, connection_id: u64, context: &str) -> bool {
         self.connection_id != Some(connection_id) || self.context != context
     }

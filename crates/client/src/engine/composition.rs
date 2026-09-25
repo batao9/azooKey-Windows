@@ -8503,10 +8503,8 @@ impl TextServiceFactory {
             Ok(())
         })();
 
-        if result.is_ok() && start_jev {
-            if self.begin_jev_conversion().is_err() {
-                tracing::debug!("Jev request unavailable; retain KKC candidates");
-            }
+        if result.is_ok() && start_jev && self.begin_jev_conversion().is_err() {
+            tracing::debug!("Jev request unavailable; retain KKC candidates");
         }
 
         if result.is_err()
