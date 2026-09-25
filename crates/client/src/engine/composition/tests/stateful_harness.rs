@@ -1997,7 +1997,7 @@ fn apply_user_action(
             ClientAction::StartComposition => {
                 harness.state = CompositionState::Composing;
             }
-            ClientAction::ShowCandidateWindow => {}
+            ClientAction::ShowCandidateWindow | ClientAction::StartJevConversion => {}
             ClientAction::CommitLearning { .. } => {}
             ClientAction::CommitTextDirect(text) => {
                 harness.committed_clauses.push(SimCommittedClause {

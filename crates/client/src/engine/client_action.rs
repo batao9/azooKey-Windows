@@ -5,6 +5,7 @@ pub enum ClientAction {
     StartComposition,
     EndComposition,
     ShowCandidateWindow,
+    StartJevConversion,
 
     AppendText(String),
     AppendTextRaw(String),

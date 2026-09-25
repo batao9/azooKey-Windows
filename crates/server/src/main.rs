@@ -33,6 +33,9 @@ use std::{
 };
 
 const USE_ZENZAI: bool = true;
+static JEV_CONVERSION_ENABLED: AtomicBool = AtomicBool::new(false);
+// Do not queue obsolete cloud work or hold the composition mutation lock.
+static JEV_REQUEST_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 const INPUT_STYLE_DIRECT: i32 = 1;
 const SERVER_LOG_FILE_NAME: &str = "server.log";
 const SERVER_PERFORMANCE_LOG_FILE_NAME: &str = "server-performance.tsv";
@@ -432,6 +435,7 @@ unsafe extern "C" {
     fn Warmup() -> bool;
     fn HasActiveComposition() -> bool;
     fn InferReconversionReadings(surface: *const c_char) -> *mut c_char;
+    fn SelectJevCandidate(json: *const c_char) -> c_int;
     fn GetComposedText(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
     fn GetComposedTextForReconversion(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
     fn GetComposedTextForCursorPrefix(
@@ -715,6 +719,7 @@ fn resolve_log_path_from_roots(
 }
 
 fn configure_server_logging(config: &AppConfig) -> Option<LogPaths> {
+    JEV_CONVERSION_ENABLED.store(config.general.jev_conversion, Ordering::Relaxed);
     let level = server_log_level_from_str(&config.debug.server_log_level);
     SERVER_LOG_LEVEL.store(level as u8, Ordering::Relaxed);
     SERVER_CRASH_TRACE_ENABLED.store(config.debug.server_crash_trace_enabled, Ordering::Relaxed);
@@ -1617,6 +1622,18 @@ impl Drop for CompositionSnapshotRollback {
     }
 }
 
+fn valid_jev_request(request: &shared::proto::RerankCandidatesRequest) -> bool {
+    request.allow_remote
+        && !request.reading.is_empty()
+        && request.reading.chars().count() <= 256
+        && request.context.chars().count() <= 2048
+        && (2..=32).contains(&request.candidates.len())
+        && request
+            .candidates
+            .iter()
+            .all(|text| !text.is_empty() && text.chars().count() <= 512)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MyAzookeyService {
     mutation_lock: Arc<tokio::sync::Mutex<()>>,
@@ -1624,6 +1641,51 @@ pub struct MyAzookeyService {
 
 #[tonic::async_trait]
 impl AzookeyService for MyAzookeyService {
+    async fn rerank_candidates(
+        &self,
+        request: Request<shared::proto::RerankCandidatesRequest>,
+    ) -> Result<Response<shared::proto::RerankCandidatesResponse>, Status> {
+        let request = request.into_inner();
+        let request_id = request_id_or_next(request.request_id);
+        let start = Instant::now();
+        let candidate_count = request.candidates.len();
+        let mut selected_index = None;
+        if JEV_CONVERSION_ENABLED.load(Ordering::Relaxed) && valid_jev_request(&request) {
+            if let Ok(permit) = JEV_REQUEST_SLOTS.try_acquire() {
+                // The snapshot and API call are independent of Swift's global KKC state.
+                selected_index = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    if !JEV_CONVERSION_ENABLED.load(Ordering::Relaxed) {
+                        return None;
+                    }
+                    let api_key = shared::jev_credentials::read_jev_api_key()?;
+                    let payload = serde_json::json!({
+                        "apiKey": api_key,
+                        "reading": request.reading,
+                        "context": request.context,
+                        "candidates": request.candidates,
+                    });
+                    let json = CString::new(payload.to_string()).ok()?;
+                    let index = unsafe { SelectJevCandidate(json.as_ptr()) };
+                    (index >= 0 && (index as usize) < candidate_count).then_some(index as u32)
+                })
+                .await
+                .unwrap_or(None);
+            }
+        }
+        performance_event_lazy!(
+            request_id,
+            "jev_rerank",
+            "total",
+            elapsed_ms(start),
+            "candidate_count={candidate_count};fallback={}",
+            selected_index.is_none()
+        );
+        Ok(Response::new(shared::proto::RerankCandidatesResponse {
+            selected_index,
+        }))
+    }
+
     async fn append_text(
         &self,
         request: Request<AppendTextRequest>,
@@ -2827,6 +2889,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod path_tests {
+    #[tokio::test]
+    async fn jev_denied_request_never_waits_for_composition_lock() {
+        use shared::proto::azookey_service_server::AzookeyService;
+        let service = super::MyAzookeyService::default();
+        let _guard = service.mutation_lock.lock().await;
+        let reply = service
+            .rerank_candidates(tonic::Request::new(
+                shared::proto::RerankCandidatesRequest::default(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reply.selected_index, None);
+    }
+
+    #[test]
+    fn jev_requires_explicit_permission_and_bounded_snapshot() {
+        let mut request = shared::proto::RerankCandidatesRequest {
+            reading: "きしゃ".into(),
+            context: String::new(),
+            candidates: vec!["記者".into(), "汽車".into()],
+            allow_remote: false,
+            request_id: 1,
+        };
+        assert!(!super::valid_jev_request(&request));
+        request.allow_remote = true;
+        assert!(super::valid_jev_request(&request));
+        request.candidates.resize(33, "貴社".into());
+        assert!(!super::valid_jev_request(&request));
+        request.candidates.truncate(2);
+        request.context = "あ".repeat(2049);
+        assert!(!super::valid_jev_request(&request));
+    }
+
     use super::{
         decode_reconversion_readings, hiragana_boundary_fallback, merge_reconversion_suggestions,
         resolve_log_path_from_roots, retained_prepared_snapshot_count,

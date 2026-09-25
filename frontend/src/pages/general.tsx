@@ -43,6 +43,7 @@ type GeneralConfigState = {
     show_candidate_window_after_space: boolean;
     show_live_conversion_reading: boolean;
     live_conversion_reading_vertical_adjustment: number;
+    jev_conversion: boolean;
     experimental_typo_correction: boolean;
 };
 
@@ -101,6 +102,7 @@ const DEFAULT_GENERAL_CONFIG: GeneralConfigState = {
     show_candidate_window_after_space: false,
     show_live_conversion_reading: true,
     live_conversion_reading_vertical_adjustment: 4,
+    jev_conversion: false,
     experimental_typo_correction: false,
 };
 
@@ -253,6 +255,7 @@ const normalizeGeneralConfig = (value?: Record<string, unknown>): GeneralConfigS
         clampLiveConversionReadingVerticalAdjustment(
             value?.live_conversion_reading_vertical_adjustment,
         ),
+    jev_conversion: value?.jev_conversion === true,
     experimental_typo_correction:
         typeof value?.experimental_typo_correction === "boolean"
             ? value.experimental_typo_correction
@@ -329,6 +332,10 @@ export const General = () => {
     const [generalValue, setGeneralValue] = useState<GeneralConfigState>(
         DEFAULT_GENERAL_CONFIG,
     );
+    const [jevWarningOpen, setJevWarningOpen] = useState(false);
+    const [jevApiKey, setJevApiKey] = useState("");
+    const [jevApiKeySaved, setJevApiKeySaved] = useState(false);
+    const [jevApiKeyBusy, setJevApiKeyBusy] = useState(false);
     const [learningMode, setLearningMode] = useState<LearningMode>("enabled");
     const [widthGroups, setWidthGroups] =
         useState<CharacterWidthGroupsState>(DEFAULT_WIDTH_GROUPS);
@@ -350,6 +357,10 @@ export const General = () => {
     }>({ saving: false, pendingValue: null });
 
     useEffect(() => {
+        invoke<boolean>("has_jev_api_key")
+            .then(setJevApiKeySaved)
+            .catch(() => setJevApiKeySaved(false));
+
         invoke<any>("get_config")
             .then((data) => {
                 const shortcuts = data.shortcuts ?? {};
@@ -550,6 +561,7 @@ export const General = () => {
             | "show_candidate_window_after_space"
             | "show_live_conversion_reading"
             | "live_conversion_reading_vertical_adjustment"
+            | "jev_conversion"
             | "experimental_typo_correction"
         >,
         nextValue: string,
@@ -572,6 +584,7 @@ export const General = () => {
             | "punctuation_commit_question"
             | "show_candidate_window_after_space"
             | "show_live_conversion_reading"
+            | "jev_conversion"
             | "experimental_typo_correction",
         nextValue: boolean,
     ) => {
@@ -582,6 +595,34 @@ export const General = () => {
 
         if (data) {
             setGeneralValue(normalizeGeneralConfig(data.general));
+        }
+    };
+
+    const saveJevApiKey = async () => {
+        setJevApiKeyBusy(true);
+        try {
+            await invoke("save_jev_api_key", { apiKey: jevApiKey.trim() });
+            setJevApiKey("");
+            setJevApiKeySaved(true);
+            toast("Jev APIキーを保存しました");
+        } catch {
+            toast("Jev APIキーを保存できませんでした");
+        } finally {
+            setJevApiKeyBusy(false);
+        }
+    };
+
+    const deleteJevApiKey = async () => {
+        setJevApiKeyBusy(true);
+        try {
+            await invoke("delete_jev_api_key");
+            setJevApiKey("");
+            setJevApiKeySaved(false);
+            toast("Jev APIキーを削除しました");
+        } catch {
+            toast("Jev APIキーを削除できませんでした");
+        } finally {
+            setJevApiKeyBusy(false);
         }
     };
 
@@ -1242,9 +1283,62 @@ export const General = () => {
                                 }
                             />
                         </div>
+                        <div className="space-y-3 border-t p-4">
+                            <div className="flex items-center gap-4">
+                                <FlaskConical className="h-4 w-4 shrink-0" />
+                                <div className="flex-1 space-y-1">
+                                    <p className="text-sm font-medium leading-none">Jevによる候補選択</p>
+                                    <p className="text-xs text-muted-foreground">変換キーを押したとき、通常KKCの候補からJevが選択します。</p>
+                                </div>
+                                <Switch
+                                    aria-label="Jevによる候補選択"
+                                    checked={generalValue.jev_conversion}
+                                    onCheckedChange={(value) => {
+                                        if (value) setJevWarningOpen(true);
+                                        else void updateGeneralBooleanConfig("jev_conversion", false);
+                                    }}
+                                />
+                            </div>
+                            {generalValue.jev_conversion && (
+                                <div className="space-y-2 pl-8">
+                                    <label htmlFor="jev-api-key" className="text-sm font-medium">TypeSafe APIキー</label>
+                                    <div className="flex gap-2">
+                                        <Input
+                                            id="jev-api-key"
+                                            type="password"
+                                            autoComplete="off"
+                                            spellCheck={false}
+                                            value={jevApiKey}
+                                            placeholder={jevApiKeySaved ? "設定済み（変更する場合は新しいキーを入力）" : "APIキーを入力"}
+                                            onChange={(event) => setJevApiKey(event.target.value)}
+                                        />
+                                        <Button disabled={!jevApiKey.trim() || jevApiKeyBusy} onClick={() => void saveJevApiKey()}>保存</Button>
+                                        {jevApiKeySaved && (
+                                            <Button variant="outline" disabled={jevApiKeyBusy} onClick={() => void deleteJevApiKey()}>削除</Button>
+                                        )}
+                                    </div>
+                                    <p className="text-xs text-muted-foreground">キーはWindowsの資格情報マネージャーに保存します。</p>
+                                </div>
+                            )}
+                        </div>
                     </div>
                 </section>
             </div>
+
+            <AlertDialog open={jevWarningOpen} onOpenChange={setJevWarningOpen}>
+                <AlertDialogContent>
+                    <AlertDialogHeader>
+                        <AlertDialogTitle>Jevによる候補選択を有効にしますか？</AlertDialogTitle>
+                        <AlertDialogDescription>
+                            有効にするとリアルタイム変換がOFFになります。変換キーを押すと、入力した読み・変換候補・左文脈がJevのサーバー（TypeSafe）へ送信されます。
+                        </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                        <AlertDialogCancel>キャンセル</AlertDialogCancel>
+                        <AlertDialogAction onClick={() => void updateGeneralBooleanConfig("jev_conversion", true)}>有効にする</AlertDialogAction>
+                    </AlertDialogFooter>
+                </AlertDialogContent>
+            </AlertDialog>
 
             {isRomajiEditorOpen && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
