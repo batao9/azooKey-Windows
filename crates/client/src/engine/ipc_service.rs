@@ -69,6 +69,8 @@ pub struct IPCService {
     server_session_id: Option<u64>,
     server_reset_recovered: bool,
     recovery: Arc<ServerRecoveryState>,
+    #[cfg(test)]
+    recovery_error_for_test: bool,
 }
 
 #[derive(Debug)]
@@ -447,6 +449,41 @@ impl Drop for ClientInputTraceGuard {
 }
 
 impl IPCService {
+    #[cfg(test)]
+    pub(crate) fn recovery_for_test(pending: bool) -> Self {
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let channel = {
+            let _entered = runtime.enter();
+            Endpoint::from_static("http://127.0.0.1:1").connect_lazy()
+        };
+        let (performance_log_tx, _) = tokio::sync::mpsc::channel(1);
+        Self {
+            connection_id: 0,
+            azookey_client: AzookeyServiceClient::new(channel),
+            window_client: None,
+            runtime,
+            performance_log_tx,
+            server_session_id: None,
+            server_reset_recovered: false,
+            recovery: Arc::new(ServerRecoveryState {
+                pending: AtomicBool::new(pending),
+                generation: AtomicU64::new(u64::from(pending)),
+                // Model a stalled worker without starting a launcher or server.
+                restart_request_in_flight: AtomicBool::new(true),
+                ..ServerRecoveryState::default()
+            }),
+            recovery_error_for_test: true,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_restart_for_test(&self) {
+        self.recovery.restart_completed_generation.store(
+            self.recovery.generation.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
+
     pub fn new() -> Result<Self> {
         let runtime = Arc::new(tokio::runtime::Runtime::new()?);
         let connection_id = IPC_CONNECTION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -503,6 +540,8 @@ impl IPCService {
             server_session_id: None,
             server_reset_recovered: false,
             recovery: Arc::new(ServerRecoveryState::default()),
+            #[cfg(test)]
+            recovery_error_for_test: false,
         })
     }
 
@@ -677,18 +716,6 @@ impl IPCService {
                 .restart_completed_generation
                 .load(Ordering::Acquire),
         )
-    }
-
-    pub(crate) fn wait_for_recovery_restart(&self) -> bool {
-        let started = Instant::now();
-        while started.elapsed() < INPUT_RPC_DEADLINE {
-            self.ensure_server_restart_requested();
-            if self.recovery_restart_ready() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        self.recovery_restart_ready()
     }
 
     pub(crate) fn recovery_pending_error(&self) -> anyhow::Error {
@@ -1457,6 +1484,11 @@ impl IPCService {
             return Ok(None);
         }
         if !self.recovery_restart_ready() {
+            return Err(self.recovery_pending_error());
+        }
+
+        #[cfg(test)]
+        if self.recovery_error_for_test {
             return Err(self.recovery_pending_error());
         }
 
