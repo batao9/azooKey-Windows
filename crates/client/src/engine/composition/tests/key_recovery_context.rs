@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use windows::{
     core::{implement, Error, GUID, HRESULT, VARIANT},
     Win32::{
@@ -18,10 +20,23 @@ fn not_implemented<T>() -> windows::core::Result<T> {
 #[implement(ITfContext, ITfCompartmentMgr)]
 pub(super) struct TestContext {
     disabled: bool,
+    selection_probe: Option<Rc<dyn Fn()>>,
 }
 
 pub(super) fn new(disabled: bool) -> ITfContext {
-    TestContext { disabled }.into()
+    TestContext {
+        disabled,
+        selection_probe: None,
+    }
+    .into()
+}
+
+pub(super) fn new_with_selection_probe(observer: Rc<dyn Fn()>) -> ITfContext {
+    TestContext {
+        disabled: false,
+        selection_probe: Some(observer),
+    }
+    .into()
 }
 
 impl ITfContext_Impl for TestContext_Impl {
@@ -31,6 +46,9 @@ impl ITfContext_Impl for TestContext_Impl {
         _: Option<&ITfEditSession>,
         _: TF_CONTEXT_EDIT_CONTEXT_FLAGS,
     ) -> windows::core::Result<HRESULT> {
+        if let Some(observer) = &self.selection_probe {
+            observer();
+        }
         not_implemented()
     }
 

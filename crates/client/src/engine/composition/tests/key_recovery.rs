@@ -1,4 +1,6 @@
 use std::{
+    cell::Cell,
+    rc::Rc,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -6,8 +8,10 @@ use std::{
 use super::*;
 use crate::{
     engine::{
-        client_action::ClientAction, input_mode::InputMode, ipc_service::IPCService,
-        state::IMEState,
+        client_action::ClientAction,
+        input_mode::InputMode,
+        ipc_service::IPCService,
+        state::{AppConfigSnapshot, IMEState},
     },
     tsf::factory::TextServiceFactory,
 };
@@ -23,6 +27,26 @@ use windows::{
 mod test_context;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+struct RestoreConfigSnapshot(Option<AppConfigSnapshot>);
+
+impl RestoreConfigSnapshot {
+    fn with_reconversion_key(key: shared::ReconversionKey) -> Self {
+        let restore =
+            Self(IMEState::swap_app_config_snapshot_for_test(None).expect("save config snapshot"));
+        let configured = IMEState::app_config_snapshot()
+            .expect("app config snapshot")
+            .with_reconversion_key_for_test(key);
+        IMEState::swap_app_config_snapshot_for_test(Some(configured)).expect("install test config");
+        restore
+    }
+}
+
+impl Drop for RestoreConfigSnapshot {
+    fn drop(&mut self) {
+        let _ = IMEState::swap_app_config_snapshot_for_test(self.0.take());
+    }
+}
 
 struct RestoreGlobals {
     ipc_service: Option<IPCService>,
@@ -74,6 +98,11 @@ fn assert_unchanged(factory: &TextServiceFactory, before: &Composition) {
     assert_eq!(after.deferred_projection, before.deferred_projection);
     assert_eq!(after.raw_input, before.raw_input);
     assert_eq!(after.state, before.state);
+    assert_eq!(after.temporary_latin, before.temporary_latin);
+    assert_eq!(
+        after.temporary_latin_shift_pending,
+        before.temporary_latin_shift_pending
+    );
 }
 
 fn seed_composition(factory: &TextServiceFactory, state: CompositionState, temporary_latin: bool) {
@@ -307,6 +336,52 @@ fn pending_recovery_callbacks_replay_keys_once_and_preserve_shift_chords() {
             .has_deferred_input()
             .expect("healthy replay drained"));
         assert!(!snapshot(factory).temporary_latin);
+
+        {
+            let _restore_config =
+                RestoreConfigSnapshot::with_reconversion_key(shared::ReconversionKey::Convert);
+            {
+                let service = factory.borrow().expect("text service");
+                let mut composition = service.borrow_mut_composition().expect("composition");
+                *composition = Composition {
+                    temporary_latin: true,
+                    deferred_actions: vec![DeferredClientAction {
+                        action: ClientAction::SetTemporaryLatin(false),
+                        transition: CompositionState::None,
+                    }],
+                    ..Composition::default()
+                };
+            }
+            let requests = Rc::new(Cell::new(0));
+            let observer_processor = processor.clone();
+            let observed_requests = requests.clone();
+            let observer: Rc<dyn Fn()> = Rc::new(move || {
+                let observed_factory = observer_processor.as_impl();
+                assert!(!observed_factory.has_deferred_input().expect("queue state"));
+                assert!(!snapshot(observed_factory).temporary_latin);
+                observed_requests.set(observed_requests.get() + 1);
+            });
+            let probe_context = test_context::new_with_selection_probe(observer);
+            let before_test = snapshot(factory);
+            assert!(sink
+                .OnTestKeyDown(Some(&probe_context), WPARAM(0x1C), LPARAM(0))
+                .expect("test convert after queued work")
+                .as_bool());
+            assert_unchanged(factory, &before_test);
+            assert_eq!(requests.get(), 0);
+
+            assert!(!sink
+                .OnKeyDown(Some(&probe_context), WPARAM(0x1C), LPARAM(0))
+                .expect("drain then probe convert")
+                .as_bool());
+            assert_eq!(requests.get(), 1);
+            assert!(!factory.has_deferred_input().expect("queue drained"));
+            assert!(!snapshot(factory).temporary_latin);
+            assert!(!IMEState::ipc_service()
+                .expect("IPC state")
+                .expect("healthy IPC")
+                .recovery_pending());
+        }
 
         // A disabled host rejects ownership and prevents deferred mode changes from executing.
         let mut state = IMEState::get().expect("IME state");

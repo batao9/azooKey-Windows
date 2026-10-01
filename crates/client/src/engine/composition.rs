@@ -6068,7 +6068,8 @@ impl TextServiceFactory {
 
             // Drain ready work before deciding ownership of the next physical key.
             // OnTest claims that callback even when the projected key is pass-through.
-            let replay_failed = if self.deferred_input_ready()? {
+            let replay_ready = self.deferred_input_ready()?;
+            let replay_failed = if replay_ready {
                 match self.flush_deferred_user_actions() {
                     Ok(()) => false,
                     Err(error)
@@ -6086,6 +6087,21 @@ impl TextServiceFactory {
             } else {
                 false
             };
+            if replay_ready && !replay_failed && !self.has_deferred_input()? {
+                // The sink could not probe selection before the queued work was
+                // drained. Dispatch reconversion for this same physical key now.
+                match self.handle_reconversion_key(context, wparam) {
+                    Ok(Some(handled)) => return Ok(handled),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            "Reconversion after deferred replay failed; passing key through"
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
             if let Some((actions, transition, config_snapshot)) =
                 self.process_key(context, wparam, lparam, KeyEventPhase::Handle)?
             {
