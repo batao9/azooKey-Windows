@@ -37,11 +37,11 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     ) -> Result<BOOL> {
         self.update_shift_key_state(wparam, true);
 
-        if self.deferred_input_ready()?
-            && pic.is_some_and(|context| {
-                !crate::engine::state::keyboard_disabled_from_context(context)
-            })
-        {
+        if self.observe_disabled_key_test_context(pic)? {
+            self.clear_reconversion_test_result();
+            return Ok(false.into());
+        }
+        if self.borrow()?.disabled_context_observed || self.deferred_input_ready()? {
             self.remember_reconversion_test_result(wparam, None);
             return Ok(true.into());
         }
@@ -83,6 +83,7 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     #[tracing::instrument]
     fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
         self.update_shift_key_state(wparam, true);
+        self.cleanup_observed_disabled_context()?;
         if self.has_deferred_input()? {
             self.clear_reconversion_test_result();
             return Ok(self.handle_key(pic, wparam, lparam)?.into());
@@ -129,6 +130,12 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
         // Release the tracked modifier before fallible composition work so an
         // error cannot leave later ordinary keys looking Shift-modified.
         self.update_shift_key_state(wparam, false);
+        if self.observe_disabled_key_test_context(pic)? {
+            return Ok(false.into());
+        }
+        if self.borrow()?.disabled_context_observed {
+            return Ok(true.into());
+        }
         let result = self
             .process_key_up(pic, wparam, lparam, KeyEventPhase::Test)?
             .is_some();
@@ -169,6 +176,19 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
 }
 
 impl TextServiceFactory_Impl {
+    fn observe_disabled_key_test_context(&self, context: Option<&ITfContext>) -> Result<bool> {
+        let Some(context) = context else {
+            return Ok(true);
+        };
+        let disabled = crate::engine::state::keyboard_disabled_from_context(context);
+        if disabled {
+            // A rejected Test has no Handle callback. Record invalidation without
+            // modifying composition or doing TSF/IPC cleanup in the test path.
+            self.borrow_mut()?.disabled_context_observed = true;
+        }
+        Ok(disabled)
+    }
+
     fn remember_reconversion_test_result(&self, wparam: WPARAM, selected: Option<bool>) {
         if let Ok(mut text_service) = self.borrow_mut() {
             text_service.reconversion_test_result = selected.map(|selected| (wparam.0, selected));

@@ -5452,6 +5452,7 @@ impl TextServiceFactory {
         context: &ITfContext,
         range: &ITfRange,
     ) -> Result<bool> {
+        self.cleanup_observed_disabled_context()?;
         if !self.standard_reconversion_is_enabled() {
             return Ok(false);
         }
@@ -5975,6 +5976,7 @@ impl TextServiceFactory {
     }
 
     fn flush_deferred_user_actions(&self) -> Result<()> {
+        self.cleanup_observed_disabled_context()?;
         if let Some(ipc_service) = IMEState::ipc_service()? {
             ipc_service.ensure_server_restart_requested();
             if ipc_service.recovery_pending() && !ipc_service.recovery_restart_ready() {
@@ -6053,6 +6055,7 @@ impl TextServiceFactory {
         let input_trace = client_performance_log_enabled().then(ClientInputTraceGuard::begin);
         let total_start = input_trace.as_ref().map(|_| Instant::now());
         let result: Result<bool> = (|| {
+            self.cleanup_observed_disabled_context()?;
             if let Some(context) = context {
                 self.borrow_mut()?.context = Some(context.clone());
                 let disabled = keyboard_disabled_from_context(context);
@@ -6176,6 +6179,7 @@ impl TextServiceFactory {
         let input_trace = client_performance_log_enabled().then(ClientInputTraceGuard::begin);
         let total_start = input_trace.as_ref().map(|_| Instant::now());
         let result: Result<bool> = (|| {
+            self.cleanup_observed_disabled_context()?;
             if let Some(context) = context {
                 self.borrow_mut()?.context = Some(context.clone());
                 let disabled = keyboard_disabled_from_context(context);
@@ -6254,6 +6258,7 @@ impl TextServiceFactory {
     #[tracing::instrument]
     pub fn handle_preserved_eisu_shortcut(&self, context: Option<&ITfContext>) -> Result<bool> {
         let result: Result<bool> = (|| {
+            self.cleanup_observed_disabled_context()?;
             let Some(context) = context else {
                 self.set_keyboard_disabled_state(true)?;
                 return Ok(false);
@@ -6398,6 +6403,17 @@ impl TextServiceFactory {
             let _ = ipc_service.clear_text();
             let _ = IMEState::set_ipc_service(ipc_service);
         }
+    }
+
+    pub(crate) fn cleanup_observed_disabled_context(&self) -> Result<()> {
+        let observed = {
+            let mut text_service = self.borrow_mut()?;
+            std::mem::take(&mut text_service.disabled_context_observed)
+        };
+        if observed {
+            self.cancel_composition_for_disabled_context();
+        }
+        Ok(())
     }
 
     fn cancel_composition_for_disabled_context(&self) {
@@ -6558,6 +6574,7 @@ impl TextServiceFactory {
         &self,
         mode: InputMode,
     ) -> Result<()> {
+        self.cleanup_observed_disabled_context()?;
         let (this, context, tip_composition, generation) = {
             let mut text_service = self.borrow_mut()?;
             let tip_composition = text_service.borrow_composition()?.tip_composition.clone();
@@ -6648,6 +6665,7 @@ impl TextServiceFactory {
     }
 
     pub(crate) fn request_language_bar_input_mode_toggle(&self, mode: InputMode) -> Result<()> {
+        self.cleanup_observed_disabled_context()?;
         let (composition, replaces_pending_mode_switch) = {
             let text_service = self.borrow()?;
             let composition = text_service.borrow_composition()?.clone();

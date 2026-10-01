@@ -132,6 +132,13 @@ fn queued_actions(factory: &TextServiceFactory) -> Vec<Vec<ClientAction>> {
         .collect()
 }
 
+fn disabled_context_observed(factory: &TextServiceFactory) -> bool {
+    factory
+        .borrow()
+        .expect("text service")
+        .disabled_context_observed
+}
+
 fn fake_replay(
     factory: &TextServiceFactory,
     operations: &mut Vec<ClientAction>,
@@ -383,11 +390,12 @@ fn pending_recovery_callbacks_replay_keys_once_and_preserve_shift_chords() {
                 .recovery_pending());
         }
 
-        // A disabled host rejects ownership and prevents deferred mode changes from executing.
+        // A disabled test is rejected, then the next enabled test claims cleanup.
         let mut state = IMEState::get().expect("IME state");
         state.ipc_service = None;
+        state.keyboard_disabled = false;
         drop(state);
-        {
+        let seed_mode_change = || {
             let service = factory.borrow().expect("text service");
             let mut composition = service.borrow_mut_composition().expect("composition");
             *composition = Composition {
@@ -397,26 +405,75 @@ fn pending_recovery_callbacks_replay_keys_once_and_preserve_shift_chords() {
                 }],
                 ..Composition::default()
             };
-        }
+        };
         let disabled_context = test_context::new(true);
+        seed_mode_change();
         let before_disabled_test = snapshot(factory);
         assert!(!sink
             .OnTestKeyDown(Some(&disabled_context), WPARAM(0x41), LPARAM(0))
             .expect("disabled-host key test")
             .as_bool());
         assert_unchanged(factory, &before_disabled_test);
-        // Skip the language-bar notification of this unactivated test factory.
-        IMEState::get().expect("IME state").keyboard_disabled = true;
+        assert!(disabled_context_observed(factory));
+        let before_cleanup_test = snapshot(factory);
+        assert!(sink
+            .OnTestKeyDown(Some(&context), WPARAM(0x71), LPARAM(0))
+            .expect("enabled F2 claims cleanup")
+            .as_bool());
+        assert_unchanged(factory, &before_cleanup_test);
+        assert!(disabled_context_observed(factory));
         assert!(!sink
-            .OnKeyDown(Some(&disabled_context), WPARAM(0x41), LPARAM(0))
-            .expect("disabled-host key handling")
+            .OnKeyDown(Some(&context), WPARAM(0x71), LPARAM(0))
+            .expect("enabled F2 cleans stale composition")
             .as_bool());
         assert_eq!(IMEState::input_mode().expect("input mode"), InputMode::Kana);
         assert!(!factory
             .has_deferred_input()
             .expect("disabled work cancelled"));
-        // This unactivated factory has no language bar. Reset the admission
-        // state between fixtures rather than exercising unrelated activation UI.
+        assert!(snapshot(factory).deferred_projection.is_none());
+        assert!(!disabled_context_observed(factory));
+        assert!(!sink
+            .OnTestKeyDown(Some(&context), WPARAM(0x71), LPARAM(0))
+            .expect("F2 after cleanup is unowned")
+            .as_bool());
+
+        // Disabled key-up also leaves cleanup for the next enabled TSF callback.
+        seed_mode_change();
+        let before_disabled_up = snapshot(factory);
+        assert!(!sink
+            .OnTestKeyUp(Some(&disabled_context), WPARAM(0x41), LPARAM(0))
+            .expect("disabled key-up test")
+            .as_bool());
+        assert_unchanged(factory, &before_disabled_up);
+        assert!(disabled_context_observed(factory));
+        assert!(sink
+            .OnTestKeyUp(Some(&context), WPARAM(0x41), LPARAM(0))
+            .expect("enabled key-up claims cleanup")
+            .as_bool());
+        assert!(disabled_context_observed(factory));
+        assert!(!sink
+            .OnKeyUp(Some(&context), WPARAM(0x41), LPARAM(0))
+            .expect("enabled key-up cleans stale composition")
+            .as_bool());
+        assert_eq!(IMEState::input_mode().expect("input mode"), InputMode::Kana);
+        assert!(!factory
+            .has_deferred_input()
+            .expect("key-up cleanup drained"));
+        assert!(snapshot(factory).deferred_projection.is_none());
+        assert!(!disabled_context_observed(factory));
+
+        // Direct Handle admission remains guarded independently of the rejected-Test path.
+        seed_mode_change();
+        // Avoid language-bar notification for this unactivated test service.
+        IMEState::get().expect("IME state").keyboard_disabled = true;
+        assert!(!sink
+            .OnKeyDown(Some(&disabled_context), WPARAM(0x41), LPARAM(0))
+            .expect("direct disabled-host handling")
+            .as_bool());
+        assert_eq!(IMEState::input_mode().expect("input mode"), InputMode::Kana);
+        assert!(!factory
+            .has_deferred_input()
+            .expect("direct disabled work cancelled"));
         IMEState::get().expect("IME state").keyboard_disabled = false;
 
         IMEState::set_ipc_service(IPCService::recovery_for_test(true))
