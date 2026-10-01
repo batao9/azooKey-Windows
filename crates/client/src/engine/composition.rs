@@ -5658,8 +5658,7 @@ impl TextServiceFactory {
         });
         let total_start = trace_request_id.map(|_| Instant::now());
         let result: Result<ProcessKeyResult> = (|| {
-            if phase == KeyEventPhase::Test && context.map_or(true, keyboard_disabled_from_context)
-            {
+            if phase == KeyEventPhase::Test && context.is_none_or(keyboard_disabled_from_context) {
                 return Ok(None);
             }
 
@@ -5906,7 +5905,7 @@ impl TextServiceFactory {
         _lparam: LPARAM,
         phase: KeyEventPhase,
     ) -> Result<Option<(Vec<ClientAction>, CompositionState)>> {
-        if phase == KeyEventPhase::Test && context.map_or(true, keyboard_disabled_from_context) {
+        if phase == KeyEventPhase::Test && context.is_none_or(keyboard_disabled_from_context) {
             return Ok(None);
         }
         if !Self::is_shift_key(wparam) {
@@ -5970,7 +5969,7 @@ impl TextServiceFactory {
 
     pub(crate) fn deferred_input_ready(&self) -> Result<bool> {
         Ok(self.has_deferred_input()?
-            && IMEState::ipc_service()?.map_or(true, |ipc_service| {
+            && IMEState::ipc_service()?.is_none_or(|ipc_service| {
                 !ipc_service.recovery_pending() || ipc_service.recovery_restart_ready()
             }))
     }
