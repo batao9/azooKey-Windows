@@ -145,6 +145,8 @@ pub struct TextService {
     pub mode: InputMode,
     pub this: Option<ITfTextInputProcessor>,
     pub shift_key_down: bool,
+    pub shift_key_used_in_chord: bool,
+    pub disabled_context_observed: bool,
     // (virtual key, selection was non-empty). A matched empty Space skips a
     // second selection edit session in OnKeyDown and follows the normal path.
     pub reconversion_test_result: Option<(usize, bool)>,

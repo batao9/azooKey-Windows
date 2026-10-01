@@ -90,6 +90,12 @@ struct ShiftKeyState {
     tracked: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyEventPhase {
+    Test,
+    Handle,
+}
+
 impl ShiftKeyState {
     #[inline]
     fn for_regular_key(self) -> bool {
@@ -5268,6 +5274,23 @@ impl TextServiceFactory {
         config_snapshot: &AppConfigSnapshot,
         replace_pending_mode_switch: bool,
     ) -> Result<bool> {
+        self.process_deferred_user_action(
+            composition,
+            input,
+            config_snapshot,
+            replace_pending_mode_switch,
+            KeyEventPhase::Handle,
+        )
+    }
+
+    fn process_deferred_user_action(
+        &self,
+        composition: &Composition,
+        input: DeferredUserAction,
+        config_snapshot: &AppConfigSnapshot,
+        replace_pending_mode_switch: bool,
+        phase: KeyEventPhase,
+    ) -> Result<bool> {
         let mut projection = Self::deferred_projection(composition, IMEState::input_mode()?);
         let mut projected_composition = composition.clone();
         projected_composition.state = projection.state.clone();
@@ -5308,6 +5331,9 @@ impl TextServiceFactory {
         let Some((transition, actions)) = planned else {
             return Ok(false);
         };
+        if phase == KeyEventPhase::Test {
+            return Ok(true);
+        }
         let fallback = actions
             .into_iter()
             .map(|action| DeferredClientAction {
@@ -5352,6 +5378,9 @@ impl TextServiceFactory {
         &self,
         key_code: usize,
     ) -> Result<Option<ReconversionKey>> {
+        if self.has_deferred_input()? {
+            return Ok(None);
+        }
         if !matches!(
             key_code,
             VK_CONVERT_KEY_CODE | VK_SPACE_KEY_CODE | VK_OEM_SLASH_KEY_CODE
@@ -5423,6 +5452,7 @@ impl TextServiceFactory {
         context: &ITfContext,
         range: &ITfRange,
     ) -> Result<bool> {
+        self.cleanup_observed_disabled_context()?;
         if !self.standard_reconversion_is_enabled() {
             return Ok(false);
         }
@@ -5612,11 +5642,12 @@ impl TextServiceFactory {
     }
 
     #[tracing::instrument]
-    pub fn process_key(
+    pub(crate) fn process_key(
         &self,
         context: Option<&ITfContext>,
         wparam: WPARAM,
         lparam: LPARAM,
+        phase: KeyEventPhase,
     ) -> Result<ProcessKeyResult> {
         let standalone_trace = (current_input_trace_request_id().is_none()
             && client_performance_log_enabled())
@@ -5628,14 +5659,7 @@ impl TextServiceFactory {
         });
         let total_start = trace_request_id.map(|_| Instant::now());
         let result: Result<ProcessKeyResult> = (|| {
-            let Some(context) = context else {
-                self.set_keyboard_disabled_state(true)?;
-                return Ok(None);
-            };
-            let keyboard_disabled = keyboard_disabled_from_context(context);
-            self.set_keyboard_disabled_state(keyboard_disabled)?;
-            if keyboard_disabled {
-                self.cancel_composition_for_disabled_context();
+            if phase == KeyEventPhase::Test && context.is_none_or(keyboard_disabled_from_context) {
                 return Ok(None);
             }
 
@@ -5704,7 +5728,11 @@ impl TextServiceFactory {
                 && !is_ctrl_down
                 && ctrl_conversion_function.is_none()
             {
-                self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(wparam))?;
+                if phase == KeyEventPhase::Handle {
+                    self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(
+                        wparam,
+                    ))?;
+                }
                 return Ok(None);
             }
 
@@ -5712,54 +5740,42 @@ impl TextServiceFactory {
                 let shortcuts = &app_config.shortcuts;
 
                 if is_ctrl_space && !shortcuts.ctrl_space_toggle {
-                    self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(
-                        wparam,
-                    ))?;
+                    if phase == KeyEventPhase::Handle {
+                        self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(
+                            wparam,
+                        ))?;
+                    }
                     return Ok(None);
                 }
 
                 if is_alt_backquote && !shortcuts.alt_backquote_toggle {
-                    self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(
-                        wparam,
-                    ))?;
+                    if phase == KeyEventPhase::Handle {
+                        self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(
+                            wparam,
+                        ))?;
+                    }
                     return Ok(None);
                 }
 
                 if is_eisu && !shortcuts.eisu_toggle {
-                    self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(
-                        wparam,
-                    ))?;
+                    if phase == KeyEventPhase::Handle {
+                        self.clear_temporary_latin_shift_pending_if_needed(!Self::is_shift_key(
+                            wparam,
+                        ))?;
+                    }
                     return Ok(None);
                 }
             }
 
             #[allow(clippy::let_and_return)]
-            let (mut composition, mut mode) = {
+            let (composition, mode) = {
                 let text_service = self.borrow()?;
                 let composition = text_service.borrow_composition()?.clone();
                 let mode = IMEState::input_mode()?;
                 (composition, mode)
             };
-            let mut has_deferred_input =
+            let has_deferred_input =
                 !composition.deferred_actions.is_empty() || !composition.deferred_inputs.is_empty();
-            if has_deferred_input {
-                let restart_ready = IMEState::ipc_service()?
-                    .is_some_and(|ipc_service| ipc_service.wait_for_recovery_restart());
-                if restart_ready {
-                    if let Err(error) = self.flush_deferred_user_actions() {
-                        tracing::warn!(
-                            ?error,
-                            "Deferred recovery was not ready before planning the next key"
-                        );
-                    } else {
-                        let text_service = self.borrow()?;
-                        composition = text_service.borrow_composition()?.clone();
-                        mode = IMEState::input_mode()?;
-                        has_deferred_input = !composition.deferred_actions.is_empty()
-                            || !composition.deferred_inputs.is_empty();
-                    }
-                }
-            }
             let projected =
                 has_deferred_input.then(|| Self::deferred_projection(&composition, mode.clone()));
             let temporary_latin = projected
@@ -5768,13 +5784,15 @@ impl TextServiceFactory {
                 .unwrap_or(composition.temporary_latin);
             if temporary_latin && is_shift_key && !is_shift_left && !is_shift_right {
                 if let Some(projection) = projected {
-                    self.enqueue_deferred_actions(
-                        &composition,
-                        vec![DeferredClientAction {
-                            action: ClientAction::SetTemporaryLatinShiftPending(true),
-                            transition: projection.state,
-                        }],
-                    )?;
+                    if phase == KeyEventPhase::Handle {
+                        self.enqueue_deferred_actions(
+                            &composition,
+                            vec![DeferredClientAction {
+                                action: ClientAction::SetTemporaryLatinShiftPending(true),
+                                transition: projection.state,
+                            }],
+                        )?;
+                    }
                     return Ok(Some((
                         Vec::new(),
                         composition.state.clone(),
@@ -5815,13 +5833,18 @@ impl TextServiceFactory {
             };
 
             if has_deferred_input {
-                if !self.enqueue_deferred_user_action(
+                if !self.process_deferred_user_action(
                     &composition,
                     deferred_user_action,
                     &config_snapshot,
                     false,
+                    phase,
                 )? {
-                    self.clear_temporary_latin_shift_pending_if_needed(should_clear_shift_pending)?;
+                    if phase == KeyEventPhase::Handle {
+                        self.clear_temporary_latin_shift_pending_if_needed(
+                            should_clear_shift_pending,
+                        )?;
+                    }
                     return Ok(None);
                 }
                 return Ok(Some((
@@ -5838,11 +5861,15 @@ impl TextServiceFactory {
                 app_config,
                 romaji_lookup,
             ) else {
-                self.clear_temporary_latin_shift_pending_if_needed(should_clear_shift_pending)?;
+                if phase == KeyEventPhase::Handle {
+                    self.clear_temporary_latin_shift_pending_if_needed(should_clear_shift_pending)?;
+                }
                 return Ok(None);
             };
 
-            if !Self::ensure_ipc_service_for_key_event("process_key") {
+            if phase == KeyEventPhase::Handle
+                && !Self::ensure_ipc_service_for_key_event("process_key")
+            {
                 return Ok(None);
             }
 
@@ -5872,25 +5899,20 @@ impl TextServiceFactory {
     }
 
     #[tracing::instrument]
-    pub fn process_key_up(
+    pub(crate) fn process_key_up(
         &self,
         context: Option<&ITfContext>,
         wparam: WPARAM,
         _lparam: LPARAM,
+        phase: KeyEventPhase,
     ) -> Result<Option<(Vec<ClientAction>, CompositionState)>> {
-        let Some(context) = context else {
-            self.set_keyboard_disabled_state(true)?;
-            return Ok(None);
-        };
-        let keyboard_disabled = keyboard_disabled_from_context(context);
-        self.set_keyboard_disabled_state(keyboard_disabled)?;
-        if keyboard_disabled {
-            self.cancel_composition_for_disabled_context();
+        if phase == KeyEventPhase::Test && context.is_none_or(keyboard_disabled_from_context) {
             return Ok(None);
         }
         if !Self::is_shift_key(wparam) {
             return Ok(None);
         }
+        let shift_only = !self.borrow()?.shift_key_used_in_chord;
 
         let composition = {
             let text_service = self.borrow()?;
@@ -5904,19 +5926,21 @@ impl TextServiceFactory {
                 return Ok(None);
             }
             let mut actions = vec![ClientAction::SetTemporaryLatinShiftPending(false)];
-            if projection.temporary_latin {
+            if projection.temporary_latin && shift_only {
                 actions.insert(0, ClientAction::SetTemporaryLatin(false));
             }
-            self.enqueue_deferred_actions(
-                &composition,
-                actions
-                    .into_iter()
-                    .map(|action| DeferredClientAction {
-                        action,
-                        transition: projection.state.clone(),
-                    })
-                    .collect(),
-            )?;
+            if phase == KeyEventPhase::Handle {
+                self.enqueue_deferred_actions(
+                    &composition,
+                    actions
+                        .into_iter()
+                        .map(|action| DeferredClientAction {
+                            action,
+                            transition: projection.state.clone(),
+                        })
+                        .collect(),
+                )?;
+            }
             return Ok(Some((Vec::new(), composition.state.clone())));
         }
 
@@ -5925,22 +5949,57 @@ impl TextServiceFactory {
         }
 
         let mut actions = vec![ClientAction::SetTemporaryLatinShiftPending(false)];
-        if composition.temporary_latin {
+        if composition.temporary_latin && shift_only {
             actions.insert(0, ClientAction::SetTemporaryLatin(false));
         }
 
-        if !Self::ensure_ipc_service_for_key_event("process_key_up") {
+        if phase == KeyEventPhase::Handle
+            && !Self::ensure_ipc_service_for_key_event("process_key_up")
+        {
             return Ok(None);
         }
 
         Ok(Some((actions, composition.state.clone())))
     }
 
+    pub(crate) fn has_deferred_input(&self) -> Result<bool> {
+        let text_service = self.borrow()?;
+        let composition = text_service.borrow_composition()?;
+        Ok(!composition.deferred_actions.is_empty() || !composition.deferred_inputs.is_empty())
+    }
+
+    pub(crate) fn deferred_input_ready(&self) -> Result<bool> {
+        Ok(self.has_deferred_input()?
+            && IMEState::ipc_service()?.is_none_or(|ipc_service| {
+                !ipc_service.recovery_pending() || ipc_service.recovery_restart_ready()
+            }))
+    }
+
     fn flush_deferred_user_actions(&self) -> Result<()> {
+        self.cleanup_observed_disabled_context()?;
+        if let Some(ipc_service) = IMEState::ipc_service()? {
+            ipc_service.ensure_server_restart_requested();
+            if ipc_service.recovery_pending() && !ipc_service.recovery_restart_ready() {
+                return Ok(());
+            }
+        }
+        self.replay_deferred_user_actions(|actions, transition, config_snapshot| {
+            self.handle_action_with_config_snapshot(actions, transition, config_snapshot)
+        })
+    }
+
+    fn replay_deferred_user_actions(
+        &self,
+        mut execute: impl FnMut(&[ClientAction], CompositionState, AppConfigSnapshot) -> Result<()>,
+    ) -> Result<()> {
         loop {
             let composition = self.borrow()?.borrow_composition()?.clone();
             if !composition.deferred_actions.is_empty() {
-                self.handle_action(&[], composition.state.clone())?;
+                execute(
+                    &[],
+                    composition.state.clone(),
+                    IMEState::app_config_snapshot()?,
+                )?;
                 continue;
             }
 
@@ -5974,11 +6033,7 @@ impl TextServiceFactory {
                         .deferred_inputs
                         .pop_front();
                     if let Some((transition, actions)) = planned {
-                        self.handle_action_with_config_snapshot(
-                            &actions,
-                            transition,
-                            config_snapshot,
-                        )?;
+                        execute(&actions, transition, config_snapshot)?;
                     } else {
                         self.borrow()?
                             .borrow_mut_composition()?
@@ -6000,18 +6055,63 @@ impl TextServiceFactory {
         let input_trace = client_performance_log_enabled().then(ClientInputTraceGuard::begin);
         let total_start = input_trace.as_ref().map(|_| Instant::now());
         let result: Result<bool> = (|| {
+            self.cleanup_observed_disabled_context()?;
             if let Some(context) = context {
                 self.borrow_mut()?.context = Some(context.clone());
+                let disabled = keyboard_disabled_from_context(context);
+                self.set_keyboard_disabled_state(disabled)?;
+                if disabled {
+                    self.cancel_composition_for_disabled_context();
+                    return Ok(false);
+                }
             } else {
                 self.set_keyboard_disabled_state(true)?;
                 return Ok(false);
             };
 
+            // Drain ready work before deciding ownership of the next physical key.
+            // OnTest claims that callback even when the projected key is pass-through.
+            let replay_ready = self.deferred_input_ready()?;
+            let replay_failed = if replay_ready {
+                match self.flush_deferred_user_actions() {
+                    Ok(()) => false,
+                    Err(error)
+                        if requires_action_recovery(&error)
+                            || is_non_destructive_ipc_error(&error) =>
+                    {
+                        tracing::warn!(
+                            ?error,
+                            "Deferred recovery failed; preserving the current key before retrying"
+                        );
+                        true
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                false
+            };
+            if replay_ready && !replay_failed && !self.has_deferred_input()? {
+                // The sink could not probe selection before the queued work was
+                // drained. Dispatch reconversion for this same physical key now.
+                match self.handle_reconversion_key(context, wparam) {
+                    Ok(Some(handled)) => return Ok(handled),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            "Reconversion after deferred replay failed; passing key through"
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
             if let Some((actions, transition, config_snapshot)) =
-                self.process_key(context, wparam, lparam)?
+                self.process_key(context, wparam, lparam, KeyEventPhase::Handle)?
             {
                 if actions.is_empty() {
-                    self.flush_deferred_user_actions()?;
+                    if !replay_failed {
+                        self.flush_deferred_user_actions()?;
+                    }
                 } else {
                     self.handle_action_with_config_snapshot(&actions, transition, config_snapshot)?;
                 }
@@ -6079,14 +6179,23 @@ impl TextServiceFactory {
         let input_trace = client_performance_log_enabled().then(ClientInputTraceGuard::begin);
         let total_start = input_trace.as_ref().map(|_| Instant::now());
         let result: Result<bool> = (|| {
+            self.cleanup_observed_disabled_context()?;
             if let Some(context) = context {
                 self.borrow_mut()?.context = Some(context.clone());
+                let disabled = keyboard_disabled_from_context(context);
+                self.set_keyboard_disabled_state(disabled)?;
+                if disabled {
+                    self.cancel_composition_for_disabled_context();
+                    return Ok(false);
+                }
             } else {
                 self.set_keyboard_disabled_state(true)?;
                 return Ok(false);
             };
 
-            if let Some((actions, transition)) = self.process_key_up(context, wparam, lparam)? {
+            if let Some((actions, transition)) =
+                self.process_key_up(context, wparam, lparam, KeyEventPhase::Handle)?
+            {
                 if actions.is_empty() {
                     self.flush_deferred_user_actions()?;
                 } else {
@@ -6149,6 +6258,7 @@ impl TextServiceFactory {
     #[tracing::instrument]
     pub fn handle_preserved_eisu_shortcut(&self, context: Option<&ITfContext>) -> Result<bool> {
         let result: Result<bool> = (|| {
+            self.cleanup_observed_disabled_context()?;
             let Some(context) = context else {
                 self.set_keyboard_disabled_state(true)?;
                 return Ok(false);
@@ -6293,6 +6403,17 @@ impl TextServiceFactory {
             let _ = ipc_service.clear_text();
             let _ = IMEState::set_ipc_service(ipc_service);
         }
+    }
+
+    pub(crate) fn cleanup_observed_disabled_context(&self) -> Result<()> {
+        let observed = {
+            let mut text_service = self.borrow_mut()?;
+            std::mem::take(&mut text_service.disabled_context_observed)
+        };
+        if observed {
+            self.cancel_composition_for_disabled_context();
+        }
+        Ok(())
     }
 
     fn cancel_composition_for_disabled_context(&self) {
@@ -6453,6 +6574,7 @@ impl TextServiceFactory {
         &self,
         mode: InputMode,
     ) -> Result<()> {
+        self.cleanup_observed_disabled_context()?;
         let (this, context, tip_composition, generation) = {
             let mut text_service = self.borrow_mut()?;
             let tip_composition = text_service.borrow_composition()?.tip_composition.clone();
@@ -6543,6 +6665,7 @@ impl TextServiceFactory {
     }
 
     pub(crate) fn request_language_bar_input_mode_toggle(&self, mode: InputMode) -> Result<()> {
+        self.cleanup_observed_disabled_context()?;
         let (composition, replaces_pending_mode_switch) = {
             let text_service = self.borrow()?;
             let composition = text_service.borrow_composition()?.clone();
