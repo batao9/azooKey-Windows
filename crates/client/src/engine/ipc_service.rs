@@ -2982,6 +2982,8 @@ mod tests {
     }
 
     impl Probe {
+        // Match the Tonic error type used by the RPCs under test.
+        #[allow(clippy::result_large_err)]
         fn mutation_status(&self) -> Result<(), tonic::Status> {
             if self.unavailable.load(Ordering::Acquire) {
                 Err(tonic::Status::unavailable(

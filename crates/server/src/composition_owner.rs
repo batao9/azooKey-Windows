@@ -1,3 +1,6 @@
+// RPC authorization propagates Tonic's prescribed error type without boxing.
+#![allow(clippy::result_large_err)]
+
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
