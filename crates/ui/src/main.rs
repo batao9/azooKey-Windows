@@ -5,8 +5,8 @@ use std::{fs, sync::Arc};
 use azookey_server::TonicNamedPipeServer;
 use ipc::{WindowAction, WindowController, WindowService};
 use shared::{
-    proto::window_service_server::WindowServiceServer,
-    LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_DEFAULT, UI_PIPE_PATH,
+    proto::window_service_server::WindowServiceServer, ui_pipe_path,
+    LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_DEFAULT,
 };
 use tao::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use tao::platform::windows::{EventLoopBuilderExtWindows, WindowExtWindows};
@@ -355,7 +355,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // start grpc server
-    let incoming = TonicNamedPipeServer::new(UI_PIPE_PATH)?;
+    let incoming = TonicNamedPipeServer::new(ui_pipe_path()?)?;
     tokio::spawn(async move {
         println!("WindowServer listening");
         Server::builder()

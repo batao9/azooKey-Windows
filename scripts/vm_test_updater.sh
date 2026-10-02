@@ -407,7 +407,7 @@ function Assert-UpdatedProtectedInstall {
   if (![string]::Equals($task.Actions[0].Execute.Trim('"'), $expectedLauncher, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "Updater did not recreate the protected launcher task: $($task.Actions[0].Execute)"
   }
-  if ($task.Principal.RunLevel -ne "Highest") {
+  if ($task.Principal.RunLevel -ne "Limited") {
     throw "Updater changed the startup task run level: $($task.Principal.RunLevel)"
   }
   if (Test-Path -LiteralPath (Join-Path $installLocation ".azookey-updater-staging")) {

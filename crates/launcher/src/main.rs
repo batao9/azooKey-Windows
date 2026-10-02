@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use shared::{zenzai_cpu_backend_supported, AppConfig};
+use shared::{launcher_pipe_path, zenzai_cpu_backend_supported, AppConfig};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::fs::{self, File};
@@ -24,8 +24,8 @@ use windows::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
                 SDDL_REVISION,
             },
-            GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-            TOKEN_USER,
+            GetTokenInformation, TokenLogonSid, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+            TOKEN_GROUPS, TOKEN_QUERY,
         },
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     },
@@ -36,7 +36,6 @@ const SERVER_RESTART_WINDOW: Duration = Duration::from_secs(60);
 const SERVER_RESTART_BURST_LIMIT: usize = 5;
 const SERVER_RESTART_COOLDOWN: Duration = Duration::from_secs(30);
 const SERVER_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const LAUNCHER_PIPE_PATH: &str = r"\\.\pipe\azookey_launcher";
 const LAUNCHER_RESTART_COMMAND: &str = "restart-server";
 const LAUNCHER_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const LAUNCHER_CRASH_TRACE_FILE_NAME: &str = "launcher-crash-trace.json";
@@ -52,7 +51,9 @@ fn main() -> anyhow::Result<()> {
 
     let exe_path = env::current_exe()?.parent().unwrap().to_path_buf();
     let (command_tx, command_rx) = mpsc::channel();
-    start_launcher_command_listener(command_tx);
+    // Reserve the session-specific pipe before starting either child. A duplicate
+    // launcher (or an ACL failure) must fail without launching more processes.
+    start_launcher_command_listener(command_tx, launcher_pipe_path()?)?;
 
     let server_exe_path = exe_path.clone();
     let server_handle = thread::spawn(move || {
@@ -420,44 +421,54 @@ fn terminate_server_child(server: &mut Child) -> anyhow::Result<ExitStatus> {
         .context("Failed to wait for azookey-server.exe after restart request")
 }
 
-fn start_launcher_command_listener(command_tx: Sender<LauncherCommand>) {
+fn start_launcher_command_listener(
+    command_tx: Sender<LauncherCommand>,
+    pipe_path: &str,
+) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let pipe = {
+        let _runtime_guard = runtime.enter();
+        create_launcher_command_pipe(pipe_path, true)?
+    };
+
+    let pipe_path = pipe_path.to_owned();
     thread::spawn(move || {
-        if let Err(error) = run_launcher_command_listener(command_tx) {
+        if let Err(error) =
+            runtime.block_on(run_launcher_command_listener(pipe, command_tx, &pipe_path))
+        {
             eprintln!("[launcher] command listener stopped: {error:?}");
         }
     });
+    Ok(())
 }
 
-fn run_launcher_command_listener(command_tx: Sender<LauncherCommand>) -> anyhow::Result<()> {
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async move {
-        let security_descriptor = create_launcher_pipe_security_descriptor()?;
+async fn run_launcher_command_listener(
+    mut pipe: NamedPipeServer,
+    command_tx: Sender<LauncherCommand>,
+    pipe_path: &str,
+) -> anyhow::Result<()> {
+    loop {
+        let connection = pipe.connect().await;
 
-        let mut security_attributes = UnsafeSecurityAttributes(SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: security_descriptor.0,
-            bInheritHandle: false.into(),
-        });
-
-        let mut first_pipe_instance = true;
-        loop {
-            let mut pipe =
-                create_launcher_command_pipe(&mut security_attributes, first_pipe_instance)?;
-            first_pipe_instance = false;
-            pipe.connect()
-                .await
-                .context("Failed to connect launcher command pipe")?;
-
-            if let Err(error) = handle_launcher_command(&mut pipe, &command_tx).await {
-                eprintln!("[launcher] command failed: {error:?}");
+        // Reserve the next instance before dropping the connected handle. This
+        // keeps the name owned without discarding the client's unread response
+        // (DisconnectNamedPipe would discard it; Tokio flush is a no-op).
+        let next_pipe = create_launcher_command_pipe(pipe_path, false)?;
+        match connection {
+            Ok(()) => {
+                if let Err(error) = handle_launcher_command(&mut pipe, &command_tx).await {
+                    eprintln!("[launcher] command failed: {error:?}");
+                }
             }
+            Err(error) => eprintln!("[launcher] command connection failed: {error:?}"),
         }
-    })
+        pipe = next_pipe;
+    }
 }
 
 fn create_launcher_pipe_security_descriptor() -> anyhow::Result<PSECURITY_DESCRIPTOR> {
-    let user_sid = current_user_sid_string()?;
-    let sddl = launcher_pipe_sddl(&user_sid);
+    let logon_sid = current_logon_sid_string()?;
+    let sddl = launcher_pipe_sddl(&logon_sid);
     let sddl_wide = sddl.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
     let mut security_descriptor = PSECURITY_DESCRIPTOR::default();
 
@@ -474,71 +485,81 @@ fn create_launcher_pipe_security_descriptor() -> anyhow::Result<PSECURITY_DESCRI
     Ok(security_descriptor)
 }
 
-fn launcher_pipe_sddl(user_sid: &str) -> String {
-    format!("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{user_sid})S:(ML;;NW;;;ME)")
+fn launcher_pipe_sddl(logon_sid: &str) -> String {
+    format!("D:(D;;GA;;;NU)(A;;GA;;;SY)(A;;GRGW;;;{logon_sid})S:(ML;;NW;;;ME)")
 }
 
-fn current_user_sid_string() -> anyhow::Result<String> {
+fn current_logon_sid_string() -> anyhow::Result<String> {
     unsafe {
         let mut token = HANDLE::default();
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
             .context("Failed to open current process token")?;
 
-        let result = user_sid_string_from_token(token);
+        let result = logon_sid_string_from_token(token);
         let _ = CloseHandle(token);
         result
     }
 }
 
-fn user_sid_string_from_token(token: HANDLE) -> anyhow::Result<String> {
+fn logon_sid_string_from_token(token: HANDLE) -> anyhow::Result<String> {
     unsafe {
         let mut token_info_length = 0;
-        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut token_info_length);
+        let _ = GetTokenInformation(token, TokenLogonSid, None, 0, &mut token_info_length);
         anyhow::ensure!(
-            token_info_length > 0,
-            "Failed to get current user token SID size"
+            token_info_length >= size_of::<TOKEN_GROUPS>() as u32,
+            "Failed to get current logon SID buffer size"
         );
 
-        let mut token_info = vec![0u8; token_info_length as usize];
+        // TOKEN_GROUPS contains pointers; use the same aligned buffer and
+        // fail-closed single-logon-SID check as the server.
+        let word_count = (token_info_length as usize).div_ceil(size_of::<usize>());
+        let mut token_info = vec![0usize; word_count];
         GetTokenInformation(
             token,
-            TokenUser,
+            TokenLogonSid,
             Some(token_info.as_mut_ptr().cast()),
             token_info_length,
             &mut token_info_length,
         )
-        .context("Failed to get current user token SID")?;
+        .context("Failed to get current logon SID")?;
 
-        let token_user = &*(token_info.as_ptr() as *const TOKEN_USER);
+        let token_groups = &*(token_info.as_ptr() as *const TOKEN_GROUPS);
+        anyhow::ensure!(
+            token_groups.GroupCount == 1,
+            "Expected one logon SID, got {}",
+            token_groups.GroupCount
+        );
         let mut sid_string = PWSTR::null();
-        ConvertSidToStringSidW(token_user.User.Sid, &mut sid_string)
-            .context("Failed to convert current user SID to string")?;
+        ConvertSidToStringSidW(token_groups.Groups[0].Sid, &mut sid_string)
+            .context("Failed to convert current logon SID to string")?;
 
         let result = sid_string
             .to_string()
-            .context("Failed to decode current user SID string");
+            .context("Failed to decode current logon SID string");
         let _ = LocalFree(HLOCAL(sid_string.as_ptr().cast()));
         result
     }
 }
 
 fn create_launcher_command_pipe(
-    security_attributes: &mut UnsafeSecurityAttributes,
+    path: &str,
     first_pipe_instance: bool,
 ) -> anyhow::Result<NamedPipeServer> {
-    let mut options = ServerOptions::new();
-    if first_pipe_instance {
-        options.first_pipe_instance(true);
-    }
-
+    let descriptor = create_launcher_pipe_security_descriptor()?;
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: false.into(),
+    };
+    let result = unsafe {
+        ServerOptions::new()
+            .first_pipe_instance(first_pipe_instance)
+            .create_with_security_attributes_raw(path, addr_of_mut!(attributes) as *mut c_void)
+    };
     unsafe {
-        options
-            .create_with_security_attributes_raw(
-                LAUNCHER_PIPE_PATH,
-                addr_of_mut!(security_attributes.0) as *mut c_void,
-            )
-            .context("Failed to create launcher command pipe")
+        let _ = LocalFree(HLOCAL(descriptor.0));
     }
+    result.context("Failed to create launcher command pipe")
 }
 
 async fn handle_launcher_command(
@@ -636,11 +657,6 @@ enum LauncherCommandKind {
     RestartServer,
 }
 
-struct UnsafeSecurityAttributes(SECURITY_ATTRIBUTES);
-
-unsafe impl Send for UnsafeSecurityAttributes {}
-unsafe impl Sync for UnsafeSecurityAttributes {}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -674,17 +690,93 @@ mod tests {
     }
 
     #[test]
-    fn launcher_pipe_sddl_is_limited_to_current_user_and_medium_integrity() {
-        let sddl = launcher_pipe_sddl("S-1-5-21-1-2-3-1001");
+    fn launcher_pipe_sddl_denies_network_and_grants_only_system_and_current_logon() {
+        assert_eq!(
+            launcher_pipe_sddl("S-1-5-5-1-2"),
+            "D:(D;;GA;;;NU)(A;;GA;;;SY)(A;;GRGW;;;S-1-5-5-1-2)S:(ML;;NW;;;ME)"
+        );
+    }
 
-        assert!(sddl.contains("(A;;GA;;;SY)"));
-        assert!(sddl.contains("(A;;GA;;;BA)"));
-        assert!(sddl.contains("(A;;GA;;;S-1-5-21-1-2-3-1001)"));
-        assert!(sddl.contains("S:(ML;;NW;;;ME)"));
-        assert!(!sddl.contains(";;;BU)"));
-        assert!(!sddl.contains(";;;AC)"));
-        assert!(!sddl.contains(";;;RC)"));
-        assert!(!sddl.contains(";;;LW)"));
+    #[test]
+    fn launcher_pipe_reserves_name_across_connections_and_duplicate_startup_fails() {
+        use super::{
+            create_launcher_command_pipe, run_launcher_command_listener,
+            start_launcher_command_listener,
+        };
+        use std::sync::mpsc;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::windows::named_pipe::ClientOptions,
+        };
+        use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_PIPE_BUSY};
+
+        fn open_client(path: &str) -> tokio::net::windows::named_pipe::NamedPipeClient {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match ClientOptions::new().open(path) {
+                    Ok(client) => return client,
+                    Err(error)
+                        if error.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32)
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("Failed to open test launcher pipe: {error}"),
+                }
+            }
+        }
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let path = format!(
+            r"\\.\pipe\LOCAL\azookey_launcher_test_{}_{}",
+            std::process::id(),
+            super::now_timestamp_millis()
+        );
+        let pipe = {
+            let _runtime_guard = runtime.enter();
+            create_launcher_command_pipe(&path, true).unwrap()
+        };
+        let (command_tx, command_rx) = mpsc::channel();
+
+        // Initialization failure must reach main's gate before children spawn.
+        assert!(start_launcher_command_listener(command_tx.clone(), &path).is_err());
+        let watchdog = std::thread::spawn(move || {
+            while let Ok(super::LauncherCommand::RestartServer { reply }) = command_rx.recv() {
+                reply.send(Ok(())).unwrap();
+            }
+        });
+
+        runtime.block_on(async {
+            let listener_path = path.clone();
+            let listener = tokio::spawn(async move {
+                run_launcher_command_listener(pipe, command_tx, &listener_path).await
+            });
+            for _ in 0..3 {
+                // An abandoned connection must not release the launcher name
+                // or stop subsequent restart requests.
+                drop(open_client(&path));
+                let mut client = open_client(&path);
+                client.write_all(b"restart-server\n").await.unwrap();
+                let mut response = [0u8; 256];
+                let size = client.read(&mut response).await.unwrap();
+                assert_eq!(&response[..size], b"ok\n");
+
+                let error = create_launcher_command_pipe(&path, true).unwrap_err();
+                assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .raw_os_error(),
+                    Some(ERROR_ACCESS_DENIED.0 as i32)
+                );
+            }
+
+            listener.abort();
+            assert!(listener.await.unwrap_err().is_cancelled());
+            // Releasing the resident handle permits a new launcher instance.
+            assert!(create_launcher_command_pipe(&path, true).is_ok());
+        });
+        watchdog.join().unwrap();
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use anyhow::{Context as _, Result};
+use shared::launcher_pipe_path;
 use std::time::{Duration, Instant};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -7,7 +8,6 @@ use tokio::{
 };
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY};
 
-const LAUNCHER_PIPE_PATH: &str = r"\\.\pipe\azookey_launcher";
 const LAUNCHER_RESTART_COMMAND: &[u8] = b"restart-server\n";
 const LAUNCHER_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const LAUNCHER_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -39,10 +39,11 @@ pub(crate) fn request_restart() -> Result<()> {
 }
 
 async fn open_launcher_pipe() -> Result<Option<NamedPipeClient>> {
+    let pipe_path = launcher_pipe_path()?;
     let started_at = Instant::now();
 
     loop {
-        match ClientOptions::new().open(LAUNCHER_PIPE_PATH) {
+        match ClientOptions::new().open(pipe_path) {
             Ok(client) => return Ok(Some(client)),
             Err(error) if launcher_pipe_missing(error.raw_os_error()) => return Ok(None),
             Err(error)
