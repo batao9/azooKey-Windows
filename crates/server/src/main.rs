@@ -1782,16 +1782,15 @@ impl AzookeyService for MyAzookeyService {
         request: Request<StartReconversionRequest>,
     ) -> Result<Response<StartReconversionResponse>, Status> {
         let mut mutation_guard = self.mutation_lock.lock().await;
-        mutation_guard.authorize(&request, true, release_composition_state)?;
-        let request = request.into_inner();
+        mutation_guard.authorize(&request, false, release_composition_state)?;
         let _request_guard = ServerRequestGuard::begin(true);
-        let request_id = request_id_or_next(request.request_id);
+        let request_id = request_id_or_next(request.get_ref().request_id);
         set_request_id(request_id);
         let handler_start = Instant::now();
-        let surface = request.surface;
-        let surface_len = validate_reconversion_surface(&surface)?;
+        let surface = &request.get_ref().surface;
+        let surface_len = validate_reconversion_surface(surface)?;
 
-        let mut readings = infer_reconversion_readings(&surface)
+        let mut readings = infer_reconversion_readings(surface)
             .map_err(|error| status_from_error("start_reconversion", error))?;
         readings.truncate(MAX_RECONVERSION_READINGS);
         if readings.is_empty() {
@@ -1812,6 +1811,8 @@ impl AzookeyService for MyAzookeyService {
 
         // Reading inference is non-mutating. Only replace the converter state after it
         // succeeds, so unsupported text cannot disturb an existing composition.
+        mutation_guard.authorize(&request, true, release_composition_state)?;
+        let surface = request.into_inner().surface;
         let mut chosen_index = 0;
         let mut best_surface_rank = usize::MAX;
         let mut conversions = Vec::with_capacity(readings.len());
@@ -2865,6 +2866,89 @@ mod path_tests {
     };
     use shared::proto::Suggestion;
     use std::{ffi::OsStr, path::Path};
+
+    #[tokio::test]
+    async fn unsupported_reconversion_does_not_claim_or_release_composition() {
+        use azookey_server::{PipeClient, TonicNamedPipeServer};
+        use futures_core::Stream;
+        use shared::proto::{
+            azookey_service_server::AzookeyService, ClearTextRequest, SetContextRequest,
+            StartReconversionRequest,
+        };
+        use std::{os::windows::io::IntoRawHandle, sync::Arc};
+        use tokio::net::windows::named_pipe::NamedPipeClient;
+        use tonic::{transport::server::Connected, Code, Request};
+
+        fn request<T>(body: T, client: &Arc<PipeClient>) -> Request<T> {
+            let mut request = Request::new(body);
+            request.extensions_mut().insert(Arc::clone(client));
+            request
+        }
+
+        let path = format!(
+            r"\\.\pipe\LOCAL\azookey_reconversion_owner_test_{}_{}",
+            std::process::id(),
+            super::next_request_id()
+        );
+        let mut incoming = Box::pin(TonicNamedPipeServer::new(&path).unwrap());
+        let first_handle = shared::open_named_pipe_client_handle(&path).unwrap();
+        let _first_pipe =
+            unsafe { NamedPipeClient::from_raw_handle(first_handle.into_raw_handle()) }.unwrap();
+        let first_transport = std::future::poll_fn(|cx| incoming.as_mut().poll_next(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        let second_handle = shared::open_named_pipe_client_handle(&path).unwrap();
+        let _second_pipe =
+            unsafe { NamedPipeClient::from_raw_handle(second_handle.into_raw_handle()) }.unwrap();
+        let second_transport = std::future::poll_fn(|cx| incoming.as_mut().poll_next(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        let first = first_transport.connect_info();
+        let second = second_transport.connect_info();
+        let service = MyAzookeyService::default();
+        // Unassigned CJK: reading inference is unsupported without needing a
+        // dictionary or model fixture. No candidate generation is performed.
+        let unsupported = StartReconversionRequest {
+            surface: "\u{2fa1f}".into(),
+            ..Default::default()
+        };
+        let skipped = service
+            .start_reconversion(request(unsupported.clone(), &first))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!skipped.applied);
+        service
+            .clear_text(request(ClearTextRequest::default(), &second))
+            .await
+            .expect("a no-op must not block a different connection");
+
+        service
+            .set_context(request(SetContextRequest::default(), &first))
+            .await
+            .unwrap();
+        let skipped = service
+            .start_reconversion(request(unsupported, &first))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!skipped.applied);
+        assert_eq!(
+            service
+                .clear_text(request(ClearTextRequest::default(), &second))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied,
+            "a no-op must preserve the existing owner"
+        );
+        service
+            .clear_text(request(ClearTextRequest::default(), &first))
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn mutation_lock_keeps_replace_transaction_exclusive() {

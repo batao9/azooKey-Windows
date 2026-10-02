@@ -34,12 +34,47 @@ async fn two_rpc_connections_cannot_read_modify_or_learn_each_others_composition
     let mut first = client().await;
     let mut second = client().await;
     first.clear_text(ClearTextRequest::default()).await.unwrap();
+    // An unassigned scalar in the CJK range cannot pass through or have a
+    // dictionary reading. A no-op reconversion must not acquire ownership.
+    let unsupported = StartReconversionRequest {
+        surface: "\u{2fa1f}".into(),
+        ..Default::default()
+    };
+    let skipped = first
+        .start_reconversion(unsupported.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!skipped.applied);
+    assert!(skipped.composing_text.is_none());
+    let claimed = second
+        .append_text(append("べつのにゅうりょく"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        claimed.composing_text.unwrap().hiragana,
+        "べつのにゅうりょく"
+    );
+    second
+        .clear_text(ClearTextRequest::default())
+        .await
+        .unwrap();
     let original = first
         .append_text(append("ひみつ"))
         .await
         .unwrap()
         .into_inner();
     assert_eq!(original.composing_text.as_ref().unwrap().hiragana, "ひみつ");
+
+    // Unsupported reconversion by the existing owner must retain that owner's
+    // input and authority; the non-owner requests below must still be denied.
+    let skipped = first
+        .start_reconversion(unsupported)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!skipped.applied);
 
     let handshake = second.append_text(append("")).await.unwrap().into_inner();
     assert_eq!(handshake.server_session_id, original.server_session_id);
