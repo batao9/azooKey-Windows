@@ -12,6 +12,8 @@
 [Release](https://github.com/batao9/azooKey-Windows/releases)からazookey-setup.exeをダウンロードし、インストーラーを実行してください。
 こちらは [fkunn1326/azooKey-Windows](https://github.com/fkunn1326/azooKey-Windows) の fork ですので注意してください。
 
+インストールには管理者権限が必要です。インストール後は標準ユーザーを含む各ログオンセッションで launcher・変換サーバー・候補 UI が通常権限で自動起動し、サーバーの再起動要求は操作したセッションにのみ作用します。
+
 # 機能
 
 - [x] ライブ変換
@@ -129,7 +131,7 @@ cargo make build [--debug/--release]
 
 配布用インストーラーは Inno Setup で作成する `build/azookey-setup.exe` の 1 種類です。Tauri は設定アプリ `frontend.exe` のビルドにのみ使用し、Tauri/NSIS インストーラーは生成・同梱しません。`frontend.exe` を含むアプリ本体、IME DLL、サーバー、UI、ランチャー、辞書、Zenzai model、llama backend は Inno installer が `{autopf}\Azookey`（通常は `C:\Program Files\Azookey`）に配置します。設定・学習・ログ・`EngineRuntime` は `%APPDATA%\Azookey`、候補 UI の WebView2 data は `%LOCALAPPDATA%\Azookey\ui-webview` に保存します。
 
-`launcher.exe`を管理者権限で実行すると、azookeyの変換エンジンが起動します。
+`launcher.exe`を通常権限で実行すると、そのログオンセッションの azookey の変換エンジンと候補 UI が起動します。
 
 また、IMEを登録する際は以下のように`regsvr32.exe`を使用して登録する必要があります。
 ```c

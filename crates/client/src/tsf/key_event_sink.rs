@@ -168,6 +168,7 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
         if !fforeground.as_bool() {
             self.clear_tracked_modifier_key_state();
             self.clear_reconversion_test_result();
+            self.end_composition_for_tsf_event();
             self.set_keyboard_disabled_state(true)?;
         }
 

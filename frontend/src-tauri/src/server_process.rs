@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result};
-use shared::AppConfig;
+use shared::{launcher_pipe_path, AppConfig};
 use std::{
     ffi::OsString,
     os::windows::ffi::OsStringExt as _,
@@ -17,25 +17,25 @@ use windows::{
     core::PWSTR,
     Win32::{
         Foundation::{
-            CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY,
+            CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY, HANDLE,
             WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
+        Security::{GetTokenInformation, TokenSessionId, TOKEN_QUERY},
         System::{
             Diagnostics::ToolHelp::{
                 CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
                 TH32CS_SNAPPROCESS,
             },
             Threading::{
-                OpenProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
-                PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-                PROCESS_TERMINATE,
+                OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, TerminateProcess,
+                WaitForSingleObject, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
             },
         },
     },
 };
 
 const SERVER_EXE_NAME: &str = "azookey-server.exe";
-const LAUNCHER_PIPE_PATH: &str = r"\\.\pipe\azookey_launcher";
 const LAUNCHER_RESTART_COMMAND: &[u8] = b"restart-server\n";
 const LAUNCHER_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const LAUNCHER_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -101,10 +101,11 @@ fn request_launcher_restart() -> Result<bool> {
 }
 
 async fn open_launcher_pipe() -> Result<Option<NamedPipeClient>> {
+    let pipe_path = launcher_pipe_path()?;
     let started_at = Instant::now();
 
     loop {
-        match ClientOptions::new().open(LAUNCHER_PIPE_PATH) {
+        match ClientOptions::new().open(pipe_path) {
             Ok(client) => return Ok(Some(client)),
             Err(error) if launcher_pipe_missing(error.raw_os_error()) => return Ok(None),
             Err(error)
@@ -151,6 +152,7 @@ fn resolve_server_path() -> Result<PathBuf> {
 }
 
 fn matching_server_process_ids(target: &str) -> Result<Vec<u32>> {
+    let session_id = process_session_id(std::process::id())?;
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)? };
     let _snapshot_guard = HandleGuard(snapshot);
 
@@ -165,9 +167,10 @@ fn matching_server_process_ids(target: &str) -> Result<Vec<u32>> {
     while has_entry {
         if wide_null_terminated_to_string(&entry.szExeFile).eq_ignore_ascii_case(SERVER_EXE_NAME) {
             let process_id = entry.th32ProcessID;
-            if process_image_path(process_id)
-                .map(|path| normalize_path(&path) == target)
-                .unwrap_or(false)
+            if process_session_id(process_id).ok() == Some(session_id)
+                && process_image_path(process_id)
+                    .map(|path| normalize_path(&path) == target)
+                    .unwrap_or(false)
             {
                 process_ids.push(process_id);
             }
@@ -177,6 +180,27 @@ fn matching_server_process_ids(target: &str) -> Result<Vec<u32>> {
     }
 
     Ok(process_ids)
+}
+
+fn process_session_id(process_id: u32) -> Result<u32> {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id)? };
+    let _process_guard = HandleGuard(process);
+    let mut token = HANDLE::default();
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }?;
+    let _token_guard = HandleGuard(token);
+    let mut session_id = 0u32;
+    let mut returned_length = 0;
+    unsafe {
+        GetTokenInformation(
+            token,
+            TokenSessionId,
+            Some((&mut session_id as *mut u32).cast()),
+            std::mem::size_of::<u32>() as u32,
+            &mut returned_length,
+        )
+    }
+    .context("Failed to get process session")?;
+    Ok(session_id)
 }
 
 fn terminate_process(process_id: u32) -> Result<()> {

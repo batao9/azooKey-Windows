@@ -12,14 +12,21 @@ use std::{
     error::Error as StdError,
     fmt,
     future::Future,
+    io,
     os::windows::io::IntoRawHandle,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
-use tokio::{net::windows::named_pipe::NamedPipeClient, time};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::windows::named_pipe::NamedPipeClient,
+    time,
+};
 use tonic::transport::{channel::Channel, Endpoint};
 use tower::service_fn;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY};
@@ -69,8 +76,86 @@ pub struct IPCService {
     server_session_id: Option<u64>,
     server_reset_recovered: bool,
     recovery: Arc<ServerRecoveryState>,
+    transport: Arc<TransportLifecycle>,
     #[cfg(test)]
     recovery_error_for_test: bool,
+    #[cfg(test)]
+    reconnect_channel_for_test: Option<Channel>,
+}
+
+#[derive(Debug, Default)]
+struct TransportLifecycle {
+    opened: AtomicBool,
+    retired: AtomicBool,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+impl TransportLifecycle {
+    fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        self.wake.notify_waiters();
+    }
+}
+
+// Channel clones (including the logging worker) must not keep an old owner
+// alive. Retirement wakes the transport's pending read and closes the real pipe.
+struct RetirableIo<T> {
+    inner: Option<T>,
+    lifecycle: Arc<TransportLifecycle>,
+    retired: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl<T: Unpin> RetirableIo<T> {
+    fn new(inner: T, lifecycle: Arc<TransportLifecycle>) -> Self {
+        let wake = lifecycle.wake.clone();
+        let retired = Box::pin(async move { wake.notified().await });
+        Self {
+            inner: Some(inner),
+            lifecycle,
+            retired,
+        }
+    }
+
+    fn io(&mut self, cx: &mut Context<'_>) -> io::Result<Pin<&mut T>> {
+        if self.retired.as_mut().poll(cx).is_ready()
+            || self.lifecycle.retired.load(Ordering::Acquire)
+        {
+            self.inner.take();
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "retired IPC transport",
+            ));
+        }
+        Ok(Pin::new(self.inner.as_mut().expect("live transport")))
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for RetirableIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.get_mut().io(cx)?.poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for RetirableIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.get_mut().io(cx)?.poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().io(cx)?.poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().io(cx)?.poll_shutdown(cx)
+    }
 }
 
 #[derive(Debug)]
@@ -80,6 +165,7 @@ struct ServerRecoveryState {
     restart_completed_generation: AtomicU64,
     restart_request_in_flight: AtomicBool,
     input_ledger: Mutex<InputLedger>,
+    context_epoch: AtomicU64,
 }
 
 impl Default for ServerRecoveryState {
@@ -89,6 +175,7 @@ impl Default for ServerRecoveryState {
             generation: AtomicU64::new(0),
             restart_completed_generation: AtomicU64::new(0),
             restart_request_in_flight: AtomicBool::new(false),
+            context_epoch: AtomicU64::new(0),
             input_ledger: Mutex::new(InputLedger {
                 operations: Vec::new(),
                 complete: true,
@@ -125,12 +212,6 @@ pub(crate) struct TextRemoval {
 pub(crate) struct ReconversionResult {
     pub(crate) candidates: Candidates,
     pub(crate) selection_index: i32,
-}
-
-#[derive(Debug)]
-struct CursorMove {
-    candidates: Candidates,
-    raw_input: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -180,10 +261,17 @@ pub(crate) fn is_non_destructive_ipc_error(error: &anyhow::Error) -> bool {
             matches!(
                 status.code(),
                 tonic::Code::InvalidArgument
+                    | tonic::Code::PermissionDenied
                     | tonic::Code::OutOfRange
                     | tonic::Code::FailedPrecondition
             )
         })
+}
+
+pub(crate) fn is_ipc_permission_denied(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<tonic::Status>()
+        .is_some_and(|status| status.code() == tonic::Code::PermissionDenied)
 }
 
 pub(crate) fn requires_ipc_recovery(error: &anyhow::Error) -> bool {
@@ -191,7 +279,7 @@ pub(crate) fn requires_ipc_recovery(error: &anyhow::Error) -> bool {
 }
 
 fn preserve_recovery_error(error: anyhow::Error) -> anyhow::Error {
-    if is_ipc_deadline(&error) {
+    if is_non_destructive_ipc_error(&error) {
         error
     } else {
         IpcRecoveryPending {
@@ -338,16 +426,14 @@ enum NonIdempotentEditAttempt<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NonIdempotentEditRecovery {
     None,
-    RetriedAfterUnchangedRefresh,
-    RefreshedAfterReconnect,
+    RetriedAfterReconstruction,
 }
 
 impl NonIdempotentEditRecovery {
     fn log_value(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::RetriedAfterUnchangedRefresh => "retry_after_unchanged_refresh",
-            Self::RefreshedAfterReconnect => "refresh_after_reconnect",
+            Self::RetriedAfterReconstruction => "retry_after_reconstruction",
         }
     }
 }
@@ -473,6 +559,8 @@ impl IPCService {
                 ..ServerRecoveryState::default()
             }),
             recovery_error_for_test: true,
+            reconnect_channel_for_test: None,
+            transport: Arc::new(TransportLifecycle::default()),
         }
     }
 
@@ -487,18 +575,21 @@ impl IPCService {
     pub fn new() -> Result<Self> {
         let runtime = Arc::new(tokio::runtime::Runtime::new()?);
         let connection_id = IPC_CONNECTION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let transport = Arc::new(TransportLifecycle::default());
 
         let server_channel = Self::connect_named_pipe_channel(
             &runtime,
             "http://[::]:50051",
-            shared::SERVER_PIPE_PATH,
+            shared::server_pipe_path()?,
             SERVER_PIPE_BUSY_TIMEOUT,
+            Some(transport.clone()),
         )?;
         let window_client = match Self::connect_named_pipe_channel(
             &runtime,
             "http://[::]:50052",
-            shared::UI_PIPE_PATH,
+            shared::ui_pipe_path()?,
             UI_PIPE_BUSY_TIMEOUT,
+            None,
         ) {
             Ok(ui_channel) => Some(WindowServiceClient::new(ui_channel)),
             Err(error) => {
@@ -540,8 +631,11 @@ impl IPCService {
             server_session_id: None,
             server_reset_recovered: false,
             recovery: Arc::new(ServerRecoveryState::default()),
+            transport,
             #[cfg(test)]
             recovery_error_for_test: false,
+            #[cfg(test)]
+            reconnect_channel_for_test: None,
         })
     }
 
@@ -550,38 +644,53 @@ impl IPCService {
         endpoint: &'static str,
         pipe_name: &'static str,
         busy_timeout: Duration,
+        lifecycle: Option<Arc<TransportLifecycle>>,
     ) -> Result<Channel> {
         let endpoint = Endpoint::try_from(endpoint)?;
-        let connect = endpoint.connect_with_connector(service_fn(move |_| async move {
-            let busy_started_at = Instant::now();
-            let client = loop {
-                match open_named_pipe_client(pipe_name) {
-                    Ok(client) => break client,
-                    Err(e)
-                        if matches!(
-                            e.raw_os_error(),
-                            Some(code)
-                                if code == ERROR_PIPE_BUSY.0 as i32
-                                    || code == ERROR_FILE_NOT_FOUND.0 as i32
-                                    || code == ERROR_PATH_NOT_FOUND.0 as i32
-                        ) =>
-                    {
-                        if busy_started_at.elapsed() >= busy_timeout {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                format!(
+        let connect = endpoint.connect_with_connector(service_fn(move |_| {
+            let lifecycle = lifecycle.clone();
+            async move {
+                if lifecycle.as_ref().is_some_and(|state| {
+                    state.retired.load(Ordering::Acquire)
+                        || state.opened.swap(true, Ordering::AcqRel)
+                }) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "IPC transport requires reconstruction",
+                    ));
+                }
+                let busy_started_at = Instant::now();
+                let client = loop {
+                    match open_named_pipe_client(pipe_name) {
+                        Ok(client) => break client,
+                        Err(e)
+                            if matches!(
+                                e.raw_os_error(),
+                                Some(code)
+                                    if code == ERROR_PIPE_BUSY.0 as i32
+                                        || code == ERROR_FILE_NOT_FOUND.0 as i32
+                                        || code == ERROR_PATH_NOT_FOUND.0 as i32
+                            ) =>
+                        {
+                            if busy_started_at.elapsed() >= busy_timeout {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    format!(
                                     "{pipe_name} remained unavailable for at least {busy_timeout:?}"
                                 ),
-                            ));
+                                ));
+                            }
                         }
+                        Err(e) => return Err(e),
                     }
-                    Err(e) => return Err(e),
-                }
 
-                time::sleep(PIPE_BUSY_RETRY_INTERVAL).await;
-            };
+                    time::sleep(PIPE_BUSY_RETRY_INTERVAL).await;
+                };
 
-            Ok::<_, std::io::Error>(TokioIo::new(client))
+                let lifecycle = lifecycle.unwrap_or_default();
+                lifecycle.opened.store(true, Ordering::Release);
+                Ok::<_, std::io::Error>(TokioIo::new(RetirableIo::new(client, lifecycle)))
+            }
         }));
         let channel = runtime.block_on(async {
             time::timeout(IPC_CONNECT_DEADLINE, connect)
@@ -632,12 +741,42 @@ impl IPCService {
     }
 
     fn reconnect(&mut self) -> anyhow::Result<()> {
+        // A new server-assigned transport identity cannot refresh the old
+        // composition. Only a complete edit ledger is trustworthy for replay.
+        let ledger = self.input_ledger_snapshot().0;
+        if !ledger.complete {
+            // Successful clause edits can invalidate the relative ledger. The
+            // existing recovery path rebuilds from the client's current raw
+            // input and reconciles clause caches before replaying deferred input.
+            self.require_server_recovery("reconnect_incomplete_ledger");
+            return Err(self.recovery_pending_error());
+        }
+        self.reconnect_transport()?;
+        self.send_replace_composition(&ledger, current_or_next_request_id())?;
+        self.server_reset_recovered = false;
+        Ok(())
+    }
+
+    fn reconnect_transport(&mut self) -> anyhow::Result<()> {
+        self.transport.retire();
+        #[cfg(test)]
+        if let Some(channel) = self.reconnect_channel_for_test.as_ref() {
+            self.azookey_client = AzookeyServiceClient::new(channel.clone());
+            self.connection_id = IPC_CONNECTION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            self.transport = Arc::new(TransportLifecycle::default());
+            return Ok(());
+        }
+        #[cfg(test)]
+        if self.recovery_error_for_test {
+            return Err(self.recovery_pending_error());
+        }
         let refreshed = Self::new()?;
         self.connection_id = refreshed.connection_id;
         self.azookey_client = refreshed.azookey_client;
         self.window_client = refreshed.window_client;
         self.runtime = refreshed.runtime;
         self.performance_log_tx = refreshed.performance_log_tx;
+        self.transport = refreshed.transport;
         Ok(())
     }
 
@@ -874,7 +1013,12 @@ impl IPCService {
                     "{operation} first attempt failed, reconnecting IPC once: {first_error:?}"
                 );
 
-                match self.reconnect() {
+                let reconnect = if matches!(operation, "clear_text" | "start_reconversion") {
+                    self.reconnect_transport()
+                } else {
+                    self.reconnect()
+                };
+                match reconnect {
                     Ok(()) => {
                         tracing::info!("{operation} IPC reconnect succeeded, retrying request");
                     }
@@ -912,25 +1056,11 @@ impl IPCService {
                 }
 
                 tracing::warn!(
-                    "{operation} first attempt failed, reconnecting IPC once without replaying edit RPC: {first_error:?}"
+                    "{operation} first attempt failed, reconstructing composition before retry: {first_error:?}"
                 );
                 Ok(NonIdempotentEditAttempt::ReconnectAndRefresh(first_error))
             }
         }
-    }
-
-    #[inline]
-    fn should_retry_non_idempotent_edit_after_refresh(
-        previous_candidates: Option<&Candidates>,
-        refreshed_candidates: &Candidates,
-        previous_raw_input: Option<&str>,
-        refreshed_raw_input: Option<&str>,
-    ) -> bool {
-        previous_candidates.is_some_and(|previous| {
-            previous.has_same_composition(refreshed_candidates)
-                && !refreshed_candidates.is_empty_composition()
-                && previous_raw_input.is_none_or(|previous| refreshed_raw_input == Some(previous))
-        })
     }
 
     fn verified_remove_raw_input(
@@ -954,9 +1084,9 @@ impl IPCService {
     fn run_non_idempotent_edit_with_reconnect(
         &mut self,
         operation: &str,
-        request_id: u64,
-        previous_candidates: Option<&Candidates>,
-        previous_raw_input: Option<&str>,
+        _request_id: u64,
+        _previous_candidates: Option<&Candidates>,
+        _previous_raw_input: Option<&str>,
         mut send: impl FnMut(&mut Self) -> anyhow::Result<Candidates>,
     ) -> anyhow::Result<(Candidates, NonIdempotentEditRecovery, Option<String>)> {
         match Self::classify_non_idempotent_edit_attempt(operation, send(self))? {
@@ -967,7 +1097,7 @@ impl IPCService {
                 match self.reconnect() {
                     Ok(()) => {
                         tracing::info!(
-                            "{operation} IPC reconnect succeeded, refreshing server composition without replaying edit RPC"
+                            "{operation} IPC reconnect reconstructed the acknowledged composition"
                         );
                     }
                     Err(reconnect_error) => {
@@ -978,48 +1108,13 @@ impl IPCService {
                     }
                 }
 
-                // remove_text, shrink_text, and non-zero move_cursor may have already
-                // changed server state before the transport broke. Refresh first, and
-                // only replay the edit if the server state is still the previous one.
-                match self.send_move_cursor_with_raw_input(0, request_id) {
-                    Ok(refreshed) => {
-                        let refreshed_candidates = refreshed.candidates;
-                        if Self::should_retry_non_idempotent_edit_after_refresh(
-                            previous_candidates,
-                            &refreshed_candidates,
-                            previous_raw_input,
-                            refreshed.raw_input.as_deref(),
-                        ) {
-                            tracing::warn!(
-                                "{operation} refreshed unchanged composition after reconnect, retrying edit RPC once"
-                            );
-                            let candidates = send(self)?;
-                            return Ok((
-                                candidates,
-                                NonIdempotentEditRecovery::RetriedAfterUnchangedRefresh,
-                                None,
-                            ));
-                        }
-
-                        // The edit may have completed before the connection failed, but
-                        // refresh alone cannot safely reproduce that mutation in the local
-                        // recovery ledger. Discard it so a later deadline recovery cannot
-                        // rebuild the pre-edit composition and resurrect removed text or an
-                        // old cursor position.
-                        self.invalidate_input_ledger();
-                        Ok((
-                            refreshed_candidates,
-                            NonIdempotentEditRecovery::RefreshedAfterReconnect,
-                            refreshed.raw_input,
-                        ))
-                    }
-                    Err(refresh_error) => {
-                        tracing::error!(
-                            "{operation} refresh failed after IPC reconnect: {refresh_error:?}"
-                        );
-                        Err(refresh_error)
-                    }
-                }
+                // ReplaceComposition rebuilt the acknowledged pre-edit ledger,
+                // so replay exactly once even if the old transport applied it.
+                Ok((
+                    send(self)?,
+                    NonIdempotentEditRecovery::RetriedAfterReconstruction,
+                    None,
+                ))
             }
         }
     }
@@ -1066,9 +1161,6 @@ impl IPCService {
             INPUT_RPC_DEADLINE,
             self.azookey_client.append_text(request),
         );
-        if response.is_err() && !response.as_ref().is_err_and(is_ipc_deadline) {
-            self.invalidate_input_ledger();
-        }
         let response = response?;
         let response = response.into_inner();
         self.observe_server_session("append_text", response.server_session_id);
@@ -1302,11 +1394,7 @@ impl IPCService {
         Ok((advances, response.completed))
     }
 
-    fn send_move_cursor_with_raw_input(
-        &mut self,
-        offset: i32,
-        request_id: u64,
-    ) -> anyhow::Result<CursorMove> {
+    fn send_move_cursor(&mut self, offset: i32, request_id: u64) -> anyhow::Result<Candidates> {
         let mut request =
             tonic::Request::new(shared::proto::MoveCursorRequest { offset, request_id });
         request.set_timeout(INPUT_RPC_DEADLINE);
@@ -1320,15 +1408,7 @@ impl IPCService {
         let response = response.into_inner();
         self.observe_server_session("move_cursor", response.server_session_id);
         self.record_successful_move(offset);
-        Ok(CursorMove {
-            candidates: Self::candidates_from_composing_text(response.composing_text)?,
-            raw_input: response.raw_input,
-        })
-    }
-
-    fn send_move_cursor(&mut self, offset: i32, request_id: u64) -> anyhow::Result<Candidates> {
-        self.send_move_cursor_with_raw_input(offset, request_id)
-            .map(|result| result.candidates)
+        Self::candidates_from_composing_text(response.composing_text)
     }
 
     fn send_adjust_clause_boundary(
@@ -1469,6 +1549,7 @@ impl IPCService {
         )?
         .into_inner();
         self.observe_server_session("replace_composition", response.server_session_id);
+        self.recovery.context_epoch.fetch_add(1, Ordering::AcqRel);
         if let Ok(mut ledger) = self.recovery.input_ledger.lock() {
             *ledger = input_ledger.clone();
         }
@@ -1488,7 +1569,7 @@ impl IPCService {
         }
 
         #[cfg(test)]
-        if self.recovery_error_for_test {
+        if self.recovery_error_for_test && self.reconnect_channel_for_test.is_none() {
             return Err(self.recovery_pending_error());
         }
 
@@ -1502,7 +1583,8 @@ impl IPCService {
             .map(|ledger| ledger.clone())
             .unwrap_or_else(|| fallback_input_ledger(raw_input, raw_hiragana));
 
-        self.reconnect().map_err(preserve_recovery_error)?;
+        self.reconnect_transport()
+            .map_err(preserve_recovery_error)?;
         let candidates = self
             .send_replace_composition(&input_ledger, current_or_next_request_id())
             .map_err(preserve_recovery_error)?;
@@ -1526,6 +1608,13 @@ impl IPCService {
 
     pub(crate) fn connection_id(&self) -> u64 {
         self.connection_id
+    }
+
+    pub(crate) fn context_cache_key(&self) -> (u64, u64) {
+        (
+            self.connection_id,
+            self.recovery.context_epoch.load(Ordering::Acquire),
+        )
     }
 
     fn enqueue_client_performance(
@@ -1625,25 +1714,6 @@ impl IPCService {
         self.append_text_with_style_and_context(text, input_style, None)
     }
 
-    #[inline]
-    fn should_retry_append_after_refresh(
-        previous_candidates: Option<&Candidates>,
-        refreshed_candidates: &Candidates,
-    ) -> bool {
-        previous_candidates.is_some_and(|previous| {
-            previous.has_same_composition(refreshed_candidates)
-                || refreshed_candidates.is_empty_composition()
-        })
-    }
-
-    #[inline]
-    fn should_reset_client_composition_after_append_refresh(
-        previous_candidates: Option<&Candidates>,
-        refreshed_candidates: &Candidates,
-    ) -> bool {
-        previous_candidates.is_some() && refreshed_candidates.is_empty_composition()
-    }
-
     #[tracing::instrument]
     fn append_text_with_style_and_context(
         &mut self,
@@ -1671,11 +1741,16 @@ impl IPCService {
                     text.chars().count()
                 );
 
-                match self.reconnect() {
+                let reconnect = if text.is_empty() {
+                    // The initialization handshake must stay claim-free even
+                    // after a disconnect while another transport owns input.
+                    self.reconnect_transport()
+                } else {
+                    self.reconnect()
+                };
+                match reconnect {
                     Ok(()) => {
-                        tracing::info!(
-                            "append_text IPC reconnect succeeded (style={input_style}), refreshing current composition"
-                        );
+                        tracing::info!("append_text IPC reconnect succeeded (style={input_style})");
                     }
                     Err(reconnect_error) => {
                         tracing::error!(
@@ -1697,77 +1772,9 @@ impl IPCService {
                     }
                 }
 
-                match self.send_move_cursor(0, request_id) {
-                    Ok(candidates) => {
-                        if Self::should_retry_append_after_refresh(previous_candidates, &candidates)
-                        {
-                            if Self::should_reset_client_composition_after_append_refresh(
-                                previous_candidates,
-                                &candidates,
-                            ) {
-                                self.server_reset_recovered = true;
-                                tracing::warn!(
-                                    "append_text recovered empty composition after reconnect (style={input_style}); client composition reset required"
-                                );
-                            }
-                            tracing::warn!(
-                                "append_text recovered unchanged composition after reconnect (style={input_style}), retrying original input"
-                            );
-                            let retry_response = send(self)?;
-                            let candidates = Self::candidates_from_composing_text(
-                                retry_response.composing_text,
-                            )?;
-                            self.log_client_performance_from_start(
-                                performance_start,
-                                request_id,
-                                "append_text",
-                                "rpc_total",
-                                || {
-                                    let input_len = input_len.unwrap_or_default();
-                                    format!(
-                                        "status=success;retry=true;input_len={input_len};input_style={input_style}"
-                                    )
-                                },
-                            );
-                            return Ok(candidates);
-                        }
-
-                        tracing::info!(
-                            "append_text recovered changed composition after reconnect (style={input_style}), reusing server state"
-                        );
-                        self.log_client_performance_from_start(
-                            performance_start,
-                            request_id,
-                            "append_text",
-                            "rpc_total",
-                            || {
-                                let input_len = input_len.unwrap_or_default();
-                                format!(
-                                    "status=recovered_changed;input_len={input_len};input_style={input_style}"
-                                )
-                            },
-                        );
-                        return Ok(candidates);
-                    }
-                    Err(refresh_error) => {
-                        tracing::error!(
-                            "append_text refresh failed after reconnect (style={input_style}): {refresh_error:?}"
-                        );
-                        self.log_client_performance_from_start(
-                            performance_start,
-                            request_id,
-                            "append_text",
-                            "rpc_total",
-                            || {
-                                let input_len = input_len.unwrap_or_default();
-                                format!(
-                                    "status=error;phase=refresh;input_len={input_len};input_style={input_style}"
-                                )
-                            },
-                        );
-                        return Err(refresh_error);
-                    }
-                }
+                // The old input ledger survived the ambiguous failure and has
+                // now been replaced absolutely. Append the new input once.
+                send(self)?
             }
         };
         let candidates = Self::candidates_from_composing_text(response.composing_text)?;
@@ -1849,6 +1856,8 @@ impl IPCService {
 
     #[tracing::instrument]
     pub fn clear_text(&mut self) -> anyhow::Result<()> {
+        // Shared by all IPC clones: ClearText also clears the server context.
+        self.recovery.context_epoch.fetch_add(1, Ordering::AcqRel);
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
         let result =
@@ -2069,16 +2078,9 @@ impl IPCService {
                 Err(error) => format!("status=error;offset={offset};error={error:?}"),
             },
         );
-        let (navigation, _, _) = result?;
-        Ok(
-            completed_advance.unwrap_or_else(|| super::composition::ClauseAdvance {
-                // If the transport failed after the server had already advanced,
-                // refresh can recover only the current navigation candidates.
-                shrunk: navigation.clone(),
-                navigation,
-                raw_input: super::composition::ClauseAdvanceRawInput::Unavailable,
-            }),
-        )
+        result?;
+        completed_advance
+            .ok_or_else(|| anyhow::anyhow!("advance_clause completed without a verified response"))
     }
 
     #[tracing::instrument(skip(self, previous_candidates))]
@@ -2292,11 +2294,11 @@ impl IPCService {
         result
     }
 
-    #[tracing::instrument(skip(self, previous_candidates))]
+    #[tracing::instrument(skip(self, _previous_candidates))]
     pub(crate) fn update_composition_snapshot(
         &mut self,
         operation: ClauseSnapshotOperation,
-        previous_candidates: &Candidates,
+        _previous_candidates: &Candidates,
         selected_candidate_id: u64,
     ) -> anyhow::Result<()> {
         let request_id = current_or_next_request_id();
@@ -2319,22 +2321,15 @@ impl IPCService {
                         reconnect_error
                     })?;
 
-                    let refreshed_candidates = self.send_move_cursor(0, request_id)?;
-                    if Self::should_retry_non_idempotent_edit_after_refresh(
-                        Some(previous_candidates),
-                        &refreshed_candidates,
-                        None,
-                        None,
-                    ) {
-                        self.send_update_composition_snapshot(
-                            operation,
-                            selected_candidate_id,
-                            request_id,
-                        )?;
-                        Ok(NonIdempotentEditRecovery::RetriedAfterUnchangedRefresh)
-                    } else {
-                        Ok(NonIdempotentEditRecovery::RefreshedAfterReconnect)
+                    if operation != ClauseSnapshotOperation::Clear {
+                        // ReplaceComposition cannot rebuild the server snapshot
+                        // stack or its candidate IDs. Never report a lost Pop as
+                        // successful against the newly empty snapshot stack.
+                        self.require_server_recovery("reconnect_lost_snapshots");
+                        return Err(self.recovery_pending_error());
                     }
+                    self.send_update_composition_snapshot(operation, 0, request_id)?;
+                    Ok(NonIdempotentEditRecovery::RetriedAfterReconstruction)
                 }
             })();
         self.log_client_performance_from_start(
@@ -2394,8 +2389,9 @@ impl IPCService {
             match Self::connect_named_pipe_channel(
                 self.runtime.as_ref(),
                 "http://[::]:50052",
-                shared::UI_PIPE_PATH,
+                shared::ui_pipe_path().ok()?,
                 UI_PIPE_BUSY_TIMEOUT,
+                None,
             ) {
                 Ok(ui_channel) => {
                     tracing::info!(
@@ -2775,12 +2771,12 @@ impl IPCService {
 mod tests {
     use super::{
         append_input_segment, await_rpc_with_deadline, fallback_input_ledger,
-        is_non_destructive_ipc_error, mark_input_ledger_incomplete, move_input_cursor,
-        pop_input_segment_character, preserve_recovery_error, recovery_generation_is_current,
-        requires_ipc_recovery, restart_generation_ready, restart_request_needed, Candidates,
-        ClauseSnapshotOperation, CompositionOperation, IPCService, InputLedger,
-        IpcDeadlineExceeded, NonIdempotentEditAttempt, ServerRecoveryState, INPUT_STYLE_DIRECT,
-        INPUT_STYLE_ROMAN2KANA,
+        is_ipc_permission_denied, is_non_destructive_ipc_error, mark_input_ledger_incomplete,
+        move_input_cursor, pop_input_segment_character, preserve_recovery_error,
+        recovery_generation_is_current, requires_ipc_recovery, restart_generation_ready,
+        restart_request_needed, Candidates, ClauseSnapshotOperation, CompositionOperation,
+        IPCService, InputLedger, IpcDeadlineExceeded, NonIdempotentEditAttempt, RetirableIo,
+        ServerRecoveryState, TransportLifecycle, INPUT_STYLE_DIRECT, INPUT_STYLE_ROMAN2KANA,
     };
     use std::{
         future::Future,
@@ -2809,6 +2805,488 @@ mod tests {
         fn drop(&mut self) {
             self.dropped.store(true, Ordering::Release);
         }
+    }
+
+    #[test]
+    fn retired_transport_closes_pipe_even_while_channel_clones_remain() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct WakeFlag(Arc<AtomicBool>);
+        impl std::task::Wake for WakeFlag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let lifecycle = Arc::new(TransportLifecycle::default());
+            let logging_clone = lifecycle.clone();
+            let (client, mut server) = tokio::io::duplex(8);
+            let mut client = RetirableIo::new(client, lifecycle.clone());
+            server.write_all(b"a").await.unwrap();
+            let mut buf = [0];
+            client.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf, [b'a']);
+
+            // Poll a blocked read before retirement, as tonic does on an idle
+            // channel. Retirement must wake it, rather than wait for more I/O.
+            let mut read = Box::pin(client.read(&mut buf));
+            let awakened = Arc::new(AtomicBool::new(false));
+            let waker = std::task::Waker::from(Arc::new(WakeFlag(awakened.clone())));
+            assert!(read
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending());
+            lifecycle.retire();
+            assert!(awakened.load(Ordering::Acquire));
+            let error = tokio::time::timeout(Duration::from_secs(1), read)
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+            assert_eq!(server.read(&mut [0]).await.unwrap(), 0);
+            assert!(logging_clone.retired.load(Ordering::Acquire));
+        });
+    }
+
+    #[test]
+    fn permission_denied_preserves_mutation_ledger_without_reconnect_or_restart() {
+        let mut service = IPCService::recovery_for_test(false);
+        service.record_successful_append("tya", INPUT_STYLE_ROMAN2KANA);
+        service.record_successful_remove();
+        service.record_successful_append("k", INPUT_STYLE_ROMAN2KANA);
+        let before = service.input_ledger_snapshot().0;
+        let mut attempts = 0;
+        let error = service
+            .run_non_idempotent_edit_with_reconnect("remove_text", 1, None, Some("k"), |_| {
+                attempts += 1;
+                Err(tonic::Status::permission_denied("another live owner").into())
+            })
+            .unwrap_err();
+
+        assert_eq!(attempts, 1);
+        assert!(is_ipc_permission_denied(&error));
+        assert!(is_non_destructive_ipc_error(&error));
+        assert!(!requires_ipc_recovery(&error));
+        assert!(!service.recovery_pending());
+        assert!(!service.transport.retired.load(Ordering::Acquire));
+        assert_eq!(service.input_ledger_snapshot().0, before);
+        let preserved = preserve_recovery_error(error);
+        assert!(is_ipc_permission_denied(&preserved));
+        assert!(!requires_ipc_recovery(&preserved));
+    }
+
+    #[test]
+    fn reconnect_incomplete_ledger_defers_input_until_fallback_recovery_is_ready() {
+        let mut service = IPCService::recovery_for_test(false);
+        service.record_successful_append("ka", INPUT_STYLE_ROMAN2KANA);
+        service.invalidate_input_ledger();
+        let before = service.input_ledger_snapshot().0;
+        let error = service.reconnect().unwrap_err();
+        assert!(is_non_destructive_ipc_error(&error));
+        assert!(requires_ipc_recovery(&error));
+        assert!(service.recovery_pending());
+        assert!(!service.recovery_restart_ready());
+        assert_eq!(service.input_ledger_snapshot().0, before);
+        service.complete_restart_for_test();
+        assert!(service.recovery_restart_ready());
+    }
+
+    use shared::proto::{ReplaceCompositionRequest, ReplaceCompositionResponse};
+    use tonic::codegen::{http, BoxFuture, Service};
+
+    #[derive(Clone)]
+    struct Probe {
+        requests: Arc<std::sync::Mutex<Vec<ReplaceCompositionRequest>>>,
+        deny: Arc<AtomicBool>,
+        unavailable: Arc<AtomicBool>,
+    }
+    impl tonic::server::NamedService for Probe {
+        const NAME: &'static str = "azookey.AzookeyService";
+    }
+    impl tonic::server::UnaryService<ReplaceCompositionRequest> for Probe {
+        type Response = ReplaceCompositionResponse;
+        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+        fn call(&mut self, request: tonic::Request<ReplaceCompositionRequest>) -> Self::Future {
+            let request = request.into_inner();
+            let reading = match request
+                .operations
+                .first()
+                .map(|operation| operation.text.as_str())
+            {
+                Some("na") => "な",
+                Some("kana") => "かな",
+                _ => "",
+            };
+            self.requests.lock().unwrap().push(request);
+            let denied = self.deny.load(Ordering::Acquire);
+            Box::pin(async move {
+                if denied {
+                    return Err(tonic::Status::permission_denied("another live owner"));
+                }
+                Ok(tonic::Response::new(ReplaceCompositionResponse {
+                    composing_text: Some(probe_composing_text(reading)),
+                    server_session_id: 7,
+                }))
+            })
+        }
+    }
+    fn probe_composing_text(reading: &str) -> shared::proto::ComposingText {
+        shared::proto::ComposingText {
+            hiragana: reading.to_string(),
+            suggestions: vec![shared::proto::Suggestion {
+                text: reading.to_string(),
+                corresponding_count: reading.chars().count() as i32,
+                candidate_id: 1,
+                ..Default::default()
+            }],
+        }
+    }
+
+    struct AdvanceProbe;
+    impl tonic::server::UnaryService<shared::proto::AdvanceClauseRequest> for AdvanceProbe {
+        type Response = shared::proto::AdvanceClauseResponse;
+        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+        fn call(&mut self, _: tonic::Request<shared::proto::AdvanceClauseRequest>) -> Self::Future {
+            Box::pin(async {
+                Ok(tonic::Response::new(shared::proto::AdvanceClauseResponse {
+                    shrunk_text: Some(probe_composing_text("な")),
+                    navigation_text: Some(probe_composing_text("な")),
+                    raw_input: "na".into(),
+                    server_session_id: 7,
+                }))
+            })
+        }
+    }
+
+    struct AdjustmentProbe;
+    impl tonic::server::UnaryService<shared::proto::AdjustClauseBoundaryRequest> for AdjustmentProbe {
+        type Response = shared::proto::AdjustClauseBoundaryResponse;
+        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+        fn call(
+            &mut self,
+            _: tonic::Request<shared::proto::AdjustClauseBoundaryRequest>,
+        ) -> Self::Future {
+            Box::pin(async {
+                Ok(tonic::Response::new(
+                    shared::proto::AdjustClauseBoundaryResponse {
+                        composing_text: Some(probe_composing_text("かな")),
+                        applied: true,
+                        adjusted_input_count: 2,
+                        cursor_offset: 1,
+                        server_session_id: 7,
+                    },
+                ))
+            })
+        }
+    }
+
+    impl Probe {
+        // Match the Tonic error type used by the RPCs under test.
+        #[allow(clippy::result_large_err)]
+        fn mutation_status(&self) -> Result<(), tonic::Status> {
+            if self.unavailable.load(Ordering::Acquire) {
+                Err(tonic::Status::unavailable(
+                    "transport closed after clause edit",
+                ))
+            } else if self.deny.load(Ordering::Acquire) {
+                Err(tonic::Status::permission_denied("another live owner"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    impl tonic::server::UnaryService<shared::proto::AppendTextRequest> for Probe {
+        type Response = shared::proto::AppendTextResponse;
+        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+        fn call(&mut self, _: tonic::Request<shared::proto::AppendTextRequest>) -> Self::Future {
+            let status = self.mutation_status();
+            Box::pin(async move {
+                status?;
+                Ok(tonic::Response::new(shared::proto::AppendTextResponse {
+                    composing_text: Some(probe_composing_text("なk")),
+                    server_session_id: 7,
+                }))
+            })
+        }
+    }
+    impl tonic::server::UnaryService<shared::proto::UpdateCompositionSnapshotRequest> for Probe {
+        type Response = shared::proto::UpdateCompositionSnapshotResponse;
+        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+        fn call(
+            &mut self,
+            _: tonic::Request<shared::proto::UpdateCompositionSnapshotRequest>,
+        ) -> Self::Future {
+            let status = self.mutation_status();
+            Box::pin(async move {
+                status?;
+                Ok(tonic::Response::new(
+                    shared::proto::UpdateCompositionSnapshotResponse {
+                        server_session_id: 7,
+                    },
+                ))
+            })
+        }
+    }
+    impl Service<http::Request<tonic::body::BoxBody>> for Probe {
+        type Response = http::Response<tonic::body::BoxBody>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, request: http::Request<tonic::body::BoxBody>) -> Self::Future {
+            let path = request.uri().path().to_string();
+            let probe = self.clone();
+            Box::pin(async move {
+                match path.rsplit('/').next().unwrap() {
+                    "ReplaceComposition" => {
+                        let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::<
+                            ReplaceCompositionResponse,
+                            ReplaceCompositionRequest,
+                        >::default(
+                        ));
+                        Ok(grpc.unary(probe, request).await)
+                    }
+                    "AdvanceClause" => {
+                        let mut grpc =
+                            tonic::server::Grpc::new(tonic::codec::ProstCodec::default());
+                        Ok(grpc.unary(AdvanceProbe, request).await)
+                    }
+                    "AdjustClauseBoundary" => {
+                        let mut grpc =
+                            tonic::server::Grpc::new(tonic::codec::ProstCodec::default());
+                        Ok(grpc.unary(AdjustmentProbe, request).await)
+                    }
+                    "AppendText" => {
+                        let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::<
+                            shared::proto::AppendTextResponse,
+                            shared::proto::AppendTextRequest,
+                        >::default(
+                        ));
+                        Ok(grpc.unary(probe, request).await)
+                    }
+                    "UpdateCompositionSnapshot" => {
+                        let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::<
+                            shared::proto::UpdateCompositionSnapshotResponse,
+                            shared::proto::UpdateCompositionSnapshotRequest,
+                        >::default(
+                        ));
+                        Ok(grpc.unary(probe, request).await)
+                    }
+                    _ => panic!("unexpected probe RPC: {path}"),
+                }
+            })
+        }
+    }
+    struct Incoming(tokio::net::TcpListener);
+    impl tonic::codegen::tokio_stream::Stream for Incoming {
+        type Item = std::io::Result<tokio::net::TcpStream>;
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.0
+                .poll_accept(cx)
+                .map(|result| Some(result.map(|(stream, _)| stream)))
+        }
+    }
+
+    fn recovery_rpc_service() -> (
+        IPCService,
+        Probe,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
+        let mut service = IPCService::recovery_for_test(false);
+        let probe = Probe {
+            requests: Arc::default(),
+            deny: Arc::new(AtomicBool::new(true)),
+            unavailable: Arc::new(AtomicBool::new(false)),
+        };
+        let listener = service
+            .runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = service.runtime.spawn(
+            tonic::transport::Server::builder()
+                .add_service(probe.clone())
+                .serve_with_incoming(Incoming(listener)),
+        );
+        let channel = service
+            .runtime
+            .block_on(
+                tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+                    .unwrap()
+                    .connect(),
+            )
+            .unwrap();
+        service.reconnect_channel_for_test = Some(channel.clone());
+        service.azookey_client =
+            shared::proto::azookey_service_client::AzookeyServiceClient::new(channel);
+        (service, probe, server)
+    }
+
+    #[test]
+    fn replacement_rpc_replays_mixed_mutations_and_preserves_ledger_on_owner_denial() {
+        let (mut service, probe, server) = recovery_rpc_service();
+        service.record_successful_append("tya", INPUT_STYLE_ROMAN2KANA);
+        service.record_successful_remove();
+        service.record_successful_append("あ", INPUT_STYLE_DIRECT);
+        service.record_successful_move(-1);
+        service.record_successful_append("k", INPUT_STYLE_ROMAN2KANA);
+        let before = service.input_ledger_snapshot().0;
+        assert!(before.complete);
+
+        let error = service.send_replace_composition(&before, 123).unwrap_err();
+        assert!(is_ipc_permission_denied(&error));
+        assert!(!service.recovery_pending());
+        assert_eq!(service.input_ledger_snapshot().0, before);
+        probe.deny.store(false, Ordering::Release);
+        service.send_replace_composition(&before, 123).unwrap();
+        let requests = probe.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        let operations = &requests[1].operations;
+        assert_eq!(operations.len(), 5);
+        assert_eq!(operations[0].text, "tya");
+        assert_eq!(operations[0].input_style, INPUT_STYLE_ROMAN2KANA);
+        assert_eq!(
+            operations[1].kind,
+            shared::proto::CompositionOperationKind::Remove as i32
+        );
+        assert_eq!(operations[2].text, "あ");
+        assert_eq!(operations[2].input_style, INPUT_STYLE_DIRECT);
+        assert_eq!(
+            operations[3].kind,
+            shared::proto::CompositionOperationKind::MoveCursor as i32
+        );
+        assert_eq!(operations[3].cursor_offset, -1);
+        assert_eq!(operations[4].text, "k");
+        assert_eq!(service.input_ledger_snapshot().0, before);
+        server.abort();
+    }
+
+    #[test]
+    fn successful_clause_edits_then_unavailable_transport_recover_and_continue_input() {
+        for boundary_adjustment in [false, true] {
+            let (mut service, probe, server) = recovery_rpc_service();
+            probe.deny.store(false, Ordering::Release);
+            service.record_successful_append("kana", INPUT_STYLE_ROMAN2KANA);
+            let (raw_input, reading) = if boundary_adjustment {
+                let adjustment = service
+                    .send_adjust_clause_boundary(1, 1, "kana", 1)
+                    .unwrap();
+                assert_eq!(adjustment.adjusted_input_count, Some(2));
+                ("kana", "かな")
+            } else {
+                let advance = service.send_advance_clause(2, 1, 1).unwrap();
+                assert_eq!(advance.navigation.hiragana, "な");
+                ("na", "な")
+            };
+            let before = service.input_ledger_snapshot().0;
+            assert!(!before.complete);
+
+            // A live owner's denial must never request fallback/restart even
+            // when a preceding successful clause edit left the ledger incomplete.
+            probe.deny.store(true, Ordering::Release);
+            let denied = service.append_text("k".into()).unwrap_err();
+            assert!(is_ipc_permission_denied(&denied));
+            assert!(!service.recovery_pending());
+            assert_eq!(service.input_ledger_snapshot().0, before);
+
+            probe.deny.store(false, Ordering::Release);
+            probe.unavailable.store(true, Ordering::Release);
+            let error = service.append_text("k".into()).unwrap_err();
+            assert!(requires_ipc_recovery(&error));
+            assert!(service.recovery_pending());
+            assert!(!service.recovery_restart_ready());
+            assert_eq!(service.input_ledger_snapshot().0, before);
+            assert!(probe.requests.lock().unwrap().is_empty());
+
+            service.complete_restart_for_test();
+            let recovered = service
+                .recover_composition_if_needed(raw_input, reading)
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.candidates.hiragana, reading);
+            assert!(!service.recovery_pending());
+            let ledger = service.input_ledger_snapshot().0;
+            assert!(ledger.complete);
+            assert_eq!(ledger, fallback_input_ledger(raw_input, reading));
+            let requests = probe.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].operations[0].text, raw_input);
+            assert_eq!(
+                requests[0].operations[0].input_style,
+                INPUT_STYLE_ROMAN2KANA
+            );
+            drop(requests);
+
+            probe.unavailable.store(false, Ordering::Release);
+            assert!(!service
+                .append_text("k".into())
+                .unwrap()
+                .is_empty_composition());
+            let ledger = service.input_ledger_snapshot().0;
+            assert!(ledger.complete);
+            assert_eq!(ledger.operations.len(), 2);
+            assert_eq!(
+                ledger.operations[1],
+                CompositionOperation::Append {
+                    text: "k".into(),
+                    input_style: INPUT_STYLE_ROMAN2KANA,
+                }
+            );
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn lost_snapshot_after_transport_failure_enters_typed_recovery() {
+        let (mut service, probe, server) = recovery_rpc_service();
+        service.record_successful_append("kana", INPUT_STYLE_ROMAN2KANA);
+        let before = service.input_ledger_snapshot().0;
+        let denied = service
+            .update_composition_snapshot(ClauseSnapshotOperation::Pop, &Candidates::default(), 1)
+            .unwrap_err();
+        assert!(is_ipc_permission_denied(&denied));
+        assert!(!service.recovery_pending());
+        probe.unavailable.store(true, Ordering::Release);
+        // If reconnect reaches a different live owner, ReplaceComposition is
+        // denied. Do not treat that as a lost-snapshot reason to restart it.
+        let denied = service
+            .update_composition_snapshot(ClauseSnapshotOperation::Pop, &Candidates::default(), 1)
+            .unwrap_err();
+        assert!(is_ipc_permission_denied(&denied));
+        assert!(!service.recovery_pending());
+        assert_eq!(service.input_ledger_snapshot().0, before);
+        probe.deny.store(false, Ordering::Release);
+        let error = service
+            .update_composition_snapshot(ClauseSnapshotOperation::Pop, &Candidates::default(), 1)
+            .unwrap_err();
+        assert!(requires_ipc_recovery(&error));
+        assert!(service.recovery_pending());
+        assert_eq!(service.input_ledger_snapshot().0, before);
+        service.complete_restart_for_test();
+        assert!(service
+            .recover_composition_if_needed("kana", "かな")
+            .unwrap()
+            .is_some());
+        assert!(!service.recovery_pending());
+        probe.unavailable.store(false, Ordering::Release);
+        assert!(service.append_text("k".into()).is_ok());
+        server.abort();
+    }
+
+    #[test]
+    fn clear_attempt_invalidates_context_dedup_in_all_client_clones() {
+        let mut service = IPCService::recovery_for_test(false);
+        let other_clone = service.clone();
+        let mut context = crate::tsf::text_service::SurroundingTextContextState::default();
+        context.remember(other_clone.context_cache_key(), "same preceding text");
+        assert!(!context.should_send(service.context_cache_key(), "same preceding text"));
+        // The fake channel cannot succeed; even an ambiguous/failed release
+        // must not leave a successful SetContext entry eligible for dedup.
+        let _ = service.clear_text();
+        assert!(context.should_send(other_clone.context_cache_key(), "same preceding text"));
     }
 
     #[test]
@@ -3028,159 +3506,6 @@ mod tests {
     }
 
     #[test]
-    fn append_retry_is_enabled_when_server_state_is_unchanged() {
-        let previous = Candidates {
-            texts: vec!["か".to_string()],
-            sub_texts: vec![String::new()],
-            hiragana: "か".to_string(),
-            corresponding_count: vec![1],
-            candidate_ids: vec![1],
-        };
-
-        assert!(IPCService::should_retry_append_after_refresh(
-            Some(&previous),
-            &previous
-        ));
-    }
-
-    #[test]
-    fn append_retry_ignores_refreshed_candidate_ids() {
-        let previous = Candidates {
-            texts: vec!["か".to_string()],
-            sub_texts: vec![String::new()],
-            hiragana: "か".to_string(),
-            corresponding_count: vec![1],
-            candidate_ids: vec![1],
-        };
-        let refreshed = Candidates {
-            candidate_ids: vec![2],
-            ..previous.clone()
-        };
-
-        assert!(IPCService::should_retry_append_after_refresh(
-            Some(&previous),
-            &refreshed
-        ));
-    }
-
-    #[test]
-    fn append_retry_is_disabled_when_server_state_has_changed() {
-        let previous = Candidates::default();
-        let refreshed = Candidates {
-            texts: vec!["か".to_string()],
-            sub_texts: vec![String::new()],
-            hiragana: "か".to_string(),
-            corresponding_count: vec![1],
-            candidate_ids: vec![1],
-        };
-
-        assert!(!IPCService::should_retry_append_after_refresh(
-            Some(&previous),
-            &refreshed
-        ));
-    }
-
-    #[test]
-    fn append_retry_is_enabled_when_server_state_was_reset() {
-        let previous = Candidates {
-            texts: vec!["感じ".to_string()],
-            sub_texts: vec![String::new()],
-            hiragana: "かんじ".to_string(),
-            corresponding_count: vec![5],
-            candidate_ids: vec![1],
-        };
-
-        assert!(IPCService::should_retry_append_after_refresh(
-            Some(&previous),
-            &Candidates::default()
-        ));
-    }
-
-    #[test]
-    fn append_recovery_requires_client_reset_when_server_state_was_reset() {
-        let previous = Candidates {
-            texts: vec!["漢字".to_string()],
-            sub_texts: vec![String::new()],
-            hiragana: "かんじ".to_string(),
-            corresponding_count: vec![5],
-            candidate_ids: vec![1],
-        };
-
-        assert!(
-            IPCService::should_reset_client_composition_after_append_refresh(
-                Some(&previous),
-                &Candidates::default()
-            )
-        );
-    }
-
-    #[test]
-    fn append_recovery_does_not_reset_client_when_server_state_is_unchanged() {
-        let previous = Candidates {
-            texts: vec!["か".to_string()],
-            sub_texts: vec![String::new()],
-            hiragana: "か".to_string(),
-            corresponding_count: vec![1],
-            candidate_ids: vec![1],
-        };
-
-        assert!(
-            !IPCService::should_reset_client_composition_after_append_refresh(
-                Some(&previous),
-                &previous
-            )
-        );
-    }
-
-    #[test]
-    fn non_idempotent_edit_retry_is_enabled_when_refreshed_state_is_unchanged() {
-        let previous = Candidates {
-            texts: vec!["か".to_string()],
-            sub_texts: vec![String::new()],
-            hiragana: "か".to_string(),
-            corresponding_count: vec![1],
-            candidate_ids: vec![1],
-        };
-
-        assert!(IPCService::should_retry_non_idempotent_edit_after_refresh(
-            Some(&previous),
-            &previous,
-            None,
-            None,
-        ));
-    }
-
-    #[test]
-    fn remove_retry_requires_unchanged_raw_input_identity() {
-        let unchanged_candidates = Candidates {
-            texts: vec!["ん".to_string()],
-            sub_texts: vec![String::new()],
-            hiragana: "ん".to_string(),
-            corresponding_count: vec![1],
-            candidate_ids: vec![1],
-        };
-
-        assert!(IPCService::should_retry_non_idempotent_edit_after_refresh(
-            Some(&unchanged_candidates),
-            &unchanged_candidates,
-            Some("nn"),
-            Some("nn"),
-        ));
-        assert!(!IPCService::should_retry_non_idempotent_edit_after_refresh(
-            Some(&unchanged_candidates),
-            &unchanged_candidates,
-            Some("nn"),
-            Some("n"),
-        ));
-        assert!(!IPCService::should_retry_non_idempotent_edit_after_refresh(
-            Some(&unchanged_candidates),
-            &unchanged_candidates,
-            Some("nn"),
-            None,
-        ));
-    }
-
-    #[test]
     fn remove_refresh_returns_canonical_raw_input_when_edit_response_was_lost() {
         assert_eq!(
             IPCService::verified_remove_raw_input(None, Some("bun".to_string()))
@@ -3188,71 +3513,6 @@ mod tests {
             "bun"
         );
         assert!(IPCService::verified_remove_raw_input(None, None).is_err());
-    }
-
-    #[test]
-    fn non_idempotent_edit_retry_ignores_refreshed_candidate_ids() {
-        let previous = Candidates {
-            texts: vec!["か".to_string()],
-            sub_texts: vec![String::new()],
-            hiragana: "か".to_string(),
-            corresponding_count: vec![1],
-            candidate_ids: vec![1],
-        };
-        let refreshed = Candidates {
-            candidate_ids: vec![2],
-            ..previous.clone()
-        };
-
-        assert!(IPCService::should_retry_non_idempotent_edit_after_refresh(
-            Some(&previous),
-            &refreshed,
-            None,
-            None,
-        ));
-    }
-
-    #[test]
-    fn non_idempotent_edit_retry_is_disabled_when_refreshed_state_changed() {
-        let previous = Candidates {
-            texts: vec!["か".to_string()],
-            sub_texts: vec![String::new()],
-            hiragana: "か".to_string(),
-            corresponding_count: vec![1],
-            candidate_ids: vec![1],
-        };
-        let refreshed = Candidates {
-            texts: vec!["".to_string()],
-            sub_texts: vec![String::new()],
-            hiragana: String::new(),
-            corresponding_count: vec![0],
-            candidate_ids: vec![1],
-        };
-
-        assert!(!IPCService::should_retry_non_idempotent_edit_after_refresh(
-            Some(&previous),
-            &refreshed,
-            None,
-            None,
-        ));
-    }
-
-    #[test]
-    fn non_idempotent_edit_retry_is_disabled_for_empty_refreshed_state() {
-        let previous = Candidates {
-            texts: vec!["か".to_string()],
-            sub_texts: vec![String::new()],
-            hiragana: "か".to_string(),
-            corresponding_count: vec![1],
-            candidate_ids: vec![1],
-        };
-
-        assert!(!IPCService::should_retry_non_idempotent_edit_after_refresh(
-            Some(&previous),
-            &Candidates::default(),
-            None,
-            None,
-        ));
     }
 
     #[test]

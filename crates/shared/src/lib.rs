@@ -3,6 +3,7 @@ use std::{
     collections::HashMap,
     env, error, fmt, fs, io,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 // Generated Tonic APIs prescribe tonic::Status as their error type.
@@ -14,11 +15,51 @@ pub mod proto {
         tonic::include_file_descriptor_set!("azookey_service_descriptor");
 }
 
-// AppContainer clients resolve LOCAL inside their package namespace. The
-// server publishes the same leaf names there as well as in the desktop LOCAL
-// namespace.
-pub const SERVER_PIPE_PATH: &str = r"\\.\pipe\LOCAL\azookey_server";
-pub const UI_PIPE_PATH: &str = r"\\.\pipe\LOCAL\azookey_ui";
+// Desktop LOCAL pipe names are global in NPFS, so every leaf includes the
+// Terminal Services session ID. AppContainer clients resolve LOCAL inside their
+// package namespace; the server publishes the same suffixed leaf there too.
+static PIPE_PATHS: OnceLock<Result<[String; 3], String>> = OnceLock::new();
+
+#[cfg(any(windows, test))]
+fn pipe_paths_for_session(session_id: u32) -> [String; 3] {
+    ["azookey_server", "azookey_ui", "azookey_launcher"]
+        .map(|leaf| format!(r"\\.\pipe\LOCAL\{leaf}_s{session_id}"))
+}
+
+fn session_pipe_path(index: usize) -> io::Result<&'static str> {
+    PIPE_PATHS
+        .get_or_init(|| {
+            #[cfg(windows)]
+            {
+                use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+
+                let mut session_id = 0;
+                unsafe { ProcessIdToSessionId(std::process::id(), &mut session_id) }
+                    .map_err(|error| format!("Failed to get IPC process session: {error}"))?;
+                Ok(pipe_paths_for_session(session_id))
+            }
+            #[cfg(not(windows))]
+            {
+                Err("Session-specific named pipes require Windows".to_owned())
+            }
+        })
+        .as_ref()
+        .map(|paths| paths[index].as_str())
+        .map_err(|message| io::Error::other(message.clone()))
+}
+
+pub fn server_pipe_path() -> io::Result<&'static str> {
+    session_pipe_path(0)
+}
+
+pub fn ui_pipe_path() -> io::Result<&'static str> {
+    session_pipe_path(1)
+}
+
+pub fn launcher_pipe_path() -> io::Result<&'static str> {
+    session_pipe_path(2)
+}
+
 // Bounds the suffix-bearing candidate payload and snapshot cloning performed
 // when clause navigation starts. Longer compositions continue lazily.
 pub const MAX_PREPARED_CLAUSE_ADVANCES: usize = 16;
@@ -61,13 +102,40 @@ pub fn open_named_pipe_client_handle(
 
 #[cfg(test)]
 mod pipe_path_tests {
-    use super::{SERVER_PIPE_PATH, UI_PIPE_PATH};
+    use super::pipe_paths_for_session;
 
     #[test]
-    fn ipc_pipe_paths_use_the_logon_session_local_namespace() {
-        assert_eq!(SERVER_PIPE_PATH, r"\\.\pipe\LOCAL\azookey_server");
-        assert_eq!(UI_PIPE_PATH, r"\\.\pipe\LOCAL\azookey_ui");
-        assert_ne!(SERVER_PIPE_PATH, UI_PIPE_PATH);
+    fn ipc_pipe_paths_share_the_explicit_session_suffix() {
+        assert_eq!(
+            pipe_paths_for_session(7),
+            [
+                r"\\.\pipe\LOCAL\azookey_server_s7",
+                r"\\.\pipe\LOCAL\azookey_ui_s7",
+                r"\\.\pipe\LOCAL\azookey_launcher_s7",
+            ]
+        );
+    }
+
+    #[test]
+    fn every_pipe_name_is_distinct_within_and_between_sessions() {
+        let sessions = [0, 1, 7, 8, u32::MAX];
+        let paths = sessions.map(pipe_paths_for_session);
+        for (index, session_paths) in paths.iter().enumerate() {
+            for (pipe_index, path) in session_paths.iter().enumerate() {
+                assert!(!session_paths[..pipe_index].contains(path));
+                for other_session_paths in &paths[..index] {
+                    assert!(!other_session_paths.contains(path));
+                }
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unsupported_session_lookup_fails_without_a_fixed_path_fallback() {
+        assert!(super::server_pipe_path().is_err());
+        assert!(super::ui_pipe_path().is_err());
+        assert!(super::launcher_pipe_path().is_err());
     }
 }
 

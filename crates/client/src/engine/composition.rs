@@ -23,7 +23,7 @@ use super::{
     full_width::{convert_kana_symbol, to_fullwidth, to_halfwidth},
     input_mode::InputMode,
     ipc_service::{
-        client_performance_log_enabled, current_input_trace_request_id,
+        client_performance_log_enabled, current_input_trace_request_id, is_ipc_permission_denied,
         is_non_destructive_ipc_error, requires_ipc_recovery, Candidates, ClauseSnapshotOperation,
         ClientInputTraceGuard, IPCService, WindowRpcDelivery,
     },
@@ -183,7 +183,7 @@ fn deferred_action_suffix(
 }
 
 fn requires_action_recovery(error: &anyhow::Error) -> bool {
-    requires_ipc_recovery(error) || is_edit_session_error(error)
+    requires_ipc_recovery(error) || is_ipc_permission_denied(error) || is_edit_session_error(error)
 }
 
 fn requires_server_resynchronization(error: &anyhow::Error) -> bool {
@@ -6451,6 +6451,47 @@ impl TextServiceFactory {
     }
 
     pub(crate) fn end_composition_for_tsf_event(&self) {
+        // Collect queued learning while the candidate IDs and owner are still
+        // valid. Focus loss may terminate a deferred terminal action.
+        let mut pending_learning_commits = Vec::new();
+        if !IMEState::keyboard_disabled().unwrap_or(true)
+            && !self.current_context_has_sensitive_input_scope()
+        {
+            if let Ok(text_service) = self.borrow() {
+                if let Ok(composition) = text_service.borrow_composition() {
+                    for deferred in &composition.deferred_actions {
+                        if let ClientAction::CommitLearning {
+                            scope,
+                            kind,
+                            was_temporary_latin,
+                        } = &deferred.action
+                        {
+                            pending_learning_commits.extend(
+                                Self::collect_learning_candidate_ids(
+                                    *scope,
+                                    composition.selection_index,
+                                    &composition.candidates,
+                                    &composition.clause_snapshots,
+                                    &composition.future_clause_snapshots,
+                                    *was_temporary_latin,
+                                )
+                                .into_iter()
+                                .map(|candidate_id| {
+                                    PendingLearningCommit {
+                                        candidate_id,
+                                        kind: *kind,
+                                    }
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let mut ipc_service = IMEState::ipc_service().ok().flatten();
+        if let Some(ipc_service) = ipc_service.as_mut() {
+            Self::flush_pending_learning_commits(ipc_service, &mut pending_learning_commits);
+        }
         self.end_composition_async_best_effort();
 
         if let Ok(mut text_service) = self.borrow_mut() {
@@ -6460,7 +6501,7 @@ impl TextServiceFactory {
             }
         }
 
-        if let Ok(Some(mut ipc_service)) = IMEState::ipc_service() {
+        if let Some(mut ipc_service) = ipc_service {
             ipc_service.discard_input_ledger();
             if let Ok(delivery) =
                 ipc_service.update_candidate_window(Some(false), None, Some(vec![]), Some(0), None)
@@ -7063,6 +7104,14 @@ impl TextServiceFactory {
                         );
                     }
                     ClientAction::EndComposition => {
+                        self.borrow()?.borrow_mut_composition()?.deferred_actions =
+                            deferred_action_suffix(actions, action_index);
+                        // EndComposition can reenter focus-loss callbacks, which
+                        // release the owner. Learn before requesting that TSF edit.
+                        Self::flush_pending_learning_commits(
+                            &mut ipc_service,
+                            &mut pending_learning_commits,
+                        );
                         // Let TSF commit the document before waiting for the synchronous UI
                         // RPC. UI cleanup is still attempted after a TSF error, and terminal
                         // RemoveText can own the cleanup before its fallible final edit. A
@@ -7103,10 +7152,6 @@ impl TextServiceFactory {
                         current_clause_consumed_prefix_restore = None;
                         current_clause_remainder_origin = None;
                         next_split_group_id = 0;
-                        Self::flush_pending_learning_commits(
-                            &mut ipc_service,
-                            &mut pending_learning_commits,
-                        );
                         ipc_service.clear_text()?;
                     }
                     ClientAction::AppendText(text) => {
@@ -8640,3 +8685,41 @@ impl TextServiceFactory {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn authorization_denial_defers_actions_without_server_resynchronization() {
+        let error = anyhow::Error::new(tonic::Status::permission_denied("another live owner"));
+        assert!(requires_action_recovery(&error));
+        assert!(!requires_server_resynchronization(&error));
+        let actions = vec![DeferredClientAction {
+            action: ClientAction::AppendText("k".into()),
+            transition: CompositionState::Composing,
+        }];
+        assert_eq!(deferred_action_suffix(&actions, 0), actions);
+    }
+
+    #[test]
+    fn terminal_suffix_does_not_relearn_commits_during_reentrant_focus_loss() {
+        let actions = vec![
+            DeferredClientAction {
+                action: ClientAction::CommitLearning {
+                    scope: LearningCommitScope::Composition,
+                    kind: LearningCommitKind::Normal,
+                    was_temporary_latin: false,
+                },
+                transition: CompositionState::None,
+            },
+            DeferredClientAction {
+                action: ClientAction::EndComposition,
+                transition: CompositionState::None,
+            },
+        ];
+        let suffix = deferred_action_suffix(&actions, 1);
+        assert_eq!(suffix.len(), 1);
+        assert_eq!(suffix[0].action, ClientAction::EndComposition);
+    }
+}

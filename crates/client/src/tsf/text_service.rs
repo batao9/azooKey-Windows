@@ -110,16 +110,16 @@ impl CandidateWindowVisibilityState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SurroundingTextContextState {
-    connection_id: Option<u64>,
+    connection_id: Option<(u64, u64)>,
     context: String,
 }
 
 impl SurroundingTextContextState {
-    pub fn should_send(&self, connection_id: u64, context: &str) -> bool {
+    pub fn should_send(&self, connection_id: (u64, u64), context: &str) -> bool {
         self.connection_id != Some(connection_id) || self.context != context
     }
 
-    pub fn remember(&mut self, connection_id: u64, context: &str) {
+    pub fn remember(&mut self, connection_id: (u64, u64), context: &str) {
         self.connection_id = Some(connection_id);
         self.context.clear();
         self.context.push_str(context);
@@ -220,12 +220,13 @@ mod tests {
     fn surrounding_text_context_state_resends_after_connection_change() {
         let mut state = SurroundingTextContextState::default();
 
-        assert!(state.should_send(1, "context"));
-        state.remember(1, "context");
+        assert!(state.should_send((1, 0), "context"));
+        state.remember((1, 0), "context");
 
-        assert!(!state.should_send(1, "context"));
-        assert!(state.should_send(2, "context"));
-        assert!(state.should_send(1, "changed"));
+        assert!(!state.should_send((1, 0), "context"));
+        assert!(state.should_send((2, 0), "context"));
+        assert!(state.should_send((1, 1), "context"));
+        assert!(state.should_send((1, 0), "changed"));
     }
 
     #[test]
