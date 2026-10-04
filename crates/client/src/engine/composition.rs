@@ -4770,7 +4770,7 @@ impl TextServiceFactory {
                 action,
                 UserAction::Space | UserAction::Tab | UserAction::Reconvert
             )
-            && Self::jev_composition_eligible(composition)
+            && Self::jev_composition_eligible(composition, false)
         {
             return Some((
                 CompositionState::Previewing,

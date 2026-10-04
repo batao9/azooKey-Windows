@@ -1,10 +1,50 @@
 //! Explicit cloud ranking. COM objects and completion callbacks stay on the TSF thread.
 use super::*;
-use std::{cell::RefCell, sync::mpsc, time::Instant};
+use std::{cell::RefCell, mem::ManuallyDrop, sync::mpsc, time::Instant};
 use windows::Win32::{
     Foundation::HWND,
-    UI::WindowsAndMessaging::{KillTimer, SetTimer},
+    UI::{
+        TextServices::{IEnumTfPropertyValue, TF_ANCHOR_START, TF_PROPERTYVAL},
+        WindowsAndMessaging::{KillTimer, SetTimer},
+    },
 };
+
+fn input_scope_allows_remote_scoring(value: &windows::core::VARIANT) -> Result<bool> {
+    if value.is_empty() {
+        return Ok(true);
+    }
+    let input_scope = IUnknown::try_from(value)?.cast::<ITfInputScope>()?;
+    let mut scopes_ptr = std::ptr::null_mut();
+    let mut count = 0;
+    unsafe {
+        let result = input_scope.GetInputScopes(&mut scopes_ptr, &mut count);
+        let allowed = result.map(|()| {
+            count == 0
+                || (!scopes_ptr.is_null()
+                    && !std::slice::from_raw_parts(scopes_ptr, count as usize)
+                        .iter()
+                        .copied()
+                        .any(TextServiceFactory::is_sensitive_input_scope))
+        });
+        CoTaskMemFree(Some(scopes_ptr.cast()));
+        Ok(allowed?)
+    }
+}
+
+fn tracked_input_scope_allows_remote_scoring(value: &windows::core::VARIANT) -> Result<bool> {
+    let values = IUnknown::try_from(value)?.cast::<IEnumTfPropertyValue>()?;
+    let mut items = [TF_PROPERTYVAL::default()];
+    let mut fetched = 0;
+    let result = unsafe { values.Next(&mut items, &mut fetched) };
+    // TF_PROPERTYVAL does not release its ManuallyDrop VARIANT.
+    let value = unsafe { ManuallyDrop::take(&mut items[0].varValue) };
+    result?;
+    anyhow::ensure!(
+        fetched == 1 && items[0].guidId == GUID_PROP_INPUTSCOPE,
+        "Missing tracked input-scope property"
+    );
+    input_scope_allows_remote_scoring(&value)
+}
 
 struct Pending {
     timer: usize,
@@ -106,8 +146,12 @@ impl TextServiceFactory {
         drop(pending);
     }
 
-    pub(super) fn jev_composition_eligible(composition: &Composition) -> bool {
-        !composition.temporary_latin
+    pub(super) fn jev_composition_eligible(
+        composition: &Composition,
+        disabled_context_observed: bool,
+    ) -> bool {
+        !disabled_context_observed
+            && !composition.temporary_latin
             && composition.reconversion_original.is_none()
             && composition.fixed_prefix.is_empty()
             && composition.clause_snapshots.is_empty()
@@ -117,6 +161,7 @@ impl TextServiceFactory {
     }
 
     pub(super) fn begin_jev_conversion(&self) -> Result<()> {
+        let trace_request_id = current_input_trace_request_id();
         let enabled = IMEState::app_config_snapshot()?
             .app_config()
             .general
@@ -129,7 +174,7 @@ impl TextServiceFactory {
             let service = self.borrow()?;
             let state = service.borrow_composition()?;
             if state.state != CompositionState::Previewing
-                || !Self::jev_composition_eligible(&state)
+                || !Self::jev_composition_eligible(&state, service.disabled_context_observed)
             {
                 return Ok(());
             }
@@ -142,8 +187,9 @@ impl TextServiceFactory {
                 state.preview.clone(),
             )
         };
-        let context_allowed = self.current_context_allows_remote_scoring(&composition);
-        if let Some(request_id) = current_input_trace_request_id() {
+        let context_allowed =
+            self.current_context_allows_remote_scoring(&composition, trace_request_id);
+        if let Some(request_id) = trace_request_id {
             Self::log_client_performance(request_id, "jev_start", "eligibility", Duration::ZERO,
                 format!("enabled={enabled};keyboard_disabled={keyboard_disabled};context_allowed={context_allowed}"));
         }
@@ -151,7 +197,7 @@ impl TextServiceFactory {
             return Ok(());
         }
         let mapping = choice_indices(&candidates, raw_input.chars().count());
-        if let Some(request_id) = current_input_trace_request_id() {
+        if let Some(request_id) = trace_request_id {
             Self::log_client_performance(
                 request_id,
                 "jev_start",
@@ -223,6 +269,7 @@ impl TextServiceFactory {
             }
             let mut composition = service.borrow_mut_composition()?;
             if composition.state != CompositionState::Previewing
+                || !Self::jev_composition_eligible(&composition, service.disabled_context_observed)
                 || composition.raw_input != pending.raw_input
                 || composition.candidates != pending.candidates
                 || !composition
@@ -241,7 +288,11 @@ impl TextServiceFactory {
             CompositionState::Previewing,
         )
     }
-    fn current_context_allows_remote_scoring(&self, composition: &ITfComposition) -> bool {
+    fn current_context_allows_remote_scoring(
+        &self,
+        composition: &ITfComposition,
+        trace_request_id: Option<u64>,
+    ) -> bool {
         let stage = Rc::new(std::cell::Cell::new("context"));
         let query = || -> Result<bool> {
             let (tid, context) = {
@@ -260,40 +311,39 @@ impl TextServiceFactory {
                     let stage = stage.clone();
                     move |cookie| {
                         stage.set("composition_range");
-                        let range = unsafe { composition.GetRange()? };
+                        let range = unsafe { composition.GetRange()?.Clone()? };
+                        unsafe { range.Collapse(cookie, TF_ANCHOR_START)? };
                         stage.set("property");
-                        let property = unsafe { context.GetAppProperty(&GUID_PROP_INPUTSCOPE)? };
+                        let property =
+                            unsafe { context.TrackProperties(&[], &[&GUID_PROP_INPUTSCOPE])? };
+                        // Query one insertion point rather than relying on the host's
+                        // optional FindNextAttrTransition / EnumRanges implementation.
                         stage.set("value");
-                        let value = unsafe { property.GetValue(cookie, &range)? };
-                        // No input-scope property is normal for ordinary text controls.
-                        if value.is_empty() {
-                            return Ok(true);
+                        let tracker_value = unsafe { property.GetValue(cookie, &range) };
+                        if let Some(request_id) = trace_request_id {
+                            Self::log_client_performance(
+                                request_id,
+                                "jev_start",
+                                "scope_api",
+                                Duration::ZERO,
+                                format!(
+                                    "get_value_error={:?};variant_type={:?}",
+                                    tracker_value.as_ref().err().map(|error| error.code()),
+                                    tracker_value.as_ref().ok().map(|value| unsafe {
+                                        value.as_raw().Anonymous.Anonymous.vt
+                                    })
+                                ),
+                            );
                         }
+                        let tracker_value = tracker_value?;
                         stage.set("scope");
-                        let input_scope = IUnknown::try_from(&value)?.cast::<ITfInputScope>()?;
-                        let mut scopes_ptr = std::ptr::null_mut();
-                        let mut count = 0;
-                        unsafe {
-                            input_scope.GetInputScopes(&mut scopes_ptr, &mut count)?;
-                            let allowed = if count == 0 {
-                                true
-                            } else if scopes_ptr.is_null() {
-                                false
-                            } else {
-                                !std::slice::from_raw_parts(scopes_ptr, count as usize)
-                                    .iter()
-                                    .copied()
-                                    .any(Self::is_sensitive_input_scope)
-                            };
-                            CoTaskMemFree(Some(scopes_ptr.cast()));
-                            Ok(allowed)
-                        }
+                        tracked_input_scope_allows_remote_scoring(&tracker_value)
                     }
                 }),
             )
         };
         let result = query();
-        if let Some(request_id) = current_input_trace_request_id() {
+        if let Some(request_id) = trace_request_id {
             Self::log_client_performance(
                 request_id,
                 "jev_start",
@@ -313,6 +363,149 @@ impl TextServiceFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::{
+        core::{implement, BSTR, GUID, VARIANT},
+        Win32::{
+            Foundation::{E_FAIL, E_NOTIMPL},
+            System::Com::CoTaskMemAlloc,
+            UI::TextServices::{IEnumTfPropertyValue_Impl, ITfInputScope_Impl, IS_DEFAULT},
+        },
+    };
+
+    #[implement(ITfInputScope)]
+    struct TestInputScope {
+        scopes: Vec<InputScope>,
+        fail: bool,
+    }
+
+    impl ITfInputScope_Impl for TestInputScope_Impl {
+        fn GetInputScopes(
+            &self,
+            output: *mut *mut InputScope,
+            count: *mut u32,
+        ) -> windows::core::Result<()> {
+            if self.fail {
+                return Err(E_FAIL.into());
+            }
+            unsafe {
+                *count = self.scopes.len() as u32;
+                *output = CoTaskMemAlloc(std::mem::size_of_val(self.scopes.as_slice())).cast();
+                assert!(!output.read().is_null());
+                std::ptr::copy_nonoverlapping(self.scopes.as_ptr(), *output, self.scopes.len());
+            }
+            Ok(())
+        }
+        fn GetPhrase(&self, _: *mut *mut BSTR, _: *mut u32) -> windows::core::Result<()> {
+            Err(E_NOTIMPL.into())
+        }
+        fn GetRegularExpression(&self) -> windows::core::Result<BSTR> {
+            Err(E_NOTIMPL.into())
+        }
+        fn GetSRGS(&self) -> windows::core::Result<BSTR> {
+            Err(E_NOTIMPL.into())
+        }
+        fn GetXML(&self) -> windows::core::Result<BSTR> {
+            Err(E_NOTIMPL.into())
+        }
+    }
+
+    #[implement(IEnumTfPropertyValue)]
+    struct TestTrackedScope {
+        value: VARIANT,
+        guid: GUID,
+        fetched: u32,
+        fail: bool,
+    }
+
+    impl IEnumTfPropertyValue_Impl for TestTrackedScope_Impl {
+        fn Clone(&self) -> windows::core::Result<IEnumTfPropertyValue> {
+            Err(E_NOTIMPL.into())
+        }
+        fn Next(
+            &self,
+            count: u32,
+            output: *mut TF_PROPERTYVAL,
+            fetched: *mut u32,
+        ) -> windows::core::Result<()> {
+            assert_eq!(count, 1);
+            unsafe {
+                *fetched = self.fetched;
+                (*output).guidId = self.guid;
+                (*output).varValue = ManuallyDrop::new(self.value.clone());
+            }
+            if self.fail {
+                Err(E_FAIL.into())
+            } else {
+                Ok(())
+            }
+        }
+        fn Reset(&self) -> windows::core::Result<()> {
+            Err(E_NOTIMPL.into())
+        }
+        fn Skip(&self, _: u32) -> windows::core::Result<()> {
+            Err(E_NOTIMPL.into())
+        }
+    }
+
+    #[test]
+    fn jev_tracked_scope_requires_matching_readable_property_and_blocks_sensitive_values() {
+        assert!(!tracked_input_scope_allows_remote_scoring(&VARIANT::default()).unwrap_or(false));
+        for (guid, fetched, fail, allowed) in [
+            (GUID_PROP_INPUTSCOPE, 1, false, true),
+            (GUID::zeroed(), 1, false, false),
+            (GUID_PROP_INPUTSCOPE, 0, false, false),
+            (GUID_PROP_INPUTSCOPE, 1, true, false),
+        ] {
+            let tracker: IEnumTfPropertyValue = TestTrackedScope {
+                value: VARIANT::default(),
+                guid,
+                fetched,
+                fail,
+            }
+            .into();
+            let value = VARIANT::from(tracker.cast::<IUnknown>().unwrap());
+            assert_eq!(
+                tracked_input_scope_allows_remote_scoring(&value).unwrap_or(false),
+                allowed
+            );
+        }
+        for scope in [IS_PASSWORD, IS_NUMERIC_PASSWORD, IS_PRIVATE] {
+            let input_scope: ITfInputScope = TestInputScope {
+                scopes: vec![IS_DEFAULT, scope],
+                fail: false,
+            }
+            .into();
+            let tracker: IEnumTfPropertyValue = TestTrackedScope {
+                value: VARIANT::from(input_scope.cast::<IUnknown>().unwrap()),
+                guid: GUID_PROP_INPUTSCOPE,
+                fetched: 1,
+                fail: false,
+            }
+            .into();
+            let value = VARIANT::from(tracker.cast::<IUnknown>().unwrap());
+            assert!(!tracked_input_scope_allows_remote_scoring(&value).unwrap());
+        }
+    }
+
+    #[test]
+    fn jev_scope_gate_accepts_ordinary_text_and_denies_sensitive_or_unknown_scopes() {
+        assert!(input_scope_allows_remote_scoring(&VARIANT::default()).unwrap());
+        assert!(!input_scope_allows_remote_scoring(&VARIANT::from(42)).unwrap_or(false));
+        for (scopes, fail, allowed) in [
+            (vec![IS_DEFAULT], false, true),
+            (vec![IS_DEFAULT, IS_PASSWORD], false, false),
+            (vec![IS_NUMERIC_PASSWORD], false, false),
+            (vec![IS_PRIVATE], false, false),
+            (vec![IS_DEFAULT], true, false),
+        ] {
+            let scope: ITfInputScope = TestInputScope { scopes, fail }.into();
+            let value = VARIANT::from(scope.cast::<IUnknown>().unwrap());
+            assert_eq!(
+                input_scope_allows_remote_scoring(&value).unwrap_or(false),
+                allowed
+            );
+        }
+    }
 
     fn candidates() -> Candidates {
         Candidates {
@@ -422,14 +615,46 @@ mod tests {
             raw_input: "kisha".into(),
             ..Default::default()
         };
-        assert!(TextServiceFactory::jev_composition_eligible(&composition));
+        assert!(TextServiceFactory::jev_composition_eligible(
+            &composition,
+            false
+        ));
         composition.reconversion_original = Some("記者".into());
-        assert!(!TextServiceFactory::jev_composition_eligible(&composition));
+        assert!(!TextServiceFactory::jev_composition_eligible(
+            &composition,
+            false
+        ));
         composition.reconversion_original = None;
         composition.fixed_prefix = "新聞".into();
-        assert!(!TextServiceFactory::jev_composition_eligible(&composition));
+        assert!(!TextServiceFactory::jev_composition_eligible(
+            &composition,
+            false
+        ));
         composition.fixed_prefix.clear();
         composition.temporary_latin = true;
-        assert!(!TextServiceFactory::jev_composition_eligible(&composition));
+        assert!(!TextServiceFactory::jev_composition_eligible(
+            &composition,
+            false
+        ));
+    }
+
+    #[test]
+    fn jev_completion_rejects_disabled_context_observed_without_handle_callback() {
+        let composition = Composition {
+            state: CompositionState::Previewing,
+            raw_input: "kisha".into(),
+            candidates: candidates(),
+            ..Default::default()
+        };
+        assert!(TextServiceFactory::jev_composition_eligible(
+            &composition,
+            false
+        ));
+        // A rejected OnTestKey event only records this flag: the cached keyboard
+        // state and composition snapshot can remain unchanged until Handle.
+        assert!(!TextServiceFactory::jev_composition_eligible(
+            &composition,
+            true
+        ));
     }
 }
