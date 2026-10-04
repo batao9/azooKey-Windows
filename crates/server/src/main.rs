@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use azookey_server::TonicNamedPipeServer;
+use azookey_server::{CompositionOwner, PipeClient, TonicNamedPipeServer};
 use tonic::{transport::Server, Request, Response, Status};
 use tonic_reflection::server::Builder as ReflectionBuilder;
 use windows::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass, HIGH_PRIORITY_CLASS};
@@ -16,7 +16,7 @@ use shared::proto::{
     ShrinkTextRequest, ShrinkTextResponse, StartReconversionRequest, StartReconversionResponse,
     Suggestion, UpdateCompositionSnapshotRequest, UpdateCompositionSnapshotResponse,
 };
-use shared::{AppConfig, SERVER_PIPE_PATH};
+use shared::{server_pipe_path, AppConfig};
 
 use std::{
     backtrace::Backtrace,
@@ -1636,7 +1636,13 @@ fn valid_jev_request(request: &shared::proto::RerankCandidatesRequest) -> bool {
 
 #[derive(Debug, Clone, Default)]
 pub struct MyAzookeyService {
-    mutation_lock: Arc<tokio::sync::Mutex<()>>,
+    mutation_lock: Arc<tokio::sync::Mutex<CompositionOwner>>,
+}
+
+fn release_composition_state() {
+    clear_text(); // Also clears snapshots and cached/pinned learning candidates.
+    unsafe { SetContext(c"".as_ptr()) };
+    HAS_ACTIVE_COMPOSITION.store(false, Ordering::Relaxed);
 }
 
 #[tonic::async_trait]
@@ -1690,7 +1696,16 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<AppendTextRequest>,
     ) -> Result<Response<AppendTextResponse>, Status> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        // Connection initialization is not a composition read or claim.
+        if request.get_ref().text_to_append.is_empty() {
+            PipeClient::authorize_connection(&request)?;
+            return Ok(Response::new(AppendTextResponse {
+                composing_text: Some(ComposingText::default()),
+                server_session_id: server_session_id(),
+            }));
+        }
+        let mut mutation_guard = self.mutation_lock.lock().await;
+        mutation_guard.authorize(&request, true, release_composition_state)?;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
@@ -1754,7 +1769,8 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<ReplaceCompositionRequest>,
     ) -> Result<Response<ReplaceCompositionResponse>, Status> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let mut mutation_guard = self.mutation_lock.lock().await;
+        mutation_guard.authorize(&request, true, release_composition_state)?;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
@@ -1827,16 +1843,16 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<StartReconversionRequest>,
     ) -> Result<Response<StartReconversionResponse>, Status> {
-        let _mutation_guard = self.mutation_lock.lock().await;
-        let request = request.into_inner();
+        let mut mutation_guard = self.mutation_lock.lock().await;
+        mutation_guard.authorize(&request, false, release_composition_state)?;
         let _request_guard = ServerRequestGuard::begin(true);
-        let request_id = request_id_or_next(request.request_id);
+        let request_id = request_id_or_next(request.get_ref().request_id);
         set_request_id(request_id);
         let handler_start = Instant::now();
-        let surface = request.surface;
-        let surface_len = validate_reconversion_surface(&surface)?;
+        let surface = &request.get_ref().surface;
+        let surface_len = validate_reconversion_surface(surface)?;
 
-        let mut readings = infer_reconversion_readings(&surface)
+        let mut readings = infer_reconversion_readings(surface)
             .map_err(|error| status_from_error("start_reconversion", error))?;
         readings.truncate(MAX_RECONVERSION_READINGS);
         if readings.is_empty() {
@@ -1857,6 +1873,8 @@ impl AzookeyService for MyAzookeyService {
 
         // Reading inference is non-mutating. Only replace the converter state after it
         // succeeds, so unsupported text cannot disturb an existing composition.
+        mutation_guard.authorize(&request, true, release_composition_state)?;
+        let surface = request.into_inner().surface;
         let mut chosen_index = 0;
         let mut best_surface_rank = usize::MAX;
         let mut conversions = Vec::with_capacity(readings.len());
@@ -1953,7 +1971,8 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<RemoveTextRequest>,
     ) -> Result<Response<RemoveTextResponse>, Status> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let mut mutation_guard = self.mutation_lock.lock().await;
+        mutation_guard.authorize(&request, true, release_composition_state)?;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
@@ -2009,7 +2028,8 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<MoveCursorRequest>,
     ) -> Result<Response<MoveCursorResponse>, Status> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let mut mutation_guard = self.mutation_lock.lock().await;
+        mutation_guard.authorize(&request, true, release_composition_state)?;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
@@ -2070,7 +2090,8 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<AdjustClauseBoundaryRequest>,
     ) -> Result<Response<AdjustClauseBoundaryResponse>, Status> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let mut mutation_guard = self.mutation_lock.lock().await;
+        mutation_guard.authorize(&request, true, release_composition_state)?;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
@@ -2219,7 +2240,8 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<UpdateCompositionSnapshotRequest>,
     ) -> Result<Response<UpdateCompositionSnapshotResponse>, Status> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let mut mutation_guard = self.mutation_lock.lock().await;
+        mutation_guard.authorize(&request, true, release_composition_state)?;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
@@ -2261,14 +2283,16 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<ClearTextRequest>,
     ) -> Result<Response<ClearTextResponse>, Status> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let mut mutation_guard = self.mutation_lock.lock().await;
+        mutation_guard.authorize(&request, false, release_composition_state)?;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
         set_request_id(request_id);
         let handler_start = Instant::now();
         let clear_start = Instant::now();
-        clear_text();
+        release_composition_state();
+        mutation_guard.release();
         performance_event_lazy!(
             request_id,
             "clear_text",
@@ -2293,7 +2317,8 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<ShrinkTextRequest>,
     ) -> Result<Response<ShrinkTextResponse>, Status> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let mut mutation_guard = self.mutation_lock.lock().await;
+        mutation_guard.authorize(&request, true, release_composition_state)?;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
@@ -2347,7 +2372,8 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<AdvanceClauseRequest>,
     ) -> Result<Response<AdvanceClauseResponse>, Status> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let mut mutation_guard = self.mutation_lock.lock().await;
+        mutation_guard.authorize(&request, true, release_composition_state)?;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
@@ -2415,7 +2441,8 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<PrepareFutureClausesRequest>,
     ) -> Result<Response<PrepareFutureClausesResponse>, Status> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let mut mutation_guard = self.mutation_lock.lock().await;
+        mutation_guard.authorize(&request, true, release_composition_state)?;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
@@ -2529,7 +2556,8 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<shared::proto::SetContextRequest>,
     ) -> Result<Response<shared::proto::SetContextResponse>, Status> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let mut mutation_guard = self.mutation_lock.lock().await;
+        mutation_guard.authorize(&request, true, release_composition_state)?;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(false);
         let request_id = request_id_or_next(request.request_id);
@@ -2571,6 +2599,7 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<shared::proto::UpdateConfigRequest>,
     ) -> Result<Response<shared::proto::UpdateConfigResponse>, Status> {
+        PipeClient::authorize_management(&request)?;
         let _mutation_guard = self.mutation_lock.lock().await;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(false);
@@ -2605,7 +2634,8 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<shared::proto::CommitLearningCandidateRequest>,
     ) -> Result<Response<shared::proto::CommitLearningCandidateResponse>, Status> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let mut mutation_guard = self.mutation_lock.lock().await;
+        mutation_guard.authorize(&request, true, release_composition_state)?;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
@@ -2650,7 +2680,8 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<shared::proto::CommitLearningCandidatesRequest>,
     ) -> Result<Response<shared::proto::CommitLearningCandidatesResponse>, Status> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let mut mutation_guard = self.mutation_lock.lock().await;
+        mutation_guard.authorize(&request, true, release_composition_state)?;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
@@ -2687,6 +2718,7 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<shared::proto::ResetLearningMemoryRequest>,
     ) -> Result<Response<shared::proto::ResetLearningMemoryResponse>, Status> {
+        PipeClient::authorize_management(&request)?;
         let _mutation_guard = self.mutation_lock.lock().await;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(false);
@@ -2727,6 +2759,7 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<PerformanceLogRequest>,
     ) -> Result<Response<PerformanceLogResponse>, Status> {
+        PipeClient::authorize_connection(&request)?;
         let _request_guard = ServerRequestGuard::begin(false);
         let request = request.into_inner();
         log_performance_event(
@@ -2849,14 +2882,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_v1()
         .map_err(std::io::Error::other)?;
 
-    let incoming = TonicNamedPipeServer::new_with_first_pipe_callback(SERVER_PIPE_PATH, || {
+    let pipe_path = server_pipe_path()?;
+    let incoming = TonicNamedPipeServer::new_with_first_pipe_callback(pipe_path, move || {
         log_event_lazy!(ServerLogLevel::Info, "AzookeyServer listening");
         write_server_crash_trace(
             "rust",
             "server_startup",
             "listening",
             "completed",
-            "pipe=LOCAL\\azookey_server",
+            &format!("pipe={pipe_path}"),
         );
         write_crash_trace_file(
             LAUNCHER_CRASH_TRACE_FILE_NAME,
@@ -2864,10 +2898,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "server_startup",
             "server_listening",
             "completed",
-            &format!(
-                "server_pid={};pipe=LOCAL\\azookey_server",
-                std::process::id()
-            ),
+            &format!("server_pid={};pipe={pipe_path}", std::process::id()),
         );
     })?;
 
@@ -2931,6 +2962,89 @@ mod path_tests {
     };
     use shared::proto::Suggestion;
     use std::{ffi::OsStr, path::Path};
+
+    #[tokio::test]
+    async fn unsupported_reconversion_does_not_claim_or_release_composition() {
+        use azookey_server::{PipeClient, TonicNamedPipeServer};
+        use futures_core::Stream;
+        use shared::proto::{
+            azookey_service_server::AzookeyService, ClearTextRequest, SetContextRequest,
+            StartReconversionRequest,
+        };
+        use std::{os::windows::io::IntoRawHandle, sync::Arc};
+        use tokio::net::windows::named_pipe::NamedPipeClient;
+        use tonic::{transport::server::Connected, Code, Request};
+
+        fn request<T>(body: T, client: &Arc<PipeClient>) -> Request<T> {
+            let mut request = Request::new(body);
+            request.extensions_mut().insert(Arc::clone(client));
+            request
+        }
+
+        let path = format!(
+            r"\\.\pipe\LOCAL\azookey_reconversion_owner_test_{}_{}",
+            std::process::id(),
+            super::next_request_id()
+        );
+        let mut incoming = Box::pin(TonicNamedPipeServer::new(&path).unwrap());
+        let first_handle = shared::open_named_pipe_client_handle(&path).unwrap();
+        let _first_pipe =
+            unsafe { NamedPipeClient::from_raw_handle(first_handle.into_raw_handle()) }.unwrap();
+        let first_transport = std::future::poll_fn(|cx| incoming.as_mut().poll_next(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        let second_handle = shared::open_named_pipe_client_handle(&path).unwrap();
+        let _second_pipe =
+            unsafe { NamedPipeClient::from_raw_handle(second_handle.into_raw_handle()) }.unwrap();
+        let second_transport = std::future::poll_fn(|cx| incoming.as_mut().poll_next(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        let first = first_transport.connect_info();
+        let second = second_transport.connect_info();
+        let service = MyAzookeyService::default();
+        // Unassigned CJK: reading inference is unsupported without needing a
+        // dictionary or model fixture. No candidate generation is performed.
+        let unsupported = StartReconversionRequest {
+            surface: "\u{2fa1f}".into(),
+            ..Default::default()
+        };
+        let skipped = service
+            .start_reconversion(request(unsupported.clone(), &first))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!skipped.applied);
+        service
+            .clear_text(request(ClearTextRequest::default(), &second))
+            .await
+            .expect("a no-op must not block a different connection");
+
+        service
+            .set_context(request(SetContextRequest::default(), &first))
+            .await
+            .unwrap();
+        let skipped = service
+            .start_reconversion(request(unsupported, &first))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!skipped.applied);
+        assert_eq!(
+            service
+                .clear_text(request(ClearTextRequest::default(), &second))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied,
+            "a no-op must preserve the existing owner"
+        );
+        service
+            .clear_text(request(ClearTextRequest::default(), &first))
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn mutation_lock_keeps_replace_transaction_exclusive() {

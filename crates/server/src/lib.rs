@@ -1,6 +1,6 @@
 use async_stream::try_stream;
 use futures_core::stream::Stream;
-use std::{ffi::c_void, pin::Pin, ptr::addr_of_mut};
+use std::{ffi::c_void, os::windows::io::AsRawHandle, pin::Pin, ptr::addr_of_mut, sync::Arc};
 use tokio::{
     io::{self, AsyncRead, AsyncWrite},
     net::windows::named_pipe::{NamedPipeServer, ServerOptions},
@@ -9,25 +9,31 @@ use tonic::transport::server::Connected;
 use windows::{
     core::{PCWSTR, PWSTR},
     Win32::{
-        Foundation::{CloseHandle, LocalFree, HLOCAL},
+        Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL},
         Security::{
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
                 SDDL_REVISION,
             },
-            FreeSid, GetTokenInformation,
+            FreeSid, GetTokenInformation, IsTokenRestricted,
             Isolation::{
                 DeriveAppContainerSidFromAppContainerName, GetAppContainerNamedObjectPath,
             },
-            TokenLogonSid, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_GROUPS,
-            TOKEN_QUERY,
+            TokenIsAppContainer, TokenLogonSid, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+            TOKEN_GROUPS, TOKEN_QUERY,
         },
         System::{
+            Pipes::{GetNamedPipeClientProcessId, GetNamedPipeClientSessionId},
             RemoteDesktop::ProcessIdToSessionId,
-            Threading::{GetCurrentProcess, OpenProcessToken},
+            Threading::{
+                GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+            },
         },
     },
 };
+
+mod composition_owner;
+pub use composition_owner::{CompositionOwner, PipeClient};
 
 const LOCAL_PIPE_PREFIX: &str = r"\\.\pipe\LOCAL\";
 const SEARCH_HOST_PACKAGE_FAMILY_NAME: &str = "MicrosoftWindows.Client.CBS_cw5n1h2txyewy";
@@ -76,12 +82,21 @@ impl Drop for OwnedSid {
 
 pub struct TonicNamedPipeServer {
     inner: NamedPipeServer,
+    client: Arc<PipeClient>,
 }
 
 impl Connected for TonicNamedPipeServer {
-    type ConnectInfo = ();
+    type ConnectInfo = Arc<PipeClient>;
 
-    fn connect_info(&self) -> Self::ConnectInfo {}
+    fn connect_info(&self) -> Self::ConnectInfo {
+        Arc::clone(&self.client)
+    }
+}
+
+impl Drop for TonicNamedPipeServer {
+    fn drop(&mut self) {
+        self.client.disconnect();
+    }
 }
 
 impl AsyncRead for TonicNamedPipeServer {
@@ -131,6 +146,10 @@ impl TonicNamedPipeServer {
         F: FnOnce() + Send + 'static,
     {
         let name = path.to_string();
+        let logon_sid = current_logon_sid_string()?;
+        let mut session_id = 0;
+        unsafe { ProcessIdToSessionId(std::process::id(), &mut session_id) }
+            .map_err(|error| io::Error::other(format!("failed to get server session: {error}")))?;
         let (search_host_sid, search_host_namespace) = search_host_appcontainer()?;
         let search_host_name = appcontainer_pipe_path(path, &search_host_namespace)?;
         let security_descriptor = create_pipe_security_descriptor(None)?;
@@ -183,9 +202,66 @@ impl TonicNamedPipeServer {
                     (&mut server, replacement)
                 };
                 let client = std::mem::replace(connected, replacement);
-                yield TonicNamedPipeServer { inner: client };
+                // An invalid peer must not terminate the listener. Query only at
+                // accept time, never on the per-key RPC path.
+                let Ok(identity) = pipe_client_identity(&client, &logon_sid, session_id) else {
+                    continue;
+                };
+                yield TonicNamedPipeServer { inner: client, client: identity };
             }
         })
+    }
+}
+
+fn pipe_client_identity(
+    pipe: &NamedPipeServer,
+    logon_sid: &str,
+    session_id: u32,
+) -> io::Result<Arc<PipeClient>> {
+    unsafe {
+        let handle = HANDLE(pipe.as_raw_handle());
+        let mut peer_session = 0;
+        GetNamedPipeClientSessionId(handle, &mut peer_session).map_err(io::Error::other)?;
+        if peer_session != session_id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "different pipe session",
+            ));
+        }
+        let mut process_id = 0;
+        GetNamedPipeClientProcessId(handle, &mut process_id).map_err(io::Error::other)?;
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id)
+            .map_err(io::Error::other)?;
+        let mut token = HANDLE::default();
+        let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token).map_err(io::Error::other);
+        let _ = CloseHandle(process);
+        opened?;
+        let result = (|| {
+            if logon_sid_string_from_token(token)? != logon_sid {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "different pipe logon",
+                ));
+            }
+            let mut appcontainer = 0_u32;
+            let mut length = 0;
+            GetTokenInformation(
+                token,
+                TokenIsAppContainer,
+                Some((&mut appcontainer as *mut u32).cast()),
+                size_of::<u32>() as u32,
+                &mut length,
+            )
+            .map_err(io::Error::other)?;
+            // windows-rs maps this BOOL predicate to Result: Ok means the
+            // token has restricting SIDs. UAC's filtered desktop token is not
+            // an IsTokenRestricted sandbox (TokenHasRestrictions differs).
+            Ok(PipeClient::new(
+                appcontainer == 0 && IsTokenRestricted(token).is_err(),
+            ))
+        })();
+        let _ = CloseHandle(token);
+        result
     }
 }
 
@@ -439,14 +515,14 @@ mod tests {
     #[test]
     fn appcontainer_pipe_path_uses_the_package_namespace_and_local_leaf() {
         let path = appcontainer_pipe_path(
-            r"\\.\pipe\LOCAL\azookey_server",
+            r"\\.\pipe\LOCAL\azookey_server_s7",
             r"\Sessions\7\AppContainerNamedObjects\S-1-15-2-42",
         )
         .unwrap();
 
         assert_eq!(
             path,
-            r"\\.\pipe\Sessions\7\AppContainerNamedObjects\S-1-15-2-42\azookey_server"
+            r"\\.\pipe\Sessions\7\AppContainerNamedObjects\S-1-15-2-42\azookey_server_s7"
         );
     }
 

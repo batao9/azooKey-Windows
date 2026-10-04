@@ -743,8 +743,8 @@ function Assert-SecureStartupTask {
   param([Parameter(Mandatory = $true)][string]$InstallLocation)
 
   $task = Get-ScheduledTask -TaskName "Azookey Startup" -ErrorAction Stop
-  if ($task.Principal.RunLevel -ne "Highest") {
-    throw "Startup task is not HighestAvailable: $($task.Principal.RunLevel)"
+  if ($task.Principal.RunLevel -ne "Limited") {
+    throw "Startup task is not LeastPrivilege: $($task.Principal.RunLevel)"
   }
   try {
     if ($task.Principal.GroupId -match '^S-\d-') {
@@ -756,8 +756,17 @@ function Assert-SecureStartupTask {
   } catch {
     throw "Startup task principal could not be resolved: $($task.Principal.GroupId): $($_.Exception.Message)"
   }
-  if ($principalSid -ne "S-1-5-32-544") {
-    throw "Startup task principal is not Administrators: $($task.Principal.GroupId) ($principalSid)"
+  if ($principalSid -ne "S-1-5-32-545") {
+    throw "Startup task principal is not Users: $($task.Principal.GroupId) ($principalSid)"
+  }
+  if ($task.Settings.MultipleInstances -ne "Parallel") {
+    throw "Startup task must allow concurrent sessions: $($task.Settings.MultipleInstances)"
+  }
+  if ($task.Settings.DisallowStartIfOnBatteries -or $task.Settings.StopIfGoingOnBatteries) {
+    throw "Startup task must keep running on battery power"
+  }
+  if ($task.Settings.ExecutionTimeLimit -ne "PT0S") {
+    throw "Resident startup task must not have an execution time limit"
   }
   if ($task.Actions.Count -ne 1) {
     throw "Startup task must contain exactly one action: $($task.Actions.Count)"
@@ -776,7 +785,7 @@ function Assert-SecureStartupTask {
     throw "Startup task still uses wscript/VBS: $serializedAction"
   }
 
-  Write-Host "startup task directly executes protected launcher.exe"
+  Write-Host "startup task runs protected launcher.exe as Users/LeastPrivilege with Parallel instances"
 }
 
 function Assert-ProcessRedirectionGuard {

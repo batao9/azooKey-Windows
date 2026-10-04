@@ -765,6 +765,7 @@ pub(super) fn actual_future_snapshot(
 }
 
 mod integration_patterns;
+mod key_recovery;
 mod snapshot_restore;
 pub(super) mod stateful_harness;
 mod symbol_and_width;

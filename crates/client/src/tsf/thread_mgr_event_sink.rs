@@ -83,10 +83,9 @@ impl ITfThreadMgrEventSink_Impl for TextServiceFactory_Impl {
         if let Some(focus) = focus {
             self.borrow_mut()?.advise_text_layout_sink(focus.clone())?;
         }
+        self.end_composition_for_tsf_event();
         self.set_keyboard_disabled_for_document_mgr(focus)?;
         ensure_ipc_service_for_tsf_event("OnSetFocus");
-
-        self.end_composition_for_tsf_event();
 
         if focus.is_none() {
             let mut text_service = self.borrow_mut()?;
@@ -126,6 +125,7 @@ impl ITfThreadFocusSink_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     fn OnKillThreadFocus(&self) -> Result<()> {
         self.clear_tracked_modifier_key_state();
+        self.end_composition_for_tsf_event();
         self.set_keyboard_disabled_state(true)?;
 
         Ok(())

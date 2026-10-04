@@ -226,7 +226,7 @@ impl TextServiceFactory {
                 let text_service = self.borrow_mut()?;
                 text_service
                     .surrounding_text_context_state
-                    .should_send(connection_id, &preceding_text)
+                    .should_send(ipc_service.context_cache_key(), &preceding_text)
             };
             if !should_set_context {
                 if let Some(request_id) = trace_request_id {
@@ -245,12 +245,11 @@ impl TextServiceFactory {
             }
 
             ipc_service.set_context(preceding_text.clone())?;
-            let connection_id = ipc_service.connection_id();
             {
                 let mut text_service = self.borrow_mut()?;
                 text_service
                     .surrounding_text_context_state
-                    .remember(connection_id, &preceding_text);
+                    .remember(ipc_service.context_cache_key(), &preceding_text);
             }
             IMEState::set_ipc_service(ipc_service)?;
 

@@ -1,0 +1,553 @@
+use std::{
+    cell::Cell,
+    rc::Rc,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
+
+use super::*;
+use crate::{
+    engine::{
+        client_action::ClientAction,
+        input_mode::InputMode,
+        ipc_service::IPCService,
+        state::{AppConfigSnapshot, IMEState},
+    },
+    tsf::factory::TextServiceFactory,
+};
+use windows::{
+    core::{AsImpl, Interface},
+    Win32::{
+        UI::Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState},
+        UI::TextServices::{ITfKeyEventSink, ITfTextInputProcessor},
+    },
+};
+
+#[path = "key_recovery_context.rs"]
+mod test_context;
+
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+struct RestoreConfigSnapshot(Option<AppConfigSnapshot>);
+
+impl RestoreConfigSnapshot {
+    fn with_reconversion_key(key: shared::ReconversionKey) -> Self {
+        let restore =
+            Self(IMEState::swap_app_config_snapshot_for_test(None).expect("save config snapshot"));
+        let configured = IMEState::app_config_snapshot()
+            .expect("app config snapshot")
+            .with_reconversion_key_for_test(key);
+        IMEState::swap_app_config_snapshot_for_test(Some(configured)).expect("install test config");
+        restore
+    }
+}
+
+impl Drop for RestoreConfigSnapshot {
+    fn drop(&mut self) {
+        let _ = IMEState::swap_app_config_snapshot_for_test(self.0.take());
+    }
+}
+
+struct RestoreGlobals {
+    ipc_service: Option<IPCService>,
+    input_mode: InputMode,
+    keyboard_disabled: bool,
+    keyboard_state: [u8; 256],
+}
+
+impl RestoreGlobals {
+    fn new() -> Self {
+        let state = IMEState::get().expect("IME state");
+        let mut keyboard_state = [0; 256];
+        unsafe { GetKeyboardState(&mut keyboard_state).expect("read keyboard state") };
+        let restore = Self {
+            ipc_service: state.ipc_service.clone(),
+            input_mode: state.input_mode.clone(),
+            keyboard_disabled: state.keyboard_disabled,
+            keyboard_state,
+        };
+        drop(state);
+        IMEState::set_ipc_service(IPCService::recovery_for_test(true)).expect("IPC fixture");
+        IMEState::set_input_mode(InputMode::Kana).expect("Kana mode");
+        unsafe { SetKeyboardState(&[0; 256]).expect("clear keyboard state") };
+        restore
+    }
+}
+
+impl Drop for RestoreGlobals {
+    fn drop(&mut self) {
+        if let Ok(mut state) = IMEState::get() {
+            state.ipc_service = self.ipc_service.take();
+            state.input_mode = self.input_mode.clone();
+            state.keyboard_disabled = self.keyboard_disabled;
+        }
+        unsafe { SetKeyboardState(&self.keyboard_state).expect("restore keyboard state") };
+    }
+}
+
+fn snapshot(factory: &TextServiceFactory) -> Composition {
+    let service = factory.borrow().expect("text service");
+    let composition = service.borrow_composition().expect("composition").clone();
+    composition
+}
+
+fn assert_unchanged(factory: &TextServiceFactory, before: &Composition) {
+    let after = snapshot(factory);
+    assert_eq!(after.deferred_actions, before.deferred_actions);
+    assert_eq!(after.deferred_inputs, before.deferred_inputs);
+    assert_eq!(after.deferred_projection, before.deferred_projection);
+    assert_eq!(after.raw_input, before.raw_input);
+    assert_eq!(after.state, before.state);
+    assert_eq!(after.temporary_latin, before.temporary_latin);
+    assert_eq!(
+        after.temporary_latin_shift_pending,
+        before.temporary_latin_shift_pending
+    );
+}
+
+fn seed_composition(factory: &TextServiceFactory, state: CompositionState, temporary_latin: bool) {
+    let service = factory.borrow().expect("text service");
+    let mut composition = service.borrow_mut_composition().expect("composition");
+    *composition = Composition {
+        state,
+        temporary_latin,
+        deferred_actions: vec![DeferredClientAction {
+            action: ClientAction::StartComposition,
+            transition: CompositionState::Composing,
+        }],
+        ..Composition::default()
+    };
+}
+
+fn queued_actions(factory: &TextServiceFactory) -> Vec<Vec<ClientAction>> {
+    snapshot(factory)
+        .deferred_inputs
+        .iter()
+        .filter_map(|event| match event {
+            DeferredInputEvent::Actions(actions) => {
+                Some(actions.iter().map(|entry| entry.action.clone()).collect())
+            }
+            DeferredInputEvent::User { .. } => None,
+        })
+        .collect()
+}
+
+fn disabled_context_observed(factory: &TextServiceFactory) -> bool {
+    factory
+        .borrow()
+        .expect("text service")
+        .disabled_context_observed
+}
+
+fn fake_replay(
+    factory: &TextServiceFactory,
+    operations: &mut Vec<ClientAction>,
+    raw_input: &mut String,
+    committed: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let mut first_execute = true;
+    factory.replay_deferred_user_actions(|actions, transition, _| {
+        let composition = snapshot(factory);
+        let mut transition = transition;
+        if first_execute {
+            first_execute = false;
+            if let Some(last) = composition.deferred_actions.last() {
+                transition = last.transition.clone();
+            }
+            operations.extend(
+                composition
+                    .deferred_actions
+                    .iter()
+                    .map(|entry| entry.action.clone()),
+            );
+            let service = factory.borrow()?;
+            service.borrow_mut_composition()?.deferred_actions.clear();
+        } else {
+            operations.extend_from_slice(actions);
+        }
+        for action in actions {
+            match action {
+                ClientAction::AppendText(text) => raw_input.push_str(text),
+                ClientAction::RemoveText => {
+                    raw_input.pop();
+                }
+                ClientAction::EndComposition => {
+                    committed.push(raw_input.clone());
+                    raw_input.clear();
+                }
+                _ => {}
+            }
+        }
+        let service = factory.borrow()?;
+        let mut composition = service.borrow_mut_composition()?;
+        composition.state = transition;
+        composition.raw_input.clone_from(raw_input);
+        Ok(())
+    })
+}
+
+#[test]
+fn pending_recovery_callbacks_replay_keys_once_and_preserve_shift_chords() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _restore = RestoreGlobals::new();
+
+    unsafe {
+        let context = test_context::new(false);
+        let processor =
+            TextServiceFactory::create::<ITfTextInputProcessor>().expect("text service");
+        let factory = processor.as_impl();
+        seed_composition(factory, CompositionState::None, false);
+        let sink: ITfKeyEventSink = processor.cast().expect("key event sink");
+
+        let start = Instant::now();
+        for (index, (key, action)) in [
+            (0x41, UserAction::Input('a')),
+            (0x42, UserAction::Input('b')),
+            (0x08, UserAction::Backspace),
+            (0x0D, UserAction::Enter),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let before_test = snapshot(factory);
+            let lparam = LPARAM(1 | (1 << 30));
+            assert!(sink
+                .OnTestKeyDown(Some(&context), WPARAM(key), lparam)
+                .expect("test key")
+                .as_bool());
+            assert_unchanged(factory, &before_test);
+            assert!(sink
+                .OnKeyDown(Some(&context), WPARAM(key), lparam)
+                .expect("handle key")
+                .as_bool());
+            let after = snapshot(factory);
+            assert_eq!(after.deferred_actions.len(), 1);
+            assert_eq!(after.deferred_inputs.len(), index + 1);
+            let DeferredInputEvent::User { input, .. } = &after.deferred_inputs[index] else {
+                panic!("expected user key event")
+            };
+            assert_eq!(input.action, action);
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "callbacks blocked: {:?}",
+            start.elapsed()
+        );
+        let ipc = IMEState::ipc_service().expect("IPC").expect("fixture");
+        assert!(ipc.recovery_pending());
+        assert!(!ipc.recovery_restart_ready());
+
+        let (mut operations, mut raw_input, mut committed) =
+            (Vec::new(), String::new(), Vec::new());
+        fake_replay(factory, &mut operations, &mut raw_input, &mut committed).expect("fake replay");
+        assert_eq!(
+            operations,
+            [
+                ClientAction::StartComposition,
+                ClientAction::AppendText("a".into()),
+                ClientAction::AppendText("b".into()),
+                ClientAction::RemoveText,
+                ClientAction::CommitLearning {
+                    scope: LearningCommitScope::Composition,
+                    kind: LearningCommitKind::Normal,
+                    was_temporary_latin: false,
+                },
+                ClientAction::EndComposition,
+            ]
+        );
+        assert_eq!(committed, ["a"]);
+        assert!(raw_input.is_empty());
+        assert!(!factory.has_deferred_input().expect("drained queue"));
+        let final_composition = snapshot(factory);
+        assert_eq!(final_composition.state, CompositionState::None);
+        assert!(final_composition.deferred_projection.is_none());
+        let count = operations.len();
+        fake_replay(factory, &mut operations, &mut raw_input, &mut committed)
+            .expect("second replay");
+        assert_eq!(operations.len(), count);
+
+        // A ready restart must claim even an unowned key so replay can precede it.
+        ipc.complete_restart_for_test();
+        seed_composition(factory, CompositionState::None, false);
+        let before_failed_replay_test = snapshot(factory);
+        assert!(sink
+            .OnTestKeyDown(Some(&context), WPARAM(0x41), LPARAM(0))
+            .expect("test key before failed reconstruction")
+            .as_bool());
+        assert_unchanged(factory, &before_failed_replay_test);
+        assert!(sink
+            .OnKeyDown(Some(&context), WPARAM(0x41), LPARAM(0))
+            .expect("preserve key after failed reconstruction")
+            .as_bool());
+        let preserved = snapshot(factory);
+        assert_eq!(
+            preserved.deferred_actions,
+            before_failed_replay_test.deferred_actions
+        );
+        assert_eq!(preserved.deferred_inputs.len(), 1);
+        let DeferredInputEvent::User { input, .. } = &preserved.deferred_inputs[0] else {
+            panic!("the callback should preserve one physical key")
+        };
+        assert_eq!(input.action, UserAction::Input('a'));
+        assert!(ipc.recovery_pending());
+        assert!(ipc.recovery_restart_ready());
+
+        seed_composition(factory, CompositionState::None, false);
+        assert!(factory.deferred_input_ready().expect("ready queue"));
+        let before_ready_test = snapshot(factory);
+        assert!(sink
+            .OnTestKeyDown(Some(&context), WPARAM(0x71), LPARAM(0))
+            .expect("ready F2 test")
+            .as_bool());
+        assert_unchanged(factory, &before_ready_test);
+        fake_replay(factory, &mut operations, &mut raw_input, &mut committed)
+            .expect("ready fake replay");
+        assert!(!factory.has_deferred_input().expect("ready queue drained"));
+        assert!(!sink
+            .OnTestKeyDown(Some(&context), WPARAM(0x71), LPARAM(0))
+            .expect("unowned F2 test")
+            .as_bool());
+        assert!(!sink
+            .OnKeyDown(Some(&context), WPARAM(0x71), LPARAM(0))
+            .expect("unowned F2 key")
+            .as_bool());
+
+        // Generation zero is healthy, not a stalled restart. Exercise the real
+        // Handle replay path with a local action that needs neither a host edit nor RPC.
+        IMEState::set_ipc_service(IPCService::recovery_for_test(false))
+            .expect("healthy IPC fixture");
+        {
+            let service = factory.borrow().expect("text service");
+            let mut composition = service.borrow_mut_composition().expect("composition");
+            *composition = Composition {
+                temporary_latin: true,
+                deferred_actions: vec![DeferredClientAction {
+                    action: ClientAction::SetTemporaryLatin(false),
+                    transition: CompositionState::None,
+                }],
+                ..Composition::default()
+            };
+        }
+        assert!(factory
+            .deferred_input_ready()
+            .expect("healthy queue is ready"));
+        assert!(sink
+            .OnTestKeyDown(Some(&context), WPARAM(0x71), LPARAM(0))
+            .expect("claim healthy replay")
+            .as_bool());
+        assert!(!sink
+            .OnKeyDown(Some(&context), WPARAM(0x71), LPARAM(0))
+            .expect("replay then pass F2 through")
+            .as_bool());
+        assert!(!factory
+            .has_deferred_input()
+            .expect("healthy replay drained"));
+        assert!(!snapshot(factory).temporary_latin);
+
+        {
+            let _restore_config =
+                RestoreConfigSnapshot::with_reconversion_key(shared::ReconversionKey::Convert);
+            {
+                let service = factory.borrow().expect("text service");
+                let mut composition = service.borrow_mut_composition().expect("composition");
+                *composition = Composition {
+                    temporary_latin: true,
+                    deferred_actions: vec![DeferredClientAction {
+                        action: ClientAction::SetTemporaryLatin(false),
+                        transition: CompositionState::None,
+                    }],
+                    ..Composition::default()
+                };
+            }
+            let requests = Rc::new(Cell::new(0));
+            let observer_processor = processor.clone();
+            let observed_requests = requests.clone();
+            let observer: Rc<dyn Fn()> = Rc::new(move || {
+                let observed_factory = observer_processor.as_impl();
+                assert!(!observed_factory.has_deferred_input().expect("queue state"));
+                assert!(!snapshot(observed_factory).temporary_latin);
+                observed_requests.set(observed_requests.get() + 1);
+            });
+            let probe_context = test_context::new_with_selection_probe(observer);
+            let before_test = snapshot(factory);
+            assert!(sink
+                .OnTestKeyDown(Some(&probe_context), WPARAM(0x1C), LPARAM(0))
+                .expect("test convert after queued work")
+                .as_bool());
+            assert_unchanged(factory, &before_test);
+            assert_eq!(requests.get(), 0);
+
+            assert!(!sink
+                .OnKeyDown(Some(&probe_context), WPARAM(0x1C), LPARAM(0))
+                .expect("drain then probe convert")
+                .as_bool());
+            assert_eq!(requests.get(), 1);
+            assert!(!factory.has_deferred_input().expect("queue drained"));
+            assert!(!snapshot(factory).temporary_latin);
+            assert!(!IMEState::ipc_service()
+                .expect("IPC state")
+                .expect("healthy IPC")
+                .recovery_pending());
+        }
+
+        // A disabled test is rejected, then the next enabled test claims cleanup.
+        let mut state = IMEState::get().expect("IME state");
+        state.ipc_service = None;
+        state.keyboard_disabled = false;
+        drop(state);
+        let seed_mode_change = || {
+            let service = factory.borrow().expect("text service");
+            let mut composition = service.borrow_mut_composition().expect("composition");
+            *composition = Composition {
+                deferred_actions: vec![DeferredClientAction {
+                    action: ClientAction::SetIMEMode(InputMode::Latin),
+                    transition: CompositionState::None,
+                }],
+                ..Composition::default()
+            };
+        };
+        let disabled_context = test_context::new(true);
+        seed_mode_change();
+        let before_disabled_test = snapshot(factory);
+        assert!(!sink
+            .OnTestKeyDown(Some(&disabled_context), WPARAM(0x41), LPARAM(0))
+            .expect("disabled-host key test")
+            .as_bool());
+        assert_unchanged(factory, &before_disabled_test);
+        assert!(disabled_context_observed(factory));
+        let before_cleanup_test = snapshot(factory);
+        assert!(sink
+            .OnTestKeyDown(Some(&context), WPARAM(0x71), LPARAM(0))
+            .expect("enabled F2 claims cleanup")
+            .as_bool());
+        assert_unchanged(factory, &before_cleanup_test);
+        assert!(disabled_context_observed(factory));
+        assert!(!sink
+            .OnKeyDown(Some(&context), WPARAM(0x71), LPARAM(0))
+            .expect("enabled F2 cleans stale composition")
+            .as_bool());
+        assert_eq!(IMEState::input_mode().expect("input mode"), InputMode::Kana);
+        assert!(!factory
+            .has_deferred_input()
+            .expect("disabled work cancelled"));
+        assert!(snapshot(factory).deferred_projection.is_none());
+        assert!(!disabled_context_observed(factory));
+        assert!(!sink
+            .OnTestKeyDown(Some(&context), WPARAM(0x71), LPARAM(0))
+            .expect("F2 after cleanup is unowned")
+            .as_bool());
+
+        // Disabled key-up also leaves cleanup for the next enabled TSF callback.
+        seed_mode_change();
+        let before_disabled_up = snapshot(factory);
+        assert!(!sink
+            .OnTestKeyUp(Some(&disabled_context), WPARAM(0x41), LPARAM(0))
+            .expect("disabled key-up test")
+            .as_bool());
+        assert_unchanged(factory, &before_disabled_up);
+        assert!(disabled_context_observed(factory));
+        assert!(sink
+            .OnTestKeyUp(Some(&context), WPARAM(0x41), LPARAM(0))
+            .expect("enabled key-up claims cleanup")
+            .as_bool());
+        assert!(disabled_context_observed(factory));
+        assert!(!sink
+            .OnKeyUp(Some(&context), WPARAM(0x41), LPARAM(0))
+            .expect("enabled key-up cleans stale composition")
+            .as_bool());
+        assert_eq!(IMEState::input_mode().expect("input mode"), InputMode::Kana);
+        assert!(!factory
+            .has_deferred_input()
+            .expect("key-up cleanup drained"));
+        assert!(snapshot(factory).deferred_projection.is_none());
+        assert!(!disabled_context_observed(factory));
+
+        // Direct Handle admission remains guarded independently of the rejected-Test path.
+        seed_mode_change();
+        // Avoid language-bar notification for this unactivated test service.
+        IMEState::get().expect("IME state").keyboard_disabled = true;
+        assert!(!sink
+            .OnKeyDown(Some(&disabled_context), WPARAM(0x41), LPARAM(0))
+            .expect("direct disabled-host handling")
+            .as_bool());
+        assert_eq!(IMEState::input_mode().expect("input mode"), InputMode::Kana);
+        assert!(!factory
+            .has_deferred_input()
+            .expect("direct disabled work cancelled"));
+        IMEState::get().expect("IME state").keyboard_disabled = false;
+
+        IMEState::set_ipc_service(IPCService::recovery_for_test(true))
+            .expect("pending IPC fixture");
+        seed_composition(factory, CompositionState::Composing, true);
+        let shift = WPARAM(0x10);
+        let before_shift_test = snapshot(factory);
+        assert!(sink
+            .OnTestKeyDown(Some(&context), shift, LPARAM(0))
+            .expect("test Shift")
+            .as_bool());
+        assert_unchanged(factory, &before_shift_test);
+        assert!(sink
+            .OnKeyDown(Some(&context), shift, LPARAM(0))
+            .expect("handle Shift")
+            .as_bool());
+        assert_eq!(
+            queued_actions(factory),
+            [vec![ClientAction::SetTemporaryLatinShiftPending(true)]]
+        );
+        let before_chord_f2 = snapshot(factory);
+        assert!(!sink
+            .OnTestKeyDown(Some(&context), WPARAM(0x71), LPARAM(0))
+            .expect("test F2 chord")
+            .as_bool());
+        assert_unchanged(factory, &before_chord_f2);
+        let before_chord_up = snapshot(factory);
+        assert!(sink
+            .OnTestKeyUp(Some(&context), shift, LPARAM(0))
+            .expect("test Shift-up")
+            .as_bool());
+        assert_unchanged(factory, &before_chord_up);
+        assert!(sink
+            .OnKeyUp(Some(&context), shift, LPARAM(0))
+            .expect("handle chord Shift-up")
+            .as_bool());
+        assert_eq!(snapshot(factory).deferred_inputs.len(), 2);
+        assert_eq!(
+            queued_actions(factory).last().unwrap().as_slice(),
+            &[ClientAction::SetTemporaryLatinShiftPending(false)]
+        );
+
+        seed_composition(factory, CompositionState::Composing, true);
+        {
+            let mut service = factory.borrow_mut().expect("text service");
+            service.shift_key_down = false;
+            service.shift_key_used_in_chord = false;
+        }
+        assert!(sink
+            .OnTestKeyDown(Some(&context), shift, LPARAM(0))
+            .expect("test Shift-only")
+            .as_bool());
+        assert!(sink
+            .OnKeyDown(Some(&context), shift, LPARAM(0))
+            .expect("handle Shift-only")
+            .as_bool());
+        assert_eq!(snapshot(factory).deferred_inputs.len(), 1);
+        let before_shift_only_up = snapshot(factory);
+        assert!(sink
+            .OnTestKeyUp(Some(&context), shift, LPARAM(0))
+            .expect("test Shift-only up")
+            .as_bool());
+        assert_unchanged(factory, &before_shift_only_up);
+        assert!(sink
+            .OnKeyUp(Some(&context), shift, LPARAM(0))
+            .expect("handle Shift-only up")
+            .as_bool());
+        assert_eq!(snapshot(factory).deferred_inputs.len(), 2);
+        assert_eq!(
+            queued_actions(factory).last().unwrap().as_slice(),
+            &[
+                ClientAction::SetTemporaryLatin(false),
+                ClientAction::SetTemporaryLatinShiftPending(false),
+            ]
+        );
+    }
+}

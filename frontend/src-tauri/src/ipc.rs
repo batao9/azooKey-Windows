@@ -53,6 +53,7 @@ impl IPCService {
     }
 
     fn new_inner(timeout: Option<Duration>) -> Result<Self> {
+        let pipe_path = shared::server_pipe_path()?;
         let runtime = tokio::runtime::Runtime::new()?;
         let connect_deadline = connect_deadline(timeout);
 
@@ -60,7 +61,7 @@ impl IPCService {
         let connect = endpoint.connect_with_connector(service_fn(move |_| async move {
             let started_at = Instant::now();
             let client = loop {
-                match open_named_pipe_client(shared::SERVER_PIPE_PATH) {
+                match open_named_pipe_client(pipe_path) {
                     Ok(client) => break client,
                     Err(e)
                         if should_retry_pipe_connect_error(

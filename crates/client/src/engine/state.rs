@@ -195,6 +195,14 @@ pub(crate) struct AppConfigSnapshot {
 }
 
 impl AppConfigSnapshot {
+    #[cfg(test)]
+    pub(super) fn with_reconversion_key_for_test(mut self, key: shared::ReconversionKey) -> Self {
+        Arc::make_mut(&mut self.app_config)
+            .shortcuts
+            .reconversion_key = key;
+        self
+    }
+
     fn new(app_config: AppConfig, cache_key: AppConfigCacheKey) -> Self {
         let romaji_lookup = RomajiLookup::from_rows(&app_config.romaji_table.rows);
         Self {
@@ -232,6 +240,16 @@ pub static IME_STATE: LazyLock<Mutex<IMEState>> = LazyLock::new(|| {
 });
 
 impl IMEState {
+    #[cfg(test)]
+    pub(super) fn swap_app_config_snapshot_for_test(
+        snapshot: Option<AppConfigSnapshot>,
+    ) -> anyhow::Result<Option<AppConfigSnapshot>> {
+        Ok(std::mem::replace(
+            &mut Self::get()?.app_config_snapshot,
+            snapshot,
+        ))
+    }
+
     pub fn get() -> anyhow::Result<MutexGuard<'static, IMEState>> {
         Ok(IME_STATE.lock().unwrap_or_else(|poisoned| {
             tracing::error!("IME state mutex was poisoned; recovering state");

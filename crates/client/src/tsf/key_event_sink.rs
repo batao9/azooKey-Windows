@@ -10,7 +10,7 @@ use windows::{
 
 use anyhow::Result;
 
-use crate::engine::composition::ReconversionKeyTestResult;
+use crate::engine::composition::{KeyEventPhase, ReconversionKeyTestResult};
 
 use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
 
@@ -37,6 +37,15 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     ) -> Result<BOOL> {
         self.update_shift_key_state(wparam, true);
 
+        if self.observe_disabled_key_test_context(pic)? {
+            self.clear_reconversion_test_result();
+            return Ok(false.into());
+        }
+        if self.borrow()?.disabled_context_observed || self.deferred_input_ready()? {
+            self.remember_reconversion_test_result(wparam, None);
+            return Ok(true.into());
+        }
+
         match self.test_reconversion_key(pic, wparam) {
             Ok(ReconversionKeyTestResult::Owned) => {
                 self.remember_reconversion_test_result(wparam, Some(true));
@@ -62,9 +71,10 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
             }
         }
 
-        // this function checks if the key event will be handled by "OnKeyUp" function
-        // so we need to return TRUE if we want to handle the key event
-        let result = self.process_key(pic, wparam, lparam)?.is_some();
+        // Test ownership without executing actions, queueing input, or recovering IPC.
+        let result = self
+            .process_key(pic, wparam, lparam, KeyEventPhase::Test)?
+            .is_some();
 
         Ok(result.into())
     }
@@ -73,6 +83,11 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     #[tracing::instrument]
     fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
         self.update_shift_key_state(wparam, true);
+        self.cleanup_observed_disabled_context()?;
+        if self.has_deferred_input()? {
+            self.clear_reconversion_test_result();
+            return Ok(self.handle_key(pic, wparam, lparam)?.into());
+        }
         let tested_selection = self.take_reconversion_test_result(wparam);
 
         // If OnTest already matched Space with an empty selection, do not take a second
@@ -115,7 +130,15 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
         // Release the tracked modifier before fallible composition work so an
         // error cannot leave later ordinary keys looking Shift-modified.
         self.update_shift_key_state(wparam, false);
-        let result = self.process_key_up(pic, wparam, lparam)?.is_some();
+        if self.observe_disabled_key_test_context(pic)? {
+            return Ok(false.into());
+        }
+        if self.borrow()?.disabled_context_observed {
+            return Ok(true.into());
+        }
+        let result = self
+            .process_key_up(pic, wparam, lparam, KeyEventPhase::Test)?
+            .is_some();
         Ok(result.into())
     }
 
@@ -145,6 +168,7 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
         if !fforeground.as_bool() {
             self.clear_tracked_modifier_key_state();
             self.clear_reconversion_test_result();
+            self.end_composition_for_tsf_event();
             self.set_keyboard_disabled_state(true)?;
         }
 
@@ -153,6 +177,19 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
 }
 
 impl TextServiceFactory_Impl {
+    fn observe_disabled_key_test_context(&self, context: Option<&ITfContext>) -> Result<bool> {
+        let Some(context) = context else {
+            return Ok(true);
+        };
+        let disabled = crate::engine::state::keyboard_disabled_from_context(context);
+        if disabled {
+            // A rejected Test has no Handle callback. Record invalidation without
+            // modifying composition or doing TSF/IPC cleanup in the test path.
+            self.borrow_mut()?.disabled_context_observed = true;
+        }
+        Ok(disabled)
+    }
+
     fn remember_reconversion_test_result(&self, wparam: WPARAM, selected: Option<bool>) {
         if let Ok(mut text_service) = self.borrow_mut() {
             text_service.reconversion_test_result = selected.map(|selected| (wparam.0, selected));
@@ -179,10 +216,18 @@ impl TextServiceFactory_Impl {
 
     fn update_shift_key_state(&self, wparam: WPARAM, is_down: bool) {
         if !TextServiceFactory::is_shift_key(wparam) {
+            if is_down {
+                if let Ok(mut text_service) = self.borrow_mut() {
+                    text_service.shift_key_used_in_chord = true;
+                }
+            }
             return;
         }
 
         if let Ok(mut text_service) = self.borrow_mut() {
+            if is_down && !text_service.shift_key_down {
+                text_service.shift_key_used_in_chord = false;
+            }
             text_service.shift_key_down = is_down;
         }
     }
@@ -190,6 +235,7 @@ impl TextServiceFactory_Impl {
     pub(crate) fn clear_tracked_modifier_key_state(&self) {
         if let Ok(mut text_service) = self.borrow_mut() {
             text_service.shift_key_down = false;
+            text_service.shift_key_used_in_chord = false;
         }
     }
 }
