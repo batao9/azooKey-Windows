@@ -51,8 +51,9 @@ use windows::Win32::{
         },
         TextServices::{
             ITfComposition, ITfCompositionSink_Impl, ITfContext, ITfInputScope, ITfRange,
-            ITfTextInputProcessor, InputScope, GUID_PROP_INPUTSCOPE, IS_NUMERIC_PASSWORD,
-            IS_PASSWORD, IS_PRIVATE, TF_DEFAULT_SELECTION, TF_SELECTION,
+            ITfTextInputProcessor, InputScope, GUID_PROP_INPUTSCOPE, IS_ALPHANUMERIC_PIN,
+            IS_ALPHANUMERIC_PIN_SET, IS_NUMERIC_PASSWORD, IS_NUMERIC_PIN, IS_PASSWORD, IS_PRIVATE,
+            TF_DEFAULT_SELECTION, TF_SELECTION,
         },
     },
 };
@@ -4338,7 +4339,15 @@ impl TextServiceFactory {
 
     #[inline]
     fn is_sensitive_input_scope(scope: InputScope) -> bool {
-        scope == IS_PASSWORD || scope == IS_NUMERIC_PASSWORD || scope == IS_PRIVATE
+        matches!(
+            scope,
+            IS_PASSWORD
+                | IS_NUMERIC_PASSWORD
+                | IS_PRIVATE
+                | IS_NUMERIC_PIN
+                | IS_ALPHANUMERIC_PIN
+                | IS_ALPHANUMERIC_PIN_SET
+        )
     }
 
     fn input_scope_list_contains_sensitive(input_scope: &ITfInputScope) -> bool {

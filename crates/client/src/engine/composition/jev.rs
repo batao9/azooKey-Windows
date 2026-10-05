@@ -4,7 +4,7 @@ use std::{cell::RefCell, mem::ManuallyDrop, sync::mpsc, time::Instant};
 use windows::Win32::{
     Foundation::HWND,
     UI::{
-        TextServices::{IEnumTfPropertyValue, TF_ANCHOR_START, TF_PROPERTYVAL},
+        TextServices::{IEnumTfPropertyValue, TF_ANCHOR_END, TF_ANCHOR_START, TF_PROPERTYVAL},
         WindowsAndMessaging::{KillTimer, SetTimer},
     },
 };
@@ -44,6 +44,20 @@ fn tracked_input_scope_allows_remote_scoring(value: &windows::core::VARIANT) -> 
         "Missing tracked input-scope property"
     );
     input_scope_allows_remote_scoring(&value)
+}
+
+// An absent/unsupported enumeration must not certify an unchecked text range.
+fn scope_ranges_allow_remote_scoring(
+    mut next: impl FnMut() -> Result<Option<bool>>,
+) -> Result<bool> {
+    let mut checked = false;
+    while let Some(allowed) = next()? {
+        if !allowed {
+            return Ok(false);
+        }
+        checked = true;
+    }
+    Ok(checked)
 }
 
 struct Pending {
@@ -214,9 +228,9 @@ impl TextServiceFactory {
         if mapping.len() < 2 {
             return Ok(());
         }
-        // Read surrounding text only after the fail-closed input-scope check.
-        // A failed fresh read must never send context cached from another document.
-        let Some(external_context) = self.update_context(&preview)? else {
+        // Validate the actual parent context and every span of the fresh read.
+        // Never use the KKC context cache for a cloud request.
+        let Some(external_context) = self.update_context_for_jev(&preview)? else {
             return Ok(());
         };
         let ipc = IMEState::ipc_service()?.context("No IPC service")?;
@@ -251,6 +265,51 @@ impl TextServiceFactory {
             })
         });
         Ok(())
+    }
+
+    pub(crate) fn jev_context_range_allows_remote_scoring(
+        context: &ITfContext,
+        cookie: u32,
+        range: &ITfRange,
+    ) -> Result<bool> {
+        unsafe {
+            if !has_same_com_identity(context, &range.GetContext()?)
+                || keyboard_disabled_from_context(context)
+            {
+                return Ok(false);
+            }
+            let property = context.TrackProperties(&[], &[&GUID_PROP_INPUTSCOPE])?;
+            let mut ranges = None;
+            property.EnumRanges(cookie, &mut ranges, range)?;
+            let ranges = ranges.context("Missing input-scope ranges")?;
+            let unchecked = range.Clone()?;
+            scope_ranges_allow_remote_scoring(|| {
+                let mut items = [None];
+                let mut fetched = 0;
+                ranges.Next(&mut items, &mut fetched)?;
+                if fetched == 0 {
+                    // Reject missing spans, including an entirely absent property.
+                    anyhow::ensure!(
+                        unchecked.CompareStart(cookie, range, TF_ANCHOR_END)? == 0,
+                        "Incomplete input-scope coverage"
+                    );
+                    return Ok(None);
+                }
+                let item = items[0].as_ref().context("Missing input-scope range")?;
+                // Require contiguous, nonempty spans within the requested range.
+                anyhow::ensure!(
+                    fetched == 1
+                        && item.CompareStart(cookie, &unchecked, TF_ANCHOR_START)? == 0
+                        && item.CompareEnd(cookie, &unchecked, TF_ANCHOR_START)? > 0
+                        && item.CompareEnd(cookie, range, TF_ANCHOR_END)? <= 0,
+                    "Invalid input-scope coverage"
+                );
+                let allowed =
+                    tracked_input_scope_allows_remote_scoring(&property.GetValue(cookie, item)?)?;
+                unchecked.ShiftStartToRange(cookie, item, TF_ANCHOR_END)?;
+                Ok(Some(allowed))
+            })
+        }
     }
 
     fn apply_jev_result(&self, pending: &Pending, index: usize) -> Result<()> {
@@ -469,7 +528,14 @@ mod tests {
                 allowed
             );
         }
-        for scope in [IS_PASSWORD, IS_NUMERIC_PASSWORD, IS_PRIVATE] {
+        for scope in [
+            IS_PASSWORD,
+            IS_NUMERIC_PASSWORD,
+            IS_PRIVATE,
+            IS_NUMERIC_PIN,
+            IS_ALPHANUMERIC_PIN,
+            IS_ALPHANUMERIC_PIN_SET,
+        ] {
             let input_scope: ITfInputScope = TestInputScope {
                 scopes: vec![IS_DEFAULT, scope],
                 fail: false,
@@ -496,6 +562,9 @@ mod tests {
             (vec![IS_DEFAULT, IS_PASSWORD], false, false),
             (vec![IS_NUMERIC_PASSWORD], false, false),
             (vec![IS_PRIVATE], false, false),
+            (vec![IS_DEFAULT, IS_NUMERIC_PIN], false, false),
+            (vec![IS_DEFAULT, IS_ALPHANUMERIC_PIN], false, false),
+            (vec![IS_DEFAULT, IS_ALPHANUMERIC_PIN_SET], false, false),
             (vec![IS_DEFAULT], true, false),
         ] {
             let scope: ITfInputScope = TestInputScope { scopes, fail }.into();
@@ -505,6 +574,37 @@ mod tests {
                 allowed
             );
         }
+    }
+
+    #[test]
+    fn jev_context_scope_enumeration_rejects_mixed_missing_and_unreadable_spans() {
+        for (spans, allowed) in [
+            (vec![true], true),
+            (vec![true, true], true),
+            (vec![true, false, true], false),
+            (vec![], false),
+        ] {
+            let mut spans = spans.into_iter();
+            assert_eq!(
+                scope_ranges_allow_remote_scoring(|| Ok(spans.next())).unwrap(),
+                allowed
+            );
+        }
+        // EnumRanges E_NOTIMPL, and a later Next/GetValue/coverage failure,
+        // must both fail closed even after an ordinary first span.
+        assert!(!scope_ranges_allow_remote_scoring(|| {
+            Err(windows::core::Error::from(E_NOTIMPL).into())
+        })
+        .unwrap_or(false));
+        let mut first = true;
+        assert!(!scope_ranges_allow_remote_scoring(|| {
+            if std::mem::take(&mut first) {
+                Ok(Some(true))
+            } else {
+                Err(windows::core::Error::from(E_FAIL).into())
+            }
+        })
+        .unwrap_or(false));
     }
 
     fn candidates() -> Candidates {

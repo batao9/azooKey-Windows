@@ -130,6 +130,18 @@ impl TextServiceFactory {
     }
 
     pub fn update_context(&self, preview: &str) -> Result<Option<String>> {
+        self.update_context_with_scope_check(preview, false)
+    }
+
+    pub(crate) fn update_context_for_jev(&self, preview: &str) -> Result<Option<String>> {
+        self.update_context_with_scope_check(preview, true)
+    }
+
+    fn update_context_with_scope_check(
+        &self,
+        preview: &str,
+        for_jev: bool,
+    ) -> Result<Option<String>> {
         let trace_request_id = current_input_trace_request_id();
         let total_start = trace_request_id.map(|_| Instant::now());
         let result: Result<Option<String>> = (|| unsafe {
@@ -190,6 +202,18 @@ impl TextServiceFactory {
                             &halt_cond,
                         )?;
 
+                        if for_jev
+                            && !Self::jev_context_range_allows_remote_scoring(
+                                &parent_context,
+                                cookie,
+                                &preceding_range,
+                            )
+                            .unwrap_or(false)
+                        {
+                            // Do not read sensitive/unchecked text, or reuse cached context.
+                            return Ok(String::new());
+                        }
+
                         let mut pchtext = [0u16; 64];
                         let mut pcch = 0;
                         preceding_range.GetText(
@@ -215,6 +239,12 @@ impl TextServiceFactory {
                         preview.chars().count()
                     ),
                 );
+            }
+
+            // Jev passes this fresh value explicitly; it must not touch KKC's cache
+            // or issue the normal synchronous set_context RPC.
+            if for_jev {
+                return Ok(Some(preceding_text));
             }
 
             let Some(mut ipc_service) = IMEState::ipc_service()? else {

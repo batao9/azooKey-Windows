@@ -1288,7 +1288,7 @@ export const General = () => {
                                 <FlaskConical className="h-4 w-4 shrink-0" />
                                 <div className="flex-1 space-y-1">
                                     <p className="text-sm font-medium leading-none">Jevによる候補選択</p>
-                                    <p className="text-xs text-muted-foreground">変換キーを押したとき、通常KKCの候補からJevが選択します。</p>
+                                    <p className="text-xs text-muted-foreground">デスクトップアプリで変換キーを押したとき、通常KKCの候補からJevが選択します。Windows検索などのAppContainerでは通常KKCを使います。</p>
                                 </div>
                                 <Switch
                                     aria-label="Jevによる候補選択"
@@ -1330,7 +1330,7 @@ export const General = () => {
                     <AlertDialogHeader>
                         <AlertDialogTitle>Jevによる候補選択を有効にしますか？</AlertDialogTitle>
                         <AlertDialogDescription>
-                            有効にするとリアルタイム変換がOFFになります。変換キーを押すと、入力した読み・変換候補・左文脈がJevのサーバー（TypeSafe）へ送信されます。
+                            有効にするとリアルタイム変換がOFFになります。デスクトップアプリで変換キーを押すと、入力した読み・変換候補・左文脈がJevのサーバー（TypeSafe）へ送信されます。Windows検索などのAppContainerでは通常KKCを使います。
                         </AlertDialogDescription>
                     </AlertDialogHeader>
                     <AlertDialogFooter>

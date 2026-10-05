@@ -1651,6 +1651,9 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<shared::proto::RerankCandidatesRequest>,
     ) -> Result<Response<shared::proto::RerankCandidatesResponse>, Status> {
+        // Credential-backed requests require the same desktop trust boundary as
+        // management RPCs; composition access alone is insufficient.
+        PipeClient::authorize_management(&request)?;
         let request = request.into_inner();
         let request_id = request_id_or_next(request.request_id);
         let start = Instant::now();
@@ -2925,14 +2928,21 @@ mod path_tests {
         use shared::proto::azookey_service_server::AzookeyService;
         let service = super::MyAzookeyService::default();
         let _guard = service.mutation_lock.lock().await;
-        let reply = service
-            .rerank_candidates(tonic::Request::new(
-                shared::proto::RerankCandidatesRequest::default(),
-            ))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(reply.selected_index, None);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            service.rerank_candidates(tonic::Request::new(
+                shared::proto::RerankCandidatesRequest {
+                    reading: "きしゃ".into(),
+                    candidates: vec!["記者".into(), "汽車".into()],
+                    allow_remote: true,
+                    ..Default::default()
+                },
+            )),
+        )
+        .await
+        .expect("reranking must not acquire the composition lock")
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
     }
 
     #[test]
@@ -3004,6 +3014,21 @@ mod path_tests {
         let first = first_transport.connect_info();
         let second = second_transport.connect_info();
         let service = MyAzookeyService::default();
+        {
+            let _guard = service.mutation_lock.lock().await;
+            let reply = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                service.rerank_candidates(request(
+                    shared::proto::RerankCandidatesRequest::default(),
+                    &first,
+                )),
+            )
+            .await
+            .expect("authenticated reranking must not acquire the composition lock")
+            .expect("desktop pipe identity must be allowed")
+            .into_inner();
+            assert_eq!(reply.selected_index, None);
+        }
         // Unassigned CJK: reading inference is unsupported without needing a
         // dictionary or model fixture. No candidate generation is performed.
         let unsupported = StartReconversionRequest {
