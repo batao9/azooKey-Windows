@@ -193,6 +193,9 @@ pub const LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MIN: i32 = -12;
 pub const LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MAX: i32 = 12;
 pub const LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_DEFAULT: i32 = 4;
 
+#[cfg(windows)]
+pub mod jev_credentials;
+
 #[derive(Debug)]
 pub enum ConfigError {
     MissingAppData,
@@ -619,6 +622,8 @@ fn legacy_groups_from_symbol_fullwidth(
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct GeneralConfig {
     #[serde(default)]
+    pub jev_conversion: bool,
+    #[serde(default)]
     pub punctuation_style: PunctuationStyle,
     #[serde(default)]
     pub symbol_style: SymbolStyle,
@@ -647,6 +652,7 @@ pub struct GeneralConfig {
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
+            jev_conversion: false,
             punctuation_style: PunctuationStyle::ToutenKuten,
             symbol_style: SymbolStyle::CornerBracketMiddleDot,
             space_input: SpaceInputMode::AlwaysHalf,
@@ -733,6 +739,19 @@ pub fn zenzai_cpu_backend_supported() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn jev_conversion_is_opt_in_and_round_trips() {
+        let mut general: super::GeneralConfig = serde_json::from_str("{}").unwrap();
+        assert!(!general.jev_conversion);
+        general.jev_conversion = true;
+        let saved = serde_json::to_string(&general).unwrap();
+        assert!(
+            serde_json::from_str::<super::GeneralConfig>(&saved)
+                .unwrap()
+                .jev_conversion
+        );
+    }
+
     #[cfg(windows)]
     use super::ConfigWriteGuard;
     use super::{

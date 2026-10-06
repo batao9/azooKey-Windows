@@ -1193,6 +1193,7 @@ private struct AppSettings: Decodable {
 }
 
 private struct GeneralSettings: Decodable {
+    let jev_conversion: Bool?
     let experimental_typo_correction: Bool?
 }
 
@@ -2520,6 +2521,11 @@ func cursorPrefixBoundaryFirstClauseResults(
             if let backendValue = zenzai.backend {
                 config["backend"] = backendValue
             }
+        }
+
+        // Jev uses only ordinary KKC, including warmup and clause navigation.
+        if settings.general?.jev_conversion == true {
+            config["enable"] = false
         }
 
         applyRomajiInputStyle(rows: settings.romaji_table?.rows)

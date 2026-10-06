@@ -535,6 +535,29 @@ impl Drop for ClientInputTraceGuard {
 }
 
 impl IPCService {
+    /// Cloud ranking is stateless and must never occupy the TSF input thread or recovery ledger.
+    pub(crate) fn rerank_candidates_background(
+        &self,
+        request: shared::proto::RerankCandidatesRequest,
+        result: std::sync::mpsc::Sender<Option<usize>>,
+    ) -> tokio::task::JoinHandle<()> {
+        let mut client = self.azookey_client.clone();
+        self.runtime.spawn(async move {
+            let mut request = tonic::Request::new(request);
+            request.set_timeout(Duration::from_millis(1800));
+            let selected = tokio::time::timeout(
+                Duration::from_millis(1800),
+                client.rerank_candidates(request),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|response| response.into_inner().selected_index)
+            .map(|index| index as usize);
+            let _ = result.send(selected);
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn recovery_for_test(pending: bool) -> Self {
         let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());

@@ -144,6 +144,21 @@ fn get_config(state: tauri::State<AppState>) -> AppConfig {
     get_config_impl(&state)
 }
 
+#[tauri::command]
+fn has_jev_api_key() -> bool {
+    shared::jev_credentials::read_jev_api_key().is_some()
+}
+
+#[tauri::command]
+fn save_jev_api_key(api_key: String) -> Result<(), String> {
+    shared::jev_credentials::save_jev_api_key(&api_key)
+}
+
+#[tauri::command]
+fn delete_jev_api_key() -> Result<(), String> {
+    shared::jev_credentials::delete_jev_api_key()
+}
+
 fn get_config_impl(state: &AppState) -> AppConfig {
     let _update_guard = state.config_update_lock.lock().unwrap();
     match AppConfig::read() {
@@ -478,6 +493,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             get_config,
+            has_jev_api_key,
+            save_jev_api_key,
+            delete_jev_api_key,
             take_config_startup_notice,
             update_config,
             check_capability,

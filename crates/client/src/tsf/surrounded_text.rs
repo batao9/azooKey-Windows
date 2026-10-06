@@ -129,10 +129,22 @@ impl TextServiceFactory {
         }
     }
 
-    pub fn update_context(&self, preview: &str) -> Result<()> {
+    pub fn update_context(&self, preview: &str) -> Result<Option<String>> {
+        self.update_context_with_scope_check(preview, false)
+    }
+
+    pub(crate) fn update_context_for_jev(&self, preview: &str) -> Result<Option<String>> {
+        self.update_context_with_scope_check(preview, true)
+    }
+
+    fn update_context_with_scope_check(
+        &self,
+        preview: &str,
+        for_jev: bool,
+    ) -> Result<Option<String>> {
         let trace_request_id = current_input_trace_request_id();
         let total_start = trace_request_id.map(|_| Instant::now());
-        let result: Result<()> = (|| unsafe {
+        let result: Result<Option<String>> = (|| unsafe {
             let (tid, parent_context) = {
                 let text_service = self.borrow()?;
                 let context = text_service.context::<ITfContext>()?;
@@ -190,6 +202,18 @@ impl TextServiceFactory {
                             &halt_cond,
                         )?;
 
+                        if for_jev
+                            && !Self::jev_context_range_allows_remote_scoring(
+                                &parent_context,
+                                cookie,
+                                &preceding_range,
+                            )
+                            .unwrap_or(false)
+                        {
+                            // Do not read sensitive/unchecked text, or reuse cached context.
+                            return Ok(String::new());
+                        }
+
                         let mut pchtext = [0u16; 64];
                         let mut pcch = 0;
                         preceding_range.GetText(
@@ -217,8 +241,14 @@ impl TextServiceFactory {
                 );
             }
 
+            // Jev passes this fresh value explicitly; it must not touch KKC's cache
+            // or issue the normal synchronous set_context RPC.
+            if for_jev {
+                return Ok(Some(preceding_text));
+            }
+
             let Some(mut ipc_service) = IMEState::ipc_service()? else {
-                return Ok(());
+                return Ok(Some(preceding_text));
             };
 
             let connection_id = ipc_service.connection_id();
@@ -241,7 +271,7 @@ impl TextServiceFactory {
                         ),
                     );
                 }
-                return Ok(());
+                return Ok(Some(preceding_text));
             }
 
             ipc_service.set_context(preceding_text.clone())?;
@@ -253,12 +283,12 @@ impl TextServiceFactory {
             }
             IMEState::set_ipc_service(ipc_service)?;
 
-            Ok(())
+            Ok(Some(preceding_text))
         })();
 
         if let (Some(request_id), Some(total_start)) = (trace_request_id, total_start) {
             let details = match &result {
-                Ok(()) => format!("status=success;preview_len={}", preview.chars().count()),
+                Ok(_) => format!("status=success;preview_len={}", preview.chars().count()),
                 Err(error) => format!(
                     "status=error;preview_len={};error={error:?}",
                     preview.chars().count()
@@ -267,11 +297,11 @@ impl TextServiceFactory {
             Self::log_update_context_performance(request_id, "total", total_start, details);
         }
 
-        if let Err(error) = result {
+        if let Err(error) = &result {
             tracing::warn!("Failed to update surrounded text context: {error:?}");
         }
 
-        Ok(())
+        Ok(result.ok().flatten())
     }
 }
 

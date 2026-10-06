@@ -51,8 +51,9 @@ use windows::Win32::{
         },
         TextServices::{
             ITfComposition, ITfCompositionSink_Impl, ITfContext, ITfInputScope, ITfRange,
-            ITfTextInputProcessor, InputScope, GUID_PROP_INPUTSCOPE, IS_NUMERIC_PASSWORD,
-            IS_PASSWORD, IS_PRIVATE, TF_DEFAULT_SELECTION, TF_SELECTION,
+            ITfTextInputProcessor, InputScope, GUID_PROP_INPUTSCOPE, IS_ALPHANUMERIC_PIN,
+            IS_ALPHANUMERIC_PIN_SET, IS_NUMERIC_PASSWORD, IS_NUMERIC_PIN, IS_PASSWORD, IS_PRIVATE,
+            TF_DEFAULT_SELECTION, TF_SELECTION,
         },
     },
 };
@@ -1838,6 +1839,7 @@ impl TextServiceFactory {
             ClientAction::StartComposition => "StartComposition",
             ClientAction::EndComposition => "EndComposition",
             ClientAction::ShowCandidateWindow => "ShowCandidateWindow",
+            ClientAction::StartJevConversion => "StartJevConversion",
             ClientAction::AppendText(_) => "AppendText",
             ClientAction::AppendTextRaw(_) => "AppendTextRaw",
             ClientAction::AppendTextDirect(_) => "AppendTextDirect",
@@ -2259,6 +2261,10 @@ impl TextServiceFactory {
         app_config: &AppConfig,
         transition: &CompositionState,
     ) -> Result<()> {
+        if app_config.general.jev_conversion && *transition == CompositionState::Composing {
+            self.hide_candidate_window_ui(ipc_service)?;
+            return Ok(());
+        }
         let reading = Self::live_conversion_reading(app_config, candidates, transition);
         let reading_update = reading.or(Some(""));
         let reading_vertical_adjustment =
@@ -4333,7 +4339,15 @@ impl TextServiceFactory {
 
     #[inline]
     fn is_sensitive_input_scope(scope: InputScope) -> bool {
-        scope == IS_PASSWORD || scope == IS_NUMERIC_PASSWORD || scope == IS_PRIVATE
+        matches!(
+            scope,
+            IS_PASSWORD
+                | IS_NUMERIC_PASSWORD
+                | IS_PRIVATE
+                | IS_NUMERIC_PIN
+                | IS_ALPHANUMERIC_PIN
+                | IS_ALPHANUMERIC_PIN_SET
+        )
     }
 
     fn input_scope_list_contains_sensitive(input_scope: &ITfInputScope) -> bool {
@@ -4758,6 +4772,23 @@ impl TextServiceFactory {
             // them to a different candidate's state. Candidate selection, commit, Escape,
             // mode changes, and commit-then-append input remain safe.
             return Some((composition.state.clone(), Vec::new()));
+        }
+        if app_config.general.jev_conversion
+            && composition.state == CompositionState::Composing
+            && matches!(
+                action,
+                UserAction::Space | UserAction::Tab | UserAction::Reconvert
+            )
+            && Self::jev_composition_eligible(composition, false)
+        {
+            return Some((
+                CompositionState::Previewing,
+                vec![
+                    ClientAction::SetSelection(SetSelectionType::Number(0)),
+                    ClientAction::ShowCandidateWindow,
+                    ClientAction::StartJevConversion,
+                ],
+            ));
         }
         let result = match composition.state {
             CompositionState::None => match action {
@@ -6052,6 +6083,7 @@ impl TextServiceFactory {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<bool> {
+        self.cancel_jev_conversion();
         let input_trace = client_performance_log_enabled().then(ClientInputTraceGuard::begin);
         let total_start = input_trace.as_ref().map(|_| Instant::now());
         let result: Result<bool> = (|| {
@@ -6371,6 +6403,7 @@ impl TextServiceFactory {
     }
 
     fn handle_external_composition_terminated(&self, terminated: Option<&ITfComposition>) {
+        self.cancel_jev_conversion();
         let is_current = self
             .borrow()
             .ok()
@@ -6451,6 +6484,7 @@ impl TextServiceFactory {
     }
 
     pub(crate) fn end_composition_for_tsf_event(&self) {
+        self.cancel_jev_conversion();
         // Collect queued learning while the candidate IDs and owner are still
         // valid. Focus loss may terminate a deferred terminal action.
         let mut pending_learning_commits = Vec::new();
@@ -6777,6 +6811,10 @@ impl TextServiceFactory {
         transition: CompositionState,
         config_snapshot: AppConfigSnapshot,
     ) -> Result<()> {
+        self.cancel_jev_conversion();
+        let start_jev = actions
+            .iter()
+            .any(|action| matches!(action, ClientAction::StartJevConversion));
         let trace_request_id = current_input_trace_request_id();
         let total_start = trace_request_id.map(|_| Instant::now());
         let requested_transition = transition.clone();
@@ -6847,6 +6885,27 @@ impl TextServiceFactory {
             let learning_blocked = has_learning_action
                 && (IMEState::keyboard_disabled().unwrap_or(true)
                     || self.current_context_has_sensitive_input_scope());
+
+            macro_rules! render_local_text {
+                () => {{
+                    if app_config.general.jev_conversion
+                        && transition == CompositionState::Composing
+                        && !temporary_latin
+                        && reconversion_original.is_none()
+                        && fixed_prefix.is_empty()
+                        && clause_snapshots.is_empty()
+                        && future_clause_snapshots.is_empty()
+                    {
+                        // The suffix is already canonical server output. Preserve its
+                        // boundary and the raw consumed count when rendering kana.
+                        if let Some(kana_prefix) = candidates.hiragana.strip_suffix(&suffix) {
+                            preview = kana_prefix.to_owned();
+                            raw_hiragana = candidates.hiragana.clone();
+                        }
+                    }
+                    self.set_text(&preview, &suffix)?;
+                }};
+            }
 
             macro_rules! persist_local_state {
                 () => {{
@@ -7006,7 +7065,7 @@ impl TextServiceFactory {
                     suffix = selected.sub_text.clone();
                     raw_hiragana = selected.hiragana;
                     if composition.tip_composition.is_some() {
-                        self.set_text(&preview, &suffix)?;
+                        render_local_text!();
                         self.sync_candidate_window_after_text_update(
                             &mut ipc_service,
                             &candidates,
@@ -7030,6 +7089,8 @@ impl TextServiceFactory {
                 }
 
                 match action {
+                    // Start only after all local state has been persisted below.
+                    ClientAction::StartJevConversion => {}
                     ClientAction::StartComposition => {
                         // start_composition closes any stale TIP handle and then starts a
                         // fresh composition. Merely seeing a handle is not sufficient: a
@@ -7076,7 +7137,11 @@ impl TextServiceFactory {
                         kind,
                         was_temporary_latin,
                     } => {
-                        if learning_blocked {
+                        if learning_blocked
+                            || (app_config.general.jev_conversion
+                                && composition.state == CompositionState::Composing
+                                && !composition.temporary_latin)
+                        {
                             tracing::debug!(
                                 ?scope,
                                 ?kind,
@@ -7220,7 +7285,7 @@ impl TextServiceFactory {
                             suffix = selected.sub_text.clone();
                             raw_hiragana = selected.hiragana;
 
-                            self.set_text(&preview, &suffix)?;
+                            render_local_text!();
                             self.sync_candidate_window_after_text_update(
                                 &mut ipc_service,
                                 &candidates,
@@ -7284,7 +7349,7 @@ impl TextServiceFactory {
                             suffix = selected.sub_text.clone();
                             raw_hiragana = selected.hiragana;
 
-                            self.set_text(&preview, &suffix)?;
+                            render_local_text!();
                             self.sync_candidate_window_after_text_update(
                                 &mut ipc_service,
                                 &candidates,
@@ -7348,7 +7413,7 @@ impl TextServiceFactory {
                             suffix = selected.sub_text.clone();
                             raw_hiragana = selected.hiragana;
 
-                            self.set_text(&preview, &suffix)?;
+                            render_local_text!();
                             self.sync_candidate_window_after_text_update(
                                 &mut ipc_service,
                                 &candidates,
@@ -7450,7 +7515,7 @@ impl TextServiceFactory {
                             suffix = selected.sub_text.clone();
                             raw_hiragana = selected.hiragana;
 
-                            self.set_text(&preview, &suffix)?;
+                            render_local_text!();
                             self.sync_candidate_window_update(
                                 &mut ipc_service,
                                 &candidates,
@@ -7563,7 +7628,7 @@ impl TextServiceFactory {
                             suffix = selected.sub_text.clone();
                             raw_hiragana = selected.hiragana;
 
-                            self.set_text(&preview, &suffix)?;
+                            render_local_text!();
                             self.sync_candidate_window_update(
                                 &mut ipc_service,
                                 &candidates,
@@ -8283,7 +8348,7 @@ impl TextServiceFactory {
                             raw_hiragana = selected.hiragana;
 
                             if fresh_append_after_server_reset {
-                                self.set_text(&preview, &suffix)?;
+                                render_local_text!();
                             } else {
                                 self.shift_start(&previous_preview, &selected.text)?;
                             }
@@ -8397,7 +8462,7 @@ impl TextServiceFactory {
                             raw_hiragana = selected.hiragana;
 
                             if fresh_append_after_server_reset {
-                                self.set_text(&preview, &suffix)?;
+                                render_local_text!();
                             } else {
                                 self.shift_start(&previous_preview, &selected.text)?;
                             }
@@ -8511,7 +8576,7 @@ impl TextServiceFactory {
                             raw_hiragana = selected.hiragana;
 
                             if fresh_append_after_server_reset {
-                                self.set_text(&preview, &suffix)?;
+                                render_local_text!();
                             } else {
                                 self.shift_start(&previous_preview, &selected.text)?;
                             }
@@ -8584,6 +8649,7 @@ impl TextServiceFactory {
                             &preview,
                             &suffix,
                         );
+                        // Explicit F6-F10 conversion must keep the requested script.
                         self.set_text(&preview, &suffix)?;
                     }
                 }
@@ -8613,6 +8679,10 @@ impl TextServiceFactory {
 
             Ok(())
         })();
+
+        if result.is_ok() && start_jev && self.begin_jev_conversion().is_err() {
+            tracing::debug!("Jev request unavailable; retain KKC candidates");
+        }
 
         if result.is_err()
             && Self::terminal_ui_cleanup_required_after_failure(
@@ -8685,6 +8755,8 @@ impl TextServiceFactory {
 
 #[cfg(test)]
 mod tests;
+
+mod jev;
 
 #[cfg(test)]
 mod lifecycle_tests {
