@@ -86,11 +86,11 @@ pub(crate) trait ClauseActionBackend {
             return Ok(ClauseBoundaryAdjustment::skipped());
         }
 
-        let _ = self.move_cursor_with_context(direction, &synchronized_candidates)?;
+        let _ = self.move_cursor(direction)?;
         let boundary_candidates = self.move_cursor(0)?;
         if boundary_candidates.texts.is_empty() {
             if direction < 0 {
-                let _ = self.move_cursor_with_context(1, &boundary_candidates)?;
+                let _ = self.move_cursor(1)?;
                 if let Some(selected) = ClauseState::select_split_left_candidate(
                     previous_candidates,
                     current_input_count,
@@ -130,7 +130,7 @@ pub(crate) trait ClauseActionBackend {
             previous_candidates,
             selected_candidate_id,
         )?;
-        let shrunk = self.shrink_text_with_context(offset, previous_candidates)?;
+        let shrunk = self.shrink_text(offset)?;
         let navigation = self.move_cursor(0)?;
         Ok(ClauseAdvance {
             shrunk,
@@ -197,22 +197,6 @@ pub(crate) trait ClauseActionBackend {
         Ok((advances, completed))
     }
 
-    fn move_cursor_with_context(
-        &mut self,
-        offset: i32,
-        _previous_candidates: &Candidates,
-    ) -> Result<Candidates> {
-        self.move_cursor(offset)
-    }
-
-    fn shrink_text_with_context(
-        &mut self,
-        offset: i32,
-        _previous_candidates: &Candidates,
-    ) -> Result<Candidates> {
-        self.shrink_text(offset)
-    }
-
     fn update_composition_snapshot(
         &mut self,
         _operation: ClauseSnapshotOperation,
@@ -253,10 +237,10 @@ impl ClauseActionBackend for IPCService {
     fn advance_clause(
         &mut self,
         offset: i32,
-        previous_candidates: &Candidates,
+        _previous_candidates: &Candidates,
         selected_candidate_id: u64,
     ) -> Result<ClauseAdvance> {
-        IPCService::advance_clause(self, offset, previous_candidates, selected_candidate_id)
+        IPCService::advance_clause(self, offset, selected_candidate_id)
     }
 
     fn prepare_future_clauses(
@@ -273,22 +257,6 @@ impl ClauseActionBackend for IPCService {
             initial_selected_candidate_id,
             leave_at_last,
         )
-    }
-
-    fn move_cursor_with_context(
-        &mut self,
-        offset: i32,
-        previous_candidates: &Candidates,
-    ) -> Result<Candidates> {
-        IPCService::move_cursor_with_context(self, offset, previous_candidates)
-    }
-
-    fn shrink_text_with_context(
-        &mut self,
-        offset: i32,
-        previous_candidates: &Candidates,
-    ) -> Result<Candidates> {
-        IPCService::shrink_text_with_context(self, offset, previous_candidates)
     }
 
     fn update_composition_snapshot(

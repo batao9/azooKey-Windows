@@ -1086,15 +1086,6 @@ impl IPCService {
         }
     }
 
-    fn verified_remove_raw_input(
-        completed_raw_input: Option<String>,
-        refreshed_raw_input: Option<String>,
-    ) -> anyhow::Result<String> {
-        completed_raw_input.or(refreshed_raw_input).ok_or_else(|| {
-            anyhow::anyhow!("remove_text completed without a verified server raw input")
-        })
-    }
-
     #[inline]
     fn prepare_future_clauses_reconnect_state_is_valid(
         previous_candidates: &Candidates,
@@ -1104,17 +1095,14 @@ impl IPCService {
             && previous_candidates.has_same_composition(refreshed_candidates)
     }
 
-    fn run_non_idempotent_edit_with_reconnect(
+    fn run_non_idempotent_edit_with_reconnect<T>(
         &mut self,
         operation: &str,
-        _request_id: u64,
-        _previous_candidates: Option<&Candidates>,
-        _previous_raw_input: Option<&str>,
-        mut send: impl FnMut(&mut Self) -> anyhow::Result<Candidates>,
-    ) -> anyhow::Result<(Candidates, NonIdempotentEditRecovery, Option<String>)> {
+        mut send: impl FnMut(&mut Self) -> anyhow::Result<T>,
+    ) -> anyhow::Result<(T, NonIdempotentEditRecovery)> {
         match Self::classify_non_idempotent_edit_attempt(operation, send(self))? {
-            NonIdempotentEditAttempt::Completed(candidates) => {
-                Ok((candidates, NonIdempotentEditRecovery::None, None))
+            NonIdempotentEditAttempt::Completed(value) => {
+                Ok((value, NonIdempotentEditRecovery::None))
             }
             NonIdempotentEditAttempt::ReconnectAndRefresh(first_error) => {
                 match self.reconnect() {
@@ -1136,7 +1124,6 @@ impl IPCService {
                 Ok((
                     send(self)?,
                     NonIdempotentEditRecovery::RetriedAfterReconstruction,
-                    None,
                 ))
             }
         }
@@ -1824,65 +1811,24 @@ impl IPCService {
 
     #[tracing::instrument]
     pub fn remove_text(&mut self) -> anyhow::Result<TextRemoval> {
-        self.remove_text_inner(None, None)
-    }
-
-    #[tracing::instrument(skip(self, previous_candidates, previous_raw_input))]
-    pub fn remove_text_with_context(
-        &mut self,
-        previous_candidates: &Candidates,
-        previous_raw_input: &str,
-    ) -> anyhow::Result<TextRemoval> {
-        self.remove_text_inner(Some(previous_candidates), Some(previous_raw_input))
-    }
-
-    fn remove_text_inner(
-        &mut self,
-        previous_candidates: Option<&Candidates>,
-        previous_raw_input: Option<&str>,
-    ) -> anyhow::Result<TextRemoval> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let mut completed_raw_input = None;
-        let result = self.run_non_idempotent_edit_with_reconnect(
-            "remove_text",
-            request_id,
-            previous_candidates,
-            previous_raw_input,
-            |this| {
-                let removal = this.send_remove_text(request_id)?;
-                completed_raw_input = Some(removal.raw_input);
-                Ok(removal.candidates)
-            },
-        );
+        let result = self.run_non_idempotent_edit_with_reconnect("remove_text", |this| {
+            this.send_remove_text(request_id)
+        });
         self.log_client_performance_from_start(
             performance_start,
             request_id,
             "remove_text",
             "rpc_total",
             || match &result {
-                Ok((_, recovery, _)) => {
+                Ok((_, recovery)) => {
                     format!("status=success;recovery={}", recovery.log_value())
                 }
                 Err(error) => format!("status=error;error={error:?}"),
             },
         );
-        let (candidates, _, refreshed_raw_input) = result?;
-        let raw_input =
-            match Self::verified_remove_raw_input(completed_raw_input, refreshed_raw_input) {
-                Ok(raw_input) => raw_input,
-                Err(error) => {
-                    Self::mark_server_recovery_required(
-                        &self.recovery,
-                        "remove_text_refresh_missing_raw_input",
-                    );
-                    return Err(preserve_recovery_error(error));
-                }
-            };
-        Ok(TextRemoval {
-            candidates,
-            raw_input,
-        })
+        result.map(|(removal, _)| removal)
     }
 
     #[tracing::instrument]
@@ -2030,88 +1976,53 @@ impl IPCService {
 
     #[tracing::instrument]
     pub fn shrink_text(&mut self, offset: i32) -> anyhow::Result<Candidates> {
-        self.shrink_text_inner(offset, None)
-    }
-
-    #[tracing::instrument(skip(self, previous_candidates))]
-    pub fn shrink_text_with_context(
-        &mut self,
-        offset: i32,
-        previous_candidates: &Candidates,
-    ) -> anyhow::Result<Candidates> {
-        self.shrink_text_inner(offset, Some(previous_candidates))
-    }
-
-    fn shrink_text_inner(
-        &mut self,
-        offset: i32,
-        previous_candidates: Option<&Candidates>,
-    ) -> anyhow::Result<Candidates> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let result = self.run_non_idempotent_edit_with_reconnect(
-            "shrink_text",
-            request_id,
-            previous_candidates,
-            None,
-            |this| this.send_shrink_text(offset, request_id),
-        );
+        let result = self.run_non_idempotent_edit_with_reconnect("shrink_text", |this| {
+            this.send_shrink_text(offset, request_id)
+        });
         self.log_client_performance_from_start(
             performance_start,
             request_id,
             "shrink_text",
             "rpc_total",
             || match &result {
-                Ok((_, recovery, _)) => format!(
+                Ok((_, recovery)) => format!(
                     "status=success;recovery={};offset={offset}",
                     recovery.log_value()
                 ),
                 Err(error) => format!("status=error;offset={offset};error={error:?}"),
             },
         );
-        let (candidates, _, _) = result?;
+        let (candidates, _) = result?;
         Ok(candidates)
     }
 
-    #[tracing::instrument(skip(self, previous_candidates))]
+    #[tracing::instrument]
     pub(crate) fn advance_clause(
         &mut self,
         offset: i32,
-        previous_candidates: &Candidates,
         selected_candidate_id: u64,
     ) -> anyhow::Result<super::composition::ClauseAdvance> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let mut completed_advance = None;
-        let result = self.run_non_idempotent_edit_with_reconnect(
-            "advance_clause",
-            request_id,
-            Some(previous_candidates),
-            None,
-            |this| {
-                let advance =
-                    this.send_advance_clause(offset, selected_candidate_id, request_id)?;
-                let navigation = advance.navigation.clone();
-                completed_advance = Some(advance);
-                Ok(navigation)
-            },
-        );
+        let result = self.run_non_idempotent_edit_with_reconnect("advance_clause", |this| {
+            this.send_advance_clause(offset, selected_candidate_id, request_id)
+        });
         self.log_client_performance_from_start(
             performance_start,
             request_id,
             "advance_clause",
             "rpc_total",
             || match &result {
-                Ok((_, recovery, _)) => format!(
+                Ok((_, recovery)) => format!(
                     "status=success;recovery={};offset={offset}",
                     recovery.log_value()
                 ),
                 Err(error) => format!("status=error;offset={offset};error={error:?}"),
             },
         );
-        result?;
-        completed_advance
-            .ok_or_else(|| anyhow::anyhow!("advance_clause completed without a verified response"))
+        result.map(|(advance, _)| advance)
     }
 
     #[tracing::instrument(skip(self, previous_candidates))]
@@ -2227,46 +2138,25 @@ impl IPCService {
 
     #[tracing::instrument]
     pub fn move_cursor(&mut self, offset: i32) -> anyhow::Result<Candidates> {
-        self.move_cursor_inner(offset, None)
-    }
-
-    #[tracing::instrument(skip(self, previous_candidates))]
-    pub fn move_cursor_with_context(
-        &mut self,
-        offset: i32,
-        previous_candidates: &Candidates,
-    ) -> anyhow::Result<Candidates> {
-        self.move_cursor_inner(offset, Some(previous_candidates))
-    }
-
-    fn move_cursor_inner(
-        &mut self,
-        offset: i32,
-        previous_candidates: Option<&Candidates>,
-    ) -> anyhow::Result<Candidates> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
-        let result = self.run_non_idempotent_edit_with_reconnect(
-            "move_cursor",
-            request_id,
-            previous_candidates,
-            None,
-            |this| this.send_move_cursor(offset, request_id),
-        );
+        let result = self.run_non_idempotent_edit_with_reconnect("move_cursor", |this| {
+            this.send_move_cursor(offset, request_id)
+        });
         self.log_client_performance_from_start(
             performance_start,
             request_id,
             "move_cursor",
             "rpc_total",
             || match &result {
-                Ok((_, recovery, _)) => format!(
+                Ok((_, recovery)) => format!(
                     "status=success;recovery={};offset={offset}",
                     recovery.log_value()
                 ),
                 Err(error) => format!("status=error;offset={offset};error={error:?}"),
             },
         );
-        let (candidates, _, _) = result?;
+        let (candidates, _) = result?;
         Ok(candidates)
     }
 
@@ -2813,7 +2703,7 @@ mod tests {
         future::Future,
         pin::Pin,
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
         },
         task::{Context, Poll},
@@ -2917,7 +2807,7 @@ mod tests {
         let before = service.input_ledger_snapshot().0;
         let mut attempts = 0;
         let error = service
-            .run_non_idempotent_edit_with_reconnect("remove_text", 1, None, Some("k"), |_| {
+            .run_non_idempotent_edit_with_reconnect::<Candidates>("remove_text", |_| {
                 attempts += 1;
                 Err(tonic::Status::permission_denied("another live owner").into())
             })
@@ -2959,6 +2849,8 @@ mod tests {
         requests: Arc<std::sync::Mutex<Vec<ReplaceCompositionRequest>>>,
         deny: Arc<AtomicBool>,
         unavailable: Arc<AtomicBool>,
+        missing_raw_input: Arc<AtomicBool>,
+        append_requests: Arc<AtomicUsize>,
     }
     impl tonic::server::NamedService for Probe {
         const NAME: &'static str = "azookey.AzookeyService";
@@ -2999,6 +2891,26 @@ mod tests {
                 candidate_id: 1,
                 ..Default::default()
             }],
+        }
+    }
+
+    impl tonic::server::UnaryService<shared::proto::RemoveTextRequest> for Probe {
+        type Response = shared::proto::RemoveTextResponse;
+        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+        fn call(&mut self, _: tonic::Request<shared::proto::RemoveTextRequest>) -> Self::Future {
+            // Lose the first edit response, then accept its replay after replacement.
+            let unavailable = self.unavailable.swap(false, Ordering::AcqRel);
+            let missing_raw_input = self.missing_raw_input.load(Ordering::Acquire);
+            Box::pin(async move {
+                if unavailable {
+                    return Err(tonic::Status::unavailable("edit response lost"));
+                }
+                Ok(tonic::Response::new(shared::proto::RemoveTextResponse {
+                    composing_text: Some(probe_composing_text("t")),
+                    raw_input: (!missing_raw_input).then(|| "ty".to_string()),
+                    server_session_id: 7,
+                }))
+            })
         }
     }
 
@@ -3058,12 +2970,29 @@ mod tests {
     impl tonic::server::UnaryService<shared::proto::AppendTextRequest> for Probe {
         type Response = shared::proto::AppendTextResponse;
         type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
-        fn call(&mut self, _: tonic::Request<shared::proto::AppendTextRequest>) -> Self::Future {
-            let status = self.mutation_status();
+        fn call(
+            &mut self,
+            request: tonic::Request<shared::proto::AppendTextRequest>,
+        ) -> Self::Future {
+            self.append_requests.fetch_add(1, Ordering::Relaxed);
+            let empty = request.into_inner().text_to_append.is_empty();
+            let status = if empty {
+                if self.unavailable.swap(false, Ordering::AcqRel) {
+                    Err(tonic::Status::unavailable("handshake response lost"))
+                } else {
+                    Ok(())
+                }
+            } else {
+                self.mutation_status()
+            };
             Box::pin(async move {
                 status?;
                 Ok(tonic::Response::new(shared::proto::AppendTextResponse {
-                    composing_text: Some(probe_composing_text("なk")),
+                    composing_text: Some(if empty {
+                        shared::proto::ComposingText::default()
+                    } else {
+                        probe_composing_text("なk")
+                    }),
                     server_session_id: 7,
                 }))
             })
@@ -3103,6 +3032,14 @@ mod tests {
                         let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::<
                             ReplaceCompositionResponse,
                             ReplaceCompositionRequest,
+                        >::default(
+                        ));
+                        Ok(grpc.unary(probe, request).await)
+                    }
+                    "RemoveText" => {
+                        let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::<
+                            shared::proto::RemoveTextResponse,
+                            shared::proto::RemoveTextRequest,
                         >::default(
                         ));
                         Ok(grpc.unary(probe, request).await)
@@ -3158,6 +3095,8 @@ mod tests {
             requests: Arc::default(),
             deny: Arc::new(AtomicBool::new(true)),
             unavailable: Arc::new(AtomicBool::new(false)),
+            missing_raw_input: Arc::new(AtomicBool::new(false)),
+            append_requests: Arc::default(),
         };
         let listener = service
             .runtime
@@ -3181,6 +3120,99 @@ mod tests {
         service.azookey_client =
             shared::proto::azookey_service_client::AzookeyServiceClient::new(channel);
         (service, probe, server)
+    }
+
+    #[test]
+    fn bare_empty_append_keeps_claim_free_handshake_with_or_without_reconnect() {
+        for lose_response in [false, true] {
+            let (mut service, probe, server) = recovery_rpc_service();
+            probe.unavailable.store(lose_response, Ordering::Release);
+            service.record_successful_append("kana", INPUT_STYLE_ROMAN2KANA);
+            let before = service.input_ledger_snapshot().0;
+
+            let candidates = service.append_text(String::new()).unwrap();
+            assert!(candidates.is_empty_composition());
+            assert_eq!(
+                probe.append_requests.load(Ordering::Relaxed),
+                1 + usize::from(lose_response)
+            );
+            assert!(
+                probe.requests.lock().unwrap().is_empty(),
+                "a handshake must not claim input through replacement"
+            );
+            assert_eq!(service.input_ledger_snapshot().0, before);
+            assert!(!service.recovery_pending());
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn removal_returns_canonical_raw_input_with_or_without_reconstruction() {
+        for lose_response in [false, true] {
+            let (mut service, probe, server) = recovery_rpc_service();
+            probe.deny.store(false, Ordering::Release);
+            probe.unavailable.store(lose_response, Ordering::Release);
+            service.record_successful_append("tya", INPUT_STYLE_ROMAN2KANA);
+
+            let removal = service.remove_text().unwrap();
+            assert_eq!(removal.raw_input, "ty");
+            assert_eq!(removal.candidates.hiragana, "t");
+            assert!(!service.recovery_pending());
+            let requests = probe.requests.lock().unwrap();
+            assert_eq!(requests.len(), usize::from(lose_response));
+            if lose_response {
+                assert_eq!(requests[0].operations.len(), 1);
+                assert_eq!(requests[0].operations[0].text, "tya");
+            }
+            let ledger = service.input_ledger_snapshot().0;
+            assert!(ledger.complete);
+            assert_eq!(ledger.operations.len(), 2);
+            assert_eq!(ledger.operations[1], CompositionOperation::Remove);
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn removal_without_canonical_raw_input_requires_recovery_without_replay() {
+        let (mut service, probe, server) = recovery_rpc_service();
+        probe.missing_raw_input.store(true, Ordering::Release);
+        service.record_successful_append("tya", INPUT_STYLE_ROMAN2KANA);
+        let before = service.input_ledger_snapshot().0;
+
+        let error = service.remove_text().unwrap_err();
+        assert!(requires_ipc_recovery(&error));
+        assert!(service.recovery_pending());
+        assert_eq!(service.input_ledger_snapshot().0, before);
+        assert!(probe.requests.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[test]
+    fn clause_advance_returns_complete_response_after_reconstruction() {
+        let (mut service, probe, server) = recovery_rpc_service();
+        probe.deny.store(false, Ordering::Release);
+        service.record_successful_append("kana", INPUT_STYLE_ROMAN2KANA);
+        let mut attempts = 0;
+        let (advance, recovery) = service
+            .run_non_idempotent_edit_with_reconnect("advance_clause", |this| {
+                attempts += 1;
+                if attempts == 1 {
+                    return Err(tonic::Status::unavailable("edit response lost").into());
+                }
+                this.send_advance_clause(2, 1, 123)
+            })
+            .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            recovery,
+            super::NonIdempotentEditRecovery::RetriedAfterReconstruction
+        );
+        assert_eq!(advance.shrunk.hiragana, "な");
+        assert_eq!(advance.navigation.hiragana, "な");
+        assert!(matches!(advance.raw_input,
+            crate::engine::composition::ClauseAdvanceRawInput::Verified(ref raw) if raw == "na"));
+        assert_eq!(probe.requests.lock().unwrap().len(), 1);
+        server.abort();
     }
 
     #[test]
@@ -3562,16 +3594,6 @@ mod tests {
 
         assert!(is_non_destructive_ipc_error(&error));
         assert!(!IPCService::should_reconnect_rpc_error(&error));
-    }
-
-    #[test]
-    fn remove_refresh_returns_canonical_raw_input_when_edit_response_was_lost() {
-        assert_eq!(
-            IPCService::verified_remove_raw_input(None, Some("bun".to_string()))
-                .expect("refresh raw input should recover the completed removal"),
-            "bun"
-        );
-        assert!(IPCService::verified_remove_raw_input(None, None).is_err());
     }
 
     #[test]

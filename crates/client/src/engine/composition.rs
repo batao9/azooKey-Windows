@@ -4109,7 +4109,7 @@ impl TextServiceFactory {
             };
 
             let previous_candidates = candidates.clone();
-            let _ = backend.move_cursor_with_context(direction, &previous_candidates)?;
+            let _ = backend.move_cursor(direction)?;
             let next_candidates = backend.move_cursor(0)?;
             if next_candidates.texts.is_empty() {
                 return Ok(ClauseBoundarySync::BackendDesynchronized);
@@ -4182,8 +4182,7 @@ impl TextServiceFactory {
         applied_directions: &[i32],
     ) -> Result<bool> {
         for direction in applied_directions.iter().rev() {
-            let previous_candidates = candidates.clone();
-            let _ = backend.move_cursor_with_context(-direction, &previous_candidates)?;
+            let _ = backend.move_cursor(-direction)?;
             let restored_candidates = backend.move_cursor(0)?;
             if restored_candidates.texts.is_empty() {
                 return Ok(false);
@@ -7501,8 +7500,7 @@ impl TextServiceFactory {
                             persist_local_state!();
                             continue;
                         }
-                        let removal =
-                            ipc_service.remove_text_with_context(&candidates, &raw_input)?;
+                        let removal = ipc_service.remove_text()?;
                         raw_input = removal.raw_input;
                         candidates = removal.candidates;
                         if ipc_service.take_server_reset_recovered()
@@ -7621,7 +7619,7 @@ impl TextServiceFactory {
                             persist_local_state!();
                             continue;
                         }
-                        candidates = ipc_service.move_cursor_with_context(*offset, &candidates)?;
+                        candidates = ipc_service.move_cursor(*offset)?;
                         if ipc_service.take_server_reset_recovered()
                             && Self::has_client_composition_state(
                                 &raw_input,
@@ -8332,8 +8330,7 @@ impl TextServiceFactory {
                         let shrunk_candidates = if session_changed_before_shrink {
                             Candidates::default()
                         } else {
-                            ipc_service
-                                .shrink_text_with_context(corresponding_count, &candidates)?
+                            ipc_service.shrink_text(corresponding_count)?
                         };
                         let mut fresh_append_after_server_reset = session_changed_before_shrink
                             || shrunk_candidates.is_empty_composition();
@@ -8446,8 +8443,7 @@ impl TextServiceFactory {
                         let shrunk_candidates = if session_changed_before_shrink {
                             Candidates::default()
                         } else {
-                            ipc_service
-                                .shrink_text_with_context(corresponding_count, &candidates)?
+                            ipc_service.shrink_text(corresponding_count)?
                         };
                         let mut fresh_append_after_server_reset = session_changed_before_shrink
                             || shrunk_candidates.is_empty_composition();
@@ -8560,8 +8556,7 @@ impl TextServiceFactory {
                         let shrunk_candidates = if session_changed_before_shrink {
                             Candidates::default()
                         } else {
-                            ipc_service
-                                .shrink_text_with_context(corresponding_count, &candidates)?
+                            ipc_service.shrink_text(corresponding_count)?
                         };
                         let mut fresh_append_after_server_reset = session_changed_before_shrink
                             || shrunk_candidates.is_empty_composition();
