@@ -9,3 +9,4 @@ logs/*
 *.dll
 *.lib
 .codex
+.env
