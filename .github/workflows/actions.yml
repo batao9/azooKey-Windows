@@ -37,6 +37,11 @@ jobs:
       with:
         submodules: recursive
 
+    - name: Install pinned Rust toolchain
+      run: |
+        rustc --version --verbose
+        cargo --version
+
     - name: Cache Rust
       uses: Swatinem/rust-cache@v2
       with:
@@ -60,9 +65,6 @@ jobs:
 
     - name: Verify release version metadata
       run: node scripts/sync-version.mjs --check-release
-
-    - name: Install Rust lint components
-      run: rustup component add clippy rustfmt
 
     - name: Check Rust formatting
       run: cargo fmt --all -- --check
@@ -92,6 +94,11 @@ jobs:
     - uses: actions/checkout@v4
       with:
         submodules: recursive
+
+    - name: Install pinned Rust toolchain
+      run: |
+        rustc --version --verbose
+        cargo --version
 
     - name: Cache Rust
       uses: Swatinem/rust-cache@v2
@@ -191,6 +198,11 @@ jobs:
       with:
         fetch-depth: 0
         submodules: recursive
+
+    - name: Install pinned Rust toolchain
+      run: |
+        rustc --version --verbose
+        cargo --version
 
     - name: Cache Rust
       uses: Swatinem/rust-cache@v2

@@ -8,5 +8,10 @@ logs/*
 *.gguf
 *.dll
 *.lib
-.codex
+# Local coding-agent settings, skills, and dependencies
+.codex/
+.opencode/
+.pi/
+.claude/
+.agents/
 .env
