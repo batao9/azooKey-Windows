@@ -133,6 +133,60 @@ fn final_remove_leaves_terminal_end_to_the_followup_action() {
 }
 
 #[test]
+fn first_clause_partial_commit_defers_only_its_preparatory_moves_ui() {
+    let batch = |steps: Vec<ClientAction>| {
+        steps
+            .into_iter()
+            .map(|action| DeferredClientAction {
+                action,
+                transition: CompositionState::Composing,
+            })
+            .collect::<Vec<_>>()
+    };
+    let actions = batch(vec![
+        ClientAction::MoveClause(-1),
+        ClientAction::MoveClause(-1),
+        ClientAction::ShrinkText(String::new()),
+    ]);
+    assert!(TextServiceFactory::followup_owns_partial_commit_ui(
+        &actions, 0
+    ));
+    assert!(TextServiceFactory::followup_owns_partial_commit_ui(
+        &actions, 1
+    ));
+    assert!(!TextServiceFactory::followup_owns_partial_commit_ui(
+        &actions, 2
+    ));
+    assert!(!TextServiceFactory::followup_owns_partial_commit_ui(
+        &actions, 3
+    ));
+
+    for steps in [
+        vec![ClientAction::MoveClause(-1)],
+        vec![ClientAction::MoveClause(-1), ClientAction::EndComposition],
+        vec![
+            ClientAction::MoveClause(1),
+            ClientAction::ShrinkText(String::new()),
+        ],
+        vec![
+            ClientAction::MoveClause(-1),
+            ClientAction::AppendText(String::new()),
+            ClientAction::ShrinkText(String::new()),
+        ],
+        vec![
+            ClientAction::MoveClause(-1),
+            ClientAction::ShrinkText(String::new()),
+            ClientAction::EndComposition,
+        ],
+    ] {
+        assert!(!TextServiceFactory::followup_owns_partial_commit_ui(
+            &batch(steps),
+            0
+        ));
+    }
+}
+
+#[test]
 fn terminal_end_reuses_only_a_delivered_preceding_ui_cleanup() {
     assert!(TextServiceFactory::preceding_action_sent_terminal_ui_cleanup(Some(0), 1));
     assert!(

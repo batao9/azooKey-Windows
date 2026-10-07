@@ -1744,6 +1744,14 @@ impl IPCService {
         input_style: i32,
         previous_candidates: Option<&Candidates>,
     ) -> anyhow::Result<Candidates> {
+        if text.is_empty() {
+            if let Some(candidates) = previous_candidates {
+                // Empty AppendText is a claim-free handshake, not a candidate refresh.
+                // A partial commit already received the remaining candidates from ShrinkText.
+                return Ok(candidates.clone());
+            }
+        }
+
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
         let input_len = performance_start.map(|_| text.chars().count());
@@ -2870,6 +2878,34 @@ mod tests {
             assert_eq!(server.read(&mut [0]).await.unwrap(), 0);
             assert!(logging_clone.retired.load(Ordering::Acquire));
         });
+    }
+
+    #[test]
+    fn empty_contextual_append_preserves_partial_commit_candidates_without_rpc() {
+        // The dummy transport cannot serve RPCs. Both input styles must keep the
+        // ShrinkText response rather than replace it with an empty handshake response.
+        let mut service = IPCService::recovery_for_test(false);
+        service.record_successful_append("su", INPUT_STYLE_ROMAN2KANA);
+        let ledger = service.input_ledger_snapshot().0;
+        let remaining = Candidates {
+            texts: vec!["す".into()],
+            sub_texts: vec![String::new()],
+            hiragana: "す".into(),
+            corresponding_count: vec![2],
+            candidate_ids: vec![7],
+        };
+        for direct in [false, true] {
+            let actual = if direct {
+                service.append_text_direct_with_context(String::new(), &remaining)
+            } else {
+                service.append_text_with_context(String::new(), &remaining)
+            }
+            .expect("empty contextual append must not make an RPC");
+            assert!(actual.has_same_composition(&remaining));
+            assert_eq!(actual.candidate_ids, remaining.candidate_ids);
+            assert_eq!(service.input_ledger_snapshot().0, ledger);
+            assert!(!service.recovery_pending());
+        }
     }
 
     #[test]

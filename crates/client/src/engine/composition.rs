@@ -1118,6 +1118,24 @@ impl TextServiceFactory {
     }
 
     #[inline]
+    fn followup_owns_partial_commit_ui(
+        actions: &[DeferredClientAction],
+        action_index: usize,
+    ) -> bool {
+        let Some((commit, moves)) = actions
+            .get(action_index..)
+            .and_then(|tail| tail.split_last())
+        else {
+            return false;
+        };
+        !moves.is_empty()
+            && matches!(commit.action, ClientAction::ShrinkText(_))
+            && moves
+                .iter()
+                .all(|step| matches!(step.action, ClientAction::MoveClause(-1)))
+    }
+
+    #[inline]
     fn preceding_action_sent_terminal_ui_cleanup(
         terminal_ui_cleanup_sent_at: Option<usize>,
         action_index: usize,
@@ -7804,6 +7822,11 @@ impl TextServiceFactory {
                         }
                     }
                     ClientAction::MoveClause(direction) => {
+                        // Ctrl+Enter rewinds before committing. Intermediate TSF writes in
+                        // this callback can erase the IMM32 host's partial-result string;
+                        // ShrinkText owns the final document and candidate-window update.
+                        let defer_commit_ui_sync =
+                            Self::followup_owns_partial_commit_ui(actions, action_index);
                         if ipc_service.take_server_reset_recovered()
                             && Self::has_client_composition_state(
                                 &raw_input,
@@ -7885,7 +7908,7 @@ impl TextServiceFactory {
                             reset_after_empty_server_composition!(
                                 "move_clause detected server reset"
                             );
-                        } else if effect.applied {
+                        } else if effect.applied && !defer_commit_ui_sync {
                             self.sync_clause_action_ui(
                                 &preview,
                                 &suffix,
@@ -7920,7 +7943,9 @@ impl TextServiceFactory {
                                 &clause_snapshots,
                                 &future_clause_snapshots,
                             );
-                        } else if let Some(sync) = deferred_ready_ui_sync {
+                        } else if let Some(sync) =
+                            deferred_ready_ui_sync.filter(|_| !defer_commit_ui_sync)
+                        {
                             self.sync_clause_action_ui(
                                 &preview,
                                 &suffix,
