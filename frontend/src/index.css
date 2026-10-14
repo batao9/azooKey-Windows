@@ -119,6 +119,82 @@
 }
 
 
+/* Shared settings layout; editors keep their action bars outside the scroll area. */
+.settings-page {
+  container-type: inline-size;
+}
+.settings-content {
+  display: grid;
+  gap: 1.5rem;
+  max-width: 52rem;
+  margin-inline: auto;
+}
+.settings-section > h2 {
+  margin-bottom: 0.625rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+.settings-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+}
+.settings-card > * + * {
+  border-top: 1px solid var(--border);
+}
+.settings-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 13.75rem);
+  align-items: center;
+  gap: 1rem;
+  padding: 1rem;
+}
+.settings-control {
+  display: flex;
+  justify-content: flex-end;
+  min-width: 0;
+}
+.settings-control > [data-slot="select-trigger"] {
+  width: 100%;
+}
+.settings-description {
+  font-size: 0.75rem;
+  line-height: 1.6;
+  color: var(--muted-foreground);
+}
+.settings-subgroup {
+  margin-left: 1rem;
+  border-left: 2px solid var(--border);
+}
+.settings-subgroup > .settings-row + .settings-row {
+  border-top: 1px solid var(--border);
+}
+.settings-row:has(textarea),
+.settings-row:has(input[type="password"]) {
+  grid-template-columns: minmax(0, 1fr);
+}
+.settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+@container (max-width: 440px) {
+  .settings-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.625rem;
+  }
+  .settings-control {
+    justify-content: flex-start;
+  }
+  .settings-actions > .ml-auto {
+    margin-left: auto;
+  }
+}
+.settings-row:has([role="switch"]) {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
 .candidate-main {
   width: 225px;
   height: 150px;

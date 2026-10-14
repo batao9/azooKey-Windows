@@ -1,36 +1,27 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { getVersion } from "@tauri-apps/api/app";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
-import { Download, FlaskConical, Keyboard, RefreshCcw, Table2, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
-    AlertDialog,
-    AlertDialogAction,
-    AlertDialogCancel,
-    AlertDialogContent,
-    AlertDialogDescription,
-    AlertDialogFooter,
-    AlertDialogHeader,
-    AlertDialogTitle,
-    AlertDialogTrigger,
+    AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
+    AlertDialogDescription, AlertDialogFooter, AlertDialogHeader,
+    AlertDialogTitle, AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import {
-    Select,
-    SelectContent,
-    SelectItem,
-    SelectTrigger,
-    SelectValue,
+    Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import { saveConfigWithToast } from "@/lib/config";
+import { SettingsRow, SettingsSection } from "@/components/settings-section";
+import { DebugSettings } from "@/components/debug-settings";
+import { RomajiEditor, normalizeRomajiRows, type RomajiRow } from "@/components/romaji-editor";
+import { Zenzai } from "@/pages/zenzai";
+import { getConfigAfterPendingUpdates, saveConfigWithToast } from "@/lib/config";
 
 type WidthMode = "half" | "full";
 type LearningMode = "enabled" | "read_only" | "disabled";
 type ReconversionKey = "convert" | "shift_convert" | "space" | "win_slash" | "disabled";
-
 type GeneralConfigState = {
     punctuation_style: string;
     symbol_style: string;
@@ -46,49 +37,11 @@ type GeneralConfigState = {
     jev_conversion: boolean;
     experimental_typo_correction: boolean;
 };
-
-type CharacterWidthGroupsState = {
-    alphabet: WidthMode;
-    number: WidthMode;
-    bracket: WidthMode;
-    comma_period: WidthMode;
-    middle_dot_corner_bracket: WidthMode;
-    quote: WidthMode;
-    colon_semicolon: WidthMode;
-    hash_group: WidthMode;
-    tilde: WidthMode;
-    math_symbol: WidthMode;
-    question_exclamation: WidthMode;
-};
-
-type RomajiRow = {
-    input: string;
-    output: string;
-    next_input: string;
-};
-
-type UpdateCheckResponse = {
-    current_version: string;
-    latest_version: string;
-    latest_tag: string;
-    release_name: string;
-    release_url: string;
-    update_available: boolean;
-};
-
-type ResetLearningHistoryResponse = {
-    reset: boolean;
-    server_applied: boolean;
-    message?: string | null;
-};
-
-type UpdateStatus =
-    | "idle"
-    | "checking"
-    | "available"
-    | "not_available"
-    | "starting"
-    | "error";
+type CharacterWidthGroupsState = Record<
+    "alphabet" | "number" | "bracket" | "comma_period" | "middle_dot_corner_bracket" |
+    "quote" | "colon_semicolon" | "hash_group" | "tilde" | "math_symbol" | "question_exclamation",
+    WidthMode
+>;
 
 const DEFAULT_GENERAL_CONFIG: GeneralConfigState = {
     punctuation_style: "touten_kuten",
@@ -105,47 +58,42 @@ const DEFAULT_GENERAL_CONFIG: GeneralConfigState = {
     jev_conversion: false,
     experimental_typo_correction: false,
 };
-
 const LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MIN = -12;
 const LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MAX = 12;
-
 const clampLiveConversionReadingVerticalAdjustment = (value: unknown): number => {
-    const numericValue =
-        typeof value === "number"
-            ? value
-            : typeof value === "string"
-              ? Number.parseInt(value, 10)
-              : Number.NaN;
-    if (!Number.isFinite(numericValue)) {
-        return DEFAULT_GENERAL_CONFIG.live_conversion_reading_vertical_adjustment;
-    }
-    return Math.min(
-        LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MAX,
-        Math.max(LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MIN, Math.round(numericValue)),
-    );
+    const number = typeof value === "number" ? value
+        : typeof value === "string" ? Number.parseInt(value, 10) : Number.NaN;
+    return Number.isFinite(number)
+        ? Math.min(LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MAX,
+            Math.max(LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MIN, Math.round(number)))
+        : DEFAULT_GENERAL_CONFIG.live_conversion_reading_vertical_adjustment;
 };
-
 const DEFAULT_WIDTH_GROUPS: CharacterWidthGroupsState = {
-    alphabet: "half",
-    number: "half",
-    bracket: "full",
-    comma_period: "full",
-    middle_dot_corner_bracket: "full",
-    quote: "full",
-    colon_semicolon: "full",
-    hash_group: "half",
-    tilde: "full",
-    math_symbol: "full",
-    question_exclamation: "full",
+    alphabet: "half", number: "half", bracket: "full", comma_period: "full",
+    middle_dot_corner_bracket: "full", quote: "full", colon_semicolon: "full",
+    hash_group: "half", tilde: "full", math_symbol: "full", question_exclamation: "full",
 };
-
 const PUNCTUATION_OPTIONS = [
     { value: "touten_kuten", label: "、。" },
     { value: "fullwidth_comma_fullwidth_period", label: "，．" },
     { value: "touten_fullwidth_period", label: "、．" },
     { value: "fullwidth_comma_kuten", label: "，。" },
 ];
-
+const SYMBOL_OPTIONS = [
+    { value: "corner_bracket_middle_dot", label: "「」・" },
+    { value: "square_bracket_backslash", label: "［］／" },
+    { value: "corner_bracket_backslash", label: "「」／" },
+    { value: "square_bracket_middle_dot", label: "［］・" },
+];
+const SPACE_OPTIONS = [
+    { value: "always_half", label: "常に半角" },
+    { value: "follow_input_mode", label: "入力モードに従う" },
+];
+const NUMPAD_OPTIONS = [
+    { value: "direct_input", label: "直接入力" },
+    { value: "always_half", label: "常に半角" },
+    { value: "follow_input_mode", label: "入力モードに従う" },
+];
 const RECONVERSION_KEY_OPTIONS: { value: ReconversionKey; label: string }[] = [
     { value: "convert", label: "変換" },
     { value: "shift_convert", label: "Shift + 変換" },
@@ -153,48 +101,22 @@ const RECONVERSION_KEY_OPTIONS: { value: ReconversionKey; label: string }[] = [
     { value: "win_slash", label: "Win + /" },
     { value: "disabled", label: "無効" },
 ];
-
 const normalizeReconversionKey = (value: unknown): ReconversionKey =>
     RECONVERSION_KEY_OPTIONS.some((option) => option.value === value)
-        ? (value as ReconversionKey)
-        : "win_slash";
-
-const SYMBOL_OPTIONS = [
-    { value: "corner_bracket_middle_dot", label: "「」・" },
-    { value: "square_bracket_backslash", label: "［］／" },
-    { value: "corner_bracket_backslash", label: "「」／" },
-    { value: "square_bracket_middle_dot", label: "［］・" },
+        ? value as ReconversionKey : "win_slash";
+const LEARNING_MODE_OPTIONS: { value: LearningMode; label: string }[] = [
+    { value: "enabled", label: "学習して履歴を使う" },
+    { value: "read_only", label: "既存の履歴のみ使う" },
+    { value: "disabled", label: "学習も履歴の使用もしない" },
 ];
-
-const SPACE_OPTIONS = [
-    { value: "always_half", label: "常に半角" },
-    { value: "follow_input_mode", label: "入力モードに従う" },
-];
-
-const NUMPAD_OPTIONS = [
-    { value: "direct_input", label: "直接入力" },
-    { value: "always_half", label: "常に半角" },
-    { value: "follow_input_mode", label: "入力モードに従う" },
-];
-
-const LEARNING_MODE_OPTIONS: Array<{ value: LearningMode; label: string }> = [
-    { value: "enabled", label: "有効" },
-    { value: "read_only", label: "新規学習はしない" },
-    { value: "disabled", label: "無効" },
-];
-
 const WIDTH_OPTIONS = [
     { value: "half", label: "半角" },
     { value: "full", label: "全角" },
 ];
-
-const WIDTH_ROWS: Array<{
-    key: keyof CharacterWidthGroupsState;
-    label: string;
-}> = [
+const WIDTH_ROWS: { key: keyof CharacterWidthGroupsState; label: string }[] = [
     { key: "number", label: "数字" },
     { key: "bracket", label: "() {} []" },
-    { key: "comma_period", label: "、 。" },
+    { key: "comma_period", label: "、。" },
     { key: "middle_dot_corner_bracket", label: "･ ｢｣" },
     { key: "quote", label: "\" '" },
     { key: "colon_semicolon", label: ": ;" },
@@ -203,401 +125,124 @@ const WIDTH_ROWS: Array<{
     { key: "math_symbol", label: "< > = + - / *" },
     { key: "question_exclamation", label: "? !" },
 ];
-
-const normalizeGeneralConfig = (value?: Record<string, unknown>): GeneralConfigState => ({
-    punctuation_style:
-        typeof value?.punctuation_style === "string"
-            ? value.punctuation_style
-            : DEFAULT_GENERAL_CONFIG.punctuation_style,
-    symbol_style:
-        typeof value?.symbol_style === "string"
-            ? value.symbol_style
-            : DEFAULT_GENERAL_CONFIG.symbol_style,
-    space_input:
-        value?.space_input === "always_full"
-            ? "follow_input_mode"
-            : typeof value?.space_input === "string"
-              ? value.space_input
-              : DEFAULT_GENERAL_CONFIG.space_input,
-    numpad_input:
-        value?.numpad_input === "direct_input"
-            ? "direct_input"
-            : value?.numpad_input === "always_half"
-              ? "always_half"
-              : value?.numpad_input === "follow_input_mode"
-                ? "follow_input_mode"
-                : DEFAULT_GENERAL_CONFIG.numpad_input,
-    punctuation_commit:
-        typeof value?.punctuation_commit === "boolean"
-            ? value.punctuation_commit
-            : DEFAULT_GENERAL_CONFIG.punctuation_commit,
-    punctuation_commit_punctuation:
-        typeof value?.punctuation_commit_punctuation === "boolean"
-            ? value.punctuation_commit_punctuation
-            : DEFAULT_GENERAL_CONFIG.punctuation_commit_punctuation,
-    punctuation_commit_exclamation:
-        typeof value?.punctuation_commit_exclamation === "boolean"
-            ? value.punctuation_commit_exclamation
-            : DEFAULT_GENERAL_CONFIG.punctuation_commit_exclamation,
-    punctuation_commit_question:
-        typeof value?.punctuation_commit_question === "boolean"
-            ? value.punctuation_commit_question
-            : DEFAULT_GENERAL_CONFIG.punctuation_commit_question,
-    show_candidate_window_after_space:
-        typeof value?.show_candidate_window_after_space === "boolean"
-            ? value.show_candidate_window_after_space
-            : DEFAULT_GENERAL_CONFIG.show_candidate_window_after_space,
-    show_live_conversion_reading:
-        typeof value?.show_live_conversion_reading === "boolean"
-            ? value.show_live_conversion_reading
-            : DEFAULT_GENERAL_CONFIG.show_live_conversion_reading,
-    live_conversion_reading_vertical_adjustment:
-        clampLiveConversionReadingVerticalAdjustment(
-            value?.live_conversion_reading_vertical_adjustment,
-        ),
-    jev_conversion: value?.jev_conversion === true,
-    experimental_typo_correction:
-        typeof value?.experimental_typo_correction === "boolean"
-            ? value.experimental_typo_correction
-            : DEFAULT_GENERAL_CONFIG.experimental_typo_correction,
-});
-
-const normalizeLearningMode = (value?: unknown): LearningMode => {
-    if (value === "enabled" || value === "read_only" || value === "disabled") {
-        return value;
-    }
-    return "enabled";
-};
-
-const normalizeWidthGroups = (
-    value?: Record<string, unknown>,
-): CharacterWidthGroupsState => {
-    const next = { ...DEFAULT_WIDTH_GROUPS };
-    if (!value) {
-        return next;
-    }
-
-    for (const [key, current] of Object.entries(next)) {
-        const incoming = value[key];
-        if (incoming === "half" || incoming === "full") {
-            (next[key as keyof CharacterWidthGroupsState] as WidthMode) = incoming;
-        } else {
-            (next[key as keyof CharacterWidthGroupsState] as WidthMode) = current;
+const normalizeGeneralConfig = (value?: Record<string, unknown>): GeneralConfigState => {
+    const next = { ...DEFAULT_GENERAL_CONFIG };
+    for (const key of Object.keys(next) as (keyof GeneralConfigState)[]) {
+        if (typeof value?.[key] === typeof next[key]) {
+            Object.assign(next, { [key]: value![key] });
         }
     }
-
+    if (next.space_input === "always_full") next.space_input = "follow_input_mode";
+    if (!["direct_input", "always_half", "follow_input_mode"].includes(next.numpad_input)) {
+        next.numpad_input = DEFAULT_GENERAL_CONFIG.numpad_input;
+    }
+    next.live_conversion_reading_vertical_adjustment =
+        clampLiveConversionReadingVerticalAdjustment(value?.live_conversion_reading_vertical_adjustment);
+    return next;
+};
+const normalizeLearningMode = (value: unknown): LearningMode =>
+    value === "enabled" || value === "read_only" || value === "disabled" ? value : "enabled";
+const normalizeWidthGroups = (value?: Record<string, unknown>): CharacterWidthGroupsState => {
+    const next = { ...DEFAULT_WIDTH_GROUPS };
+    for (const key of Object.keys(next) as (keyof CharacterWidthGroupsState)[]) {
+        if (value?.[key] === "half" || value?.[key] === "full") next[key] = value[key];
+    }
     return next;
 };
 
-const normalizeRomajiRows = (rows?: unknown): RomajiRow[] => {
-    if (!Array.isArray(rows)) {
-        return [];
-    }
-
-    return rows
-        .map((row) => {
-            if (!row || typeof row !== "object") {
-                return null;
-            }
-            const record = row as Record<string, unknown>;
-            if (typeof record.input !== "string" || typeof record.output !== "string") {
-                return null;
-            }
-            return {
-                input: record.input,
-                output: record.output,
-                next_input:
-                    typeof record.next_input === "string" ? record.next_input : "",
-            };
-        })
-        .filter((row): row is RomajiRow => row !== null);
-};
-
-const normalizeRomajiRowsForSave = (rows: RomajiRow[]): RomajiRow[] =>
-    rows
-        .map((row) => ({
-            input: row.input.trim(),
-            output: row.output.trim(),
-            next_input: row.next_input.trim(),
-        }))
-        .filter((row) => row.input.length > 0 || row.output.length > 0 || row.next_input.length > 0);
-
-export const General = () => {
+export const General = ({ page }: { page: "input" | "conversion" | "keys" | "advanced" }) => {
     const [shortcutValue, setShortcutValue] = useState({
-        ctrlSpaceToggle: true,
-        altBackquoteToggle: true,
-        eisuToggle: false,
+        ctrlSpaceToggle: true, altBackquoteToggle: true, eisuToggle: false,
         reconversionKey: "win_slash" as ReconversionKey,
     });
-    const [generalValue, setGeneralValue] = useState<GeneralConfigState>(
-        DEFAULT_GENERAL_CONFIG,
-    );
+    const [generalValue, setGeneralValue] = useState(DEFAULT_GENERAL_CONFIG);
+    const [widthGroups, setWidthGroups] = useState(DEFAULT_WIDTH_GROUPS);
+    const [learningMode, setLearningMode] = useState<LearningMode>("enabled");
+    const [romajiRows, setRomajiRows] = useState<RomajiRow[]>([]);
+    const [loadState, setLoadState] = useState<"loading" | "ready" | "error">("loading");
+    const [loadAttempt, setLoadAttempt] = useState(0);
     const [jevWarningOpen, setJevWarningOpen] = useState(false);
     const [jevApiKey, setJevApiKey] = useState("");
-    const [jevApiKeySaved, setJevApiKeySaved] = useState(false);
+    const [jevApiKeySaved, setJevApiKeySaved] = useState<boolean | null>(null);
     const [jevApiKeyBusy, setJevApiKeyBusy] = useState(false);
-    const [learningMode, setLearningMode] = useState<LearningMode>("enabled");
-    const [widthGroups, setWidthGroups] =
-        useState<CharacterWidthGroupsState>(DEFAULT_WIDTH_GROUPS);
-    const [romajiRows, setRomajiRows] = useState<RomajiRow[]>([]);
-    const [isRomajiEditorOpen, setIsRomajiEditorOpen] = useState(false);
-    const [romajiDraftRows, setRomajiDraftRows] = useState<RomajiRow[]>([]);
-    const [defaultRomajiRows, setDefaultRomajiRows] = useState<RomajiRow[]>([]);
-    const [appVersion, setAppVersion] = useState<string | null>(null);
-    const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
-    const [updateCheck, setUpdateCheck] = useState<UpdateCheckResponse | null>(null);
-    const [updateError, setUpdateError] = useState<string | null>(null);
-    const [pendingFocusNewRow, setPendingFocusNewRow] = useState(false);
-    const didCheckUpdatesOnStartup = useRef(false);
-    const romajiEditorScrollRef = useRef<HTMLDivElement | null>(null);
-    const romajiInputRefs = useRef<Array<HTMLInputElement | null>>([]);
+    const [jevApiKeyChecking, setJevApiKeyChecking] = useState(false);
     const liveConversionReadingAdjustmentSaveRef = useRef<{
-        saving: boolean;
-        pendingValue: number | null;
+        saving: boolean; pendingValue: number | null;
     }>({ saving: false, pendingValue: null });
 
     useEffect(() => {
-        invoke<boolean>("has_jev_api_key")
-            .then(setJevApiKeySaved)
-            .catch(() => setJevApiKeySaved(false));
-
-        invoke<any>("get_config")
-            .then((data) => {
-                const shortcuts = data.shortcuts ?? {};
-                setShortcutValue({
-                    ctrlSpaceToggle: shortcuts.ctrl_space_toggle ?? true,
-                    altBackquoteToggle: shortcuts.alt_backquote_toggle ?? true,
-                    eisuToggle: shortcuts.eisu_toggle ?? false,
-                    reconversionKey: normalizeReconversionKey(shortcuts.reconversion_key),
-                });
-
-                setGeneralValue(normalizeGeneralConfig(data.general));
-                setLearningMode(normalizeLearningMode(data.learning?.mode));
-                setWidthGroups(normalizeWidthGroups(data.character_width?.groups));
-                setRomajiRows(normalizeRomajiRows(data.romaji_table?.rows));
-            })
-            .catch(() => {
-                // Keep default values if config fetch fails
+        let cancelled = false;
+        setLoadState("loading");
+        getConfigAfterPendingUpdates().then((data) => {
+            if (cancelled) return;
+            const shortcuts = data.shortcuts ?? {};
+            setShortcutValue({
+                ctrlSpaceToggle: shortcuts.ctrl_space_toggle ?? true,
+                altBackquoteToggle: shortcuts.alt_backquote_toggle ?? true,
+                eisuToggle: shortcuts.eisu_toggle ?? false,
+                reconversionKey: normalizeReconversionKey(shortcuts.reconversion_key),
             });
-
-        invoke<any>("get_default_romaji_rows")
-            .then((rows) => {
-                setDefaultRomajiRows(normalizeRomajiRows(rows));
-            })
-            .catch(() => {
-                // Keep empty defaults if fetch fails
-            });
-
-        getVersion()
-            .then(setAppVersion)
-            .catch(() => {
-                setAppVersion(null);
-            });
-
-        if (!didCheckUpdatesOnStartup.current) {
-            didCheckUpdatesOnStartup.current = true;
-            void checkUpdates(false);
-        }
-    }, []);
-
-    useEffect(() => {
-        if (!isRomajiEditorOpen || !pendingFocusNewRow || romajiDraftRows.length === 0) {
-            return;
-        }
-
-        const rafId = requestAnimationFrame(() => {
-            const container = romajiEditorScrollRef.current;
-            if (container) {
-                container.scrollTo({ top: container.scrollHeight, behavior: "auto" });
-            }
-
-            const lastIndex = romajiDraftRows.length - 1;
-            const input = romajiInputRefs.current[lastIndex];
-            if (input) {
-                input.focus();
-            }
-            setPendingFocusNewRow(false);
-        });
-
-        return () => cancelAnimationFrame(rafId);
-    }, [isRomajiEditorOpen, pendingFocusNewRow, romajiDraftRows.length]);
-
-    const updateConfig = (updater: (config: any) => void) =>
-        saveConfigWithToast(updater);
-
-    const checkUpdates = async (showToast: boolean) => {
-        setUpdateStatus("checking");
-        setUpdateError(null);
-        try {
-            const data = await invoke<UpdateCheckResponse>("check_for_updates");
-            setUpdateCheck(data);
-            setUpdateStatus(data.update_available ? "available" : "not_available");
-            if (showToast) {
-                toast(
-                    data.update_available
-                        ? `v${data.latest_version} にアップデートできます`
-                        : "最新版を利用中です",
-                );
-            }
-            return data;
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            setUpdateError(message);
-            setUpdateStatus("error");
-            if (showToast) {
-                toast("更新の確認に失敗しました", {
-                    description: message,
-                });
-            }
-            return null;
-        }
-    };
-
-    const startUpdate = async () => {
-        setUpdateStatus("starting");
-        setUpdateError(null);
-        try {
-            await invoke("start_update");
-            toast("アップデートを開始しました");
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            setUpdateError(message);
-            setUpdateStatus(updateCheck?.update_available ? "available" : "error");
-            toast("アップデートを開始できませんでした", {
-                description: message,
+            setGeneralValue(normalizeGeneralConfig(data.general));
+            setLearningMode(normalizeLearningMode(data.learning?.mode));
+            setWidthGroups(normalizeWidthGroups(data.character_width?.groups));
+            setRomajiRows(normalizeRomajiRows(data.romaji_table?.rows));
+            setLoadState("ready");
+        }).catch(() => { if (!cancelled) setLoadState("error"); });
+        if (page === "advanced") {
+            invoke<boolean>("has_jev_api_key").then((saved) => {
+                if (!cancelled) setJevApiKeySaved(saved);
+            }).catch(() => {
+                if (!cancelled) toast("Jev APIキーの状態を取得できませんでした");
             });
         }
-    };
+        return () => { cancelled = true; };
+    }, [page, loadAttempt]);
 
-    const handleUpdateButton = async () => {
-        if (updateStatus === "available") {
-            await startUpdate();
-            return;
-        }
-
-        await checkUpdates(true);
-    };
-
-    const updateButtonLabel = (() => {
-        if (updateStatus === "checking") {
-            return "確認中";
-        }
-        if (updateStatus === "starting") {
-            return "アップデートを開始中";
-        }
-        if (updateStatus === "available") {
-            return "最新版にアップデート";
-        }
-        return "更新を確認";
-    })();
-
-    const updateDescription = (() => {
-        if (updateStatus === "available" && updateCheck) {
-            return `v${updateCheck.latest_version} が利用できます`;
-        }
-        if (updateStatus === "not_available") {
-            return "最新版を利用中です";
-        }
-        if (updateStatus === "error") {
-            return "更新を確認できませんでした";
-        }
-        return null;
-    })();
-
-    const handleCtrlSpaceToggle = async () => {
-        const nextValue = !shortcutValue.ctrlSpaceToggle;
-        const data = await updateConfig((config) => {
-            config.shortcuts = config.shortcuts ?? {};
-            config.shortcuts.ctrl_space_toggle = nextValue;
-        });
-
-        if (data) {
-            setShortcutValue((prev) => ({ ...prev, ctrlSpaceToggle: nextValue }));
-        }
-    };
-
-    const handleAltBackquoteToggle = async () => {
-        const nextValue = !shortcutValue.altBackquoteToggle;
-        const data = await updateConfig((config) => {
-            config.shortcuts = config.shortcuts ?? {};
-            config.shortcuts.alt_backquote_toggle = nextValue;
-        });
-
-        if (data) {
-            setShortcutValue((prev) => ({ ...prev, altBackquoteToggle: nextValue }));
-        }
-    };
-
-    const handleEisuToggle = async () => {
-        const nextValue = !shortcutValue.eisuToggle;
-        const data = await updateConfig((config) => {
-            config.shortcuts = config.shortcuts ?? {};
-            config.shortcuts.eisu_toggle = nextValue;
-        });
-
-        if (data) {
-            setShortcutValue((prev) => ({ ...prev, eisuToggle: nextValue }));
-        }
-    };
-
-    const handleReconversionKey = async (nextValue: ReconversionKey) => {
-        const data = await updateConfig((config) => {
-            config.shortcuts = config.shortcuts ?? {};
-            config.shortcuts.reconversion_key = nextValue;
-        });
-
-        if (data) {
-            setShortcutValue((prev) => ({ ...prev, reconversionKey: nextValue }));
-        }
-    };
-
-    const updateGeneralConfig = async (
-        key: keyof Omit<
-            GeneralConfigState,
-            | "punctuation_commit"
-            | "punctuation_commit_punctuation"
-            | "punctuation_commit_exclamation"
-            | "punctuation_commit_question"
-            | "show_candidate_window_after_space"
-            | "show_live_conversion_reading"
-            | "live_conversion_reading_vertical_adjustment"
-            | "jev_conversion"
-            | "experimental_typo_correction"
-        >,
-        nextValue: string,
-    ) => {
-        const data = await updateConfig((config) => {
+    const updateGeneralConfig = async <K extends keyof GeneralConfigState>(key: K, nextValue: GeneralConfigState[K]) => {
+        const data = await saveConfigWithToast((config) => {
             config.general = config.general ?? {};
             config.general[key] = nextValue;
         });
-
-        if (data) {
-            setGeneralValue(normalizeGeneralConfig(data.general));
-        }
+        if (data) setGeneralValue(normalizeGeneralConfig(data.general));
     };
-
-    const updateGeneralBooleanConfig = async (
-        key:
-            | "punctuation_commit"
-            | "punctuation_commit_punctuation"
-            | "punctuation_commit_exclamation"
-            | "punctuation_commit_question"
-            | "show_candidate_window_after_space"
-            | "show_live_conversion_reading"
-            | "jev_conversion"
-            | "experimental_typo_correction",
-        nextValue: boolean,
-    ) => {
-        const data = await updateConfig((config) => {
-            config.general = config.general ?? {};
-            config.general[key] = nextValue;
+    const updateShortcut = async (key: string, nextValue: boolean | ReconversionKey) => {
+        const data = await saveConfigWithToast((config) => {
+            config.shortcuts = config.shortcuts ?? {};
+            config.shortcuts[key] = nextValue;
         });
-
         if (data) {
-            setGeneralValue(normalizeGeneralConfig(data.general));
+            setShortcutValue({
+                ctrlSpaceToggle: data.shortcuts.ctrl_space_toggle,
+                altBackquoteToggle: data.shortcuts.alt_backquote_toggle,
+                eisuToggle: data.shortcuts.eisu_toggle,
+                reconversionKey: normalizeReconversionKey(data.shortcuts.reconversion_key),
+            });
         }
     };
-
+    const updateWidthGroup = async (key: keyof CharacterWidthGroupsState, nextValue: WidthMode) => {
+        const data = await saveConfigWithToast((config) => {
+            config.character_width = config.character_width ?? {};
+            config.character_width.groups = config.character_width.groups ?? {};
+            config.character_width.groups[key] = nextValue;
+        });
+        if (data) setWidthGroups(normalizeWidthGroups(data.character_width?.groups));
+    };
+    const updateLearningMode = async (nextValue: LearningMode) => {
+        const data = await saveConfigWithToast((config) => {
+            config.learning = config.learning ?? {};
+            config.learning.mode = nextValue;
+        });
+        if (data) setLearningMode(normalizeLearningMode(data.learning?.mode));
+    };
+    const resetLearningHistory = async () => {
+        try {
+            const result = await invoke<{ reset: boolean; server_applied: boolean; message?: string | null }>("reset_learning_history");
+            if (result.reset && result.server_applied) toast("学習履歴を削除しました");
+            else toast("学習履歴を削除できませんでした", { description: result.message ?? undefined });
+        } catch (error) {
+            toast("学習履歴を削除できませんでした", { description: String(error) });
+        }
+    };
     const saveJevApiKey = async () => {
         setJevApiKeyBusy(true);
         try {
@@ -605,13 +250,9 @@ export const General = () => {
             setJevApiKey("");
             setJevApiKeySaved(true);
             toast("Jev APIキーを保存しました");
-        } catch {
-            toast("Jev APIキーを保存できませんでした");
-        } finally {
-            setJevApiKeyBusy(false);
-        }
+        } catch { toast("Jev APIキーを保存できませんでした"); }
+        finally { setJevApiKeyBusy(false); }
     };
-
     const deleteJevApiKey = async () => {
         setJevApiKeyBusy(true);
         try {
@@ -619,829 +260,232 @@ export const General = () => {
             setJevApiKey("");
             setJevApiKeySaved(false);
             toast("Jev APIキーを削除しました");
-        } catch {
-            toast("Jev APIキーを削除できませんでした");
+        } catch { toast("Jev APIキーを削除できませんでした"); }
+        finally { setJevApiKeyBusy(false); }
+    };
+    const checkJevApiKey = async () => {
+        if (jevApiKeyBusy) return;
+        setJevApiKeyBusy(true);
+        setJevApiKeyChecking(true);
+        try {
+            await invoke("check_jev_api_key");
+            toast("保存済みAPIキーは有効です");
+        } catch (error) {
+            toast("保存済みAPIキーを確認できませんでした", { description: String(error) });
         } finally {
             setJevApiKeyBusy(false);
+            setJevApiKeyChecking(false);
         }
     };
-
-    const updateCandidateWindowDelay = async (nextValue: boolean) => {
-        await updateGeneralBooleanConfig("show_candidate_window_after_space", nextValue);
-    };
-
-    const updateLiveConversionReading = async (nextValue: boolean) => {
-        await updateGeneralBooleanConfig("show_live_conversion_reading", nextValue);
-    };
-
     const flushLiveConversionReadingVerticalAdjustmentSave = async () => {
         const saveState = liveConversionReadingAdjustmentSaveRef.current;
-        if (saveState.saving) {
-            return;
-        }
-
+        if (saveState.saving) return;
         saveState.saving = true;
         try {
             while (saveState.pendingValue !== null) {
-                const normalizedValue = saveState.pendingValue;
+                const nextValue = saveState.pendingValue;
                 saveState.pendingValue = null;
-                const data = await updateConfig((config) => {
+                const data = await saveConfigWithToast((config) => {
                     config.general = config.general ?? {};
-                    config.general.live_conversion_reading_vertical_adjustment = normalizedValue;
+                    config.general.live_conversion_reading_vertical_adjustment = nextValue;
                 });
-
-                if (data && saveState.pendingValue === null) {
-                    setGeneralValue(normalizeGeneralConfig(data.general));
-                }
+                if (data && saveState.pendingValue === null) setGeneralValue(normalizeGeneralConfig(data.general));
             }
-        } finally {
-            saveState.saving = false;
-        }
-
-        if (saveState.pendingValue !== null) {
-            void flushLiveConversionReadingVerticalAdjustmentSave();
-        }
+        } finally { saveState.saving = false; }
+        if (saveState.pendingValue !== null) void flushLiveConversionReadingVerticalAdjustmentSave();
     };
-
     const updateLiveConversionReadingVerticalAdjustment = (nextValue: number) => {
-        const normalizedValue = clampLiveConversionReadingVerticalAdjustment(nextValue);
-        liveConversionReadingAdjustmentSaveRef.current.pendingValue = normalizedValue;
+        liveConversionReadingAdjustmentSaveRef.current.pendingValue = clampLiveConversionReadingVerticalAdjustment(nextValue);
         void flushLiveConversionReadingVerticalAdjustmentSave();
     };
 
-    const updateLearningMode = async (nextValue: LearningMode) => {
-        const data = await updateConfig((config) => {
-            config.learning = config.learning ?? {};
-            config.learning.mode = nextValue;
-        });
-
-        if (data) {
-            setLearningMode(normalizeLearningMode(data.learning?.mode));
-        }
-    };
-
-    const resetLearningHistory = async () => {
-        try {
-            const result = await invoke<ResetLearningHistoryResponse>(
-                "reset_learning_history",
-            );
-            if (result.reset && result.server_applied) {
-                toast("学習履歴を削除しました");
-                return;
-            }
-
-            toast("学習履歴を削除できませんでした", {
-                description: result.message ?? undefined,
-            });
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            toast("学習履歴を削除できませんでした", {
-                description: message,
-            });
-        }
-    };
-
-    const updateWidthGroup = async (
-        key: keyof CharacterWidthGroupsState,
-        nextValue: WidthMode,
-    ) => {
-        const data = await updateConfig((config) => {
-            config.character_width = config.character_width ?? {};
-            config.character_width.groups = config.character_width.groups ?? {};
-            config.character_width.groups[key] = nextValue;
-        });
-
-        if (data) {
-            setWidthGroups(normalizeWidthGroups(data.character_width?.groups));
-        }
-    };
-
-    const openRomajiEditor = () => {
-        setRomajiDraftRows(
-            romajiRows.length > 0
-                ? romajiRows
-                : [{ input: "", output: "", next_input: "" }],
-        );
-        setIsRomajiEditorOpen(true);
-    };
-
-    const closeRomajiEditor = () => {
-        setIsRomajiEditorOpen(false);
-        setPendingFocusNewRow(false);
-    };
-
-    const setRomajiRowValue = (
-        index: number,
-        key: keyof RomajiRow,
-        value: string,
-    ) => {
-        setRomajiDraftRows((prev) => {
-            const next = [...prev];
-            next[index] = { ...next[index], [key]: value };
-            return next;
-        });
-    };
-
-    const removeRomajiRow = (index: number) => {
-        setRomajiDraftRows((prev) => {
-            if (prev.length <= 1) {
-                return [{ input: "", output: "", next_input: "" }];
-            }
-            return prev.filter((_, rowIndex) => rowIndex !== index);
-        });
-    };
-
-    const addRomajiRow = () => {
-        setRomajiDraftRows((prev) => [...prev, { input: "", output: "", next_input: "" }]);
-        setPendingFocusNewRow(true);
-    };
-
-    const resetRomajiTableDraft = async () => {
-        let rows = defaultRomajiRows;
-        if (rows.length === 0) {
-            try {
-                const fetchedRows = await invoke<any>("get_default_romaji_rows");
-                rows = normalizeRomajiRows(fetchedRows);
-                setDefaultRomajiRows(rows);
-            } catch (_error) {
-                toast("初期テーブルの取得に失敗しました");
-                return;
-            }
-        }
-
-        setRomajiDraftRows(
-            rows.length > 0 ? rows : [{ input: "", output: "", next_input: "" }],
-        );
-        toast("初期テーブルに戻しました（保存で反映されます）");
-    };
-
-    const saveRomajiTable = async () => {
-        const normalizedRows = normalizeRomajiRowsForSave(romajiDraftRows);
-
-        if (normalizedRows.some((row) => !row.input || !row.output)) {
-            toast("ローマ字テーブルに未入力の行があります");
-            return;
-        }
-
-        const data = await updateConfig((config) => {
-            config.romaji_table = config.romaji_table ?? {};
-            config.romaji_table.rows = normalizedRows;
-        });
-
-        if (data) {
-            const nextRows = normalizeRomajiRows(data.romaji_table?.rows);
-            setRomajiRows(nextRows);
-            setIsRomajiEditorOpen(false);
-            toast("ローマ字テーブルを更新しました");
-        }
-    };
-
-    const widthSummary = useMemo(() => {
-        const visibleModes = WIDTH_ROWS.map((row) => widthGroups[row.key]);
-        const fullCount = visibleModes.filter((mode) => mode === "full").length;
-        const halfCount = visibleModes.length - fullCount;
-        return `半角 ${halfCount} / 全角 ${fullCount}`;
-    }, [widthGroups]);
+    if (loadState !== "ready") return (
+        <div className="settings-content" role="status">
+            <p className={loadState === "error" ? "text-sm text-destructive" : "settings-description"}>
+                {loadState === "error" ? "設定を読み込めませんでした。" : "設定を読み込んでいます…"}
+            </p>
+            {loadState === "error" && <Button variant="outline" onClick={() => setLoadAttempt((attempt) => attempt + 1)}>再試行</Button>}
+        </div>
+    );
 
     return (
-        <>
-            <div className="space-y-8">
-                <section className="space-y-2">
-                    <h1 className="text-sm font-bold text-foreground">バージョンと更新プログラム</h1>
-                    <div className="flex items-center space-x-4 rounded-md border p-4">
-                        <RefreshCcw />
-                        <div className="flex-1 space-y-1">
-                            <p className="text-sm font-medium leading-none">
-                                {appVersion ? `v${appVersion}` : "v-"}
-                            </p>
-                            {updateDescription ? (
-                                <p className="text-xs text-muted-foreground">
-                                    {updateDescription}
-                                </p>
-                            ) : null}
-                            {updateError ? (
-                                <p className="text-xs text-destructive">
-                                    {updateError}
-                                </p>
-                            ) : null}
-                        </div>
-                        <Button
-                            variant={updateStatus === "available" ? "default" : "secondary"}
-                            onClick={() => void handleUpdateButton()}
-                            disabled={updateStatus === "checking" || updateStatus === "starting"}
-                        >
-                            {updateStatus === "available" ? <Download /> : <RefreshCcw />}
-                            {updateButtonLabel}
-                        </Button>
-                    </div>
-                </section>
-
-                <section className="space-y-3">
-                    <h1 className="text-sm font-bold text-foreground">基本設定</h1>
-                    <div className="space-y-3 rounded-md border p-4">
-                        <div className="grid grid-cols-[1fr_220px] items-center gap-4">
-                            <p className="text-sm font-medium">句読点</p>
-                            <div className="flex justify-end">
-                                <Select
-                                    value={generalValue.punctuation_style}
-                                    onValueChange={(value) => void updateGeneralConfig("punctuation_style", value)}
-                                >
-                                    <SelectTrigger>
-                                        <SelectValue placeholder="句読点を選択" />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                        {PUNCTUATION_OPTIONS.map((option) => (
-                                            <SelectItem key={option.value} value={option.value}>
-                                                {option.label}
-                                            </SelectItem>
-                                        ))}
-                                    </SelectContent>
-                                </Select>
-                            </div>
-                        </div>
-
-                        <div className="grid grid-cols-[1fr_220px] items-center gap-4">
-                            <p className="text-sm font-medium">記号</p>
-                            <div className="flex justify-end">
-                                <Select
-                                    value={generalValue.symbol_style}
-                                    onValueChange={(value) => void updateGeneralConfig("symbol_style", value)}
-                                >
-                                    <SelectTrigger>
-                                        <SelectValue placeholder="記号を選択" />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                        {SYMBOL_OPTIONS.map((option) => (
-                                            <SelectItem key={option.value} value={option.value}>
-                                                {option.label}
-                                            </SelectItem>
-                                        ))}
-                                    </SelectContent>
-                                </Select>
-                            </div>
-                        </div>
-
-                        <div className="grid grid-cols-[1fr_220px] items-center gap-4">
-                            <p className="text-sm font-medium">スペースの入力</p>
-                            <div className="flex justify-end">
-                                <Select
-                                    value={generalValue.space_input}
-                                    onValueChange={(value) => void updateGeneralConfig("space_input", value)}
-                                >
-                                    <SelectTrigger>
-                                        <SelectValue placeholder="スペースの入力を選択" />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                        {SPACE_OPTIONS.map((option) => (
-                                            <SelectItem key={option.value} value={option.value}>
-                                                {option.label}
-                                            </SelectItem>
-                                        ))}
-                                    </SelectContent>
-                                </Select>
-                            </div>
-                        </div>
-
-                        <div className="grid grid-cols-[1fr_220px] items-center gap-4">
-                            <p className="text-sm font-medium">テンキーからの入力</p>
-                            <div className="flex justify-end">
-                                <Select
-                                    value={generalValue.numpad_input}
-                                    onValueChange={(value) => void updateGeneralConfig("numpad_input", value)}
-                                >
-                                    <SelectTrigger>
-                                        <SelectValue placeholder="テンキー入力を選択" />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                        {NUMPAD_OPTIONS.map((option) => (
-                                            <SelectItem key={option.value} value={option.value}>
-                                                {option.label}
-                                            </SelectItem>
-                                        ))}
-                                    </SelectContent>
-                                </Select>
-                            </div>
-                        </div>
-
-                        <div className="grid grid-cols-[1fr_220px] items-center gap-4">
-                            <p className="text-sm font-medium">再変換</p>
-                            <div className="flex justify-end">
-                                <Select
-                                    value={shortcutValue.reconversionKey}
-                                    onValueChange={(value: ReconversionKey) => void handleReconversionKey(value)}
-                                >
-                                    <SelectTrigger>
-                                        <SelectValue placeholder="再変換キーを選択" />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                        {RECONVERSION_KEY_OPTIONS.map((option) => (
-                                            <SelectItem key={option.value} value={option.value}>
-                                                {option.label}
-                                            </SelectItem>
-                                        ))}
-                                    </SelectContent>
-                                </Select>
-                            </div>
-                        </div>
-
-                        <div className="flex items-center gap-4">
-                            <div className="flex-1 space-y-1">
-                                <p className="text-sm font-medium leading-none">候補ウィンドウを非表示</p>
-                                <p className="text-xs text-muted-foreground">
-                                    Space または Tab の入力まで候補を表示しません
-                                </p>
-                            </div>
-                            <Switch
-                                checked={generalValue.show_candidate_window_after_space}
-                                onCheckedChange={(value) => void updateCandidateWindowDelay(value)}
-                            />
-                        </div>
-
-                        <div className="flex items-center gap-4">
-                            <div className="flex-1 space-y-1">
-                                <p className="text-sm font-medium leading-none">ライブ変換中の読みを表示</p>
-                                <p className="text-xs text-muted-foreground">
-                                    未確定入力の読みを小さく表示します
-                                </p>
-                            </div>
-                            <Switch
-                                checked={generalValue.show_live_conversion_reading}
-                                onCheckedChange={(value) => void updateLiveConversionReading(value)}
-                            />
-                        </div>
-
-                        {generalValue.show_live_conversion_reading ? (
-                            <div className="space-y-2 border-t pt-3">
-                                <div className="flex items-center gap-4">
-                                    <div className="flex-1 space-y-1">
-                                        <p className="text-sm font-medium leading-none">読み表示の高さ</p>
-                                        <p className="text-xs text-muted-foreground">
-                                            プラスで上、マイナスで下に移動します
-                                        </p>
-                                    </div>
-                                    <span className="w-14 text-right text-sm tabular-nums">
-                                        {generalValue.live_conversion_reading_vertical_adjustment > 0
-                                            ? "+"
-                                            : ""}
-                                        {generalValue.live_conversion_reading_vertical_adjustment}px
-                                    </span>
+        <div className="settings-content">
+            {page === "input" && <>
+                <SettingsSection title="文字の入力">
+                    {([
+                        ["punctuation_style", "句読点", PUNCTUATION_OPTIONS],
+                        ["symbol_style", "記号", SYMBOL_OPTIONS],
+                        ["space_input", "スペース", SPACE_OPTIONS],
+                        ["numpad_input", "テンキー", NUMPAD_OPTIONS],
+                    ] as const).map(([key, label, options]) => (
+                        <SettingsRow key={key} label={label} htmlFor={key}>
+                            <Select value={generalValue[key]} onValueChange={(value) => void updateGeneralConfig(key, value)}>
+                                <SelectTrigger id={key}><SelectValue /></SelectTrigger>
+                                <SelectContent>{options.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
+                            </Select>
+                        </SettingsRow>
+                    ))}
+                </SettingsSection>
+                <SettingsSection title="半角・全角">
+                    {WIDTH_ROWS.map(({ key, label }) => (
+                        <SettingsRow key={key} label={label} htmlFor={`width-${key}`}>
+                            <Select value={widthGroups[key]} onValueChange={(value: WidthMode) => void updateWidthGroup(key, value)}>
+                                <SelectTrigger id={`width-${key}`}><SelectValue /></SelectTrigger>
+                                <SelectContent>{WIDTH_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
+                            </Select>
+                        </SettingsRow>
+                    ))}
+                </SettingsSection>
+            </>}
+            {page === "conversion" && <>
+                <Zenzai />
+                <SettingsSection title="確定">
+                    <SettingsRow label="記号入力で変換を確定" htmlFor="punctuation-commit">
+                        <Switch id="punctuation-commit" checked={generalValue.punctuation_commit} onCheckedChange={(value) => void updateGeneralConfig("punctuation_commit", value)} />
+                    </SettingsRow>
+                    {generalValue.punctuation_commit && <div className="settings-subgroup">
+                        {([
+                            ["punctuation_commit_punctuation", "句読点"],
+                            ["punctuation_commit_exclamation", "！"],
+                            ["punctuation_commit_question", "？"],
+                        ] as const).map(([key, label]) => (
+                            <SettingsRow key={key} label={label} htmlFor={key}>
+                                <Switch id={key} checked={generalValue[key]} onCheckedChange={(value) => void updateGeneralConfig(key, value)} />
+                            </SettingsRow>
+                        ))}
+                    </div>}
+                </SettingsSection>
+                <SettingsSection title="候補と読みの表示">
+                    <SettingsRow label="Space / Tab まで候補を非表示" htmlFor="candidate-delay">
+                        <Switch id="candidate-delay" checked={generalValue.show_candidate_window_after_space} onCheckedChange={(value) => void updateGeneralConfig("show_candidate_window_after_space", value)} />
+                    </SettingsRow>
+                    <SettingsRow label="ライブ変換中の読みを表示" htmlFor="live-reading">
+                        <Switch id="live-reading" checked={generalValue.show_live_conversion_reading} onCheckedChange={(value) => void updateGeneralConfig("show_live_conversion_reading", value)} />
+                    </SettingsRow>
+                    {generalValue.show_live_conversion_reading && <div className="settings-subgroup">
+                        <SettingsRow label="読み表示の高さ" htmlFor="reading-height">
+                            <div className="w-full space-y-1">
+                                <div className="flex items-center gap-2 text-xs">
+                                    <span>下</span>
+                                    <input id="reading-height" type="range" min={LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MIN} max={LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MAX} step={1}
+                                        value={generalValue.live_conversion_reading_vertical_adjustment} className="min-w-0 w-full accent-primary"
+                                        aria-valuetext={`${generalValue.live_conversion_reading_vertical_adjustment}px`}
+                                        onChange={(event) => {
+                                            const nextValue = clampLiveConversionReadingVerticalAdjustment(event.currentTarget.value);
+                                            setGeneralValue((current) => ({ ...current, live_conversion_reading_vertical_adjustment: nextValue }));
+                                        }}
+                                        onPointerUp={(event) => updateLiveConversionReadingVerticalAdjustment(event.currentTarget.valueAsNumber)}
+                                        onKeyUp={(event) => {
+                                            if (["ArrowDown", "ArrowLeft", "ArrowRight", "ArrowUp", "End", "Home", "PageDown", "PageUp"].includes(event.key)) {
+                                                updateLiveConversionReadingVerticalAdjustment(event.currentTarget.valueAsNumber);
+                                            }
+                                        }}
+                                        onBlur={(event) => updateLiveConversionReadingVerticalAdjustment(event.currentTarget.valueAsNumber)} />
+                                    <span>上</span>
                                 </div>
-                                <input
-                                    type="range"
-                                    min={LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MIN}
-                                    max={LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MAX}
-                                    step={1}
-                                    value={generalValue.live_conversion_reading_vertical_adjustment}
-                                    className="w-full accent-primary"
-                                    onChange={(event) => {
-                                        const nextValue = clampLiveConversionReadingVerticalAdjustment(
-                                            event.currentTarget.value,
-                                        );
-                                        setGeneralValue((current) => ({
-                                            ...current,
-                                            live_conversion_reading_vertical_adjustment: nextValue,
-                                        }));
-                                    }}
-                                    onPointerUp={(event) => {
-                                        updateLiveConversionReadingVerticalAdjustment(
-                                            event.currentTarget.valueAsNumber,
-                                        );
-                                    }}
-                                    onKeyUp={(event) => {
-                                        if (
-                                            [
-                                                "ArrowDown",
-                                                "ArrowLeft",
-                                                "ArrowRight",
-                                                "ArrowUp",
-                                                "End",
-                                                "Home",
-                                                "PageDown",
-                                                "PageUp",
-                                            ].includes(event.key)
-                                        ) {
-                                            updateLiveConversionReadingVerticalAdjustment(
-                                                event.currentTarget.valueAsNumber,
-                                            );
-                                        }
-                                    }}
-                                    onBlur={(event) => {
-                                        updateLiveConversionReadingVerticalAdjustment(
-                                            event.currentTarget.valueAsNumber,
-                                        );
-                                    }}
-                                />
+                                <p className="text-right text-xs tabular-nums">{generalValue.live_conversion_reading_vertical_adjustment > 0 ? "+" : ""}{generalValue.live_conversion_reading_vertical_adjustment}px</p>
                             </div>
-                        ) : null}
-                    </div>
-                </section>
-
-                <section className="space-y-3">
-                    <h1 className="text-sm font-bold text-foreground">変換学習</h1>
-                    <div className="space-y-3 rounded-md border p-4">
-                        <div className="grid grid-cols-[1fr_220px] items-center gap-4">
-                            <div className="space-y-1">
-                                <p className="text-sm font-medium leading-none">変換学習</p>
-                                <p className="text-xs text-muted-foreground">
-                                    確定した候補を次回以降の変換順位に反映します
-                                </p>
-                            </div>
-                            <div className="flex justify-end">
-                                <Select
-                                    value={learningMode}
-                                    onValueChange={(value: LearningMode) =>
-                                        void updateLearningMode(value)
-                                    }
-                                >
-                                    <SelectTrigger>
-                                        <SelectValue placeholder="変換学習" />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                        {LEARNING_MODE_OPTIONS.map((option) => (
-                                            <SelectItem key={option.value} value={option.value}>
-                                                {option.label}
-                                            </SelectItem>
-                                        ))}
-                                    </SelectContent>
-                                </Select>
-                            </div>
-                        </div>
-
-                        <div className="flex items-center gap-4 border-t pt-3">
-                            <div className="flex-1 space-y-1">
-                                <p className="text-sm font-medium leading-none">学習履歴を削除</p>
-                                <p className="text-xs text-muted-foreground">
-                                    保存済みの変換学習データを削除します
-                                </p>
-                            </div>
-                            <AlertDialog>
-                                <AlertDialogTrigger asChild>
-                                    <Button variant="outline">
-                                        <Trash2 />
-                                        削除
-                                    </Button>
-                                </AlertDialogTrigger>
-                                <AlertDialogContent>
-                                    <AlertDialogHeader>
-                                        <AlertDialogTitle>学習履歴を削除</AlertDialogTitle>
-                                        <AlertDialogDescription>
-                                            これまでの変換学習データを削除します。
-                                        </AlertDialogDescription>
-                                    </AlertDialogHeader>
-                                    <AlertDialogFooter>
-                                        <AlertDialogCancel>キャンセル</AlertDialogCancel>
-                                        <AlertDialogAction
-                                            onClick={() => void resetLearningHistory()}
-                                        >
-                                            削除
-                                        </AlertDialogAction>
-                                    </AlertDialogFooter>
-                                </AlertDialogContent>
-                            </AlertDialog>
-                        </div>
-                    </div>
-                </section>
-
-                <section className="space-y-3">
-                    <h1 className="text-sm font-bold text-foreground">句読点確定</h1>
-                    <div className="space-y-3 rounded-md border p-4">
-                        <div className="flex items-center gap-4">
-                            <div className="flex-1 space-y-1">
-                                <p className="text-sm font-medium leading-none">句読点確定</p>
-                                <p className="text-xs text-muted-foreground">
-                                    対象記号の入力時に現在の変換を確定します
-                                </p>
-                            </div>
-                            <Switch
-                                checked={generalValue.punctuation_commit}
-                                onCheckedChange={(value) =>
-                                    void updateGeneralBooleanConfig("punctuation_commit", value)
-                                }
-                            />
-                        </div>
-
-                        {generalValue.punctuation_commit ? (
-                            <div className="space-y-3 border-t pt-3">
-                                <div className="flex items-center gap-4">
-                                    <p className="flex-1 text-sm font-medium">句読点</p>
-                                    <Switch
-                                        checked={generalValue.punctuation_commit_punctuation}
-                                        onCheckedChange={(value) =>
-                                            void updateGeneralBooleanConfig(
-                                                "punctuation_commit_punctuation",
-                                                value,
-                                            )
-                                        }
-                                    />
+                        </SettingsRow>
+                    </div>}
+                </SettingsSection>
+                <SettingsSection title="変換学習">
+                    <SettingsRow label="学習と履歴の使用" htmlFor="learning-mode">
+                        <Select value={learningMode} onValueChange={(value: LearningMode) => void updateLearningMode(value)}>
+                            <SelectTrigger id="learning-mode"><SelectValue /></SelectTrigger>
+                            <SelectContent>{LEARNING_MODE_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
+                        </Select>
+                    </SettingsRow>
+                    <SettingsRow label="学習履歴">
+                        <AlertDialog>
+                            <AlertDialogTrigger asChild><Button variant="outline">履歴を削除</Button></AlertDialogTrigger>
+                            <AlertDialogContent>
+                                <AlertDialogHeader>
+                                    <AlertDialogTitle>学習履歴を削除しますか？</AlertDialogTitle>
+                                    <AlertDialogDescription>これまでの変換学習データを削除します。この操作は取り消せません。</AlertDialogDescription>
+                                </AlertDialogHeader>
+                                <AlertDialogFooter>
+                                    <AlertDialogCancel>キャンセル</AlertDialogCancel>
+                                    <AlertDialogAction onClick={() => void resetLearningHistory()}>削除</AlertDialogAction>
+                                </AlertDialogFooter>
+                            </AlertDialogContent>
+                        </AlertDialog>
+                    </SettingsRow>
+                </SettingsSection>
+            </>}
+            {page === "keys" && <>
+                <SettingsSection title="英数・かな切り替え">
+                    {([
+                        ["ctrl_space_toggle", "ctrlSpaceToggle", "Ctrl + Space"],
+                        ["alt_backquote_toggle", "altBackquoteToggle", "Alt + `"],
+                        ["eisu_toggle", "eisuToggle", "英数 (CapsLock)"],
+                    ] as const).map(([key, stateKey, label]) => (
+                        <SettingsRow key={key} label={label} htmlFor={key}>
+                            <Switch id={key} checked={shortcutValue[stateKey]} onCheckedChange={(value) => void updateShortcut(key, value)} />
+                        </SettingsRow>
+                    ))}
+                </SettingsSection>
+                <SettingsSection title="再変換">
+                    <SettingsRow label="再変換キー" htmlFor="reconversion-key">
+                        <Select value={shortcutValue.reconversionKey} onValueChange={(value: ReconversionKey) => void updateShortcut("reconversion_key", value)}>
+                            <SelectTrigger id="reconversion-key"><SelectValue /></SelectTrigger>
+                            <SelectContent>{RECONVERSION_KEY_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
+                        </Select>
+                    </SettingsRow>
+                </SettingsSection>
+                <SettingsSection title="ローマ字入力">
+                    <SettingsRow label="ローマ字テーブル" description={`${romajiRows.length} 件`}>
+                        <RomajiEditor rows={romajiRows} onSaved={setRomajiRows} />
+                    </SettingsRow>
+                </SettingsSection>
+            </>}
+            {page === "advanced" && <>
+                <SettingsSection title="実験的機能">
+                    <SettingsRow label="誤入力の補正" description="意図しない変換結果になる場合があります。" htmlFor="typo-correction">
+                        <Switch id="typo-correction" checked={generalValue.experimental_typo_correction} onCheckedChange={(value) => void updateGeneralConfig("experimental_typo_correction", value)} />
+                    </SettingsRow>
+                    <SettingsRow label="Jev による候補選択" description="読み・候補・左文脈を外部へ送信します。ONの間はZenzaiを使いません。" htmlFor="jev-conversion">
+                        <Switch id="jev-conversion" checked={generalValue.jev_conversion} onCheckedChange={(value) => {
+                            if (value) setJevWarningOpen(true);
+                            else void updateGeneralConfig("jev_conversion", false);
+                        }} />
+                    </SettingsRow>
+                    {(generalValue.jev_conversion || jevApiKeySaved) && <div className="settings-subgroup">
+                        <SettingsRow label="TypeSafe APIキー" description="Windowsの資格情報マネージャーに保存します。" htmlFor="jev-api-key">
+                            <div className="w-full space-y-2">
+                                <Input id="jev-api-key" type="password" autoComplete="off" spellCheck={false} value={jevApiKey}
+                                    disabled={jevApiKeyBusy || jevApiKeySaved === null}
+                                    placeholder={jevApiKeySaved ? "設定済み（変更する場合は入力）" : "APIキーを入力"}
+                                    onChange={(event) => setJevApiKey(event.target.value)} />
+                                <div className="settings-actions">
+                                    <Button disabled={!jevApiKey.trim() || jevApiKeyBusy || jevApiKeySaved === null} onClick={() => void saveJevApiKey()}>キーを保存</Button>
+                                    {jevApiKeySaved && <>
+                                        <Button variant="outline" disabled={jevApiKeyBusy} onClick={() => void checkJevApiKey()}>
+                                            {jevApiKeyChecking ? "確認中…" : "保存済みキーを確認"}
+                                        </Button>
+                                        <Button variant="outline" disabled={jevApiKeyBusy} onClick={() => void deleteJevApiKey()}>削除</Button>
+                                    </>}
                                 </div>
-                                <div className="flex items-center gap-4">
-                                    <p className="flex-1 text-sm font-medium">！</p>
-                                    <Switch
-                                        checked={generalValue.punctuation_commit_exclamation}
-                                        onCheckedChange={(value) =>
-                                            void updateGeneralBooleanConfig(
-                                                "punctuation_commit_exclamation",
-                                                value,
-                                            )
-                                        }
-                                    />
-                                </div>
-                                <div className="flex items-center gap-4">
-                                    <p className="flex-1 text-sm font-medium">？</p>
-                                    <Switch
-                                        checked={generalValue.punctuation_commit_question}
-                                        onCheckedChange={(value) =>
-                                            void updateGeneralBooleanConfig(
-                                                "punctuation_commit_question",
-                                                value,
-                                            )
-                                        }
-                                    />
-                                </div>
+                                {jevApiKeySaved && <p className="settings-description">モデル一覧APIで認証を確認します。入力内容は送信しません。</p>}
                             </div>
-                        ) : null}
-                    </div>
-                </section>
-
-                <section className="space-y-3">
-                    <h1 className="text-sm font-bold text-foreground">キー設定</h1>
-                    <div className="space-y-3 rounded-md border p-4">
-                        <div className="flex items-center gap-4">
-                            <Table2 className="h-4 w-4" />
-                            <div className="flex-1">
-                                <p className="text-sm font-medium">ローマ字テーブル</p>
-                                <p className="text-xs text-muted-foreground">
-                                    登録件数: {romajiRows.length} 件
-                                </p>
-                            </div>
-                            <Button variant="secondary" onClick={openRomajiEditor}>
-                                編集
-                            </Button>
-                        </div>
-                    </div>
-                </section>
-
-                <section className="space-y-3">
-                    <h1 className="text-sm font-bold text-foreground">半角全角設定</h1>
-                    <div className="space-y-3 rounded-md border p-4">
-                        <p className="text-xs text-muted-foreground">
-                            記号カテゴリごとに半角/全角を指定します（{widthSummary}）。
-                        </p>
-                        <div className="rounded-md border">
-                            <table className="w-full table-fixed text-sm">
-                                <thead className="bg-muted/30 text-left text-xs text-muted-foreground">
-                                    <tr>
-                                        <th className="px-3 py-2 font-medium">文字グループ</th>
-                                        <th className="w-40 px-3 py-2 text-right font-medium">変換前文字列</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {WIDTH_ROWS.map((row) => (
-                                        <tr key={row.key} className="border-t">
-                                            <td className="px-3 py-2 font-medium">{row.label}</td>
-                                            <td className="px-3 py-2">
-                                                <div className="flex justify-end">
-                                                    <Select
-                                                        value={widthGroups[row.key]}
-                                                        onValueChange={(value: WidthMode) =>
-                                                            void updateWidthGroup(row.key, value)
-                                                        }
-                                                    >
-                                                        <SelectTrigger className="w-28">
-                                                            <SelectValue placeholder="幅" />
-                                                        </SelectTrigger>
-                                                        <SelectContent>
-                                                            {WIDTH_OPTIONS.map((option) => (
-                                                                <SelectItem key={option.value} value={option.value}>
-                                                                    {option.label}
-                                                                </SelectItem>
-                                                            ))}
-                                                        </SelectContent>
-                                                    </Select>
-                                                </div>
-                                            </td>
-                                        </tr>
-                                    ))}
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-                </section>
-
-                <section className="space-y-3">
-                    <h1 className="text-sm font-bold text-foreground">入力モード切替ショートカット</h1>
-                    <div className="divide-y rounded-md border">
-                        <div className="flex items-center gap-4 p-4">
-                            <Keyboard className="h-4 w-4 shrink-0" />
-                            <div className="flex-1 space-y-1">
-                                <p className="text-sm font-medium leading-none">Ctrl + Space を有効化</p>
-                                <p className="text-xs text-muted-foreground">
-                                    英数/かな切り替えのショートカットとして Ctrl + Space を使用します
-                                </p>
-                            </div>
-                            <Switch checked={shortcutValue.ctrlSpaceToggle} onCheckedChange={handleCtrlSpaceToggle} />
-                        </div>
-                        <div className="flex items-center gap-4 p-4">
-                            <Keyboard className="h-4 w-4 shrink-0" />
-                            <div className="flex-1 space-y-1">
-                                <p className="text-sm font-medium leading-none">Alt + ` を有効化</p>
-                                <p className="text-xs text-muted-foreground">
-                                    英数/かな切り替えのショートカットとして Alt + ` を使用します
-                                </p>
-                            </div>
-                            <Switch checked={shortcutValue.altBackquoteToggle} onCheckedChange={handleAltBackquoteToggle} />
-                        </div>
-                        <div className="flex items-center gap-4 p-4">
-                            <Keyboard className="h-4 w-4 shrink-0" />
-                            <div className="flex-1 space-y-1">
-                                <p className="text-sm font-medium leading-none">英数 (CapsLock) を有効化</p>
-                                <p className="text-xs text-muted-foreground">
-                                    英数/かな切り替えのショートカットとして英数 (CapsLock) を使用します
-                                </p>
-                            </div>
-                            <Switch checked={shortcutValue.eisuToggle} onCheckedChange={handleEisuToggle} />
-                        </div>
-                    </div>
-                </section>
-
-                <section className="space-y-3">
-                    <h1 className="text-sm font-bold text-foreground">実験的機能</h1>
-                    <div className="rounded-md border">
-                        <div className="flex items-center gap-4 p-4">
-                            <FlaskConical className="h-4 w-4 shrink-0" />
-                            <div className="flex-1 space-y-1">
-                                <p className="text-sm font-medium leading-none">誤入力の補正機能</p>
-                                <p className="text-xs text-muted-foreground">
-                                    キーボードの打ち間違いを補正候補として表示します。変換結果が意図しない内容になる場合があります。
-                                </p>
-                            </div>
-                            <Switch
-                                aria-label="誤入力の補正機能"
-                                checked={generalValue.experimental_typo_correction}
-                                onCheckedChange={(value) =>
-                                    void updateGeneralBooleanConfig("experimental_typo_correction", value)
-                                }
-                            />
-                        </div>
-                        <div className="space-y-3 border-t p-4">
-                            <div className="flex items-center gap-4">
-                                <FlaskConical className="h-4 w-4 shrink-0" />
-                                <div className="flex-1 space-y-1">
-                                    <p className="text-sm font-medium leading-none">Jevによる候補選択</p>
-                                    <p className="text-xs text-muted-foreground">デスクトップアプリで変換キーを押したとき、通常KKCの候補からJevが選択します。Windows検索などのAppContainerでは通常KKCを使います。</p>
-                                </div>
-                                <Switch
-                                    aria-label="Jevによる候補選択"
-                                    checked={generalValue.jev_conversion}
-                                    onCheckedChange={(value) => {
-                                        if (value) setJevWarningOpen(true);
-                                        else void updateGeneralBooleanConfig("jev_conversion", false);
-                                    }}
-                                />
-                            </div>
-                            {generalValue.jev_conversion && (
-                                <div className="space-y-2 pl-8">
-                                    <label htmlFor="jev-api-key" className="text-sm font-medium">TypeSafe APIキー</label>
-                                    <div className="flex gap-2">
-                                        <Input
-                                            id="jev-api-key"
-                                            type="password"
-                                            autoComplete="off"
-                                            spellCheck={false}
-                                            value={jevApiKey}
-                                            placeholder={jevApiKeySaved ? "設定済み（変更する場合は新しいキーを入力）" : "APIキーを入力"}
-                                            onChange={(event) => setJevApiKey(event.target.value)}
-                                        />
-                                        <Button disabled={!jevApiKey.trim() || jevApiKeyBusy} onClick={() => void saveJevApiKey()}>保存</Button>
-                                        {jevApiKeySaved && (
-                                            <Button variant="outline" disabled={jevApiKeyBusy} onClick={() => void deleteJevApiKey()}>削除</Button>
-                                        )}
-                                    </div>
-                                    <p className="text-xs text-muted-foreground">キーはWindowsの資格情報マネージャーに保存します。</p>
-                                </div>
-                            )}
-                        </div>
-                    </div>
-                </section>
-            </div>
-
+                        </SettingsRow>
+                    </div>}
+                </SettingsSection>
+                <DebugSettings />
+            </>}
             <AlertDialog open={jevWarningOpen} onOpenChange={setJevWarningOpen}>
                 <AlertDialogContent>
                     <AlertDialogHeader>
                         <AlertDialogTitle>Jevによる候補選択を有効にしますか？</AlertDialogTitle>
                         <AlertDialogDescription>
-                            有効にするとリアルタイム変換がOFFになります。デスクトップアプリで変換キーを押すと、入力した読み・変換候補・左文脈がJevのサーバー（TypeSafe）へ送信されます。Windows検索などのAppContainerでは通常KKCを使います。
+                            有効にするとZenzaiとリアルタイム変換を使わなくなります。デスクトップアプリで変換キーを押すと、入力した読み・変換候補・左文脈がJevのサーバー（TypeSafe）へ送信されます。Windows検索などのAppContainerでは通常KKCを使います。
                         </AlertDialogDescription>
                     </AlertDialogHeader>
                     <AlertDialogFooter>
                         <AlertDialogCancel>キャンセル</AlertDialogCancel>
-                        <AlertDialogAction onClick={() => void updateGeneralBooleanConfig("jev_conversion", true)}>有効にする</AlertDialogAction>
+                        <AlertDialogAction onClick={() => void updateGeneralConfig("jev_conversion", true)}>有効にする</AlertDialogAction>
                     </AlertDialogFooter>
                 </AlertDialogContent>
             </AlertDialog>
-
-            {isRomajiEditorOpen && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-                    <div className="flex h-[80vh] w-full max-w-5xl flex-col rounded-lg border bg-background p-4 shadow-lg">
-                        <div className="mb-3 flex items-center justify-between">
-                            <div>
-                                <h2 className="text-sm font-bold">ローマ字テーブル設定</h2>
-                                <p className="text-xs text-muted-foreground">
-                                    入力 / 出力 / 次の入力 を編集して保存します
-                                </p>
-                            </div>
-                            <Button variant="outline" onClick={closeRomajiEditor}>
-                                閉じる
-                            </Button>
-                        </div>
-
-                        <div ref={romajiEditorScrollRef} className="flex-1 overflow-auto rounded-md border">
-                            <table className="w-full table-fixed text-sm">
-                                <colgroup>
-                                    <col className="w-12" />
-                                    <col />
-                                    <col />
-                                    <col />
-                                    <col className="w-14" />
-                                </colgroup>
-                                <thead className="sticky top-0 bg-muted/30 text-left text-xs text-muted-foreground">
-                                    <tr>
-                                        <th className="px-2 py-2 font-medium">#</th>
-                                        <th className="px-2 py-2 font-medium">入力</th>
-                                        <th className="px-2 py-2 font-medium">出力</th>
-                                        <th className="px-2 py-2 font-medium">次の入力</th>
-                                        <th className="px-2 py-2 text-center font-medium">操作</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {romajiDraftRows.map((row, index) => (
-                                        <tr key={`row-${index}`} className="border-t">
-                                            <td className="px-2 py-2 text-xs text-muted-foreground">{index + 1}</td>
-                                            <td className="px-2 py-2">
-                                                <Input
-                                                    ref={(element) => {
-                                                        romajiInputRefs.current[index] = element;
-                                                    }}
-                                                    value={row.input}
-                                                    onChange={(event) =>
-                                                        setRomajiRowValue(index, "input", event.target.value)
-                                                    }
-                                                    placeholder="例: ka"
-                                                />
-                                            </td>
-                                            <td className="px-2 py-2">
-                                                <Input
-                                                    value={row.output}
-                                                    onChange={(event) =>
-                                                        setRomajiRowValue(index, "output", event.target.value)
-                                                    }
-                                                    placeholder="例: か"
-                                                />
-                                            </td>
-                                            <td className="px-2 py-2">
-                                                <Input
-                                                    value={row.next_input}
-                                                    onChange={(event) =>
-                                                        setRomajiRowValue(index, "next_input", event.target.value)
-                                                    }
-                                                    placeholder="例: k"
-                                                />
-                                            </td>
-                                            <td className="px-2 py-2 text-center">
-                                                <Button
-                                                    variant="ghost"
-                                                    size="icon"
-                                                    onClick={() => removeRomajiRow(index)}
-                                                    aria-label="行を削除"
-                                                >
-                                                    <Trash2 className="h-4 w-4" />
-                                                </Button>
-                                            </td>
-                                        </tr>
-                                    ))}
-                                </tbody>
-                            </table>
-                        </div>
-
-                        <div className="mt-3 flex items-center justify-between gap-2">
-                            <div className="flex gap-2">
-                                <Button variant="secondary" onClick={addRomajiRow}>
-                                    行を追加
-                                </Button>
-                                <Button variant="outline" onClick={() => void resetRomajiTableDraft()}>
-                                    テーブルを初期化
-                                </Button>
-                            </div>
-                            <div className="flex gap-2">
-                                <Button variant="outline" onClick={closeRomajiEditor}>
-                                    キャンセル
-                                </Button>
-                                <Button onClick={() => void saveRomajiTable()}>保存</Button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            )}
-        </>
+        </div>
     );
 };
