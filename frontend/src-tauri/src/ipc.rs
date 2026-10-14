@@ -33,6 +33,20 @@ impl IPCService {
         Self::new_inner(None)
     }
 
+    pub fn get_or_connect(connection: &mut Option<Self>) -> Result<&mut Self> {
+        Self::get_or_connect_with(connection, Self::new)
+    }
+
+    fn get_or_connect_with(
+        connection: &mut Option<Self>,
+        connect: impl FnOnce() -> Result<Self>,
+    ) -> Result<&mut Self> {
+        if connection.is_none() {
+            *connection = Some(connect()?);
+        }
+        Ok(connection.as_mut().unwrap())
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_test() -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("test runtime should be created");
@@ -164,6 +178,24 @@ mod tests {
         ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY, IPC_CONNECT_DEADLINE,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn reconnects_after_startup_failure_and_reuses_the_connection() {
+        let mut connection = None;
+        assert!(super::IPCService::get_or_connect_with(&mut connection, || {
+            anyhow::bail!("server has not started")
+        })
+        .is_err());
+        assert!(connection.is_none());
+        assert!(super::IPCService::get_or_connect_with(&mut connection, || {
+            Ok(super::IPCService::new_for_test())
+        })
+        .is_ok());
+        assert!(super::IPCService::get_or_connect_with(&mut connection, || {
+            panic!("an existing connection must be reused")
+        })
+        .is_ok());
+    }
 
     #[test]
     fn explicit_reconnect_timeout_controls_outer_deadline() {

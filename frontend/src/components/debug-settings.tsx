@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { FileText, RefreshCcw, Server, ShieldAlert, SlidersHorizontal } from "lucide-react";
+import { RefreshCcw } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -12,7 +12,8 @@ import {
     SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import { saveConfigWithToast } from "@/lib/config";
+import { getConfigAfterPendingUpdates, saveConfigWithToast } from "@/lib/config";
+import { SettingsRow, SettingsSection } from "@/components/settings-section";
 
 type ServerLogLevel = "off" | "error" | "warn" | "info" | "debug";
 
@@ -58,15 +59,20 @@ export const DebugSettings = () => {
     const [debugConfig, setDebugConfig] =
         useState<DebugConfigState>(DEFAULT_DEBUG_CONFIG);
 
+    const [loadState, setLoadState] = useState<"loading" | "ready" | "error">("loading");
+    const [loadAttempt, setLoadAttempt] = useState(0);
     useEffect(() => {
-        invoke<any>("get_config")
+        let cancelled = false;
+        setLoadState("loading");
+        getConfigAfterPendingUpdates()
             .then((data) => {
+                if (cancelled) return;
                 setDebugConfig(normalizeDebugConfig(data.debug));
+                setLoadState("ready");
             })
-            .catch(() => {
-                // Keep default values if config fetch fails.
-            });
-    }, []);
+            .catch(() => { if (!cancelled) setLoadState("error"); });
+        return () => { cancelled = true; };
+    }, [loadAttempt]);
 
     const restartServer = async () => {
         if (isRestartingServer) {
@@ -115,75 +121,48 @@ export const DebugSettings = () => {
     };
 
     return (
-        <section className="space-y-3">
-            <h1 className="text-sm font-bold text-foreground">デバッグ用設定</h1>
-            <div className="flex items-center gap-4 rounded-md border p-4">
-                <FileText />
-                <div className="flex-1 space-y-1">
-                    <p className="text-sm font-medium leading-none">サーバーログ</p>
-                    <p className="text-xs text-muted-foreground">
-                        server.log と性能計測ログを記録します
+        <>
+            <SettingsSection title="ログ">
+                {loadState !== "ready" ? <div className="p-4 space-y-2" role="status">
+                    <p className={loadState === "error" ? "text-sm text-destructive" : "settings-description"}>
+                        {loadState === "error" ? "デバッグ設定を読み込めませんでした。" : "設定を読み込んでいます…"}
                     </p>
-                </div>
-                <Switch
-                    checked={debugConfig.server_log_enabled}
-                    onCheckedChange={(checked) => void updateServerLogEnabled(checked)}
-                />
-            </div>
-            <div className="flex items-center gap-4 rounded-md border p-4">
-                <SlidersHorizontal />
-                <div className="flex-1 space-y-1">
-                    <p className="text-sm font-medium leading-none">ログレベル</p>
-                    <p className="text-xs text-muted-foreground">
-                        Debug でキー入力と性能計測ログを記録します
-                    </p>
-                </div>
-                <Select
-                    value={debugConfig.server_log_level}
-                    onValueChange={(value) => void updateServerLogLevel(value as ServerLogLevel)}
-                >
-                    <SelectTrigger className="w-36">
-                        <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                        <SelectItem value="off">Off</SelectItem>
-                        <SelectItem value="error">Error</SelectItem>
-                        <SelectItem value="warn">Warn</SelectItem>
-                        <SelectItem value="info">Info</SelectItem>
-                        <SelectItem value="debug">Debug</SelectItem>
-                    </SelectContent>
-                </Select>
-            </div>
-            <div className="flex items-center gap-4 rounded-md border p-4">
-                <ShieldAlert />
-                <div className="flex-1 space-y-1">
-                    <p className="text-sm font-medium leading-none">クラッシュトレース</p>
-                    <p className="text-xs text-muted-foreground">
-                        直前の候補生成状態だけを小さなファイルに残します
-                    </p>
-                </div>
-                <Switch
-                    checked={debugConfig.server_crash_trace_enabled}
-                    onCheckedChange={(checked) => void updateCrashTraceEnabled(checked)}
-                />
-            </div>
-            <div className="flex items-center gap-4 rounded-md border p-4">
-                <Server />
-                <div className="flex-1 space-y-1">
-                    <p className="text-sm font-medium leading-none">サーバー再起動</p>
-                    <p className="text-xs text-muted-foreground">
-                        変換サーバーを停止して起動し直します
-                    </p>
-                </div>
-                <Button
-                    variant="secondary"
-                    onClick={() => void restartServer()}
-                    disabled={isRestartingServer}
-                >
-                    <RefreshCcw />
-                    {isRestartingServer ? "再起動中" : "サーバー再起動"}
-                </Button>
-            </div>
-        </section>
+                    {loadState === "error" && <Button variant="outline" onClick={() => setLoadAttempt((attempt) => attempt + 1)}>再試行</Button>}
+                </div> : <>
+                    <SettingsRow label="サーバーログを記録" description="server.log と性能計測ログを記録します。" htmlFor="server-log-enabled">
+                        <Switch id="server-log-enabled" checked={debugConfig.server_log_enabled}
+                            onCheckedChange={(checked) => void updateServerLogEnabled(checked)} />
+                    </SettingsRow>
+                    {debugConfig.server_log_enabled && <div className="settings-subgroup">
+                        <SettingsRow label="ログレベル" htmlFor="server-log-level">
+                            <Select value={debugConfig.server_log_level} onValueChange={(value) => void updateServerLogLevel(value as ServerLogLevel)}>
+                                <SelectTrigger id="server-log-level"><SelectValue /></SelectTrigger>
+                                <SelectContent>
+                                    <SelectItem value="off">Off</SelectItem>
+                                    <SelectItem value="error">Error</SelectItem>
+                                    <SelectItem value="warn">Warn</SelectItem>
+                                    <SelectItem value="info">Info</SelectItem>
+                                    <SelectItem value="debug">Debug</SelectItem>
+                                </SelectContent>
+                            </Select>
+                        </SettingsRow>
+                        {debugConfig.server_log_level === "debug" && <p className="px-4 pb-3 text-xs text-destructive" role="status">
+                            Debugではキー入力も記録されます。機密情報の入力に注意してください。
+                        </p>}
+                    </div>}
+                </>}
+            </SettingsSection>
+            <SettingsSection title="障害からの復旧">
+                <SettingsRow label="クラッシュトレース" description="直前の候補生成状態を小さなファイルに残します。" htmlFor="crash-trace">
+                    <Switch id="crash-trace" checked={debugConfig.server_crash_trace_enabled} disabled={loadState !== "ready"}
+                        onCheckedChange={(checked) => void updateCrashTraceEnabled(checked)} />
+                </SettingsRow>
+                <SettingsRow label="変換サーバー">
+                    <Button variant="outline" onClick={() => void restartServer()} disabled={isRestartingServer}>
+                        <RefreshCcw />{isRestartingServer ? "再起動中…" : "再起動"}
+                    </Button>
+                </SettingsRow>
+            </SettingsSection>
+        </>
     );
 };

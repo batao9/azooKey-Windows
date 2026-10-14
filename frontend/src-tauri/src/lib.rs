@@ -1,4 +1,5 @@
 mod ipc;
+mod jev_api;
 mod server_process;
 mod updater;
 
@@ -159,6 +160,13 @@ fn delete_jev_api_key() -> Result<(), String> {
     shared::jev_credentials::delete_jev_api_key()
 }
 
+#[tauri::command]
+async fn check_jev_api_key() -> Result<(), String> {
+    let api_key = shared::jev_credentials::read_jev_api_key()
+        .ok_or_else(|| "保存済みのAPIキーがありません。".to_string())?;
+    jev_api::check_api_key(&api_key).await
+}
+
 fn get_config_impl(state: &AppState) -> AppConfig {
     let _update_guard = state.config_update_lock.lock().unwrap();
     match AppConfig::read() {
@@ -273,24 +281,16 @@ fn update_config_impl(
         });
     }
 
-    if let Some(ipc) = state.ipc.lock().unwrap().as_mut() {
-        if let Err(error) = ipc.update_config() {
-            eprintln!("Failed to notify IPC config update: {}", error);
-            return Ok(UpdateConfigResponse {
-                saved: true,
-                server_applied: false,
-                changed,
-                config: new_config,
-                message: Some(error.to_string()),
-            });
-        }
-    } else {
+    let applied = ipc::IPCService::get_or_connect(&mut state.ipc.lock().unwrap())
+        .and_then(|ipc| ipc.update_config());
+    if let Err(error) = applied {
+        eprintln!("Failed to notify IPC config update: {}", error);
         return Ok(UpdateConfigResponse {
             saved: true,
             server_applied: false,
             changed,
             config: new_config,
-            message: Some("IPC service is not initialized".to_string()),
+            message: Some(error.to_string()),
         });
     }
 
@@ -312,31 +312,25 @@ fn reset_learning_history(
 }
 
 fn reset_learning_history_impl(state: &AppState) -> ResetLearningHistoryResponse {
-    if let Some(ipc) = state.ipc.lock().unwrap().as_mut() {
-        let reset = match ipc.reset_learning_memory() {
-            Ok(reset) => reset,
-            Err(error) => {
-                eprintln!("Failed to reset learning memory: {}", error);
-                return ResetLearningHistoryResponse {
-                    reset: false,
-                    server_applied: false,
-                    message: Some(error.to_string()),
-                };
-            }
-        };
-        if !reset {
+    let reset = ipc::IPCService::get_or_connect(&mut state.ipc.lock().unwrap())
+        .and_then(|ipc| ipc.reset_learning_memory());
+    match reset {
+        Err(error) => {
+            eprintln!("Failed to reset learning memory: {}", error);
+            return ResetLearningHistoryResponse {
+                reset: false,
+                server_applied: false,
+                message: Some(error.to_string()),
+            };
+        }
+        Ok(false) => {
             return ResetLearningHistoryResponse {
                 reset: false,
                 server_applied: true,
                 message: Some("サーバー側で学習履歴の削除に失敗しました。".to_string()),
-            };
+            }
         }
-    } else {
-        return ResetLearningHistoryResponse {
-            reset: false,
-            server_applied: false,
-            message: Some("IPC service is not initialized".to_string()),
-        };
+        Ok(true) => {}
     }
 
     ResetLearningHistoryResponse {
@@ -496,6 +490,7 @@ pub fn run() {
             has_jev_api_key,
             save_jev_api_key,
             delete_jev_api_key,
+            check_jev_api_key,
             take_config_startup_notice,
             update_config,
             check_capability,
