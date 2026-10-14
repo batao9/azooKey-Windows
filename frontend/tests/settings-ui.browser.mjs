@@ -17,7 +17,7 @@ function installMock() {
         romaji_table: { rows: [{ input: "ka", output: "か", next_input: "" }] },
         user_dictionary: { entries: Array.from({ length: 25 }, (_, i) => ({ reading: `よみ${i}`, word: `単語${i}` })) },
     };
-    window.settingsTest = { config, checks: 0, writes: 0, failCheck: false, failSave: false, failLoad: sessionStorage.getItem("failSettingsLoad") === "true", available: true, holdSave: false, jevApiKeySaved: false, keyChecks: 0, keyCheckArgs: [], holdKeyCheck: false, keyCheckError: null, links: [], callbacks: {}, listeners: {}, nextCallback: 0, destroys: 0 };
+    window.settingsTest = { config, checks: 0, writes: 0, updateStarts: 0, failStart: false, holdStart: false, failCheck: false, failSave: false, failLoad: sessionStorage.getItem("failSettingsLoad") === "true", available: true, holdSave: false, jevApiKeySaved: false, keyChecks: 0, keyCheckArgs: [], holdKeyCheck: false, keyCheckError: null, links: [], callbacks: {}, listeners: {}, nextCallback: 0, destroys: 0 };
     window.isTauri = true;
     window.__TAURI_INTERNALS__ = {
         metadata: { currentWindow: { label: "main" } },
@@ -48,7 +48,11 @@ function installMock() {
                     state.checks++;
                     if (state.failCheck) throw new Error("mock update failure");
                     return { current_version: "0.1.0-batao.15", latest_version: "0.1.0-batao.16", release_url: "https://github.com/batao9/azooKey-Windows/releases/tag/v0.1.0-batao.16", update_available: state.available };
-                case "start_update": return {};
+                case "start_update":
+                    state.updateStarts++;
+                    while (state.holdStart) await new Promise((resolve) => setTimeout(resolve, 20));
+                    if (state.failStart) throw new Error("mock updater launch failure");
+                    return { launched: true };
                 case "check_capability": return { cpu: true, cuda: false, vulkan: true };
                 case "has_jev_api_key": return state.jevApiKeySaved;
                 case "check_jev_api_key":
@@ -237,6 +241,32 @@ test("settings layout, editing safety, navigation and update badge", async () =>
         await page.getByRole("button", { name: "更新を確認", exact: true }).click();
         await page.getByText("最新版を利用中です。", { exact: true }).waitFor();
         assert.equal(await page.getByLabel("更新があります", { exact: true }).count(), 0);
+
+        await page.evaluate(() => { window.settingsTest.available = true; window.settingsTest.failStart = true; });
+        await page.getByRole("button", { name: "更新を確認", exact: true }).click();
+        const updateButton = page.getByRole("button", { name: "アップデート", exact: true });
+        const recheckButton = page.getByRole("button", { name: "更新を確認", exact: true });
+        await updateButton.click();
+        await page.getByText("Error: mock updater launch failure", { exact: true }).waitFor();
+        assert.ok(await updateButton.isEnabled(), "failed helper launches must allow retry");
+        await page.evaluate(() => { window.settingsTest.failStart = false; window.settingsTest.holdStart = true; });
+        await updateButton.click();
+        await page.getByText("アップデートを開始中…", { exact: true }).waitFor();
+        assert.ok(await updateButton.isDisabled());
+        assert.ok(await recheckButton.isDisabled());
+        await page.evaluate(() => { window.settingsTest.holdStart = false; });
+        await page.getByText("アップデートを開始しました。完了までお待ちください。", { exact: true }).waitFor();
+        assert.ok(await updateButton.isDisabled(), "successful helper launch must stay disabled until restart");
+        assert.ok(await recheckButton.isDisabled(), "rechecking must not reset the launched state");
+        await page.getByRole("link", { name: "入力と文字", exact: true }).click();
+        await page.getByLabel("句読点", { exact: true }).waitFor();
+        await page.getByRole("link", { name: /Azookeyについて/ }).click();
+        await page.getByText("アップデートを開始しました。完了までお待ちください。", { exact: true }).waitFor();
+        assert.ok(await updateButton.isDisabled(), "launch protection must survive navigation");
+        await updateButton.evaluate((button) => button.click());
+        await recheckButton.evaluate((button) => button.click());
+        assert.equal(await page.evaluate(() => window.settingsTest.updateStarts), 2, "only the failed launch and its successful retry may invoke the backend");
+        assert.equal(await page.getByLabel("更新があります", { exact: true }).count(), 1, "launching must not silently clear the update notification");
 
         await page.getByRole("link", { name: "入力と文字", exact: true }).click();
         await page.getByLabel("句読点", { exact: true }).waitFor();

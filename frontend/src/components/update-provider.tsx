@@ -12,7 +12,7 @@ type UpdateCheck = {
 type UpdateState = {
     version: string | null;
     result: UpdateCheck | null;
-    status: "idle" | "checking" | "starting";
+    status: "idle" | "checking" | "starting" | "launched";
     error: string | null;
     check: () => Promise<void>;
     start: () => Promise<void>;
@@ -50,13 +50,14 @@ export function UpdateProvider({ children }: { children: ReactNode }) {
         setError(null);
         try {
             await invoke("start_update");
+            // The helper can still be running; keep this session locked until restart.
+            setStatus("launched");
             toast("アップデートを開始しました");
         } catch (error) {
-            setError(String(error));
-            toast("アップデートを開始できませんでした");
-        } finally {
             busy.current = false;
             setStatus("idle");
+            setError(String(error));
+            toast("アップデートを開始できませんでした");
         }
     }, []);
 

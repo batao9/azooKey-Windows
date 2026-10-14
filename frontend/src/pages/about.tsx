@@ -27,6 +27,7 @@ export const About = () => {
                     <p className="settings-description" role="status">
                         {status === "checking" ? "更新を確認中…"
                             : status === "starting" ? "アップデートを開始中…"
+                            : status === "launched" ? "アップデートを開始しました。完了までお待ちください。"
                             : available ? `新しいバージョン v${result.latest_version} が利用できます。`
                             : error ? "更新を確認できませんでした。"
                             : result ? "最新版を利用中です。" : ""}
