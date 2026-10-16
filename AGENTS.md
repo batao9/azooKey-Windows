@@ -1,87 +1,20 @@
-# AGENTS.md
+# azooKey-Windows agent guidance
 
-このリポジトリの開発運用ルールを定義する。
+These repository rules apply to Codex, OpenCode, Pi, and other coding agents. Keep product procedures here; user-wide defaults and roles belong in the user's agent configuration, not this repository. See [agent operations](docs/agent-operations.md).
 
-## 基本ルール
+## Routing
 
-- 開発は機能・修正ごとに独立したブランチで行う。
-- `master` へ直接コミットしない。開発前に `master` を最新化し、そこから作業ブランチを作成する。
-- 変更後は必要なローカル検証を行い、`origin` へ push して GitHub CI で確認する。
-- VM 名、スナップショット名、SSH 接続先、鍵パスなどの環境依存値はリポジトリに固定しない。必要に応じて環境変数または `.local/` のローカルスクリプトで指定する。
+- Use `.agents/skills/azookey-dev-flow` for implementation and verification, `.agents/skills/azookey-pr` for an explicitly requested ordinary PR flow, and `.agents/skills/azookey-release` for release work.
+- The authoritative high-signal reviewer procedure is [docs/agent-review.md](docs/agent-review.md); native adapters are in `.codex/agents/` and `.opencode/agents/`.
+- Version, release-channel, installer trust, and issue-close rules are in [docs/versioning-release.md](docs/versioning-release.md). VM operations use `python3 scripts/vm.py`; profiles and local values are documented by that interface and `.local/vm.json`.
 
-## ブランチ構成
+## Repository invariants
 
-- `master`
-  - メインブランチ。直接開発しない。
-  - 開発前に最新化し、`master` から機能開発用またはバグ修正用のブランチを切る。
-- `feature/<feature>`
-  - 機能開発用ブランチ。
-  - 対応する issue がある場合は `feature/<issue-number>-<feature>` の形式にする。
-- `fix/<issue>`
-  - バグ修正用ブランチ。
-  - 対応する issue がある場合は `fix/<issue-number>-<issue>` の形式にする。
-
-## 開発フロー
-
-1. `master` を最新化する。
-2. `master` から作業ブランチを作成する。
-3. 実装し、変更範囲に応じた test を追加・更新する。
-4. VM ビルド、VM test、インストール検証など、変更に必要な確認を行う。
-5. `origin/<branch>` に push し、GitHub CI の結果を確認する。
-6. 必要に応じて CI で生成したビルドを実機にインストールし、動作を確認する。
-7. `origin/master` へ PR を出す。
-
-## Issue のクローズ運用
-
-- 機能追加・不具合修正の PR では、PR 本文に `Issue: #<issue-number>` と記載して関連 Issue を参照する。
-- PR 本文や commit message では `Closes`、`Fixes`、`Resolves` などの closing keyword を使わず、PR の merge 時点では Issue を close しない。
-- GitHub の Issue / PR sidebar から Development link を設定する場合は、repository の auto-close 設定が無効であることを確認する。
-- Issue は、その変更を含む GitHub Release が公開され、tag・CI・配布 asset の確認が完了した後に `completed` として close する。
-- リリース時は、前回 release 以降に merge された PR の Issue 参照から close 候補を作り、リリース内容の承認時に対象を確定する。部分対応や残作業がある Issue は open のまま残す。
-- Issue を close するときは、対象 release の URL を comment に記載する。
-
-## ビルド / 検証
-
-- 正式なビルド判定は GitHub CI とする。
-- ローカル確認として、可能なら Windows VM 上でビルド・test・インストール検証を行う。
-- VM 操作用スクリプトは `scripts/` または `.local/` のものを使う。`.local/` に同じ用途のスクリプトがある場合は、環境固有の設定を含む可能性があるため `.local/` を優先する。
-- 公開用スクリプトは環境依存値を持たない。`VM_NAME`、`SNAPSHOT_NAME`、`SSH_USER`、`SSH_PORT`、`SSH_KEY`、必要に応じて `SSH_HOST` や `VBOX_MANAGE` を環境変数で指定して実行する。
-
-代表的な実行方法:
-
-- VM ビルド: `scripts/vm_build.sh <branch>`
-- `client` クレートの composition / clause adjustment / stateful test: `scripts/vm_test_client_composition.sh <branch> [cargo-test-filter|skip] [swift-test-filter|all|skip]`
-- インストーラーの無人ステージング: `scripts/vm_stage_for_manual_test.sh <installer-path|latest>`
-
-`.local/` 側に対応するスクリプトがある場合の例:
-
-- VM ビルド: `.local/vm_build_master.sh <branch>`
-- VM test: `.local/vm_test_client_composition.sh <branch> [cargo-test-filter|skip] [swift-test-filter|all|skip]`
-- インストール検証: `.local/vm_stage_for_manual_test.sh <installer-path|latest>`
-
-VM ビルドでは、指定ブランチと現在ブランチが一致していることを確認する。成果物は `.local/artifacts/` に回収する。可能なら検証前後に指定スナップショットへ復元し、VM をクリーンな状態に戻す。
-
-インストール検証では、クリーンなスナップショットへ復元してから VM を起動し、インストーラーを転送してサイレント実行する。インストールログは `.local/logs/` に回収する。
-
-## リリース版数と検証ビルド
-
-- `app-version.json` の `version` は正式リリース版数、`installerGeneration` はインストール配置・移行契約の世代を表す。検証ビルドごとの版数をここへ手動で書かない。
-- release metadata を同期するときは `node scripts/sync-version.mjs --sync-release` を実行する。`frontend/package.json`、`frontend/package-lock.json`、`frontend/src-tauri/tauri.conf.json`、`installer/AppVersion.iss` を個別に編集しない。
-- 通常のブランチ、PR、`master`、VM の build は `validation` channel とする。最新の到達可能な release tag が prerelease なら `<base>.dev.<build-number>.g<short-sha>`、stable なら次 patch の `<next-patch>-dev.<build-number>.g<short-sha>` を自動生成する。release tag がない checkout では `app-version.json` の正式版数を基準にする。
-- `release` channel は tag CI だけが `AZOOKEY_BUILD_CHANNEL=release` で明示的に選択し、さらに `HEAD` に `v<app-version>` と完全一致する tag がある場合だけ許可する。tag 上でも channel 未指定のローカル build は `validation` とする。配布 asset は master/PR build ではなく tag CI の `azookey-setup` artifact を使う。
-- build 時の生成物は `target/azookey-build/`、配布物へ埋め込む識別情報は `build/build-info.json` に置く。検証時は `version`、`channel`、`revision`、`installerGeneration` を確認する。
-- 検証版と正式版は置換検証のため同じ Inno `AppId` を使う。旧 AppData install の version/hash allowlist は特権移行の信頼ポリシーであり、build channel と混同したり、`validation` suffix だけを理由に緩和したりしない。
-- installer/version の変更では、正式版から検証版、検証版から別の検証版、検証版から次の正式版への更新経路を確認する。
-
-## テスト方針
-
-- 変更に応じて必要な test を実装する。バグ修正では、まず再現 test や回帰 test の追加を優先する。
-- 実装変更後は、変更範囲に対応する test を実行し、pass を確認してから次の段階へ進む。
-- `client` クレートの composition / clause adjustment / stateful test に関わる変更では、可能なら VM 上の test スクリプトを実行する。
-- push 前の事前確認として、可能なら VM ビルドを実行し、ビルド成功を確認する。
-
-## IME 不具合の再現・調査
-
-- 未確定入力、再入力、分節、候補に関する不具合では、最終的に表示された文字列だけを再現条件とみなさない。入力開始から不具合発生までのキー操作を、Backspace / Delete、カーソル移動、Shift+矢印、候補選択、確定、フォーカス移動を含めて時系列で確認する。
-- 再現条件が不安定な場合は、削除・訂正履歴の有無を優先的に疑う。正確な操作列が判明したら、まずその列を再現する回帰 test を追加し、その後に一般化できる不変条件を検討する。
-- ローマ字変換中は、1回の Backspace が raw 入力1文字の削除と一致するとは限らない。クライアントの推測値だけで判断せず、サーバー側の canonical input、input count、候補状態との一致を確認する。
+- Do not develop or commit directly on `master`. Use `feature/<slug>` or `fix/<issue>-<slug>` as appropriate; preserve unrelated worktree changes.
+- Treat key handling, composition updates, candidate work, text-service callbacks, and typing-triggered IPC/UI as latency-sensitive. Avoid blocking I/O, waits, unnecessary locks/copies/allocations, and unbounded work on those paths.
+- For IME regressions, reconstruct the ordered key/edit/focus history, including deletions, cursor movement, clause adjustment, candidate actions, and commit/cancel. Compare client predictions with server canonical input/count and candidate state; add a test for the exact sequence before generalizing.
+- Run checks that cover changed behavior. GitHub CI is the formal build result; Windows-specific behavior should be checked on the VM when feasible.
+- VM commands go through `scripts/vm.py` and [the VM operations guide](docs/vm-operations.md), not ad-hoc VBox/SSH commands. After verification, leave the installed current disk intact and normally shut down. Do not restore, clean, or refresh a baseline unless requested; report final VM state and installed build identity.
+- Skill discovery is not authorization to commit, push, publish, or close issues. An explicit `azookey-pr` invocation or direct request authorizes the ordinary PR workflow; release publication still requires prior approval of the release contents and issue-close list.
+- Never use PR/commit closing keywords for issues. Close an included issue as `completed` only after the containing release, tag, CI, and assets are verified; comment with the release URL.
+- Delegated work must use at least `gpt-6-luna` with `xhigh` reasoning. The repository reviewer may use `gpt-6.1-sol` with `xhigh`.

@@ -6,11 +6,12 @@ set -euo pipefail
 
 VM_NAME="${VM_NAME:-}"
 SNAPSHOT_NAME="${SNAPSHOT_NAME:-}"
-RESTORE_BEFORE_BUILD="${RESTORE_BEFORE_BUILD:-1}"
-RESTORE_AFTER_BUILD="${RESTORE_AFTER_BUILD:-1}"
+RESTORE_BEFORE_BUILD="${RESTORE_BEFORE_BUILD:-0}"
+RESTORE_AFTER_BUILD="${RESTORE_AFTER_BUILD:-0}"
+VM_LIFECYCLE_EXTERNAL="${VM_LIFECYCLE_EXTERNAL:-0}"
 ALLOW_DIRTY_WORKTREE="${ALLOW_DIRTY_WORKTREE:-1}"
 DISCARD_SAVED_STATE_BEFORE_BUILD="${DISCARD_SAVED_STATE_BEFORE_BUILD:-0}"
-PRUNE_ORPHAN_MEDIA_AFTER_RESTORE="${PRUNE_ORPHAN_MEDIA_AFTER_RESTORE:-1}"
+PRUNE_ORPHAN_MEDIA_AFTER_RESTORE="${PRUNE_ORPHAN_MEDIA_AFTER_RESTORE:-0}"
 SSH_USER="${SSH_USER:-}"
 SSH_PORT="${SSH_PORT:-}"
 SSH_KEY="${SSH_KEY:-}"
@@ -20,8 +21,6 @@ STAGING_VM_NAME="${STAGING_VM_NAME:-}"
 if [[ -z "$VBOX_MANAGE" ]]; then
   if command -v VBoxManage >/dev/null 2>&1; then
     VBOX_MANAGE="$(command -v VBoxManage)"
-  elif [[ -x "/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe" ]]; then
-    VBOX_MANAGE="/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe"
   fi
 fi
 
@@ -53,6 +52,7 @@ fi
 ACTIVE_HOST="$HOST_IP"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 HOST_TIMESTAMP_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+CACHE_ROOT_BASE64="$(printf '%s' "${VM_GUEST_CACHE_ROOT:-}" | base64 | tr -d '\r\n')"
 LOCAL_ARTIFACT="$ARTIFACT_DIR/azookey-setup-${TARGET_BRANCH_SLUG}-$TIMESTAMP.exe"
 LOCAL_BUILD_INFO="$ARTIFACT_DIR/azookey-setup-${TARGET_BRANCH_SLUG}-$TIMESTAMP.build-info.json"
 
@@ -108,12 +108,12 @@ matches_regex() {
 }
 
 is_vm_running() {
-  vbox list runningvms | matches_fixed "\"$VM_NAME\""
-}
-
-is_named_vm_running() {
-  local vm_name="$1"
-  vbox list runningvms | matches_fixed "\"$vm_name\""
+  local running_vms
+  running_vms="$(vbox list runningvms)"
+  if printf '%s\n' "$running_vms" | matches_fixed "\"$VM_NAME\""; then
+    return 0
+  fi
+  printf '%s\n' "$running_vms" | matches_fixed "{$VM_NAME}"
 }
 
 snapshot_exists() {
@@ -175,32 +175,15 @@ wait_for_vm_poweroff() {
   return 1
 }
 
-wait_for_named_vm_poweroff() {
-  local vm_name="$1"
-  local tries=60
-  for ((i=1; i<=tries; i++)); do
-    if ! is_named_vm_running "$vm_name"; then
-      return 0
-    fi
-    sleep 2
-  done
-  return 1
-}
-
-stop_staging_vm_if_running() {
-  if [[ -z "$STAGING_VM_NAME" || "$STAGING_VM_NAME" == "$VM_NAME" ]]; then
+shutdown_vm_normally() {
+  if ! is_vm_running; then
     return 0
   fi
-
-  if ! is_named_vm_running "$STAGING_VM_NAME"; then
-    return 0
-  fi
-
-  log "ビルド前に staging VM を停止します: $STAGING_VM_NAME"
-  vbox controlvm "$STAGING_VM_NAME" acpipowerbutton >/dev/null || true
-  if ! wait_for_named_vm_poweroff "$STAGING_VM_NAME"; then
-    log "staging VM が停止しないため強制停止します: $STAGING_VM_NAME"
-    vbox controlvm "$STAGING_VM_NAME" poweroff >/dev/null || true
+  log "VM を通常停止します: $VM_NAME"
+  vbox controlvm "$VM_NAME" acpipowerbutton >/dev/null || true
+  if ! wait_for_vm_poweroff; then
+    log "通常停止がタイムアウトしました。VM の状態を保持します: $VM_NAME"
+    return 1
   fi
 }
 
@@ -212,21 +195,23 @@ cleanup() {
 
   if [[ "$rc" -ne 0 && "$RESTORE_AFTER_BUILD" == "1" && "$VM_TOUCHED" == "1" && "$FINAL_RESTORE_DONE" != "1" ]]; then
     log "エラー終了のためクリーン状態へ復元します: $SNAPSHOT_NAME"
+    local may_restore=1
     if is_vm_running; then
       vbox controlvm "$VM_NAME" acpipowerbutton >/dev/null || true
       if ! wait_for_vm_poweroff; then
-        vbox controlvm "$VM_NAME" poweroff >/dev/null || true
+        log "通常停止に失敗したため復元しません。VM の状態を保持します"
+        may_restore=0
       fi
     fi
 
-    if snapshot_exists; then
+    if [[ "$may_restore" == "1" ]] && snapshot_exists; then
       vbox snapshot "$VM_NAME" restore "$SNAPSHOT_NAME" >/dev/null || true
       if [[ "$DISCARD_SAVED_STATE_BEFORE_BUILD" == "1" ]]; then
         vbox discardstate "$VM_NAME" >/dev/null 2>&1 || true
       fi
       prune_orphan_media_after_restore
       FINAL_RESTORE_DONE=1
-    else
+    elif [[ "$may_restore" == "1" ]]; then
       log "復元対象スナップショットが見つからないためスキップします: $SNAPSHOT_NAME"
     fi
   fi
@@ -237,13 +222,45 @@ cleanup() {
 
 ensure_preconditions() {
   require_env VM_NAME
-  require_env SNAPSHOT_NAME
   require_env SSH_USER
   require_env SSH_PORT
   require_env SSH_KEY
 
+  if [[ "$VM_LIFECYCLE_EXTERNAL" != "0" && "$VM_LIFECYCLE_EXTERNAL" != "1" ]]; then
+    log "VM_LIFECYCLE_EXTERNAL は 0 または 1 を指定してください"
+    exit 1
+  fi
+  if [[ "$RESTORE_BEFORE_BUILD" != "0" && "$RESTORE_BEFORE_BUILD" != "1" ]] || [[ "$RESTORE_AFTER_BUILD" != "0" && "$RESTORE_AFTER_BUILD" != "1" ]]; then
+    log "RESTORE_BEFORE_BUILD / RESTORE_AFTER_BUILD は 0 または 1 を指定してください"
+    exit 1
+  fi
+  if [[ "$DISCARD_SAVED_STATE_BEFORE_BUILD" != "0" && "$DISCARD_SAVED_STATE_BEFORE_BUILD" != "1" ]]; then
+    log "DISCARD_SAVED_STATE_BEFORE_BUILD は 0 または 1 を指定してください"
+    exit 1
+  fi
+  if [[ "$VM_LIFECYCLE_EXTERNAL" == "1" ]]; then
+    if [[ "$RESTORE_BEFORE_BUILD" != "0" || "$RESTORE_AFTER_BUILD" != "0" || "$DISCARD_SAVED_STATE_BEFORE_BUILD" == "1" || -n "$STAGING_VM_NAME" ]]; then
+      log "外部 VM lifecycle 中は restore/discard フラグを 0、STAGING_VM_NAME を空にしてください"
+      exit 1
+    fi
+  elif [[ "$RESTORE_BEFORE_BUILD" == "1" || "$RESTORE_AFTER_BUILD" == "1" ]]; then
+    require_env SNAPSHOT_NAME
+  elif [[ "$DISCARD_SAVED_STATE_BEFORE_BUILD" == "1" ]]; then
+    log "DISCARD_SAVED_STATE_BEFORE_BUILD は restore 操作と併用してください"
+    exit 1
+  fi
+  if [[ -n "$STAGING_VM_NAME" ]]; then
+    log "STAGING_VM_NAME による別 VM の暗黙停止はサポートしていません"
+    exit 1
+  fi
+
   if [[ ! -x "$VBOX_MANAGE" ]]; then
     log "VBoxManage が見つかりません。VBOX_MANAGE を設定してください: ${VBOX_MANAGE:-<unset>}"
+    exit 1
+  fi
+
+  if [[ "$RESTORE_BEFORE_BUILD" == "1" || "$RESTORE_AFTER_BUILD" == "1" ]] && ! snapshot_exists; then
+    log "復元対象スナップショットが見つかりません: $SNAPSHOT_NAME"
     exit 1
   fi
 
@@ -336,10 +353,14 @@ param(
   [Parameter(Mandatory = $true)][string]$BuildNumber,
   [Parameter(Mandatory = $true)][string]$BuildRevision,
   [Parameter(Mandatory = $true)][AllowEmptyString()][string]$BuildBaseVersion,
-  [Parameter(Mandatory = $true)][string]$BuildBranch
+  [Parameter(Mandatory = $true)][string]$BuildBranch,
+  [string]$CacheRootBase64 = ""
 )
 
 $ErrorActionPreference = "Stop"
+Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class VmBuildAwake { [DllImport("kernel32.dll", SetLastError=true)] public static extern uint SetThreadExecutionState(uint flags); }'
+if ([VmBuildAwake]::SetThreadExecutionState([uint32]2147483649) -eq 0) { throw "Failed to keep the build thread awake" }
+try {
 $env:Path += ";$env:USERPROFILE\\.cargo\\bin"
 $env:AZOOKEY_BUILD_CHANNEL = "validation"
 $env:AZOOKEY_BUILD_NUMBER = $BuildNumber
@@ -356,16 +377,14 @@ $LLAMA_CUDA_URL = "https://github.com/fkunn1326/llama.cpp/releases/download/b484
 $LLAMA_VULKAN_URL = "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-vulkan-x64.zip"
 $ZENZ_MODEL_URL = "https://huggingface.co/Miwa-Keita/zenz-v3-small-gguf/resolve/main/ggml-model-Q5_K_M.gguf"
 $downloadAllAssets = $env:DOWNLOAD_ALL_ASSETS -eq "1"
-$cacheRoot = "C:\work\azooKey-Windows"
+$cacheRoot = if ($CacheRootBase64) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($CacheRootBase64)) } else { Join-Path $env:LOCALAPPDATA 'Azookey\vm-cache' }
 
 function Sync-GuestClock {
   param([string]$TimestampUtc)
 
   try {
-    # GitHub/Tauri tool downloads can fail with NotValidYet if the restored VM clock
-    # is behind the host or the certificate validity window has just rolled.
-    # Keep a wide safety margin for local VM builds so snapshot restore time skew does not block bundling.
-    $targetUtc = [DateTime]::Parse($TimestampUtc).ToUniversalTime().AddHours(12)
+    $styles = [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
+    $targetUtc = [DateTime]::Parse($TimestampUtc, [Globalization.CultureInfo]::InvariantCulture, $styles)
     $currentUtc = (Get-Date).ToUniversalTime()
     $deltaSeconds = [Math]::Abs(($targetUtc - $currentUtc).TotalSeconds)
 
@@ -377,7 +396,7 @@ function Sync-GuestClock {
       Write-Host "guest clock already in sync"
     }
   } catch {
-    Write-Host "warning: failed to sync guest clock: $($_.Exception.Message)"
+    throw "Failed to synchronize guest clock to host UTC: $($_.Exception.Message)"
   }
 }
 
@@ -430,6 +449,7 @@ if (Test-Path $SourceDir) {
 New-Item -Path $SourceDir -ItemType Directory -Force | Out-Null
 
 tar -xzf $SourceTarPath -C $SourceDir
+if ($LASTEXITCODE -ne 0) { throw "source archive extraction failed with exit code $LASTEXITCODE" }
 Set-Location $SourceDir
 Write-Host "source extracted: $SourceDir"
 Sync-GuestClock -TimestampUtc $HostTimestampUtc
@@ -573,7 +593,8 @@ if ($swiftUsrDir) {
 
 $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\\Installer\\vswhere.exe"
 if (Test-Path $vswhere) {
-  $vsInstallPath = & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+  $vsInstallPath = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+  if ($LASTEXITCODE -ne 0) { throw "vswhere failed with exit code $LASTEXITCODE" }
   if (![string]::IsNullOrWhiteSpace($vsInstallPath)) {
     $vsDevCmd = Join-Path $vsInstallPath "Common7\\Tools\\VsDevCmd.bat"
     if (Test-Path $vsDevCmd) {
@@ -582,6 +603,7 @@ if (Test-Path $vswhere) {
           Set-Item -Path ("Env:" + $matches[1]) -Value $matches[2]
         }
       }
+      if ($LASTEXITCODE -ne 0) { throw "VsDevCmd failed with exit code $LASTEXITCODE" }
       Write-Host "loaded Visual Studio build environment"
     } else {
       Write-Host "VsDevCmd.bat not found; continuing without Visual Studio build environment"
@@ -599,26 +621,31 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 if (-not (Get-Command cargo-make -ErrorAction SilentlyContinue)) {
   Write-Host "installing cargo-make"
   cargo install --locked cargo-make
+  if ($LASTEXITCODE -ne 0) { throw "cargo install cargo-make failed with exit code $LASTEXITCODE" }
 }
 
 Set-Location (Join-Path $SourceDir "frontend")
 Write-Host "running npm ci"
 npm.cmd ci --prefer-offline --no-audit
+if ($LASTEXITCODE -ne 0) { throw "npm ci failed with exit code $LASTEXITCODE" }
 
 Set-Location $SourceDir
 Write-Host "running cargo make build --release"
 cargo make build --release
+if ($LASTEXITCODE -ne 0) { throw "cargo make build failed with exit code $LASTEXITCODE" }
 
 New-Item -Path $ArtifactDir -ItemType Directory -Force | Out-Null
 Copy-Item (Join-Path $SourceDir "build\\azookey-setup.exe") -Destination (Join-Path $ArtifactDir "azookey-setup.exe") -Force
 Copy-Item (Join-Path $SourceDir "build\\build-info.json") -Destination (Join-Path $ArtifactDir "build-info.json") -Force
 Write-Host "build finished: $ArtifactDir\\azookey-setup.exe"
+} finally {
+  [void][VmBuildAwake]::SetThreadExecutionState([uint32]2147483648)
+}
 PS1
 }
 
 main() {
   ensure_preconditions
-  stop_staging_vm_if_running
   ensure_submodules
   ensure_required_dictionary_paths
 
@@ -629,24 +656,25 @@ main() {
   create_remote_ps1 "$TMP_REMOTE_PS"
 
   if [[ "$RESTORE_BEFORE_BUILD" == "1" ]]; then
-    if snapshot_exists; then
-      VM_TOUCHED=1
-      if is_vm_running; then
-        log "スナップショット復元のため VM を停止します"
-        vbox controlvm "$VM_NAME" acpipowerbutton >/dev/null || true
-        if ! wait_for_vm_poweroff; then
-          vbox controlvm "$VM_NAME" poweroff >/dev/null
-        fi
-      fi
-      log "ビルド前にスナップショットを復元します: $SNAPSHOT_NAME"
-      vbox snapshot "$VM_NAME" restore "$SNAPSHOT_NAME" >/dev/null
-      if [[ "$DISCARD_SAVED_STATE_BEFORE_BUILD" == "1" ]]; then
-        vbox discardstate "$VM_NAME" >/dev/null 2>&1 || true
-      fi
-      prune_orphan_media_after_restore
-    else
-      log "復元対象スナップショットが見つからないためスキップします: $SNAPSHOT_NAME"
+    if ! snapshot_exists; then
+      log "復元対象スナップショットが見つかりません: $SNAPSHOT_NAME"
+      return 1
     fi
+    if is_vm_running; then
+      log "スナップショット復元のため VM を通常停止します"
+      vbox controlvm "$VM_NAME" acpipowerbutton >/dev/null || true
+      if ! wait_for_vm_poweroff; then
+        log "VM が通常停止しないため復元せず中止します"
+        return 1
+      fi
+    fi
+    log "ビルド前にスナップショットを復元します: $SNAPSHOT_NAME"
+    VM_TOUCHED=1
+    vbox snapshot "$VM_NAME" restore "$SNAPSHOT_NAME" >/dev/null
+    if [[ "$DISCARD_SAVED_STATE_BEFORE_BUILD" == "1" ]]; then
+      vbox discardstate "$VM_NAME" >/dev/null
+    fi
+    prune_orphan_media_after_restore
   fi
 
   if ! is_vm_running; then
@@ -668,31 +696,31 @@ main() {
   scp_to_vm "$TMP_REMOTE_PS" "$REMOTE_PS_SCP"
 
   log "VM 上でビルドを実行します（時間がかかる場合があります）"
-  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -SourceTarPath \"$REMOTE_TAR_WIN\" -SourceDir \"$REMOTE_SRC_WIN\" -ArtifactDir \"$REMOTE_ART_WIN\" -HostTimestampUtc \"$HOST_TIMESTAMP_UTC\" -BuildNumber \"$BUILD_NUMBER\" -BuildRevision \"$BUILD_REVISION\" -BuildBaseVersion \"$BUILD_BASE_VERSION\" -BuildBranch \"$TARGET_BRANCH\""
+  local cache_root_arg=""
+  if [[ -n "$CACHE_ROOT_BASE64" ]]; then
+    cache_root_arg=" -CacheRootBase64 $CACHE_ROOT_BASE64"
+  fi
+  ssh_run "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -SourceTarPath \"$REMOTE_TAR_WIN\" -SourceDir \"$REMOTE_SRC_WIN\" -ArtifactDir \"$REMOTE_ART_WIN\" -HostTimestampUtc \"$HOST_TIMESTAMP_UTC\" -BuildNumber \"$BUILD_NUMBER\" -BuildRevision \"$BUILD_REVISION\" -BuildBaseVersion \"$BUILD_BASE_VERSION\" -BuildBranch \"$TARGET_BRANCH\"$cache_root_arg"
 
   log "成果物を WSL 側へ回収します"
   scp_from_vm "$REMOTE_ART_SCP" "$LOCAL_ARTIFACT"
   scp_from_vm "$REMOTE_BUILD_INFO_SCP" "$LOCAL_BUILD_INFO"
 
-  log "VM を停止します"
-  vbox controlvm "$VM_NAME" acpipowerbutton >/dev/null || true
-  if ! wait_for_vm_poweroff; then
-    log "通常停止できなかったため poweroff します"
-    vbox controlvm "$VM_NAME" poweroff >/dev/null
+  if [[ "$VM_LIFECYCLE_EXTERNAL" != "1" ]]; then
+    shutdown_vm_normally
   fi
 
   if [[ "$RESTORE_AFTER_BUILD" == "1" ]]; then
-    if snapshot_exists; then
-      log "ビルド後にクリーン状態へ戻すため復元します: $SNAPSHOT_NAME"
-      vbox snapshot "$VM_NAME" restore "$SNAPSHOT_NAME" >/dev/null
-      if [[ "$DISCARD_SAVED_STATE_BEFORE_BUILD" == "1" ]]; then
-        vbox discardstate "$VM_NAME" >/dev/null 2>&1 || true
-      fi
-      prune_orphan_media_after_restore
-      FINAL_RESTORE_DONE=1
-    else
-      log "復元対象スナップショットが見つからないためスキップします: $SNAPSHOT_NAME"
+    if ! snapshot_exists; then
+      log "復元対象スナップショットが見つかりません: $SNAPSHOT_NAME"
+      return 1
     fi
+    vbox snapshot "$VM_NAME" restore "$SNAPSHOT_NAME" >/dev/null
+    if [[ "$DISCARD_SAVED_STATE_BEFORE_BUILD" == "1" ]]; then
+      vbox discardstate "$VM_NAME" >/dev/null
+    fi
+    prune_orphan_media_after_restore
+    FINAL_RESTORE_DONE=1
   fi
 
   log "完了: $LOCAL_ARTIFACT ($LOCAL_BUILD_INFO)"

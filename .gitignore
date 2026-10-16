@@ -8,10 +8,45 @@ logs/*
 *.gguf
 *.dll
 *.lib
-# Local coding-agent settings, skills, and dependencies
+# User-local agent settings remain private. Share only the repository reviewer
+# adapter, project skills/reviewer, and the minimal OpenCode project config.
 .codex/
+!.codex/
+.codex/*
+!.codex/agents/
+.codex/agents/*
+!.codex/agents/reviewer.toml
+.codex/config.toml
+
 .opencode/
+!.opencode/
+.opencode/*
+!.opencode/.gitignore
+!.opencode/agents/
+.opencode/agents/*
+!.opencode/agents/reviewer.md
+!.opencode/opencode.json
+
+.agents/
+!.agents/
+.agents/*
+!.agents/skills/
+!.agents/skills/azookey-dev-flow/
+!.agents/skills/azookey-dev-flow/**
+!.agents/skills/azookey-pr/
+!.agents/skills/azookey-pr/**
+!.agents/skills/azookey-release/
+!.agents/skills/azookey-release/**
+!.agents/agents/
+!.agents/agents/reviewer.md
+
+# Never share local dependencies, credentials, or agent session state.
 .pi/
 .claude/
-.agents/
+**/__pycache__/
+**/node_modules/
+.opencode/auth.json
+.opencode/storage/
+.opencode/sessions/
+.opencode/*.db
 .env
