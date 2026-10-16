@@ -512,16 +512,53 @@ function Copy-TreeIfExists {
   return $true
 }
 
-function Initialize-SwiftTestEnvironment {
-  git config --global core.longpaths true
-  if ($LASTEXITCODE -ne 0) { throw "git config core.longpaths failed with exit code $LASTEXITCODE" }
+function Resolve-LlamaCpuRuntime {
+  param([string]$CacheRoot, [string]$SourceDir)
 
-  $llamaLibCache = Join-Path $cacheRoot "llama_cpu\llama.lib"
-  $llamaLibDest = Join-Path $SourceDir "server-swift\llama.lib"
-  if ((Test-Path $llamaLibCache) -and !(Test-Path $llamaLibDest)) {
-    Copy-Item $llamaLibCache -Destination $llamaLibDest -Force
-    Write-Host "copied llama.lib from cache"
+  foreach ($candidate in @((Join-Path $CacheRoot "llama_cpu"), (Join-Path $SourceDir "llama_cpu"))) {
+    if ((Test-Path (Join-Path $candidate "llama.lib") -PathType Leaf) -and
+        (Test-Path (Join-Path $candidate "llama.dll") -PathType Leaf)) {
+      return $candidate
+    }
   }
+
+  # A cache is optional. Keep a cold download in this run's source tree, not in
+  # an externally supplied clone/cache that may contain unrelated files.
+  New-Item -Path $SourceDir -ItemType Directory -Force | Out-Null
+  $token = [guid]::NewGuid().ToString('N')
+  $archive = Join-Path $env:TEMP ("azookey-llama-" + $token + ".zip")
+  $runtime = Join-Path $SourceDir (".llama_cpu-" + $token)
+  $complete = $false
+  try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-avx-x64.zip" -OutFile $archive | Out-Null
+    Expand-Archive -Path $archive -DestinationPath $runtime -Force
+    foreach ($file in @("llama.lib", "llama.dll")) {
+      if (!(Test-Path (Join-Path $runtime $file) -PathType Leaf)) {
+        throw "Downloaded llama CPU runtime is missing $file"
+      }
+    }
+    $complete = $true
+    return $runtime
+  } finally {
+    if (Test-Path $archive) { Remove-Item -LiteralPath $archive -Force }
+    if (!$complete -and (Test-Path $runtime)) { Remove-Item -LiteralPath $runtime -Recurse -Force }
+  }
+}
+
+function Initialize-SwiftTestEnvironment {
+  # Apply long-path support only to Git children of this test process.
+  $configIndex = if ($env:GIT_CONFIG_COUNT) { [int]$env:GIT_CONFIG_COUNT } else { 0 }
+  Set-Item -Path ("Env:GIT_CONFIG_KEY_" + $configIndex) -Value "core.longpaths"
+  Set-Item -Path ("Env:GIT_CONFIG_VALUE_" + $configIndex) -Value "true"
+  $env:GIT_CONFIG_COUNT = [string]($configIndex + 1)
+
+  $script:llamaCpuRuntimeDir = Resolve-LlamaCpuRuntime -CacheRoot $cacheRoot -SourceDir $SourceDir
+  $llamaLibCache = Join-Path $script:llamaCpuRuntimeDir "llama.lib"
+  $llamaLibDest = Join-Path $SourceDir "server-swift\llama.lib"
+  Copy-Item $llamaLibCache -Destination $llamaLibDest -Force
+  $env:Path = $script:llamaCpuRuntimeDir + ";" + $env:Path
+  Write-Host "prepared llama CPU runtime and linker input"
 
   $emojiDictDir = Join-Path $SourceDir "server-swift\azooKey_emoji_dictionary_storage\EmojiDictionary"
   $mainDictDir = Join-Path $SourceDir "server-swift\azooKey_dictionary_storage\Dictionary"
@@ -720,7 +757,7 @@ function Invoke-SwiftPackageTests {
   $swiftToolchainBin = Split-Path (Get-Command swift).Source -Parent
   $xctestBin = Join-Path $platformDir.FullName "Windows.platform\Developer\Library\XCTest-development\usr\bin64"
   $testingBin = Join-Path $platformDir.FullName "Windows.platform\Developer\Library\Testing-development\usr\bin64"
-  $llamaCpuDir = Join-Path $cacheRoot "llama_cpu"
+  $llamaCpuDir = $script:llamaCpuRuntimeDir
 
   foreach ($requiredPath in @($swiftRuntimeBin, $swiftToolchainBin, $xctestBin, $testingBin, $llamaCpuDir)) {
     if (!(Test-Path $requiredPath)) {

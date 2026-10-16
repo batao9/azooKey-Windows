@@ -13,6 +13,7 @@ Python 3.11以降、OpenSSH、VirtualBox CLI を使う Linux/WSL ホスト用。
 鍵は秘密の内容ではなくパスを指定する。VM識別子は名前よりUUIDを推奨する。
 ホスト、ポート、Windowsユーザー、鍵、VBoxManageのパス、baseline名はこのローカルファイルだけに置く。
 設定例のVM/snapshot識別子はプレースホルダーであり、実際の値は公開しない。ゲストに既存の依存・辞書キャッシュを使う場合は、build profileの`guest_cache_root`へそのWindows絶対パスを設定する。省略時はゲストの`LOCALAPPDATA`配下の`Azookey\vm-cache`を使う。controllerはこの設定をhelperへ渡すため、キャッシュ用cloneの実パスを公開スクリプトへ埋め込まない。
+キャッシュは事前作成必須ではない。Swift testのCPU runtimeがキャッシュにも転送sourceにもない場合は、固定版をその実行のsource treeへ取得し、linkとtest runnerの両方で同じruntimeを使う。既存の外部キャッシュは書き換えない。
 controller経由ではVirtualBoxの実行ファイルもprofileから渡す。旧helperを直接使う場合は`VBOX_MANAGE`を明示するか`VBoxManage`を`PATH`に置く。
 
 ```sh

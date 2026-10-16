@@ -58,6 +58,10 @@ jobs:
       with:
         submodules: recursive
 
+    - name: Test optional Swift runtime cache
+      shell: powershell
+      run: ./scripts/test_vm_swift_runtime.ps1
+
     - name: Install pinned Rust toolchain
       run: |
         rustc --version --verbose
