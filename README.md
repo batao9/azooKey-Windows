@@ -105,7 +105,7 @@ CPUバックエンドは AVX 対応 CPU が必要です。未対応環境では�
 
 - [Rust](https://www.rust-lang.org/tools/install)
 - [Swift for Windows](https://www.swift.org/install/windows/) (Swift 6.0以上)
-- [protoc](https://protobuf.dev/installation/) 
+- [protoc](https://protobuf.dev/installation/)
 - [node.js](https://nodejs.org/en/download/)
 - [inno setup](https://jrsoftware.org/isinfo.php)
 
@@ -152,25 +152,27 @@ Windows IME はホスト環境への影響が大きいため、VirtualBox 上に
 - ビルド用 VM: Rust / Swift for Windows / Node.js / Inno Setup など、ビルドに必要なツールをインストールします。
 - 検証用 VM: インストーラーを実行し、IME の登録・入力・設定画面などを確認します。
 
-VM の名前、スナップショット名、SSH 接続先、鍵パスなどは環境ごとに異なるため、リポジトリには固定していません。`scripts/` のスクリプトを使う場合は `VM_NAME`、`SNAPSHOT_NAME`、`SSH_USER`、`SSH_PORT`、`SSH_KEY` などを環境変数で指定してください。`.local/` に同じ用途のスクリプトがある場合は、環境固有の設定が入っている可能性があるため `.local/` 側を優先して使います。
+VM 操作は `python3 scripts/vm.py` を入口にします。VM の識別子、snapshot、SSH 接続先、Windows ユーザー、鍵、VirtualBox のパスは、`scripts/vm-config.example.json` を参考に無視対象の `.local/vm.json` へ設定してください。実際の環境値は公開ファイルへ記載しません。詳細は [VM 運用手順](docs/vm-operations.md) を参照してください。
 
 代表的な実行例:
 
 ```sh
 # ビルド用 VM でインストーラーを作成
-scripts/vm_build.sh <branch>
+python3 scripts/vm.py --profile build build <branch>
 
 # ビルド用 VM で client の composition 関連 test を実行
-scripts/vm_test_client_composition.sh <branch> [cargo-test-filter|skip] [swift-test-filter|all|skip]
+python3 scripts/vm.py --profile build test <branch> composition skip
 
 # 検証用 VM にインストーラーをサイレントインストール
-scripts/vm_stage_for_manual_test.sh <installer-path|latest>
+python3 scripts/vm.py --profile manual stage <exact-installer-path>
 
-# インストール後にサイレントアンインストールまで確認
-UNINSTALL_AFTER_INSTALL=1 scripts/vm_stage_for_manual_test.sh <installer-path|latest>
+# ネイティブ UI を確認してから通常終了
+python3 scripts/vm.py --profile manual stage <exact-installer-path> --leave-running
+python3 scripts/vm.py --profile manual exec --script <ui-probe.ps1> --interactive
+python3 scripts/vm.py --profile manual handoff
 ```
 
-検証用 VM はクリーンなスナップショットから起動し、インストールログを `.local/logs/` に回収します。`UNINSTALL_AFTER_INSTALL=1` を指定した場合はアンインストールログも回収します。手動確認を続ける場合は `SHUTDOWN_AFTER_INSTALL=0` を指定して、インストール後も VM を起動したままにできます。
+通常の検証は現在のディスクで行い、検証した版をインストールしたまま通常シャットダウンします。snapshot の復元、保存状態破棄、アンインストール、baseline 更新は明示的な保守・破壊的試験として扱い、暗黙の後処理にしません。同じ VM へのコマンドは状態確認も含め順次実行します。ログと結果は `.local/logs/vm/` に保存されます。個別の試験や最終状態の指定は VM 運用手順に従ってください。
 
 # 関連
 

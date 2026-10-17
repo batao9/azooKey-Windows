@@ -1,0 +1,14 @@
+{
+  "defaults": {
+    "vbox": "/path/to/VBoxManage",
+    "host": "127.0.0.1",
+    "user": "windows-user",
+    "key": "~/.ssh/vm-key",
+    "ready_timeout": 180,
+    "shutdown_timeout": 180
+  },
+  "profiles": {
+    "build": {"role": "build", "vm": "<BUILD_VM_UUID>", "port": 2222, "snapshot": "<BUILD_SNAPSHOT_UUID>"},
+    "manual": {"role": "manual", "vm": "<MANUAL_VM_UUID>", "port": 2223, "snapshot": "<MANUAL_SNAPSHOT_UUID>"}
+  }
+}

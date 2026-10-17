@@ -1,0 +1,4 @@
+interface:
+  display_name: "azooKey PR"
+  short_description: "Open PRs and handle CI review follow-up"
+  default_prompt: "Use $azookey-pr to commit verified changes, open the azooKey Windows PR, monitor CI, and address serious review feedback."

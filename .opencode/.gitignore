@@ -1,0 +1,6 @@
+# Keep OpenCode machine-local except for the repository-owned adapter/config.
+*
+!.gitignore
+!agents/
+!agents/reviewer.md
+!opencode.json

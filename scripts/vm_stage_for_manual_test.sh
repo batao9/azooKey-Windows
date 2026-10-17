@@ -11,6 +11,9 @@ SSH_PORT="${SSH_PORT:-}"
 SSH_KEY="${SSH_KEY:-}"
 VBOX_MANAGE="${VBOX_MANAGE:-}"
 INSTALL_TIMEOUT_SEC="${INSTALL_TIMEOUT_SEC:-1200}"
+RESTORE_BEFORE_STAGE="${RESTORE_BEFORE_STAGE:-0}"
+DISCARD_SAVED_STATE_BEFORE_STAGE="${DISCARD_SAVED_STATE_BEFORE_STAGE:-0}"
+VM_DISPOSABLE="${VM_DISPOSABLE:-0}"
 SHUTDOWN_AFTER_INSTALL="${SHUTDOWN_AFTER_INSTALL:-1}"
 UNINSTALL_AFTER_INSTALL="${UNINSTALL_AFTER_INSTALL:-0}"
 VERIFY_LEGACY_NSIS_MIGRATION="${VERIFY_LEGACY_NSIS_MIGRATION:-0}"
@@ -30,8 +33,6 @@ VERIFY_TASK_RUN_FAILURE="${VERIFY_TASK_RUN_FAILURE:-0}"
 if [[ -z "$VBOX_MANAGE" ]]; then
   if command -v VBoxManage >/dev/null 2>&1; then
     VBOX_MANAGE="$(command -v VBoxManage)"
-  elif [[ -x "/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe" ]]; then
-    VBOX_MANAGE="/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe"
   fi
 fi
 
@@ -106,7 +107,12 @@ matches_fixed() {
 }
 
 is_vm_running() {
-  vbox list runningvms | matches_fixed "\"$VM_NAME\""
+  local running_vms
+  running_vms="$(vbox list runningvms)"
+  if printf '%s\n' "$running_vms" | matches_fixed "\"$VM_NAME\""; then
+    return 0
+  fi
+  printf '%s\n' "$running_vms" | matches_fixed "{$VM_NAME}"
 }
 
 snapshot_exists() {
@@ -170,14 +176,7 @@ shutdown_vm_after_install() {
     return 0
   fi
 
-  log "通常停止できなかったため poweroff します"
-  vbox controlvm "$VM_NAME" poweroff >/dev/null || true
-  if wait_for_vm_poweroff; then
-    log "VM を停止しました: $VM_NAME"
-    return 0
-  fi
-
-  log "VM の停止に失敗しました: $VM_NAME"
+  log "通常停止がタイムアウトしました。VM の状態を保持します: $VM_NAME"
   return 1
 }
 
@@ -208,7 +207,6 @@ find_installer() {
 
 ensure_preconditions() {
   require_env VM_NAME
-  require_env SNAPSHOT_NAME
   require_env SSH_USER
   require_env SSH_PORT
   require_env SSH_KEY
@@ -221,32 +219,87 @@ ensure_preconditions() {
     log "SSH 秘密鍵が見つかりません: $SSH_KEY"
     exit 1
   fi
-  if ! snapshot_exists; then
-    log "スナップショットが見つかりません: $SNAPSHOT_NAME"
+  if [[ "$RESTORE_BEFORE_STAGE" != "0" && "$RESTORE_BEFORE_STAGE" != "1" ]]; then
+    log "RESTORE_BEFORE_STAGE は 0 または 1 を指定してください"
     exit 1
   fi
+  if [[ "$DISCARD_SAVED_STATE_BEFORE_STAGE" != "0" && "$DISCARD_SAVED_STATE_BEFORE_STAGE" != "1" ]]; then
+    log "DISCARD_SAVED_STATE_BEFORE_STAGE は 0 または 1 を指定してください"
+    exit 1
+  fi
+  if [[ "$DISCARD_SAVED_STATE_BEFORE_STAGE" == "1" && "$RESTORE_BEFORE_STAGE" != "1" ]]; then
+    log "DISCARD_SAVED_STATE_BEFORE_STAGE は RESTORE_BEFORE_STAGE=1 と併用してください"
+    exit 1
+  fi
+  if [[ "$VM_DISPOSABLE" != "0" && "$VM_DISPOSABLE" != "1" ]]; then
+    log "VM_DISPOSABLE は 0 または 1 を指定してください"
+    exit 1
+  fi
+  if [[ "$RESTORE_BEFORE_STAGE" == "1" ]]; then
+    require_env SNAPSHOT_NAME
+    if ! snapshot_exists; then
+      log "スナップショットが見つかりません: $SNAPSHOT_NAME"
+      exit 1
+    fi
+  fi
+
+  local fixture
+  local value
+  local -a destructive_fixtures=(
+    UNINSTALL_AFTER_INSTALL
+    VERIFY_LEGACY_NSIS_MIGRATION
+    VERIFY_MISSING_LEGACY_NSIS_UNINSTALLER
+    VERIFY_LOCKED_FILE_UPGRADE
+    VERIFY_PREVIOUS_INNO_MIGRATION
+    VERIFY_LOCKED_PREVIOUS_INNO_MIGRATION
+    VERIFY_MISSING_PREVIOUS_INNO_UNINSTALLER
+    VERIFY_TAMPERED_PREVIOUS_INNO_UNINSTALLER
+    VERIFY_TAMPERED_PREVIOUS_INNO_DATA
+    VERIFY_PREVIOUS_INNO_REGISTRY_DELETE_FAILURE
+    VERIFY_SAFE_REINSTALL
+    VERIFY_TASK_CREATION_FAILURE
+    VERIFY_TASK_RUN_FAILURE
+  )
+  for fixture in "${destructive_fixtures[@]}"; do
+    value="${!fixture:-0}"
+    case "${value,,}" in
+      1|true|yes|on)
+        if [[ "$RESTORE_BEFORE_STAGE" != "1" && "$VM_DISPOSABLE" != "1" ]]; then
+          log "$fixture は破壊的な fixture です。RESTORE_BEFORE_STAGE=1 または VM_DISPOSABLE=1 を明示してください"
+          exit 1
+        fi
+        ;;
+    esac
+  done
   if { [[ "${VERIFY_PREVIOUS_INNO_MIGRATION,,}" =~ ^(1|true|yes|on)$ ]] || [[ "${VERIFY_LOCKED_PREVIOUS_INNO_MIGRATION,,}" =~ ^(1|true|yes|on)$ ]] || [[ "${VERIFY_MISSING_PREVIOUS_INNO_UNINSTALLER,,}" =~ ^(1|true|yes|on)$ ]] || [[ "${VERIFY_TAMPERED_PREVIOUS_INNO_UNINSTALLER,,}" =~ ^(1|true|yes|on)$ ]] || [[ "${VERIFY_TAMPERED_PREVIOUS_INNO_DATA,,}" =~ ^(1|true|yes|on)$ ]] || [[ "${VERIFY_PREVIOUS_INNO_REGISTRY_DELETE_FAILURE,,}" =~ ^(1|true|yes|on)$ ]]; } && [[ ! -f "$PREVIOUS_INNO_INSTALLER" ]]; then
     log "旧 Inno installer が見つかりません。PREVIOUS_INNO_INSTALLER を設定してください: ${PREVIOUS_INNO_INSTALLER:-<unset>}"
     exit 1
   fi
 }
 
-restore_snapshot_and_boot() {
-  if is_vm_running; then
-    log "スナップショット復元のため VM を停止します"
-    vbox controlvm "$VM_NAME" acpipowerbutton >/dev/null || true
-    if ! wait_for_vm_poweroff; then
-      vbox controlvm "$VM_NAME" poweroff >/dev/null || true
+prepare_vm() {
+  if [[ "$RESTORE_BEFORE_STAGE" == "1" ]]; then
+    if is_vm_running; then
+      log "スナップショット復元のため VM を通常停止します"
+      vbox controlvm "$VM_NAME" acpipowerbutton >/dev/null || true
+      if ! wait_for_vm_poweroff; then
+        log "VM が通常停止しないため復元せず中止します"
+        return 1
+      fi
+    fi
+    log "スナップショットへ復元します: $SNAPSHOT_NAME"
+    vbox snapshot "$VM_NAME" restore "$SNAPSHOT_NAME" >/dev/null
+    if [[ "$DISCARD_SAVED_STATE_BEFORE_STAGE" == "1" ]]; then
+      vbox discardstate "$VM_NAME" >/dev/null
     fi
   fi
 
-  log "スナップショットへ復元します: $SNAPSHOT_NAME"
-  vbox snapshot "$VM_NAME" restore "$SNAPSHOT_NAME" >/dev/null
-  # saved state付きスナップショットでも必ずコールドブートさせる
-  vbox discardstate "$VM_NAME" >/dev/null 2>&1 || true
-
-  log "VM を起動します: $VM_NAME"
-  vbox startvm "$VM_NAME" --type headless >/dev/null
+  if ! is_vm_running; then
+    log "VM を起動または保存状態から再開します: $VM_NAME"
+    vbox startvm "$VM_NAME" --type headless >/dev/null
+  else
+    log "VM は既に起動済みです: $VM_NAME"
+  fi
 
   if ! wait_for_ssh; then
     log "VM への SSH 接続に失敗しました。SSH_HOST/SSH_PORT/SSH_USER を確認してください。"
@@ -1473,7 +1526,7 @@ main() {
   installer="$(find_installer "${1:-latest}")"
 
   ensure_preconditions
-  restore_snapshot_and_boot
+  prepare_vm
 
   TMP_REMOTE_PS="$(mktemp /tmp/azookey-install-under-test.XXXXXX.ps1)"
   create_install_ps1 "$TMP_REMOTE_PS"
