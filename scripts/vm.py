@@ -131,8 +131,9 @@ class VM:
             log.write(json.dumps({'command': argv, 'exit_code': proc.returncode}, ensure_ascii=False) + '\n')
             log.write(proc.stdout + proc.stderr + '\n')
         if check and proc.returncode:
+            uncertain = argv[0] == 'ssh' and (proc.returncode < 0 or proc.returncode in (124, 125) or proc.returncode >= 128)
             raise VmError(f'Command exited {proc.returncode}: {proc.stderr.strip()[:250]}; see {self.log}',
-                          'failed', uncertain=(argv[0] == 'ssh' and proc.returncode == 255))
+                          'blocked' if uncertain else 'failed', uncertain=uncertain)
         return proc
 
     def vbox(self, *args):
@@ -272,7 +273,7 @@ class VM:
         try:
             output = self.ps(code, timeout=timeout)
         except VmError as error:
-            if not error.uncertain and not hold_pending:
+            if not error.uncertain:
                 self.finish_operation()
             raise
         if not hold_pending:
@@ -292,11 +293,27 @@ class VM:
                    "finally { [void][TaskAwake]::SetThreadExecutionState([uint32]2147483648) }")
         encoded = base64.b64encode(content.encode('utf-8-sig')).decode()
         self.begin_operation('interactive', task=token, remote_script=remote, output=output, done=done)
-        self.ps(f"[IO.File]::WriteAllBytes({ps_quote(wrapper)},[Convert]::FromBase64String('{encoded}')); "
-                f"$a=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File \"'+{ps_quote(wrapper)}+'\"'); "
-                f"$p=New-ScheduledTaskPrincipal -UserId ($env:COMPUTERNAME+'\\'+{ps_quote(self.p['user'])}) -LogonType Interactive -RunLevel Limited; "
-                f"$s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds {timeout}); "
-                f"Register-ScheduledTask -TaskName '{token}' -Action $a -Principal $p -Settings $s | Out-Null; Start-ScheduledTask -TaskName '{token}'")
+        try:
+            self.ps(f"[IO.File]::WriteAllBytes({ps_quote(wrapper)},[Convert]::FromBase64String('{encoded}')); "
+                    f"$a=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File \"'+{ps_quote(wrapper)}+'\"'); "
+                    f"$p=New-ScheduledTaskPrincipal -UserId ($env:COMPUTERNAME+'\\'+{ps_quote(self.p['user'])}) -LogonType Interactive -RunLevel Limited; "
+                    f"$s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds {timeout}); "
+                    f"Register-ScheduledTask -TaskName '{token}' -Action $a -Principal $p -Settings $s | Out-Null; Start-ScheduledTask -TaskName '{token}'")
+        except VmError as error:
+            if error.uncertain:
+                raise
+            try:
+                state = self.ps(f"try {{ $t=Get-ScheduledTask -TaskName {ps_quote(token)} -ErrorAction Stop; [string]$t.State }} "
+                                "catch { if($_.CategoryInfo.Category -eq [Management.Automation.ErrorCategory]::ObjectNotFound){'absent'}else{throw} }").lstrip('\ufeff').strip().lower()
+                if state not in ('absent', 'ready', 'disabled'):
+                    raise VmError('Interactive task may still start or run', uncertain=True)
+                if state != 'absent':
+                    self.ps(f"Unregister-ScheduledTask -TaskName {ps_quote(token)} -Confirm:$false -ErrorAction Stop")
+            except (VmError, OSError) as cleanup_error:
+                raise VmError(f'Interactive launch failed and task completion is unconfirmed: {token}; inspect before retry',
+                              uncertain=True) from cleanup_error
+            self.finish_operation()
+            raise
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             response = self.ps(f"if(Test-Path {ps_quote(done)}){{ @{{code=[IO.File]::ReadAllText({ps_quote(done)});output=[IO.File]::ReadAllText({ps_quote(output)})}} | ConvertTo-Json -Compress }}")
@@ -308,7 +325,7 @@ class VM:
                     raise VmError(f'Interactive script failed; see {output} and {self.log}', 'failed')
                 return value['output']
             time.sleep(2)
-        raise VmError(f'Interactive task {token} did not finish; inspect it before retry')
+        raise VmError(f'Interactive task {token} did not finish; inspect it before retry', uncertain=True)
 
     def guest(self, action, **kwargs):
         result = json.loads(self.script(ROOT / 'scripts/vm-guest.ps1', {'Action': action, **kwargs},

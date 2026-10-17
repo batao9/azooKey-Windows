@@ -62,6 +62,10 @@ jobs:
       shell: powershell
       run: ./scripts/test_vm_swift_runtime.ps1
 
+    - name: Test guest installer completion boundaries without installing
+      shell: powershell
+      run: ./scripts/test_vm_guest_install.ps1
+
     - name: Install pinned Rust toolchain
       run: |
         rustc --version --verbose

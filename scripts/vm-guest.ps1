@@ -30,6 +30,8 @@ try {
     if($Action -eq 'identity') {
         @{installed=Identity} | ConvertTo-Json -Depth 6 -Compress
     } elseif($Action -eq 'install') {
+        $completionKnown = $true
+        try {
         $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
         if(!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Installation requires elevated same-user SSH, not a Limited interactive task'}
         if(@(Get-Process frontend -ErrorAction SilentlyContinue).Count){throw 'Close settings editor before install; drafts must not be discarded'}
@@ -45,9 +47,14 @@ try {
         }
         $before = Identity
         $log = $Installer + '.log'
+        $completionKnown = $false
         $p = Start-Process -FilePath $Installer -ArgumentList @('/SP-','/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/RESTARTEXITCODE=3010',('/LOG="'+$log+'"')) -PassThru
         $null = $p.Handle
-        if(!$p.WaitForExit(1200000)){throw 'Installer timeout; inspect running installer before retry'}
+        if(!$p.WaitForExit(1200000)){
+            [Console]::Error.WriteLine('Installer timeout; inspect running installer before retry')
+            exit 124
+        }
+        $completionKnown = $true
         if($p.ExitCode -notin @(0,3010)){throw ('Installer exit '+$p.ExitCode+'; log '+$log)}
         $installed = Identity
         foreach($key in @('version','channel','revision','installerGeneration')){
@@ -59,6 +66,13 @@ try {
           runtime_verification='not_checked';
           settings_bytes_unchanged=($hashBefore -eq $hashAfter); settings_backup=$(if($hashBefore){$backup}else{$null});
           credential_preservation='not_checked'; install_log=$log} | ConvertTo-Json -Depth 6 -Compress
+        } catch {
+            if(!$completionKnown){
+                [Console]::Error.WriteLine('Installer completion is unknown: ' + $_.Exception.Message)
+                exit 124
+            }
+            throw
+        }
     } else {
         $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
         $vs = if(Test-Path $vswhere){& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath}else{$null}

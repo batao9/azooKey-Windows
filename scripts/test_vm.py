@@ -259,6 +259,51 @@ class VmTests(unittest.TestCase):
             self.assertEqual(self.machine.interactive('C:\\probe.ps1', '', 'azookey-vm-test', 30), 'complete')
             self.assertFalse(reservation.exists())
 
+    def test_interactive_rejected_launch_without_task_releases_reservation(self):
+        self.machine.ps = Mock(side_effect=[vm.VmError('registration failed', 'failed'), 'absent'])
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            with self.assertRaises(vm.VmError) as caught:
+                self.machine.interactive('C:\\probe.ps1', '', 'azookey-vm-test', 30)
+            self.assertFalse(caught.exception.uncertain)
+            self.assertFalse(reservation.exists())
+
+    def test_interactive_rejected_launch_unregisters_inactive_task(self):
+        self.machine.ps = Mock(side_effect=[vm.VmError('start failed', 'failed'), 'Ready', ''])
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            with self.assertRaises(vm.VmError):
+                self.machine.interactive('C:\\probe.ps1', '', 'azookey-vm-test', 30)
+            self.assertIn('Unregister-ScheduledTask', self.machine.ps.call_args.args[0])
+            self.assertFalse(reservation.exists())
+
+    def test_interactive_uncertain_launch_preserves_reservation(self):
+        self.machine.ps = Mock(side_effect=vm.VmError('SSH disconnected', uncertain=True))
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            with self.assertRaises(vm.VmError):
+                self.machine.interactive('C:\\probe.ps1', '', 'azookey-vm-test', 30)
+            self.assertTrue(reservation.exists())
+            self.machine.ps.assert_called_once()
+
+    def test_interactive_failed_launch_with_running_task_keeps_reservation(self):
+        self.machine.ps = Mock(side_effect=[vm.VmError('start failed', 'failed'), 'Running'])
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            with self.assertRaises(vm.VmError) as caught:
+                self.machine.interactive('C:\\probe.ps1', '', 'azookey-vm-test', 30)
+            self.assertTrue(caught.exception.uncertain)
+            self.assertTrue(reservation.exists())
+
+    def test_interactive_failed_launch_with_failed_cleanup_keeps_reservation(self):
+        self.machine.ps = Mock(side_effect=[vm.VmError('start failed', 'failed'), vm.VmError('probe failed', 'failed')])
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            with self.assertRaises(vm.VmError) as caught:
+                self.machine.interactive('C:\\probe.ps1', '', 'azookey-vm-test', 30)
+            self.assertTrue(caught.exception.uncertain)
+            self.assertTrue(reservation.exists())
+
     def test_script_uploads_japanese_utf8_with_bom(self):
         source = self.root / 'probe.ps1'
         source.write_text("Write-Output '日本語確認'\n", encoding='utf-8')
@@ -282,15 +327,32 @@ class VmTests(unittest.TestCase):
         source.write_text('exit 7')
         self.machine.start = Mock()
         self.machine.transfer = Mock()
-        for uncertain in (False, True):
-            with self.subTest(uncertain=uncertain):
+        for uncertain, hold_pending in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(uncertain=uncertain, hold_pending=hold_pending):
                 self.machine.ps = Mock(side_effect=vm.VmError('failed script', 'failed', uncertain=uncertain))
                 with vm.ownership(self.profile, self.root / 'locks') as reservation:
                     self.machine.reservation = reservation
                     with self.assertRaises(vm.VmError):
-                        self.machine.script(source)
+                        self.machine.script(source, hold_pending=hold_pending)
                     self.assertEqual(reservation.exists(), uncertain)
                 self.machine.finish_operation()
+
+    def test_install_success_output_is_reserved_until_json_parses(self):
+        self.machine.start = Mock()
+        self.machine.transfer = Mock()
+        self.machine.ps = Mock(return_value='not JSON')
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            with self.assertRaises(ValueError):
+                self.machine.guest('install')
+            self.assertTrue(reservation.exists())
+
+    def test_guest_timeout_status_is_uncertain(self):
+        with patch.object(vm.subprocess, 'run', return_value=subprocess.CompletedProcess(['ssh'], 124, '', 'installer timeout')):
+            with self.assertRaises(vm.VmError) as caught:
+                self.machine.capture(['ssh'])
+        self.assertTrue(caught.exception.uncertain)
+        self.assertEqual(caught.exception.status, 'blocked')
 
     def test_capture_timeout_records_indeterminate_outcome(self):
         with patch.object(vm.subprocess, 'run', side_effect=subprocess.TimeoutExpired(['ssh'], 1)):
