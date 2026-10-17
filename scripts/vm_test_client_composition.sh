@@ -515,9 +515,12 @@ function Copy-TreeIfExists {
 function Resolve-LlamaCpuRuntime {
   param([string]$CacheRoot, [string]$SourceDir)
 
+  # Runtime/linker files in the pinned b4846 CPU archive. Keep this list in sync
+  # with the asset: a lib/DLL pair alone can hide a partially extracted backend.
+  $requiredFiles = @("llama.lib", "llama.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll", "ggml-rpc.dll", "llava_shared.dll")
   foreach ($candidate in @((Join-Path $CacheRoot "llama_cpu"), (Join-Path $SourceDir "llama_cpu"))) {
-    if ((Test-Path (Join-Path $candidate "llama.lib") -PathType Leaf) -and
-        (Test-Path (Join-Path $candidate "llama.dll") -PathType Leaf)) {
+    $missing = @($requiredFiles | Where-Object { !(Test-Path (Join-Path $candidate $_) -PathType Leaf) })
+    if ($missing.Count -eq 0) {
       return $candidate
     }
   }
@@ -533,7 +536,7 @@ function Resolve-LlamaCpuRuntime {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     Invoke-WebRequest -Uri "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-avx-x64.zip" -OutFile $archive | Out-Null
     Expand-Archive -Path $archive -DestinationPath $runtime -Force
-    foreach ($file in @("llama.lib", "llama.dll")) {
+    foreach ($file in $requiredFiles) {
       if (!(Test-Path (Join-Path $runtime $file) -PathType Leaf)) {
         throw "Downloaded llama CPU runtime is missing $file"
       }

@@ -30,7 +30,7 @@ try {
   New-Item -ItemType Directory -Path $env:TEMP | Out-Null
   $payload = Join-Path $root 'payload'
   New-Item -ItemType Directory -Path $payload | Out-Null
-  foreach ($name in @('llama.lib', 'llama.dll', 'ggml.dll')) {
+  foreach ($name in @('llama.lib', 'llama.dll', 'ggml.dll', 'ggml-base.dll', 'ggml-cpu.dll', 'ggml-rpc.dll', 'llava_shared.dll')) {
     [IO.File]::WriteAllText((Join-Path $payload $name), ('fixture-' + $name))
   }
   $script:fixtureArchive = Join-Path $root 'complete.zip'
@@ -61,10 +61,21 @@ try {
 
   $incomplete = Join-Path $root 'incomplete-cache'
   New-Item -ItemType Directory -Path $incomplete | Out-Null
+  $incompleteRuntime = Join-Path $incomplete 'llama_cpu'
+  New-Item -ItemType Directory -Path $incompleteRuntime | Out-Null
+  Get-ChildItem -Path $payload -File | Where-Object Name -ne 'ggml.dll' | Copy-Item -Destination $incompleteRuntime
   $sentinel = Join-Path $incomplete 'keep.txt'
   [IO.File]::WriteAllText($sentinel, 'unrelated fixture')
   $resolved = Resolve-LlamaCpuRuntime -CacheRoot $incomplete -SourceDir (Join-Path $root 'fallback-source') 6>$null
   Assert-True ($script:requests -eq 2 -and (Test-Path $sentinel)) 'Fallback changed unrelated cache data'
+  Assert-True (!(Test-Path (Join-Path $incompleteRuntime 'ggml.dll'))) 'Partial external cache was modified'
+
+  $sourceHit = Join-Path $root 'source-runtime-hit'
+  $sourceRuntime = Join-Path $sourceHit 'llama_cpu'
+  New-Item -ItemType Directory -Path $sourceRuntime -Force | Out-Null
+  Copy-Item -Path (Join-Path $payload '*') -Destination $sourceRuntime
+  $resolved = Resolve-LlamaCpuRuntime -CacheRoot $incomplete -SourceDir $sourceHit 6>$null
+  Assert-True ($resolved -eq $sourceRuntime -and $script:requests -eq 2) 'Complete source runtime was not reused'
 
   $script:networkFailure = $true
   $failureSource = Join-Path $root 'network-failure-source'
@@ -74,7 +85,7 @@ try {
 
   $brokenPayload = Join-Path $root 'broken-payload'
   New-Item -ItemType Directory -Path $brokenPayload | Out-Null
-  [IO.File]::WriteAllText((Join-Path $brokenPayload 'llama.lib'), 'missing dll')
+  Get-ChildItem -Path $payload -File | Where-Object Name -ne 'ggml.dll' | Copy-Item -Destination $brokenPayload
   $script:fixtureArchive = Join-Path $root 'broken.zip'
   Compress-Archive -Path (Join-Path $brokenPayload '*') -DestinationPath $script:fixtureArchive
   $brokenSource = Join-Path $root 'broken-source'
@@ -82,7 +93,7 @@ try {
   Assert-True (@(Get-ChildItem -Path $brokenSource -Filter '.llama_cpu-*').Count -eq 0) 'Incomplete extraction was retained'
   Assert-True (@(Get-ChildItem -Path $env:TEMP).Count -eq 0) 'Owned download archives were not cleaned up'
 
-  @{task_status='succeeded'; cases=5; downloads_mocked=$true; network_requests=0} | ConvertTo-Json -Compress
+  @{task_status='succeeded'; cases=6; downloads_mocked=$true; network_requests=0} | ConvertTo-Json -Compress
 } finally {
   $env:TEMP = $originalTemp
   Remove-Item -LiteralPath $root -Recurse -Force
