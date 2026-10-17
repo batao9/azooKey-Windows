@@ -372,7 +372,6 @@ if ([string]::IsNullOrWhiteSpace($BuildBaseVersion)) {
 }
 $env:GITHUB_REF_NAME = $BuildBranch
 
-$LLAMA_CPU_URL = "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-avx-x64.zip"
 $LLAMA_CUDA_URL = "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-cuda-cu12.4-x64.zip"
 $LLAMA_VULKAN_URL = "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-vulkan-x64.zip"
 $ZENZ_MODEL_URL = "https://huggingface.co/Miwa-Keita/zenz-v3-small-gguf/resolve/main/ggml-model-Q5_K_M.gguf"
@@ -453,6 +452,7 @@ if ($LASTEXITCODE -ne 0) { throw "source archive extraction failed with exit cod
 Set-Location $SourceDir
 Write-Host "source extracted: $SourceDir"
 Sync-GuestClock -TimestampUtc $HostTimestampUtc
+. (Join-Path $SourceDir 'scripts\vm-runtime.ps1')
 
 $llamaCpuDir = Join-Path $SourceDir "llama_cpu"
 $llamaCudaDir = Join-Path $SourceDir "llama_cuda"
@@ -461,14 +461,8 @@ $zenzPath = Join-Path $SourceDir "zenz.gguf"
 $emojiDictDir = Join-Path $SourceDir "server-swift\\azooKey_emoji_dictionary_storage\\EmojiDictionary"
 $mainDictDir = Join-Path $SourceDir "server-swift\\azooKey_dictionary_storage\\Dictionary"
 
-if (!(Test-Path (Join-Path $llamaCpuDir "llama.lib"))) {
-  if (Copy-TreeIfExists -SourceDir (Join-Path $cacheRoot "llama_cpu") -DestDir $llamaCpuDir) {
-    Write-Host "reused llama cpu assets from cache"
-  } else {
-    Write-Host "downloading llama cpu assets"
-    Download-Extract -Url $LLAMA_CPU_URL -DestFolder $llamaCpuDir
-  }
-}
+$llamaCpuDir = Copy-LlamaCpuRuntimeForBuild -CacheRoot $cacheRoot -SourceDir $SourceDir
+Write-Host "prepared validated llama cpu assets"
 
 if ($downloadAllAssets) {
   if (!(Test-Path (Join-Path $llamaCudaDir "llama.dll"))) {

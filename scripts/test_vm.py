@@ -189,6 +189,48 @@ class VmTests(unittest.TestCase):
         self.assertEqual(caught.exception.status, 'failed')
         self.assertEqual(self.machine.commands[-1]['exit_code'], 7)
 
+    def test_known_helper_failure_releases_operation_reservation(self):
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            with patch.object(vm.subprocess, 'run', return_value=subprocess.CompletedProcess(['helper'], 7)):
+                with self.assertRaises(vm.VmError) as caught:
+                    self.machine.run_operation('test', ['helper'])
+            self.assertFalse(caught.exception.uncertain)
+            self.assertFalse(reservation.exists())
+        with vm.ownership(self.profile, self.root / 'locks'):
+            pass
+
+    def test_uncertain_helper_exits_preserve_operation_reservation(self):
+        for code in (124, 125, 141, 255, -15):
+            with self.subTest(code=code):
+                locks = self.root / ('locks-' + str(code))
+                with vm.ownership(self.profile, locks) as reservation:
+                    self.machine.reservation = reservation
+                    with patch.object(vm.subprocess, 'run', return_value=subprocess.CompletedProcess(['helper'], code)):
+                        with self.assertRaises(vm.VmError) as caught:
+                            self.machine.run_operation('test', ['helper'])
+                    self.assertTrue(caught.exception.uncertain)
+                    self.assertTrue(reservation.exists())
+                with self.assertRaisesRegex(vm.VmError, 'Unresolved guest operation'):
+                    with vm.ownership(self.profile, locks):
+                        self.fail('Uncertain guest work was not reserved')
+                self.machine.finish_operation()
+
+    def test_successful_helper_releases_operation_reservation(self):
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            with patch.object(vm.subprocess, 'run', return_value=subprocess.CompletedProcess(['helper'], 0)):
+                self.machine.run_operation('build', ['helper'])
+            self.assertFalse(reservation.exists())
+
+    def test_local_helper_launch_failure_releases_operation_reservation(self):
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            with patch.object(vm.subprocess, 'run', side_effect=FileNotFoundError('helper missing')):
+                with self.assertRaises(FileNotFoundError):
+                    self.machine.run_operation('test', ['helper'])
+            self.assertFalse(reservation.exists())
+
     def test_timeout_does_not_retry(self):
         with patch.object(vm.subprocess, 'run', side_effect=subprocess.TimeoutExpired(['test'], 1)) as run:
             with self.assertRaisesRegex(vm.VmError, 'remote work may still be active'):

@@ -14,6 +14,7 @@ Python 3.11以降、OpenSSH、VirtualBox CLI を使う Linux/WSL ホスト用。
 ホスト、ポート、Windowsユーザー、鍵、VBoxManageのパス、baseline名はこのローカルファイルだけに置く。
 設定例のVM/snapshot識別子はプレースホルダーであり、実際の値は公開しない。ゲストに既存の依存・辞書キャッシュを使う場合は、build profileの`guest_cache_root`へそのWindows絶対パスを設定する。省略時はゲストの`LOCALAPPDATA`配下の`Azookey\vm-cache`を使う。controllerはこの設定をhelperへ渡すため、キャッシュ用cloneの実パスを公開スクリプトへ埋め込まない。
 キャッシュは事前作成必須ではない。Swift testのCPU runtimeがキャッシュにも転送sourceにもない場合は、固定版をその実行のsource treeへ取得し、linkとtest runnerの両方で同じruntimeを使う。既存の外部キャッシュは書き換えない。
+buildとSwift testは共通のruntime helperを使い、固定版packageの依存DLLを含めて検証する。buildは検証済みruntimeをpackaging treeへ配置するため、不完全なcache/sourceをそのままinstallerへ取り込まない。
 controller経由ではVirtualBoxの実行ファイルもprofileから渡す。旧helperを直接使う場合は`VBOX_MANAGE`を明示するか`VBoxManage`を`PATH`に置く。
 
 ```sh
@@ -85,6 +86,7 @@ before/after状態、guest結果、コマンドの終了値と証拠パスを合
 VMの実UUIDに対するホスト共通ロックで、worktreeやprofile名が違っても同じVMを同時操作しない。`status`はロック中も利用できる。旧スクリプトの直接実行はcontrollerの排他を通らないので、通常作業ではcontrollerを使う。
 同じVMを対象とする一連の状態確認・準備・実行は順次行う。`status`と`operation-status`も同じVirtualBox objectへアクセスし、並列起動するとobject/lockの過渡エラーになり得るため、独立した読み取りとして並列化しない。`status`のロック例外は実行中操作の監視用であり、失敗した状態取得を正常状態と見なすものではない。
 実行前にホスト共通の永続予約も作り、通信断・timeout・controller中断でguest処理の終了が不明な場合は残す。後続の変更操作は予約が解決されるまで拒否する。`operation-status`、`diagnostics`、`screenshot`は予約中も利用できる。保存されたrun directoryとguestのログ・task・processを点検し、終了確認後に`resolve-operation --reason`を使う。汎用スクリプトが起動した独自processの終了は、検出リストだけで判断しない。
+build/test helperが確定した通常の失敗で終了した場合は、失敗結果を保持しつつ予約を解除する。timeout・signal・SSH切断や完了を断定できない高位exit statusは保守的に未解決として残し、mutationを自動再実行しない。
 
 timeout・中断はguest内処理の終了を意味しない。結果の `running` や timeout を確認したら、起動中のinstaller/cargo/taskとログを点検してから再試行する。失敗を `tee` の成功や別のコマンドの終了値で隠さない。CLI出力をパイプする場合は `set -o pipefail` を使う。
 

@@ -95,8 +95,26 @@ class VM:
                 raise VmError('Command timed out; remote work may still be active. Inspect before retry.', uncertain=True) from error
         self.commands.append({'command': argv, 'exit_code': proc.returncode})
         if check and proc.returncode:
-            raise VmError(f'Command exited {proc.returncode}; see {self.log}', 'failed')
+            # GNU timeout and shell signal/disconnect statuses cannot establish
+            # guest completion. Ambiguous high exit codes stay conservative.
+            uncertain = proc.returncode < 0 or proc.returncode in (124, 125) or proc.returncode >= 128
+            raise VmError(f'Command exited {proc.returncode}; see {self.log}',
+                          'blocked' if uncertain else 'failed', uncertain=uncertain)
         return proc.returncode
+
+    def run_operation(self, operation, command, timeout=60, env=None, **details):
+        self.begin_operation(operation, **details)
+        try:
+            self.run(command, timeout=timeout, env=env)
+        except VmError as error:
+            if not error.uncertain:
+                self.finish_operation()
+            raise
+        except OSError:
+            # Failure to launch the local helper cannot leave guest work behind.
+            self.finish_operation()
+            raise
+        self.finish_operation()
 
     def capture(self, argv, timeout=60, check=True):
         try:
@@ -488,9 +506,7 @@ def main():
                 command = ['bash', str(ROOT / 'scripts' / ('vm_build.sh' if cmd == 'build' else 'vm_test_client_composition.sh')), args.branch]
                 if cmd == 'test':
                     command += [args.cargo_filter, args.swift_filter]
-                vm.begin_operation(cmd, branch=args.branch)
-                vm.run(command, timeout=14400, env=vm.environment())
-                vm.finish_operation()
+                vm.run_operation(cmd, command, timeout=14400, env=vm.environment(), branch=args.branch)
                 if cmd == 'build':
                     # The helper names the recovered pair in its terminal completion line.
                     log = vm.log.read_text(errors='replace')

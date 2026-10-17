@@ -1,17 +1,15 @@
-param([string]$SourceScript = (Join-Path $PSScriptRoot 'vm_test_client_composition.sh'))
+param([string]$SourceScript = (Join-Path $PSScriptRoot 'vm-runtime.ps1'))
 $ErrorActionPreference = 'Stop'
-$template = [IO.File]::ReadAllText($SourceScript)
-$match = [regex]::Match($template, '(?s)cat > "\$ps1" <<''PS1''\r?\n(.*?)\r?\nPS1')
-if (!$match.Success) { throw 'VM test PowerShell template not found' }
+$source = [IO.File]::ReadAllText($SourceScript)
 $tokens = $null
 $parseErrors = $null
-$ast = [Management.Automation.Language.Parser]::ParseInput($match.Groups[1].Value, [ref]$tokens, [ref]$parseErrors)
-if ($parseErrors.Count) { throw 'VM test PowerShell template failed to parse' }
+$ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count) { throw 'VM runtime helper failed to parse' }
 $functions = @($ast.FindAll({param($node)
-  $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Resolve-LlamaCpuRuntime'
+  $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Resolve-LlamaCpuRuntime', 'Copy-LlamaCpuRuntimeForBuild')
 }, $true))
-if ($functions.Count -ne 1) { throw 'Expected exactly one runtime resolver' }
-. ([ScriptBlock]::Create($functions[0].Extent.Text))
+if ($functions.Count -ne 2) { throw 'Expected runtime resolver and build preparation functions' }
+foreach ($function in $functions) { . ([ScriptBlock]::Create($function.Extent.Text)) }
 
 function Assert-True([bool]$Condition, [string]$Message) {
   if (!$Condition) { throw $Message }
@@ -77,6 +75,14 @@ try {
   $resolved = Resolve-LlamaCpuRuntime -CacheRoot $incomplete -SourceDir $sourceHit 6>$null
   Assert-True ($resolved -eq $sourceRuntime -and $script:requests -eq 2) 'Complete source runtime was not reused'
 
+  $buildSource = Join-Path $root 'build-source'
+  $prepared = Copy-LlamaCpuRuntimeForBuild -CacheRoot $incomplete -SourceDir $buildSource 6>$null
+  Assert-True ($prepared -eq (Join-Path $buildSource 'llama_cpu')) 'Build runtime was not placed in the packaging tree'
+  foreach ($name in @('llama.lib', 'llama.dll', 'ggml.dll', 'ggml-base.dll', 'ggml-cpu.dll', 'ggml-rpc.dll', 'llava_shared.dll')) {
+    Assert-True (Test-Path (Join-Path $prepared $name) -PathType Leaf) ('Packaged runtime missing ' + $name)
+  }
+  Assert-True (!(Test-Path (Join-Path $incompleteRuntime 'ggml.dll'))) 'Build modified the external partial cache'
+
   $script:networkFailure = $true
   $failureSource = Join-Path $root 'network-failure-source'
   Assert-Fails { Resolve-LlamaCpuRuntime -CacheRoot $incomplete -SourceDir $failureSource 6>$null } 'Download failure was swallowed'
@@ -93,7 +99,7 @@ try {
   Assert-True (@(Get-ChildItem -Path $brokenSource -Filter '.llama_cpu-*').Count -eq 0) 'Incomplete extraction was retained'
   Assert-True (@(Get-ChildItem -Path $env:TEMP).Count -eq 0) 'Owned download archives were not cleaned up'
 
-  @{task_status='succeeded'; cases=6; downloads_mocked=$true; network_requests=0} | ConvertTo-Json -Compress
+  @{task_status='succeeded'; cases=7; downloads_mocked=$true; network_requests=0} | ConvertTo-Json -Compress
 } finally {
   $env:TEMP = $originalTemp
   Remove-Item -LiteralPath $root -Recurse -Force

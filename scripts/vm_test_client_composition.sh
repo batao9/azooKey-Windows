@@ -512,43 +512,6 @@ function Copy-TreeIfExists {
   return $true
 }
 
-function Resolve-LlamaCpuRuntime {
-  param([string]$CacheRoot, [string]$SourceDir)
-
-  # Runtime/linker files in the pinned b4846 CPU archive. Keep this list in sync
-  # with the asset: a lib/DLL pair alone can hide a partially extracted backend.
-  $requiredFiles = @("llama.lib", "llama.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll", "ggml-rpc.dll", "llava_shared.dll")
-  foreach ($candidate in @((Join-Path $CacheRoot "llama_cpu"), (Join-Path $SourceDir "llama_cpu"))) {
-    $missing = @($requiredFiles | Where-Object { !(Test-Path (Join-Path $candidate $_) -PathType Leaf) })
-    if ($missing.Count -eq 0) {
-      return $candidate
-    }
-  }
-
-  # A cache is optional. Keep a cold download in this run's source tree, not in
-  # an externally supplied clone/cache that may contain unrelated files.
-  New-Item -Path $SourceDir -ItemType Directory -Force | Out-Null
-  $token = [guid]::NewGuid().ToString('N')
-  $archive = Join-Path $env:TEMP ("azookey-llama-" + $token + ".zip")
-  $runtime = Join-Path $SourceDir (".llama_cpu-" + $token)
-  $complete = $false
-  try {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-avx-x64.zip" -OutFile $archive | Out-Null
-    Expand-Archive -Path $archive -DestinationPath $runtime -Force
-    foreach ($file in $requiredFiles) {
-      if (!(Test-Path (Join-Path $runtime $file) -PathType Leaf)) {
-        throw "Downloaded llama CPU runtime is missing $file"
-      }
-    }
-    $complete = $true
-    return $runtime
-  } finally {
-    if (Test-Path $archive) { Remove-Item -LiteralPath $archive -Force }
-    if (!$complete -and (Test-Path $runtime)) { Remove-Item -LiteralPath $runtime -Recurse -Force }
-  }
-}
-
 function Initialize-SwiftTestEnvironment {
   # Apply long-path support only to Git children of this test process.
   $configIndex = if ($env:GIT_CONFIG_COUNT) { [int]$env:GIT_CONFIG_COUNT } else { 0 }
@@ -808,6 +771,7 @@ if ($LASTEXITCODE -ne 0) { throw "source archive extraction failed with exit cod
 Set-Location $SourceDir
 Write-Host "source extracted: $SourceDir"
 Sync-GuestClock -TimestampUtc $HostTimestampUtc
+. (Join-Path $SourceDir 'scripts\vm-runtime.ps1')
 
 if (![string]::IsNullOrWhiteSpace($SwiftVendorTarPath) -and (Test-Path $SwiftVendorTarPath)) {
   $vendorRoot = Join-Path $SourceDir "vendor"
