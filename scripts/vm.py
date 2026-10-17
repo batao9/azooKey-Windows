@@ -82,6 +82,22 @@ class VM:
             raise VmError(f'Cannot inspect unresolved guest work during VM state {state}')
         return value
 
+    def remove_inactive_task(self, token):
+        query = (f"try {{ $t=Get-ScheduledTask -TaskName {ps_quote(token)} -ErrorAction Stop; [string]$t.State }} "
+                 "catch { if($_.CategoryInfo.Category -eq [Management.Automation.ErrorCategory]::ObjectNotFound){'absent'}else{throw} }")
+        try:
+            state = self.ps(query).lstrip('\ufeff').strip().lower()
+            if state == 'absent':
+                return
+            if state not in ('ready', 'disabled'):
+                raise VmError('Interactive task may still start or run', uncertain=True)
+            self.ps(f"Unregister-ScheduledTask -TaskName {ps_quote(token)} -Confirm:$false -ErrorAction Stop")
+            if self.ps(query).lstrip('\ufeff').strip().lower() != 'absent':
+                raise VmError('Interactive task still exists after removal', uncertain=True)
+        except (VmError, OSError) as error:
+            raise VmError(f'Interactive task removal is unconfirmed: {token}; inspect before retry',
+                          uncertain=True) from error
+
     def run(self, argv, timeout=60, check=True, env=None):
         # Secrets belong in guest credential storage, not command arguments.
         with self.log.open('ab') as log:
@@ -302,16 +318,7 @@ class VM:
         except VmError as error:
             if error.uncertain:
                 raise
-            try:
-                state = self.ps(f"try {{ $t=Get-ScheduledTask -TaskName {ps_quote(token)} -ErrorAction Stop; [string]$t.State }} "
-                                "catch { if($_.CategoryInfo.Category -eq [Management.Automation.ErrorCategory]::ObjectNotFound){'absent'}else{throw} }").lstrip('\ufeff').strip().lower()
-                if state not in ('absent', 'ready', 'disabled'):
-                    raise VmError('Interactive task may still start or run', uncertain=True)
-                if state != 'absent':
-                    self.ps(f"Unregister-ScheduledTask -TaskName {ps_quote(token)} -Confirm:$false -ErrorAction Stop")
-            except (VmError, OSError) as cleanup_error:
-                raise VmError(f'Interactive launch failed and task completion is unconfirmed: {token}; inspect before retry',
-                              uncertain=True) from cleanup_error
+            self.remove_inactive_task(token)
             self.finish_operation()
             raise
         end = time.monotonic() + timeout
@@ -469,7 +476,7 @@ def main():
                     if not args.reason.strip() or processes or guest.get('running_tasks'):
                         raise VmError('Resolution requires a reason and no active assigned guest work; inspect before retry')
                     if pending.get('task') and vm.state()['VMState'] == 'running':
-                        vm.ps(f"Unregister-ScheduledTask -TaskName {ps_quote(pending['task'])} -Confirm:$false -ErrorAction SilentlyContinue")
+                        vm.remove_inactive_task(pending['task'])
                     result['resolution_reason'] = args.reason
                     vm.finish_operation()
             elif cmd == 'recover-poweroff':

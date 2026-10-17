@@ -1,5 +1,7 @@
 """Behavioral tests of VM boundaries; never contact a VM or SSH endpoint."""
+import contextlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -269,12 +271,12 @@ class VmTests(unittest.TestCase):
             self.assertFalse(reservation.exists())
 
     def test_interactive_rejected_launch_unregisters_inactive_task(self):
-        self.machine.ps = Mock(side_effect=[vm.VmError('start failed', 'failed'), 'Ready', ''])
+        self.machine.ps = Mock(side_effect=[vm.VmError('start failed', 'failed'), 'Ready', '', 'absent'])
         with vm.ownership(self.profile, self.root / 'locks') as reservation:
             self.machine.reservation = reservation
             with self.assertRaises(vm.VmError):
                 self.machine.interactive('C:\\probe.ps1', '', 'azookey-vm-test', 30)
-            self.assertIn('Unregister-ScheduledTask', self.machine.ps.call_args.args[0])
+            self.assertIn('Unregister-ScheduledTask', self.machine.ps.call_args_list[-2].args[0])
             self.assertFalse(reservation.exists())
 
     def test_interactive_uncertain_launch_preserves_reservation(self):
@@ -303,6 +305,62 @@ class VmTests(unittest.TestCase):
                 self.machine.interactive('C:\\probe.ps1', '', 'azookey-vm-test', 30)
             self.assertTrue(caught.exception.uncertain)
             self.assertTrue(reservation.exists())
+
+    def resolve_interactive(self, responses):
+        locks = self.root / '.cache/azookey-vm-locks'
+        with vm.ownership(self.profile, locks, allow_pending=True) as reservation:
+            self.machine.reservation = reservation
+            self.machine.begin_operation('interactive', task='azookey-vm-test')
+            pending = json.loads(reservation.read_text())
+        output = io.StringIO()
+        with patch.object(vm, 'ROOT', self.root), \
+                patch.object(vm.Path, 'home', return_value=self.root), \
+                patch.object(vm, 'load_profile', return_value=self.profile), \
+                patch.object(vm.VM, 'state', return_value={'VMState': 'running', 'UUID': self.profile['vm']}), \
+                patch.object(vm.VM, 'operation_status', return_value={
+                    'pending': pending, 'guest': {'processes': [], 'running_tasks': []}}), \
+                patch.object(vm.VM, 'ps', side_effect=responses) as ps, \
+                patch.object(vm.sys, 'argv', ['vm.py', '--profile', 'build', 'resolve-operation', '--reason', 'inspected task']), \
+                contextlib.redirect_stdout(output):
+            code = vm.main()
+        return code, json.loads(output.getvalue()), reservation, ps
+
+    def test_resolve_interactive_requires_confirmed_task_removal(self):
+        for responses in (
+                ['Ready', vm.VmError('unregister denied', 'failed')],
+                ['Ready', '', 'Ready'],
+                ['Ready', '', vm.VmError('absence probe denied', 'failed')],
+                [vm.VmError('state probe denied', 'failed')],
+                ['Running'], ['Queued'], ['Unknown']):
+            with self.subTest(responses=responses):
+                code, result, reservation, _ = self.resolve_interactive(responses)
+                self.assertEqual(code, 1)
+                self.assertEqual(result['task_status'], 'blocked')
+                self.assertTrue(reservation.exists())
+                with self.assertRaisesRegex(vm.VmError, 'Unresolved guest operation'):
+                    with vm.ownership(self.profile, self.root / '.cache/azookey-vm-locks'):
+                        self.fail('Task removal was not confirmed')
+
+    def test_resolve_interactive_confirmed_removal_allows_next_owner(self):
+        for state in ('Ready', 'Disabled'):
+            with self.subTest(state=state):
+                code, result, reservation, ps = self.resolve_interactive([state, '', 'absent'])
+                self.assertEqual(code, 0)
+                self.assertEqual(result['task_status'], 'succeeded')
+                self.assertFalse(reservation.exists())
+                self.assertEqual(ps.call_count, 3)
+                self.assertIn('Unregister-ScheduledTask', ps.call_args_list[1].args[0])
+                self.assertIn('-ErrorAction Stop', ps.call_args_list[1].args[0])
+                with vm.ownership(self.profile, self.root / '.cache/azookey-vm-locks'):
+                    pass
+
+    def test_resolve_interactive_absent_task_needs_no_unregister(self):
+        code, result, reservation, ps = self.resolve_interactive(['absent'])
+        self.assertEqual(code, 0)
+        self.assertEqual(result['task_status'], 'succeeded')
+        self.assertFalse(reservation.exists())
+        ps.assert_called_once()
+        self.assertNotIn('Unregister-ScheduledTask', ps.call_args.args[0])
 
     def test_script_uploads_japanese_utf8_with_bom(self):
         source = self.root / 'probe.ps1'

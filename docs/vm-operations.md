@@ -88,6 +88,7 @@ VMの実UUIDに対するホスト共通ロックで、worktreeやprofile名が�
 実行前にホスト共通の永続予約も作り、通信断・timeout・controller中断でguest処理の終了が不明な場合は残す。後続の変更操作は予約が解決されるまで拒否する。`operation-status`、`diagnostics`、`screenshot`は予約中も利用できる。保存されたrun directoryとguestのログ・task・processを点検し、終了確認後に`resolve-operation --reason`を使う。汎用スクリプトが起動した独自processの終了は、検出リストだけで判断しない。
 build/test helperが確定した通常の失敗で終了した場合は、失敗結果を保持しつつ予約を解除する。timeout・signal・SSH切断や完了を断定できない高位exit statusは保守的に未解決として残し、mutationを自動再実行しない。
 installの既知の事前検証・終了済みinstallerの失敗も予約を解除する。installer起動後に完了が不明な場合はguest status124で未解決を保つ。interactiveの起動拒否はtaskの不存在/非実行状態を確認し、残った非実行taskを解除できた場合だけ予約を解除する。状態照会やcleanupの失敗、queued/runningは成功と見なさない。
+`resolve-operation`によるinteractive予約の解除も、taskの不存在、またはReady/Disabledからの削除成功と再照会による不存在確認を必要とする。削除・再照会が失敗した場合は予約を保持する。
 
 timeout・中断はguest内処理の終了を意味しない。結果の `running` や timeout を確認したら、起動中のinstaller/cargo/taskとログを点検してから再試行する。失敗を `tee` の成功や別のコマンドの終了値で隠さない。CLI出力をパイプする場合は `set -o pipefail` を使う。
 
