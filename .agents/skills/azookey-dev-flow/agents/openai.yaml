@@ -1,0 +1,4 @@
+interface:
+  display_name: "azooKey Dev Flow"
+  short_description: "Implement and verify azooKey Windows issues"
+  default_prompt: "Use $azookey-dev-flow to implement and verify an azooKey Windows issue, e.g. /azookey-dev-flow <issue-url>."

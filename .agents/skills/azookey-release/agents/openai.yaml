@@ -1,0 +1,4 @@
+interface:
+  display_name: "azooKey Release"
+  short_description: "Prepare and publish verified azooKey releases"
+  default_prompt: "Use $azookey-release to draft the next release summary and issue-close list for approval, then follow the approved release workflow."

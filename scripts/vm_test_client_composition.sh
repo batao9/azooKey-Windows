@@ -3,11 +3,12 @@ set -euo pipefail
 
 VM_NAME="${VM_NAME:-}"
 SNAPSHOT_NAME="${SNAPSHOT_NAME:-}"
-RESTORE_BEFORE_TEST="${RESTORE_BEFORE_TEST:-1}"
-RESTORE_AFTER_TEST="${RESTORE_AFTER_TEST:-1}"
+RESTORE_BEFORE_TEST="${RESTORE_BEFORE_TEST:-0}"
+RESTORE_AFTER_TEST="${RESTORE_AFTER_TEST:-0}"
+VM_LIFECYCLE_EXTERNAL="${VM_LIFECYCLE_EXTERNAL:-0}"
 ALLOW_DIRTY_WORKTREE="${ALLOW_DIRTY_WORKTREE:-1}"
 DISCARD_SAVED_STATE_BEFORE_TEST="${DISCARD_SAVED_STATE_BEFORE_TEST:-0}"
-PRUNE_ORPHAN_MEDIA_AFTER_RESTORE="${PRUNE_ORPHAN_MEDIA_AFTER_RESTORE:-1}"
+PRUNE_ORPHAN_MEDIA_AFTER_RESTORE="${PRUNE_ORPHAN_MEDIA_AFTER_RESTORE:-0}"
 SSH_USER="${SSH_USER:-}"
 SSH_PORT="${SSH_PORT:-}"
 SSH_KEY="${SSH_KEY:-}"
@@ -21,8 +22,6 @@ STAGING_VM_NAME="${STAGING_VM_NAME:-}"
 if [[ -z "$VBOX_MANAGE" ]]; then
   if command -v VBoxManage >/dev/null 2>&1; then
     VBOX_MANAGE="$(command -v VBoxManage)"
-  elif [[ -x "/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe" ]]; then
-    VBOX_MANAGE="/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe"
   fi
 fi
 
@@ -34,6 +33,7 @@ fi
 
 TARGET_BRANCH="$1"
 CARGO_TEST_FILTER="${2:-composition}"
+CARGO_TEST_PACKAGE="${CARGO_TEST_PACKAGE:-azookey-windows}"
 SWIFT_TEST_FILTER="${3:-}"
 SWIFT_TEST_ITERATIONS="${SWIFT_TEST_ITERATIONS:-1}"
 
@@ -42,6 +42,10 @@ if [[ "$CARGO_TEST_FILTER" == "-" ]]; then
 fi
 if [[ "$SWIFT_TEST_FILTER" == "-" ]]; then
   SWIFT_TEST_FILTER="skip"
+fi
+if [[ ! "$CARGO_TEST_PACKAGE" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  echo "CARGO_TEST_PACKAGE must be a valid Cargo package name (ASCII letters, digits, '_' or '-')"
+  exit 1
 fi
 if [[ ! "$SWIFT_TEST_ITERATIONS" =~ ^[1-9][0-9]*$ ]]; then
   echo "SWIFT_TEST_ITERATIONS must be a positive integer"
@@ -66,6 +70,7 @@ fi
 ACTIVE_HOST="$HOST_IP"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 HOST_TIMESTAMP_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+CACHE_ROOT_BASE64="$(printf '%s' "${VM_GUEST_CACHE_ROOT:-}" | base64 | tr -d '\r\n')"
 LOG_FILE="$LOG_DIR/vm-client-test-$TIMESTAMP.log"
 
 REMOTE_TMP_WIN="C:\\Users\\$SSH_USER\\AppData\\Local\\Temp"
@@ -143,12 +148,12 @@ matches_regex() {
 }
 
 is_vm_running() {
-  vbox list runningvms | matches_fixed "\"$VM_NAME\""
-}
-
-is_named_vm_running() {
-  local vm_name="$1"
-  vbox list runningvms | matches_fixed "\"$vm_name\""
+  local running_vms
+  running_vms="$(vbox list runningvms)"
+  if printf '%s\n' "$running_vms" | matches_fixed "\"$VM_NAME\""; then
+    return 0
+  fi
+  printf '%s\n' "$running_vms" | matches_fixed "{$VM_NAME}"
 }
 
 snapshot_exists() {
@@ -213,18 +218,6 @@ wait_for_vm_poweroff() {
   return 1
 }
 
-wait_for_named_vm_poweroff() {
-  local vm_name="$1"
-  local tries=60
-  for ((i=1; i<=tries; i++)); do
-    if ! is_named_vm_running "$vm_name"; then
-      return 0
-    fi
-    sleep 2
-  done
-  return 1
-}
-
 start_vm() {
   local tries=10
   local output=""
@@ -244,20 +237,15 @@ start_vm() {
   return 1
 }
 
-stop_staging_vm_if_running() {
-  if [[ -z "$STAGING_VM_NAME" || "$STAGING_VM_NAME" == "$VM_NAME" ]]; then
+shutdown_vm_normally() {
+  if ! is_vm_running; then
     return 0
   fi
-
-  if ! is_named_vm_running "$STAGING_VM_NAME"; then
-    return 0
-  fi
-
-  log "test 前に staging VM を停止します: $STAGING_VM_NAME"
-  vbox controlvm "$STAGING_VM_NAME" acpipowerbutton >/dev/null || true
-  if ! wait_for_named_vm_poweroff "$STAGING_VM_NAME"; then
-    log "staging VM が停止しないため強制停止します: $STAGING_VM_NAME"
-    vbox controlvm "$STAGING_VM_NAME" poweroff >/dev/null || true
+  log "VM を通常停止します: $VM_NAME"
+  vbox controlvm "$VM_NAME" acpipowerbutton >/dev/null || true
+  if ! wait_for_vm_poweroff; then
+    log "通常停止がタイムアウトしました。VM の状態を保持します: $VM_NAME"
+    return 1
   fi
 }
 
@@ -270,20 +258,24 @@ cleanup() {
 
   if [[ "$rc" -ne 0 && "$RESTORE_AFTER_TEST" == "1" && "$VM_TOUCHED" == "1" && "$FINAL_RESTORE_DONE" != "1" ]]; then
     log "エラー終了のためクリーン状態へ復元します: $SNAPSHOT_NAME"
+    local may_restore=1
     if is_vm_running; then
       vbox controlvm "$VM_NAME" acpipowerbutton >/dev/null || true
       if ! wait_for_vm_poweroff; then
-        vbox controlvm "$VM_NAME" poweroff >/dev/null || true
+        log "通常停止に失敗したため復元しません。VM の状態を保持します"
+        may_restore=0
       fi
     fi
 
-    if snapshot_exists; then
+    if [[ "$may_restore" == "1" ]] && snapshot_exists; then
       vbox snapshot "$VM_NAME" restore "$SNAPSHOT_NAME" >/dev/null || true
       if [[ "$DISCARD_SAVED_STATE_BEFORE_TEST" == "1" ]]; then
         vbox discardstate "$VM_NAME" >/dev/null 2>&1 || true
       fi
       prune_orphan_media_after_restore
       FINAL_RESTORE_DONE=1
+    elif [[ "$may_restore" == "1" ]]; then
+      log "復元対象スナップショットが見つからないため復元しません: $SNAPSHOT_NAME"
     fi
   fi
 
@@ -293,13 +285,45 @@ cleanup() {
 
 ensure_preconditions() {
   require_env VM_NAME
-  require_env SNAPSHOT_NAME
   require_env SSH_USER
   require_env SSH_PORT
   require_env SSH_KEY
 
+  if [[ "$VM_LIFECYCLE_EXTERNAL" != "0" && "$VM_LIFECYCLE_EXTERNAL" != "1" ]]; then
+    log "VM_LIFECYCLE_EXTERNAL は 0 または 1 を指定してください"
+    exit 1
+  fi
+  if [[ "$RESTORE_BEFORE_TEST" != "0" && "$RESTORE_BEFORE_TEST" != "1" ]] || [[ "$RESTORE_AFTER_TEST" != "0" && "$RESTORE_AFTER_TEST" != "1" ]]; then
+    log "RESTORE_BEFORE_TEST / RESTORE_AFTER_TEST は 0 または 1 を指定してください"
+    exit 1
+  fi
+  if [[ "$DISCARD_SAVED_STATE_BEFORE_TEST" != "0" && "$DISCARD_SAVED_STATE_BEFORE_TEST" != "1" ]]; then
+    log "DISCARD_SAVED_STATE_BEFORE_TEST は 0 または 1 を指定してください"
+    exit 1
+  fi
+  if [[ "$VM_LIFECYCLE_EXTERNAL" == "1" ]]; then
+    if [[ "$RESTORE_BEFORE_TEST" != "0" || "$RESTORE_AFTER_TEST" != "0" || "$DISCARD_SAVED_STATE_BEFORE_TEST" == "1" || -n "$STAGING_VM_NAME" ]]; then
+      log "外部 VM lifecycle 中は restore/discard フラグを 0、STAGING_VM_NAME を空にしてください"
+      exit 1
+    fi
+  elif [[ "$RESTORE_BEFORE_TEST" == "1" || "$RESTORE_AFTER_TEST" == "1" ]]; then
+    require_env SNAPSHOT_NAME
+  elif [[ "$DISCARD_SAVED_STATE_BEFORE_TEST" == "1" ]]; then
+    log "DISCARD_SAVED_STATE_BEFORE_TEST は restore 操作と併用してください"
+    exit 1
+  fi
+  if [[ -n "$STAGING_VM_NAME" ]]; then
+    log "STAGING_VM_NAME による別 VM の暗黙停止はサポートしていません"
+    exit 1
+  fi
+
   if [[ ! -x "$VBOX_MANAGE" ]]; then
     log "VBoxManage が見つかりません。VBOX_MANAGE を設定してください: ${VBOX_MANAGE:-<unset>}"
+    exit 1
+  fi
+
+  if [[ "$RESTORE_BEFORE_TEST" == "1" || "$RESTORE_AFTER_TEST" == "1" ]] && ! snapshot_exists; then
+    log "復元対象スナップショットが見つかりません: $SNAPSHOT_NAME"
     exit 1
   fi
 
@@ -414,22 +438,29 @@ param(
   [Parameter(Mandatory = $true)][string]$SourceTarPath,
   [Parameter(Mandatory = $true)][string]$SourceDir,
   [Parameter(Mandatory = $true)][string]$HostTimestampUtc,
+  [Parameter(Mandatory = $false)][string]$CargoTestPackage = "azookey-windows",
   [Parameter(Mandatory = $false)][string]$CargoTestFilter = "composition",
   [Parameter(Mandatory = $false)][string]$SwiftTestFilter = "",
   [Parameter(Mandatory = $false)][int]$SwiftTestIterations = 1,
-  [Parameter(Mandatory = $false)][string]$SwiftVendorTarPath = ""
+  [Parameter(Mandatory = $false)][string]$SwiftVendorTarPath = "",
+  [string]$CacheRootBase64 = ""
 )
 
 $ErrorActionPreference = "Stop"
+Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class VmClientTestAwake { [DllImport("kernel32.dll", SetLastError=true)] public static extern uint SetThreadExecutionState(uint flags); }'
+if ([VmClientTestAwake]::SetThreadExecutionState([uint32]2147483649) -eq 0) { throw "Failed to keep the test thread awake" }
+try {
 $env:Path += ";$env:USERPROFILE\.cargo\bin"
 $env:RUST_BACKTRACE = "1"
-$cacheRoot = "C:\work\azooKey-Windows"
+$cacheRoot = if ($CacheRootBase64) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($CacheRootBase64)) } else { Join-Path $env:LOCALAPPDATA 'Azookey\vm-cache' }
+if ($CargoTestPackage -notmatch '^[A-Za-z0-9_-]+$') { throw "Invalid Cargo test package name: $CargoTestPackage" }
 
 function Sync-GuestClock {
   param([string]$TimestampUtc)
 
   try {
-    $targetUtc = [DateTime]::Parse($TimestampUtc).ToUniversalTime().AddHours(12)
+    $styles = [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
+    $targetUtc = [DateTime]::Parse($TimestampUtc, [Globalization.CultureInfo]::InvariantCulture, $styles)
     $currentUtc = (Get-Date).ToUniversalTime()
     $deltaSeconds = [Math]::Abs(($targetUtc - $currentUtc).TotalSeconds)
 
@@ -441,7 +472,7 @@ function Sync-GuestClock {
       Write-Host "guest clock already in sync"
     }
   } catch {
-    Write-Host "warning: failed to sync guest clock: $($_.Exception.Message)"
+    throw "Failed to synchronize guest clock to host UTC: $($_.Exception.Message)"
   }
 }
 
@@ -482,14 +513,18 @@ function Copy-TreeIfExists {
 }
 
 function Initialize-SwiftTestEnvironment {
-  git config --global core.longpaths true
+  # Apply long-path support only to Git children of this test process.
+  $configIndex = if ($env:GIT_CONFIG_COUNT) { [int]$env:GIT_CONFIG_COUNT } else { 0 }
+  Set-Item -Path ("Env:GIT_CONFIG_KEY_" + $configIndex) -Value "core.longpaths"
+  Set-Item -Path ("Env:GIT_CONFIG_VALUE_" + $configIndex) -Value "true"
+  $env:GIT_CONFIG_COUNT = [string]($configIndex + 1)
 
-  $llamaLibCache = Join-Path $cacheRoot "llama_cpu\llama.lib"
+  $script:llamaCpuRuntimeDir = Resolve-LlamaCpuRuntime -CacheRoot $cacheRoot -SourceDir $SourceDir
+  $llamaLibCache = Join-Path $script:llamaCpuRuntimeDir "llama.lib"
   $llamaLibDest = Join-Path $SourceDir "server-swift\llama.lib"
-  if ((Test-Path $llamaLibCache) -and !(Test-Path $llamaLibDest)) {
-    Copy-Item $llamaLibCache -Destination $llamaLibDest -Force
-    Write-Host "copied llama.lib from cache"
-  }
+  Copy-Item $llamaLibCache -Destination $llamaLibDest -Force
+  $env:Path = $script:llamaCpuRuntimeDir + ";" + $env:Path
+  Write-Host "prepared llama CPU runtime and linker input"
 
   $emojiDictDir = Join-Path $SourceDir "server-swift\azooKey_emoji_dictionary_storage\EmojiDictionary"
   $mainDictDir = Join-Path $SourceDir "server-swift\azooKey_dictionary_storage\Dictionary"
@@ -554,7 +589,8 @@ function Initialize-SwiftTestEnvironment {
   $vsInitArgs = "-arch=x64 -host_arch=x64"
   $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
   if (Test-Path $vswhere) {
-    $vsInstallPath = & $vswhere -latest -products * -property installationPath
+    $vsInstallPath = & $vswhere -latest -products '*' -property installationPath
+    if ($LASTEXITCODE -ne 0) { throw "vswhere failed with exit code $LASTEXITCODE" }
     if (![string]::IsNullOrWhiteSpace($vsInstallPath)) {
       $candidate = Join-Path $vsInstallPath "Common7\Tools\VsDevCmd.bat"
       if (Test-Path $candidate) {
@@ -609,6 +645,7 @@ function Initialize-SwiftTestEnvironment {
         Set-Item -Path ("Env:" + $matches[1]) -Value $matches[2]
       }
     }
+    if ($LASTEXITCODE -ne 0) { throw "Visual Studio environment setup failed with exit code $LASTEXITCODE" }
     Write-Host "loaded Visual Studio build environment from $vsInitScript"
   } else {
     Write-Host "Visual Studio build environment not found; continuing without it"
@@ -686,7 +723,7 @@ function Invoke-SwiftPackageTests {
   $swiftToolchainBin = Split-Path (Get-Command swift).Source -Parent
   $xctestBin = Join-Path $platformDir.FullName "Windows.platform\Developer\Library\XCTest-development\usr\bin64"
   $testingBin = Join-Path $platformDir.FullName "Windows.platform\Developer\Library\Testing-development\usr\bin64"
-  $llamaCpuDir = Join-Path $cacheRoot "llama_cpu"
+  $llamaCpuDir = $script:llamaCpuRuntimeDir
 
   foreach ($requiredPath in @($swiftRuntimeBin, $swiftToolchainBin, $xctestBin, $testingBin, $llamaCpuDir)) {
     if (!(Test-Path $requiredPath)) {
@@ -730,9 +767,11 @@ if (Test-Path $SourceDir) {
 New-Item -Path $SourceDir -ItemType Directory -Force | Out-Null
 
 tar -xzf $SourceTarPath -C $SourceDir
+if ($LASTEXITCODE -ne 0) { throw "source archive extraction failed with exit code $LASTEXITCODE" }
 Set-Location $SourceDir
 Write-Host "source extracted: $SourceDir"
 Sync-GuestClock -TimestampUtc $HostTimestampUtc
+. (Join-Path $SourceDir 'scripts\vm-runtime.ps1')
 
 if (![string]::IsNullOrWhiteSpace($SwiftVendorTarPath) -and (Test-Path $SwiftVendorTarPath)) {
   $vendorRoot = Join-Path $SourceDir "vendor"
@@ -741,6 +780,7 @@ if (![string]::IsNullOrWhiteSpace($SwiftVendorTarPath) -and (Test-Path $SwiftVen
   }
   New-Item -Path $vendorRoot -ItemType Directory -Force | Out-Null
   tar -xzf $SwiftVendorTarPath -C $vendorRoot
+  if ($LASTEXITCODE -ne 0) { throw "Swift vendor archive extraction failed with exit code $LASTEXITCODE" }
 
   $packageSwift = Join-Path $SourceDir "server-swift\Package.swift"
   $packageRaw = Get-Content $packageSwift -Raw
@@ -759,8 +799,8 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 }
 
 if (![string]::IsNullOrWhiteSpace($CargoTestFilter) -and $CargoTestFilter -ne "skip") {
-  Write-Host "running cargo test -p azookey-windows $CargoTestFilter -- --nocapture"
-  cargo test -p azookey-windows $CargoTestFilter -- --nocapture
+  Write-Host "running cargo test -p $CargoTestPackage $CargoTestFilter -- --nocapture"
+  cargo test -p $CargoTestPackage $CargoTestFilter -- --nocapture
   if ($LASTEXITCODE -ne 0) {
     throw "cargo test failed with exit code $LASTEXITCODE"
   }
@@ -799,12 +839,14 @@ if (![string]::IsNullOrWhiteSpace($SwiftTestFilter) -and $SwiftTestFilter -ne "s
 } else {
   Write-Host "skipping swift test"
 }
+} finally {
+  [void][VmClientTestAwake]::SetThreadExecutionState([uint32]2147483648)
+}
 PS1
 }
 
 main() {
   ensure_preconditions
-  stop_staging_vm_if_running
   ensure_submodules
   ensure_required_dictionary_paths
   ensure_swift_vendor_cache
@@ -822,22 +864,25 @@ main() {
   fi
 
   if [[ "$RESTORE_BEFORE_TEST" == "1" ]]; then
-    if snapshot_exists; then
-      VM_TOUCHED=1
-      if is_vm_running; then
-        log "スナップショット復元のため VM を停止します"
-        vbox controlvm "$VM_NAME" acpipowerbutton >/dev/null || true
-        if ! wait_for_vm_poweroff; then
-          vbox controlvm "$VM_NAME" poweroff >/dev/null
-        fi
-      fi
-      log "test 前にスナップショットを復元します: $SNAPSHOT_NAME"
-      vbox snapshot "$VM_NAME" restore "$SNAPSHOT_NAME" >/dev/null
-      if [[ "$DISCARD_SAVED_STATE_BEFORE_TEST" == "1" ]]; then
-        vbox discardstate "$VM_NAME" >/dev/null 2>&1 || true
-      fi
-      prune_orphan_media_after_restore
+    if ! snapshot_exists; then
+      log "復元対象スナップショットが見つかりません: $SNAPSHOT_NAME"
+      return 1
     fi
+    if is_vm_running; then
+      log "スナップショット復元のため VM を通常停止します"
+      vbox controlvm "$VM_NAME" acpipowerbutton >/dev/null || true
+      if ! wait_for_vm_poweroff; then
+        log "VM が通常停止しないため復元せず中止します"
+        return 1
+      fi
+    fi
+    log "test 前にスナップショットを復元します: $SNAPSHOT_NAME"
+    VM_TOUCHED=1
+    vbox snapshot "$VM_NAME" restore "$SNAPSHOT_NAME" >/dev/null
+    if [[ "$DISCARD_SAVED_STATE_BEFORE_TEST" == "1" ]]; then
+      vbox discardstate "$VM_NAME" >/dev/null
+    fi
+    prune_orphan_media_after_restore
   fi
 
   if ! is_vm_running; then
@@ -865,27 +910,29 @@ main() {
   if [[ -n "${TMP_SWIFT_VENDOR_ARCHIVE:-}" ]]; then
     swift_vendor_arg=" -SwiftVendorTarPath \"$REMOTE_SWIFT_VENDOR_TAR_WIN\""
   fi
+  local cache_root_arg=""
+  if [[ -n "$CACHE_ROOT_BASE64" ]]; then
+    cache_root_arg=" -CacheRootBase64 $CACHE_ROOT_BASE64"
+  fi
 
   log "VM 上で test を実行します"
-  ssh_run_test "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -SourceTarPath \"$REMOTE_TAR_WIN\" -SourceDir \"$REMOTE_SRC_WIN\" -HostTimestampUtc \"$HOST_TIMESTAMP_UTC\" -CargoTestFilter \"$CARGO_TEST_FILTER\" -SwiftTestFilter \"$SWIFT_TEST_FILTER\" -SwiftTestIterations \"$SWIFT_TEST_ITERATIONS\"$swift_vendor_arg"
+  ssh_run_test "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -SourceTarPath \"$REMOTE_TAR_WIN\" -SourceDir \"$REMOTE_SRC_WIN\" -HostTimestampUtc \"$HOST_TIMESTAMP_UTC\" -CargoTestPackage \"$CARGO_TEST_PACKAGE\" -CargoTestFilter \"$CARGO_TEST_FILTER\" -SwiftTestFilter \"$SWIFT_TEST_FILTER\" -SwiftTestIterations \"$SWIFT_TEST_ITERATIONS\"$swift_vendor_arg$cache_root_arg"
 
-  log "VM を停止します"
-  vbox controlvm "$VM_NAME" acpipowerbutton >/dev/null || true
-  if ! wait_for_vm_poweroff; then
-    log "通常停止できなかったため poweroff します"
-    vbox controlvm "$VM_NAME" poweroff >/dev/null
+  if [[ "$VM_LIFECYCLE_EXTERNAL" != "1" ]]; then
+    shutdown_vm_normally
   fi
 
   if [[ "$RESTORE_AFTER_TEST" == "1" ]]; then
-    if snapshot_exists; then
-      log "test 後にクリーン状態へ戻すため復元します: $SNAPSHOT_NAME"
-      vbox snapshot "$VM_NAME" restore "$SNAPSHOT_NAME" >/dev/null
-      if [[ "$DISCARD_SAVED_STATE_BEFORE_TEST" == "1" ]]; then
-        vbox discardstate "$VM_NAME" >/dev/null 2>&1 || true
-      fi
-      prune_orphan_media_after_restore
-      FINAL_RESTORE_DONE=1
+    if ! snapshot_exists; then
+      log "復元対象スナップショットが見つかりません: $SNAPSHOT_NAME"
+      return 1
     fi
+    vbox snapshot "$VM_NAME" restore "$SNAPSHOT_NAME" >/dev/null
+    if [[ "$DISCARD_SAVED_STATE_BEFORE_TEST" == "1" ]]; then
+      vbox discardstate "$VM_NAME" >/dev/null
+    fi
+    prune_orphan_media_after_restore
+    FINAL_RESTORE_DONE=1
   fi
 
   log "完了: $LOG_FILE"

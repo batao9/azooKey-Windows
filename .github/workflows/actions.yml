@@ -28,6 +28,27 @@ env:
   ZENZ_MODEL_URL: https://huggingface.co/Miwa-Keita/zenz-v3-small-gguf/resolve/main/ggml-model-Q5_K_M.gguf
 
 jobs:
+  vm-tools-tests:
+    name: VM tooling regression tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Check VM helper syntax
+      run: bash -n scripts/vm_build.sh scripts/vm_test_client_composition.sh scripts/vm_stage_for_manual_test.sh
+
+    - name: Run VM tooling regression tests without a guest
+      env:
+        PYTHONDONTWRITEBYTECODE: '1'
+      run: python3 -m unittest discover -s scripts -p 'test_vm*.py'
+
   static-checks:
     name: Static checks and frontend tests
     runs-on: windows-2022
@@ -36,6 +57,14 @@ jobs:
     - uses: actions/checkout@v4
       with:
         submodules: recursive
+
+    - name: Test optional Swift runtime cache
+      shell: powershell
+      run: ./scripts/test_vm_swift_runtime.ps1
+
+    - name: Test guest installer completion boundaries without installing
+      shell: powershell
+      run: ./scripts/test_vm_guest_install.ps1
 
     - name: Install pinned Rust toolchain
       run: |
@@ -185,6 +214,7 @@ jobs:
 
   build:
     needs:
+    - vm-tools-tests
     - static-checks
     - windows-tests
     runs-on: windows-2022
