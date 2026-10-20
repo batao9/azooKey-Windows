@@ -36,6 +36,7 @@ python3 scripts/vm.py --profile manual stage .local/artifacts/<exact-installer>.
 ```
 
 `stage` / `install` は同じ入口。隣の `<installer>.build-info.json` または `build-info.json` が必須。`latest` という曖昧な成果物識別子ではなく、ビルド結果の具体的なファイルを渡す。SHA256で転送物を検証し、インストール後の version / channel / revision / installerGeneration を照合する。このidentityは検証時の版であり、終了後に復元したベースの版とは区別する。
+ファイル・metadata・identity・SHA256のローカル事前検査は、VMのクリーン開始より先に行う。不正な成果物では、開いているセッションを復元・破棄しない。
 
 ローカルの旧入口 `.local/vm_build_master.sh`、`.local/vm_test_client_composition.sh`、`.local/vm_stage_for_manual_test.sh` は互換ラッパー。公開build/test helperはcontrollerから呼ぶ。`VM_LIFECYCLE_EXTERNAL=1`では前後の復元・異常時停止をcontrollerだけが所有し、helper側のrestoreフラグは0にして二重操作を防ぐ。
 
@@ -116,6 +117,7 @@ installの既知の事前検証・終了済みinstallerの失敗も予約を解�
 
 1. 現行snapshotのUUIDと現在状態を記録。作業中の別ユーザー/agentがいないことを確認する。
 2. build VMは`prepare`、手動VMは`start --keep-current`で明示的な保守セッションを開始する。必要な限定的保守を`exec --script`で行う。証明書検証は無効化しない。
+   `prepare`が継続するのは既存の保守セッションだけ。通常の検証セッションからはベースへ戻して開始し、インストール済み試験データを新baselineへ持ち込まない。
 3. `prepare`でクリーンな保守セッションを開始し、後続のdoctor/execで変更を保持して確認する。cold boot確認には`reboot`または`shutdown --keep-current`→`start --keep-current`を使う。ベース捕捉前の停止も`shutdown --keep-current`を使う（通常のshutdown/startはベースへ戻す）。保存メモリ再開だけを合格にしない。
 4. 手動VMのベースへ入れる版・設定を明示して準備し、`shutdown --keep-current`。通常の試験データやデバッグ起動をbaselineへ混入させない。
 5. `snapshot <new-name>` でpowered-off baselineを追加し、旧baselineは残す。新しいUUIDを記録する。

@@ -254,6 +254,13 @@ class VmTests(unittest.TestCase):
 
     def lifecycle_command(self, arguments, pending=None, failure=None, real_dispatch=False,
                           failure_pending=None, clear_before_failure=False):
+        arguments = list(arguments)
+        if arguments[0] in ('stage', 'install') and arguments[1] == 'fixture.exe':
+            installer = self.root / 'fixture.exe'
+            installer.write_bytes(b'installer fixture')
+            installer.with_suffix('.build-info.json').write_text(json.dumps(dict(
+                version='test-version', channel='validation', revision='test-sha', installerGeneration=2)))
+            arguments[1] = str(installer)
         locks = self.root / '.cache/azookey-vm-locks'
         with vm.ownership(self.profile, locks, allow_pending=True) as reservation:
             if pending:
@@ -344,6 +351,50 @@ class VmTests(unittest.TestCase):
             self.assertEqual(events, [args[0]])
             session = json.loads(reservation.read_text())
             self.assertEqual(session['mode'], 'maintenance')
+
+    def test_prepare_continues_only_an_existing_maintenance_session(self):
+        for mode in ('verification', 'maintenance'):
+            with self.subTest(mode=mode):
+                pending = {'operation': 'session', 'workspace': str(self.root), 'mode': mode}
+                code, _, reservation, events = self.lifecycle_command(['prepare'], pending)
+                self.assertEqual(code, 0)
+                self.assertEqual(events, ['prepare'] if mode == 'maintenance' else ['clean start', 'prepare'])
+                self.assertEqual(json.loads(reservation.read_text())['mode'], 'maintenance')
+
+    def test_invalid_local_installer_cannot_reset_or_replace_open_session(self):
+        for command in ('stage', 'install'):
+            for mode in ('verification', 'maintenance'):
+                for case in ('missing_installer', 'missing_metadata', 'bad_json', 'missing_identity', 'non_object', 'invalid_fields', 'invalid_generation'):
+                    with self.subTest(command=command, mode=mode, case=case):
+                        installer = self.root / (case + '.exe')
+                        if case != 'missing_installer':
+                            installer.write_bytes(b'installer fixture')
+                        if case not in ('missing_installer', 'missing_metadata'):
+                            metadata = {
+                                'bad_json': '{', 'missing_identity': '{}', 'non_object': 'null',
+                                'invalid_fields': '{"version":null,"channel":"validation","revision":"test-sha","installerGeneration":2}',
+                                'invalid_generation': '{"version":"test-version","channel":"validation","revision":"test-sha","installerGeneration":"2"}',
+                            }[case]
+                            installer.with_suffix('.build-info.json').write_text(metadata)
+                        pending = {'operation': 'session', 'workspace': str(self.root), 'mode': mode}
+                        code, result, reservation, events = self.lifecycle_command([command, str(installer)], pending)
+                        self.assertEqual(code, 1)
+                        self.assertNotEqual(result['task_status'], 'succeeded')
+                        self.assertEqual(events, [])
+                        self.assertEqual(json.loads(reservation.read_text()), pending)
+
+    def test_installer_hash_read_failure_preserves_open_session(self):
+        installer = self.root / 'unreadable.exe'
+        installer.write_bytes(b'installer fixture')
+        installer.with_suffix('.build-info.json').write_text(json.dumps(dict(
+            version='test-version', channel='validation', revision='test-sha', installerGeneration=2)))
+        pending = {'operation': 'session', 'workspace': str(self.root), 'mode': 'verification'}
+        with patch.object(vm.hashlib, 'file_digest', side_effect=OSError('artifact read failed')):
+            code, result, reservation, events = self.lifecycle_command(['stage', str(installer)], pending)
+        self.assertEqual(code, 1)
+        self.assertIn('artifact read failed', result['error'])
+        self.assertEqual(events, [])
+        self.assertEqual(json.loads(reservation.read_text()), pending)
 
     def test_cli_reboot_keeps_installed_verification_session(self):
         session = {'operation': 'session', 'workspace': str(self.root), 'mode': 'verification'}
@@ -768,6 +819,21 @@ class VmTests(unittest.TestCase):
         with self.assertRaisesRegex(vm.VmError, 'identity'):
             self.machine.stage(installer, False)
         self.machine.start.assert_not_called()
+
+    def test_stage_uses_preflight_identity_and_hash_without_rereading_metadata(self):
+        installer = self.root / 'prepared.exe'
+        installer.write_bytes(b'prepared installer fixture')
+        metadata = installer.with_suffix('.build-info.json')
+        identity = dict(version='test-version', channel='validation', revision='test-sha', installerGeneration=2)
+        metadata.write_text(json.dumps(identity))
+        prepared = vm.installer_artifact(installer)
+        metadata.write_text('no longer valid JSON')
+        self.machine.start = Mock()
+        self.machine.transfer = Mock()
+        self.machine.guest = Mock(return_value={'installed': identity})
+        self.machine.stage(installer, False, prepared=prepared)
+        self.assertEqual(json.loads(self.machine.guest.call_args.kwargs['Expected']), identity)
+        self.assertEqual(self.machine.guest.call_args.kwargs['Sha256'], prepared[2])
 
     def test_stage_reports_identity_before_outer_lifecycle_resets(self):
         installer = self.root / 'setup.exe'

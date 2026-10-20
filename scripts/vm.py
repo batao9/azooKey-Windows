@@ -47,6 +47,29 @@ def load_profile(config, name):
     return profile
 
 
+def installer_artifact(installer):
+    installer = Path(installer).resolve()
+    if not installer.is_file():
+        raise VmError('Installer file not found; select an exact artifact')
+    metadata = installer.with_suffix('.build-info.json')
+    if not metadata.exists():
+        metadata = installer.parent / 'build-info.json'
+    expected = json.loads(metadata.read_text())
+    if not isinstance(expected, dict):
+        raise VmError('Build identity metadata must be a JSON object')
+    for key in ('version', 'channel', 'revision', 'installerGeneration'):
+        if key not in expected:
+            raise VmError(f'Missing build identity: {key}')
+    for key in ('version', 'channel', 'revision'):
+        if not isinstance(expected[key], str) or not expected[key].strip():
+            raise VmError(f'Invalid build identity: {key}')
+    if type(expected['installerGeneration']) is not int or expected['installerGeneration'] < 0:
+        raise VmError('Invalid build identity: installerGeneration')
+    with installer.open('rb') as stream:
+        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    return installer, expected, digest
+
+
 class VM:
     def __init__(self, profile, directory):
         self.p = profile
@@ -476,19 +499,8 @@ class VM:
                    RESTORE_AFTER_TEST='0', PRUNE_ORPHAN_MEDIA_AFTER_RESTORE='0', VM_LIFECYCLE_EXTERNAL='1')
         return env
 
-    def stage(self, installer, leave_running):
-        installer = Path(installer).resolve()
-        if not installer.is_file():
-            raise VmError('Installer file not found; select an exact artifact')
-        metadata = installer.with_suffix('.build-info.json')
-        if not metadata.exists():
-            metadata = installer.parent / 'build-info.json'
-        expected = json.loads(metadata.read_text())
-        for key in ('version', 'channel', 'revision', 'installerGeneration'):
-            if key not in expected:
-                raise VmError(f'Missing build identity: {key}')
-        with installer.open('rb') as stream:
-            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    def stage(self, installer, leave_running, prepared=None):
+        installer, expected, digest = prepared if prepared is not None else installer_artifact(installer)
         self.start()
         remote = self.remote + '\\azookey-install-' + uuid.uuid4().hex + '.exe'
         self.transfer(str(installer), remote)
@@ -687,7 +699,7 @@ def execute(vm, args, result):
     elif cmd in ('stage', 'install'):
         if profile.get('role') not in ('manual', 'disposable'):
             raise VmError('Installation requires a manual or disposable profile')
-        result['guest'] = vm.stage(args.installer, args.leave_running)
+        result['guest'] = vm.stage(args.installer, args.leave_running, prepared=getattr(args, 'installer_artifact', None))
 
 
 def main():
@@ -697,6 +709,10 @@ def main():
     result = {'task_status': 'running', 'profile': args.profile, 'operation': args.command, 'run_id': run_id}
     vm = None
     try:
+        # Validate local inputs before acquiring or resetting the guest. Reuse
+        # the same identity/hash for transfer and installed-identity checks.
+        if args.command in ('stage', 'install'):
+            args.installer_artifact = installer_artifact(args.installer)
         profile = load_profile(args.config, args.profile)
         vm = VM(profile, directory)
         identity = {**profile, 'vm': vm.state()['UUID'] or profile['vm']}
@@ -725,6 +741,8 @@ def main():
             if (preserve or cmd == 'snapshot') and pending and not session:
                 raise VmError('Unresolved guest operation; reset or confirm resolution before preserving current state')
             continuing = session and cmd in ('reboot', 'prepare', 'exec', 'doctor', 'upload', 'download', 'handoff')
+            if cmd == 'prepare' and pending.get('mode') != 'maintenance':
+                continuing = False
             keep = cmd in ('start', 'reboot', 'prepare', 'upload') or (cmd in ('stage', 'install') and args.leave_running) or (continuing and cmd != 'handoff')
             mode = 'maintenance' if cmd in ('prepare', 'snapshot') or preserve else (pending.get('mode', 'verification') if continuing else 'verification')
             vm.session_mode = mode
