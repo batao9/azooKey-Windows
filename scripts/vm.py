@@ -70,6 +70,39 @@ def installer_artifact(installer):
     return installer, expected, digest
 
 
+def script_artifact(source, directory):
+    # Decode before touching even the run directory; PS5.1 needs a UTF-8 BOM.
+    content = Path(source).read_text(encoding='utf-8-sig')
+    token = 'azookey-vm-' + uuid.uuid4().hex
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    normalized = directory / (token + '.ps1')
+    normalized.write_text(content, encoding='utf-8-sig')
+    return token, normalized
+
+
+def transfer_artifact(source, destination, download=False):
+    remote = source if download else destination
+    if not re.match(r'^[A-Za-z]:[\\/]', remote):
+        raise VmError('Remote transfer path must be an absolute Windows path')
+    remote = '/' + remote.replace('\\', '/')
+    local = Path(destination if download else source).resolve()
+    if download:
+        local.parent.mkdir(parents=True, exist_ok=True)
+    elif not local.is_file():
+        raise VmError(f'Upload source does not exist: {local}')
+    return str(local), remote
+
+
+def validate_command_profile(profile, command):
+    if command == 'prepare' and profile.get('role') != 'build':
+        raise VmError('Toolchain preparation requires a build profile')
+    if command in ('build', 'test') and profile.get('role') != 'build':
+        raise VmError('Build/test commands require a build profile')
+    if command in ('stage', 'install') and profile.get('role') not in ('manual', 'disposable'):
+        raise VmError('Installation requires a manual or disposable profile')
+
+
 class VM:
     def __init__(self, profile, directory):
         self.p = profile
@@ -258,8 +291,14 @@ class VM:
             time.sleep(2)
         raise VmError('SSH readiness deadline exceeded; managed run will reset the baseline')
 
-    def start(self, gui=False):
+    def start(self, gui=False, cold=False):
         state = self.state()['VMState']
+        if cold and state == 'saved':
+            self.begin_operation('start_current', discarded_saved_state=True)
+            self.vbox('discardstate', self.p['vm'])
+            state = self.state()['VMState']
+            if state != 'poweroff':
+                raise VmError('Saved memory discard is unconfirmed; current disk preserved', uncertain=True)
         if state in ('poweroff', 'saved', 'aborted'):
             self.vbox('startvm', self.p['vm'], '--type', 'gui' if gui else 'headless')
         elif state != 'running':
@@ -395,31 +434,19 @@ class VM:
     def recover_poweroff(self, reason):
         return self.reset(reason)
 
-    def transfer(self, source, destination, download=False, timeout=120):
+    def transfer(self, source, destination, download=False, timeout=120, prepared=None):
         # OpenSSH Windows accepts /C:/... paths; no remote shell quoting or relative ambiguity.
-        remote = source if download else destination
-        if not re.match(r'^[A-Za-z]:[\\/]', remote):
-            raise VmError('Remote transfer path must be an absolute Windows path')
-        remote = '/' + remote.replace('\\', '/')
+        local, remote = prepared if prepared is not None else transfer_artifact(source, destination, download)
         endpoint = f'{self.p["user"]}@{self.p["host"]}:{remote}'
-        local = str(Path(destination if download else source).resolve())
-        if download:
-            Path(local).parent.mkdir(parents=True, exist_ok=True)
-        elif not Path(local).is_file():
-            raise VmError(f'Upload source does not exist: {local}')
         argv = ['scp', '-i', self.p['key'], '-P', str(self.p['port']), '-o', 'BatchMode=yes',
                 '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=5',
                 '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2']
         self.run(argv + ([endpoint, local] if download else [local, endpoint]),
                  timeout=timeout, idle_timeout=timeout)
 
-    def script(self, source, arguments=None, interactive=False, timeout=120, hold_pending=False):
-        token = 'azookey-vm-' + uuid.uuid4().hex
+    def script(self, source, arguments=None, interactive=False, timeout=120, hold_pending=False, prepared=None):
+        token, normalized = prepared if prepared is not None else script_artifact(source, self.directory)
         remote = self.remote + '\\' + token + '.ps1'
-        # Windows PowerShell 5.1 reads BOM-less scripts using the ANSI code page.
-        # Validate UTF-8 before touching the guest and upload an explicit UTF-8 BOM.
-        normalized = self.directory / (token + '.ps1')
-        normalized.write_text(Path(source).read_text(encoding='utf-8-sig'), encoding='utf-8-sig')
         self.start()
         self.transfer(str(normalized), remote)
         # PowerShell parameters are quoted as data; not concatenated shell syntax.
@@ -603,8 +630,9 @@ def parser():
 
 def execute(vm, args, result):
     profile, cmd = vm.p, args.command
+    validate_command_profile(profile, cmd)
     if cmd == 'start':
-        vm.start(args.gui)
+        vm.start(args.gui, cold=args.keep_current)
     elif cmd == 'reboot':
         vm.shutdown_current()
         vm.begin_operation('reboot')
@@ -649,8 +677,6 @@ def execute(vm, args, result):
         vm.vbox('storageattach', profile['vm'], '--storagectl', args.controller,
                 '--port', str(args.port), '--device', str(args.device), '--type', 'dvddrive', '--medium', 'none')
     elif cmd in ('doctor', 'prepare'):
-        if cmd == 'prepare' and profile.get('role') != 'build':
-            raise VmError('Toolchain preparation requires a build profile')
         import tomllib
         pin = tomllib.loads((ROOT / 'rust-toolchain.toml').read_text())['toolchain']['channel']
         result['guest'] = vm.guest(cmd, RustVersion=pin, HostUtc=dt.datetime.now(dt.timezone.utc).isoformat())
@@ -673,12 +699,11 @@ def execute(vm, args, result):
         result['screenshot'] = str(target)
     elif cmd in ('upload', 'download'):
         vm.start()
-        vm.transfer(args.source, args.destination, cmd == 'download')
+        vm.transfer(args.source, args.destination, cmd == 'download', prepared=getattr(args, 'transfer_artifact', None))
     elif cmd == 'exec':
-        result['output'] = vm.script(Path(args.script).resolve(), interactive=args.interactive, timeout=args.timeout)
+        result['output'] = vm.script(Path(args.script).resolve(), interactive=args.interactive, timeout=args.timeout,
+                                     prepared=getattr(args, 'script_artifact', None))
     elif cmd in ('build', 'test'):
-        if profile.get('role') != 'build':
-            raise VmError('Build/test commands require a build profile')
         vm.start()
         command = ['bash', str(ROOT / 'scripts' / ('vm_build.sh' if cmd == 'build' else 'vm_test_client_composition.sh')), args.branch]
         if cmd == 'test':
@@ -697,8 +722,6 @@ def execute(vm, args, result):
             result['artifact'] = {'installer': str(installer), 'sha256': digest,
                                   'build_info': json.loads(metadata.read_text())}
     elif cmd in ('stage', 'install'):
-        if profile.get('role') not in ('manual', 'disposable'):
-            raise VmError('Installation requires a manual or disposable profile')
         result['guest'] = vm.stage(args.installer, args.leave_running, prepared=getattr(args, 'installer_artifact', None))
 
 
@@ -713,7 +736,12 @@ def main():
         # the same identity/hash for transfer and installed-identity checks.
         if args.command in ('stage', 'install'):
             args.installer_artifact = installer_artifact(args.installer)
+        if args.command == 'exec':
+            args.script_artifact = script_artifact(args.script, directory)
+        if args.command in ('upload', 'download'):
+            args.transfer_artifact = transfer_artifact(args.source, args.destination, args.command == 'download')
         profile = load_profile(args.config, args.profile)
+        validate_command_profile(profile, args.command)
         vm = VM(profile, directory)
         identity = {**profile, 'vm': vm.state()['UUID'] or profile['vm']}
         lock = contextlib.nullcontext() if args.command == 'status' else ownership(

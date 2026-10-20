@@ -19,7 +19,7 @@ Python 3.11以降、OpenSSH、VirtualBox CLI を使う Linux/WSL ホスト用。
 `scripts/vm-config.example.json` を参考に **`.local/vm.json`** を作る。
 鍵は秘密の内容ではなくパスを指定する。VM識別子は名前よりUUIDを推奨する。
 ホスト、ポート、Windowsユーザー、鍵、VBoxManageのパス、baseline名はこのローカルファイルだけに置く。
-`build` / `manual`は役割のprofile名で、VirtualBox上の表示名ではない。`vm`にUUIDを使えば、VM表示名の変更で公開scriptやprofile役割名を変更する必要はない。実際の表示名とsnapshot一覧・検証結果はローカルのinventory/reportに記録する。
+`build` / `manual`は役割のprofile名で、VirtualBox上の表示名ではない。`vm`にUUIDを使えば、VM表示名の変更で公開scriptやprofile役割名を変更する必要はない。実際の表示名とsnapshot一覧・検証結果はローカルのinventory/reportに記録する。commandとprofile役割の適合はVM操作より前に確認し、実行不能な組み合わせでは既存セッションを変更しない。
 設定例のVM/snapshot識別子はプレースホルダーであり、実際の値は公開しない。ゲストに既存の依存・辞書キャッシュを使う場合は、build profileの`guest_cache_root`へそのWindows絶対パスを設定する。省略時はゲストの`LOCALAPPDATA`配下の`Azookey\vm-cache`を使う。controllerはこの設定をhelperへ渡すため、キャッシュ用cloneの実パスを公開スクリプトへ埋め込まない。
 キャッシュは事前作成必須ではない。Swift testのCPU runtimeがキャッシュにも転送sourceにもない場合は、固定版をその実行のsource treeへ取得し、linkとtest runnerの両方で同じruntimeを使う。既存の外部キャッシュは書き換えない。
 buildとSwift testは共通のruntime helperを使い、固定版packageの依存DLLを含めて検証する。buildは検証済みruntimeをpackaging treeへ配置するため、不完全なcache/sourceをそのままinstallerへ取り込まない。
@@ -52,7 +52,7 @@ python3 scripts/vm.py --profile manual stage .local/artifacts/<exact-installer>.
 | セッション終了 | `shutdown` | 短い通常停止猶予の後、必要なら強制停止しベースへ復元 |
 | 即時リセット | `reset` | SSHなしで強制停止／保存メモリ破棄→ベース復元→poweroff確認。別worktreeの待機中セッションを意図的に破棄する場合だけ`--discard-session` |
 | 保守用停止 | `shutdown --keep-current` | Windowsに通常停止を一度要求して最大120秒観測。未確認なら現ディスク・予約を保持 |
-| 保守用cold boot | `start --keep-current` | 明示的に現ディスクから起動し、保守セッションを継続 |
+| 保守用cold boot | `start --keep-current` | 現ディスクを保持して起動。savedの場合は保存メモリだけを破棄してcold boot |
 | 環境診断 | `doctor` | 必要なら起動し、Rust/Swift/Node/VS/電源設定を報告 |
 | build環境準備 | `prepare` | 明示的な保守セッションでRust pin等を導入。後続のdoctor/execも変更を保持 |
 | セッション内cold boot | `reboot` | 検証／保守セッションのインストール・変更を保持して再起動 |
@@ -74,6 +74,8 @@ python3 scripts/vm.py --profile manual stage .local/artifacts/<exact-installer>.
 
 PowerShellスクリプトは native command の `$LASTEXITCODE` を確認し、失敗を明示して終了する。GUI taskにはログオンセッションが必要。通常のSSHプロセスのWindowHandleやクリップボードを、ユーザーの実画面の証拠にしない。
 `exec --script` の入力はUTF-8（BOMは任意）。controllerはWindows PowerShell 5.1で日本語リテラルを保持するため、BOM付きUTF-8へ正規化して転送する。
+読み込み・UTF-8検証・BOM付きコピーの作成はlifecycleより前に行い、そのコピーを転送する。欠落・不正encodingなどのローカル入力エラーでは、開いている検証セッションを復元しない。
+upload/downloadの絶対パス構文・ローカル入出力先もlifecycleより前に検査する。転送元の欠落や出力先directoryの作成失敗で既存セッションを破棄しない。
 
 ## ネイティブUI / IME検証
 
