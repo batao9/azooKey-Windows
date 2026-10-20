@@ -67,8 +67,8 @@ REMOTE_PS_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-vm-build.ps1"
 REMOTE_ART_SCP="/C:/work/artifacts/azookey-setup.exe"
 REMOTE_BUILD_INFO_SCP="/C:/work/artifacts/build-info.json"
 
-SSH_OPTS=(-i "$SSH_KEY" -p "$SSH_PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8)
-SCP_OPTS=(-i "$SSH_KEY" -P "$SSH_PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8)
+SSH_OPTS=(-i "$SSH_KEY" -p "$SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=2)
+SCP_OPTS=(-i "$SSH_KEY" -P "$SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=2)
 
 TMP_SRC_ARCHIVE=""
 TMP_REMOTE_PS=""
@@ -153,7 +153,7 @@ wait_for_ssh() {
     local host
     for host in "${hosts[@]}"; do
       # sshd 起動直後の banner 待ちでハングしないよう 1 試行ごとに上限時間を設ける。
-      if timeout 10s ssh "${SSH_OPTS[@]}" "$SSH_USER@$host" "echo ready" >/dev/null 2>&1; then
+      if timeout --foreground 10s ssh "${SSH_OPTS[@]}" "$SSH_USER@$host" "echo ready" >/dev/null 2>&1; then
         ACTIVE_HOST="$host"
         log "SSH 接続確認: OK (host=$ACTIVE_HOST, try $i/$tries)"
         return 0
