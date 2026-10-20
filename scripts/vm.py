@@ -438,11 +438,27 @@ class VM:
         # OpenSSH Windows accepts /C:/... paths; no remote shell quoting or relative ambiguity.
         local, remote = prepared if prepared is not None else transfer_artifact(source, destination, download)
         endpoint = f'{self.p["user"]}@{self.p["host"]}:{remote}'
+        previous = self.reservation.read_bytes() if self.reservation is not None and self.reservation.exists() else None
+        self.begin_operation('download' if download else 'upload', local_file=local, remote_file=remote)
+        def completed():
+            if previous is None:
+                self.finish_operation()
+            else:
+                temporary = self.reservation.with_suffix('.tmp')
+                temporary.write_bytes(previous)
+                temporary.replace(self.reservation)
         argv = ['scp', '-i', self.p['key'], '-P', str(self.p['port']), '-o', 'BatchMode=yes',
                 '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=5',
                 '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2']
-        self.run(argv + ([endpoint, local] if download else [local, endpoint]),
-                 timeout=timeout, idle_timeout=timeout)
+        try:
+            self.run(argv + ([endpoint, local] if download else [local, endpoint]),
+                     timeout=timeout, idle_timeout=timeout)
+        except VmError as error:
+            if not error.uncertain:
+                completed()
+            raise
+        else:
+            completed()
 
     def script(self, source, arguments=None, interactive=False, timeout=120, hold_pending=False, prepared=None):
         token, normalized = prepared if prepared is not None else script_artifact(source, self.directory)

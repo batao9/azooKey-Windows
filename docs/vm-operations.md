@@ -76,6 +76,7 @@ PowerShellスクリプトは native command の `$LASTEXITCODE` を確認し、�
 `exec --script` の入力はUTF-8（BOMは任意）。controllerはWindows PowerShell 5.1で日本語リテラルを保持するため、BOM付きUTF-8へ正規化して転送する。
 読み込み・UTF-8検証・BOM付きコピーの作成はlifecycleより前に行い、そのコピーを転送する。欠落・不正encodingなどのローカル入力エラーでは、開いている検証セッションを復元しない。
 upload/downloadの絶対パス構文・ローカル入出力先もlifecycleより前に検査する。転送元の欠落や出力先directoryの作成失敗で既存セッションを破棄しない。
+SCP起動前には転送方向と対象ファイルを予約へ記録する。正常終了または確定済みの失敗なら元の予約へ戻すが、timeout・中断・不明なI/O失敗は転送予約を保持する。保守中は次のexec/doctorで途中のファイルを使わず、完了と内容を点検してから解決する。
 
 ## ネイティブUI / IME検証
 

@@ -988,9 +988,16 @@ class VmTests(unittest.TestCase):
                         'print(p.pid,flush=True)\n'
                         'time.sleep(60)\n')
         stub.chmod(0o755)
-        with patch.dict(os.environ, {'PATH': str(bin_dir) + os.pathsep + os.environ['PATH']}):
-            with self.assertRaises(vm.VmError) as caught:
-                self.machine.transfer(str(self.key), r'C:\fixture.bin', timeout=0.5)
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            self.machine.session_mode = 'maintenance'
+            self.machine.begin_operation('session')
+            with patch.dict(os.environ, {'PATH': str(bin_dir) + os.pathsep + os.environ['PATH']}):
+                with self.assertRaises(vm.VmError) as caught:
+                    self.machine.transfer(str(self.key), r'C:\fixture.bin', timeout=0.5)
+            pending = json.loads(reservation.read_text())
+            self.assertEqual(pending['operation'], 'upload')
+            self.assertEqual(pending['mode'], 'maintenance')
         self.assertTrue(caught.exception.uncertain)
         child_pid = next(line for line in self.machine.log.read_text().splitlines() if line.isdecimal())
         proc_stat = Path('/proc') / child_pid / 'stat'
@@ -1013,6 +1020,53 @@ class VmTests(unittest.TestCase):
         with self.assertRaisesRegex(vm.VmError, 'absolute Windows path'):
             self.machine.transfer(str(self.key), 'relative.txt')
         self.machine.run.assert_not_called()
+
+    def test_uncertain_transfer_retains_operation_and_blocks_maintenance_continuation(self):
+        for download in (False, True):
+            for failure in (vm.VmError('SCP timeout', uncertain=True), KeyboardInterrupt('interrupted'), OSError('transfer IO failed')):
+                with self.subTest(download=download, failure=failure):
+                    self.machine.session_mode = 'maintenance'
+                    self.machine.run = Mock(side_effect=failure)
+                    source, target = ((r'C:\source.bin', str(self.root / 'download.bin')) if download
+                                      else (str(self.key), r'C:\target.bin'))
+                    with vm.ownership(self.profile, self.root / 'locks', allow_pending=True) as reservation:
+                        self.machine.reservation = reservation
+                        with patch.object(vm, 'ROOT', self.root):
+                            self.machine.begin_operation('session', purpose='kept maintenance')
+                            with self.assertRaises(type(failure)):
+                                self.machine.transfer(source, target, download=download)
+                        pending = json.loads(reservation.read_text())
+                        self.assertEqual(pending['operation'], 'download' if download else 'upload')
+                        self.assertEqual(pending['mode'], 'maintenance')
+                        self.assertIn('remote_file', pending)
+                    code, result, next_reservation, events = self.lifecycle_command(['exec', '--script', 'probe.ps1'], pending)
+                    self.assertEqual(code, 1)
+                    self.assertIn('Unresolved maintenance operation', result['error'])
+                    self.assertEqual(events, [])
+                    self.assertEqual(json.loads(next_reservation.read_text()), pending)
+
+    def test_completed_transfer_restores_enclosing_operation_exactly(self):
+        for failure in (None, vm.VmError('SCP rejected path', 'failed')):
+            with self.subTest(failure=failure):
+                self.machine.session_mode = 'maintenance'
+                self.machine.run = Mock(side_effect=failure, return_value=0)
+                with vm.ownership(self.profile, self.root / 'locks', allow_pending=True) as reservation:
+                    self.machine.reservation = reservation
+                    self.machine.begin_operation('session', purpose='enclosing operation')
+                    previous = reservation.read_bytes()
+                    if failure:
+                        with self.assertRaises(vm.VmError):
+                            self.machine.transfer(str(self.key), r'C:\target.bin')
+                    else:
+                        self.machine.transfer(str(self.key), r'C:\target.bin')
+                    self.assertEqual(reservation.read_bytes(), previous)
+
+    def test_transfer_without_enclosing_operation_releases_only_after_success(self):
+        self.machine.run = Mock(return_value=0)
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            self.machine.transfer(str(self.key), r'C:\target.bin')
+            self.assertFalse(reservation.exists())
 
 
 if __name__ == '__main__':
