@@ -72,14 +72,20 @@ SSH_OPTS=(
   -p "$SSH_PORT"
   -o "UserKnownHostsFile=$SESSION_KNOWN_HOSTS"
   -o StrictHostKeyChecking=accept-new
-  -o ConnectTimeout=8
+  -o BatchMode=yes
+  -o ConnectTimeout=5
+  -o ServerAliveInterval=5
+  -o ServerAliveCountMax=2
 )
 SCP_OPTS=(
   -i "$SSH_KEY"
   -P "$SSH_PORT"
   -o "UserKnownHostsFile=$SESSION_KNOWN_HOSTS"
   -o StrictHostKeyChecking=accept-new
-  -o ConnectTimeout=8
+  -o BatchMode=yes
+  -o ConnectTimeout=5
+  -o ServerAliveInterval=5
+  -o ServerAliveCountMax=2
 )
 
 log() {
@@ -152,7 +158,7 @@ wait_for_ssh() {
   for ((i=1; i<=tries; i++)); do
     local host
     for host in "${hosts[@]}"; do
-      if timeout 10s ssh "${SSH_OPTS[@]}" "$SSH_USER@$host" "echo ready" >/dev/null 2>&1; then
+      if timeout --foreground 10s ssh "${SSH_OPTS[@]}" "$SSH_USER@$host" "echo ready" >/dev/null 2>&1; then
         ACTIVE_HOST="$host"
         log "SSH 接続確認: OK (host=$ACTIVE_HOST, try $i/$tries)"
         return 0

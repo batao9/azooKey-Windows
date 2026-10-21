@@ -83,28 +83,23 @@ REMOTE_TAR_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-src.tar.gz"
 REMOTE_PS_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-vm-client-test.ps1"
 REMOTE_SWIFT_VENDOR_TAR_SCP="/C:/Users/$SSH_USER/AppData/Local/Temp/azookey-swift-vendor.tar.gz"
 
-SSH_CONTROL_PATH="/tmp/vm-client-test-$TIMESTAMP-%C"
 SSH_OPTS=(
   -i "$SSH_KEY"
   -p "$SSH_PORT"
   -o StrictHostKeyChecking=accept-new
-  -o ConnectTimeout=8
+  -o BatchMode=yes
+  -o ConnectTimeout=5
   -o ServerAliveInterval=5
-  -o ServerAliveCountMax=4
-  -o ControlMaster=auto
-  -o ControlPersist=600
-  -o "ControlPath=$SSH_CONTROL_PATH"
+  -o ServerAliveCountMax=2
 )
 SCP_OPTS=(
   -i "$SSH_KEY"
   -P "$SSH_PORT"
   -o StrictHostKeyChecking=accept-new
-  -o ConnectTimeout=8
+  -o BatchMode=yes
+  -o ConnectTimeout=5
   -o ServerAliveInterval=5
-  -o ServerAliveCountMax=4
-  -o ControlMaster=auto
-  -o ControlPersist=600
-  -o "ControlPath=$SSH_CONTROL_PATH"
+  -o ServerAliveCountMax=2
 )
 
 TMP_SRC_ARCHIVE=""
@@ -171,17 +166,17 @@ prune_orphan_media_after_restore() {
 }
 
 ssh_run() {
-  timeout "${SSH_COMMAND_TIMEOUT_SEC}s" \
+  timeout --foreground "${SSH_COMMAND_TIMEOUT_SEC}s" \
     ssh "${SSH_OPTS[@]}" "$SSH_USER@$ACTIVE_HOST" "$@"
 }
 
 ssh_run_test() {
-  timeout "${SSH_TEST_TIMEOUT_SEC}s" \
+  timeout --foreground "${SSH_TEST_TIMEOUT_SEC}s" \
     ssh "${SSH_OPTS[@]}" "$SSH_USER@$ACTIVE_HOST" "$@"
 }
 
 scp_to_vm() {
-  timeout "${SCP_COMMAND_TIMEOUT_SEC}s" \
+  timeout --foreground "${SCP_COMMAND_TIMEOUT_SEC}s" \
     scp "${SCP_OPTS[@]}" "$1" "$SSH_USER@$ACTIVE_HOST:$2"
 }
 
@@ -195,7 +190,7 @@ wait_for_ssh() {
   for ((i=1; i<=tries; i++)); do
     local host
     for host in "${hosts[@]}"; do
-      if timeout "${SSH_READY_TIMEOUT_SEC}s" \
+      if timeout --foreground "${SSH_READY_TIMEOUT_SEC}s" \
         ssh "${SSH_OPTS[@]}" "$SSH_USER@$host" "echo ready" >/dev/null 2>&1; then
         ACTIVE_HOST="$host"
         log "SSH 接続確認: OK (host=$ACTIVE_HOST, try $i/$tries)"

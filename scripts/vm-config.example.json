@@ -4,8 +4,10 @@
     "host": "127.0.0.1",
     "user": "windows-user",
     "key": "~/.ssh/vm-key",
-    "ready_timeout": 180,
-    "shutdown_timeout": 180
+    "ready_timeout": 90,
+    "shutdown_timeout": 10,
+    "maintenance_shutdown_timeout": 120,
+    "idle_timeout": 120
   },
   "profiles": {
     "build": {"role": "build", "vm": "<BUILD_VM_UUID>", "port": 2222, "snapshot": "<BUILD_SNAPSHOT_UUID>"},

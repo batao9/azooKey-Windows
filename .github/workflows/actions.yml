@@ -42,7 +42,10 @@ jobs:
         python-version: '3.11'
 
     - name: Check VM helper syntax
-      run: bash -n scripts/vm_build.sh scripts/vm_test_client_composition.sh scripts/vm_stage_for_manual_test.sh
+      run: |
+        bash -n scripts/vm_build.sh
+        bash -n scripts/vm_test_client_composition.sh
+        bash -n scripts/vm_stage_for_manual_test.sh
 
     - name: Run VM tooling regression tests without a guest
       env:

@@ -166,13 +166,15 @@ python3 scripts/vm.py --profile build test <branch> composition skip
 # 検証用 VM にインストーラーをサイレントインストール
 python3 scripts/vm.py --profile manual stage <exact-installer-path>
 
-# ネイティブ UI を確認してから通常終了
+# ネイティブ UI を確認してからベースへ復元して終了
 python3 scripts/vm.py --profile manual stage <exact-installer-path> --leave-running
 python3 scripts/vm.py --profile manual exec --script <ui-probe.ps1> --interactive
 python3 scripts/vm.py --profile manual handoff
 ```
 
-通常の検証は現在のディスクで行い、検証した版をインストールしたまま通常シャットダウンします。snapshot の復元、保存状態破棄、アンインストール、baseline 更新は明示的な保守・破壊的試験として扱い、暗黙の後処理にしません。同じ VM へのコマンドは状態確認も含め順次実行します。ログと結果は `.local/logs/vm/` に保存されます。個別の試験や最終状態の指定は VM 運用手順に従ってください。
+ビルド・検証は毎回、profileに指定したベーススナップショットへ復元してから開始します。成果物・ログ・画面をホストへ回収し、終了後もベースへ復元して電源offにします。VM内の変更は使い捨てです。インストール後のUI確認は `--leave-running` から `handoff` までを一つのセッションとして継続できます。通常の検証中にVM停止・SSH切断・進捗停止が起きた場合は、長時間待ち続けず失敗を記録して強制停止・復元します。
+
+Windows Updateやbaseline作成の保守は、`start --keep-current` / `prepare` で明示して行います。このセッションでは失敗時も現在のディスクと未解決操作を保持し、`shutdown --keep-current` / `handoff` は通常停止だけを行います。保存・復元確認後にローカルのsnapshot参照を更新します。`build` / `manual` は役割名で、VMの表示名とは別です。UUIDで設定しておけば表示名の変更で公開コードを変える必要はありません。同じVMへのコマンドは状態確認も含め順次実行し、ログと結果は `.local/logs/vm/` に保存します。
 
 # 関連
 

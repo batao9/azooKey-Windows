@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -46,6 +47,62 @@ def load_profile(config, name):
     return profile
 
 
+def installer_artifact(installer):
+    installer = Path(installer).resolve()
+    if not installer.is_file():
+        raise VmError('Installer file not found; select an exact artifact')
+    metadata = installer.with_suffix('.build-info.json')
+    if not metadata.exists():
+        metadata = installer.parent / 'build-info.json'
+    expected = json.loads(metadata.read_text())
+    if not isinstance(expected, dict):
+        raise VmError('Build identity metadata must be a JSON object')
+    for key in ('version', 'channel', 'revision', 'installerGeneration'):
+        if key not in expected:
+            raise VmError(f'Missing build identity: {key}')
+    for key in ('version', 'channel', 'revision'):
+        if not isinstance(expected[key], str) or not expected[key].strip():
+            raise VmError(f'Invalid build identity: {key}')
+    if type(expected['installerGeneration']) is not int or expected['installerGeneration'] < 0:
+        raise VmError('Invalid build identity: installerGeneration')
+    with installer.open('rb') as stream:
+        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    return installer, expected, digest
+
+
+def script_artifact(source, directory):
+    # Decode before touching even the run directory; PS5.1 needs a UTF-8 BOM.
+    content = Path(source).read_text(encoding='utf-8-sig')
+    token = 'azookey-vm-' + uuid.uuid4().hex
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    normalized = directory / (token + '.ps1')
+    normalized.write_text(content, encoding='utf-8-sig')
+    return token, normalized
+
+
+def transfer_artifact(source, destination, download=False):
+    remote = source if download else destination
+    if not re.match(r'^[A-Za-z]:[\\/]', remote):
+        raise VmError('Remote transfer path must be an absolute Windows path')
+    remote = '/' + remote.replace('\\', '/')
+    local = Path(destination if download else source).resolve()
+    if download:
+        local.parent.mkdir(parents=True, exist_ok=True)
+    elif not local.is_file():
+        raise VmError(f'Upload source does not exist: {local}')
+    return str(local), remote
+
+
+def validate_command_profile(profile, command):
+    if command == 'prepare' and profile.get('role') != 'build':
+        raise VmError('Toolchain preparation requires a build profile')
+    if command in ('build', 'test') and profile.get('role') != 'build':
+        raise VmError('Build/test commands require a build profile')
+    if command in ('stage', 'install') and profile.get('role') not in ('manual', 'disposable'):
+        raise VmError('Installation requires a manual or disposable profile')
+
+
 class VM:
     def __init__(self, profile, directory):
         self.p = profile
@@ -55,10 +112,14 @@ class VM:
         self.remote = rf'C:\Users\{profile["user"]}\AppData\Local\Temp'
         self.commands = []
         self.reservation = None
+        self.resets = []
+        self.evidence = []
+        self.session_mode = 'verification'
 
     def begin_operation(self, operation, **details):
         if self.reservation is not None:
-            value = {'operation': operation, 'run_directory': str(self.directory), **details}
+            value = {'operation': operation, 'run_directory': str(self.directory),
+                     'workspace': str(ROOT), 'mode': self.session_mode, **details}
             temporary = self.reservation.with_suffix('.tmp')
             temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n')
             temporary.replace(self.reservation)
@@ -72,12 +133,17 @@ class VM:
         value = {'pending': pending}
         state = self.state()['VMState']
         if state == 'running':
+            tasks = '$t=@(); '
+            if pending and pending.get('task'):
+                tasks = (f"try {{ $t=@(Get-ScheduledTask -TaskName {ps_quote(pending['task'])} -ErrorAction Stop | "
+                         "Where-Object {$_.State -in @('Running','Queued')} | Select-Object TaskName,State) } "
+                         "catch { if($_.CategoryInfo.Category -eq [Management.Automation.ErrorCategory]::ObjectNotFound){$t=@()}else{throw} }; ")
             value['guest'] = json.loads(self.ps(
                 "$p=@(Get-Process -ErrorAction SilentlyContinue | Where-Object {"
                 "$_.Id -ne $PID -and $_.ProcessName -match '^(cargo(-.*)?|rustc|rustup|swift.*|node|msbuild|cl|link|powershell|pwsh|azookey-install-.*|setup.*)$'"
                 "} | Select-Object ProcessName,Id,Path,StartTime); "
-                "$t=@(Get-ScheduledTask | Where-Object {$_.TaskName -like 'azookey-vm-*' -and $_.State -eq 'Running'} | Select-Object TaskName,State); "
-                "@{processes=$p;running_tasks=$t} | ConvertTo-Json -Depth 4 -Compress").lstrip('\ufeff'))
+                + tasks + "@{processes=$p;running_tasks=$t} | ConvertTo-Json -Depth 4 -Compress",
+                timeout=30 if pending and pending.get('task') else 15).lstrip('\ufeff'))
         elif state != 'poweroff':
             raise VmError(f'Cannot inspect unresolved guest work during VM state {state}')
         return value
@@ -86,26 +152,49 @@ class VM:
         query = (f"try {{ $t=Get-ScheduledTask -TaskName {ps_quote(token)} -ErrorAction Stop; [string]$t.State }} "
                  "catch { if($_.CategoryInfo.Category -eq [Management.Automation.ErrorCategory]::ObjectNotFound){'absent'}else{throw} }")
         try:
-            state = self.ps(query).lstrip('\ufeff').strip().lower()
+            state = self.ps(query, timeout=30).lstrip('\ufeff').strip().lower()
             if state == 'absent':
                 return
             if state not in ('ready', 'disabled'):
                 raise VmError('Interactive task may still start or run', uncertain=True)
-            self.ps(f"Unregister-ScheduledTask -TaskName {ps_quote(token)} -Confirm:$false -ErrorAction Stop")
-            if self.ps(query).lstrip('\ufeff').strip().lower() != 'absent':
+            self.ps(f"Unregister-ScheduledTask -TaskName {ps_quote(token)} -Confirm:$false -ErrorAction Stop", timeout=30)
+            if self.ps(query, timeout=30).lstrip('\ufeff').strip().lower() != 'absent':
                 raise VmError('Interactive task still exists after removal', uncertain=True)
         except (VmError, OSError) as error:
             raise VmError(f'Interactive task removal is unconfirmed: {token}; inspect before retry',
                           uncertain=True) from error
 
-    def run(self, argv, timeout=60, check=True, env=None):
+    def run(self, argv, timeout=60, check=True, env=None, idle_timeout=None):
         # Secrets belong in guest credential storage, not command arguments.
         with self.log.open('ab') as log:
             log.write((json.dumps({'command': argv}, ensure_ascii=False) + '\n').encode())
             log.flush()
             try:
-                proc = subprocess.run(argv, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
-                                      env=env, timeout=timeout, stdin=subprocess.DEVNULL)
+                if idle_timeout is None:
+                    proc = subprocess.run(argv, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+                                          env=env, timeout=timeout, stdin=subprocess.DEVNULL)
+                else:
+                    proc = subprocess.Popen(argv, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+                                            env=env, stdin=subprocess.DEVNULL, start_new_session=True)
+                    started = progress = time.monotonic()
+                    size = self.log.stat().st_size
+                    try:
+                        while proc.poll() is None:
+                            now = time.monotonic()
+                            current_size = self.log.stat().st_size
+                            if current_size != size:
+                                progress, size = now, current_size
+                            if now - started >= timeout or now - progress >= idle_timeout:
+                                raise subprocess.TimeoutExpired(argv, min(timeout, idle_timeout))
+                            time.sleep(0.2)
+                    finally:
+                        # Also stop helper children: a surviving SSH process must
+                        # not reconnect and write into a freshly restored guest.
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        proc.wait(timeout=5)
             except subprocess.TimeoutExpired as error:
                 self.commands.append({'command': argv, 'exit_code': None, 'status': 'timeout'})
                 raise VmError('Command timed out; remote work may still be active. Inspect before retry.', uncertain=True) from error
@@ -121,7 +210,8 @@ class VM:
     def run_operation(self, operation, command, timeout=60, env=None, **details):
         self.begin_operation(operation, **details)
         try:
-            self.run(command, timeout=timeout, env=env)
+            self.run(command, timeout=timeout, env=env,
+                     idle_timeout=float(self.p.get('idle_timeout', 120)))
         except VmError as error:
             if not error.uncertain:
                 self.finish_operation()
@@ -153,7 +243,7 @@ class VM:
         return proc
 
     def vbox(self, *args):
-        return self.capture([self.p['vbox'], *args]).stdout
+        return self.capture([self.p['vbox'], *args], timeout=20).stdout
 
     def state(self):
         for attempt in range(3):
@@ -174,21 +264,21 @@ class VM:
 
     def ssh_args(self):
         return ['ssh', '-i', self.p['key'], '-p', str(self.p['port']), '-o', 'BatchMode=yes',
-                '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=8',
-                '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3',
+                '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=5',
+                '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2',
                 f'{self.p["user"]}@{self.p["host"]}']
 
-    def ps(self, code, timeout=60):
+    def ps(self, code, timeout=15):
         code = "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=New-Object Text.UTF8Encoding($false); " + code
         encoded = base64.b64encode(code.encode('utf-16le')).decode()
         return self.capture(self.ssh_args() + ['powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand ' + encoded], timeout).stdout
 
-    def ready(self, seconds=180):
+    def ready(self, seconds=90):
         end = time.monotonic() + seconds
         woke = False
         while time.monotonic() < end:
             try:
-                if self.capture(self.ssh_args() + ['echo VM_READY'], timeout=12, check=False).returncode == 0:
+                if self.capture(self.ssh_args() + ['echo VM_READY'], timeout=min(6, max(0.1, end-time.monotonic())), check=False).returncode == 0:
                     return
             except VmError as error:
                 if not error.uncertain:
@@ -199,15 +289,21 @@ class VM:
                 self.vbox('controlvm', self.p['vm'], 'keyboardputscancode', '1d', '9d')
                 woke = True
             time.sleep(2)
-        raise VmError('SSH readiness deadline exceeded; inspect console, boot media and sleep before retry')
+        raise VmError('SSH readiness deadline exceeded; managed run will reset the baseline')
 
-    def start(self, gui=False):
+    def start(self, gui=False, cold=False):
         state = self.state()['VMState']
+        if cold and state == 'saved':
+            self.begin_operation('start_current', discarded_saved_state=True)
+            self.vbox('discardstate', self.p['vm'])
+            state = self.state()['VMState']
+            if state != 'poweroff':
+                raise VmError('Saved memory discard is unconfirmed; current disk preserved', uncertain=True)
         if state in ('poweroff', 'saved', 'aborted'):
             self.vbox('startvm', self.p['vm'], '--type', 'gui' if gui else 'headless')
         elif state != 'running':
             raise VmError(f'Refuse start during VM state {state}')
-        self.ready(int(self.p.get('ready_timeout', 180)))
+        self.ready(int(self.p.get('ready_timeout', 90)))
         now = dt.datetime.now(dt.timezone.utc).isoformat()
         self.ps(f"$target=[DateTime]::Parse({ps_quote(now)}).ToUniversalTime(); "
                 "if([Math]::Abs(((Get-Date).ToUniversalTime()-$target).TotalSeconds) -gt 30){Set-Date -Date $target.ToLocalTime() | Out-Null}")
@@ -220,62 +316,153 @@ class VM:
             self.start()
         elif state != 'running':
             raise VmError(f'Refuse normal shutdown during VM state {state}')
-        # No /f: never silently discard application drafts or force-poweroff on timeout.
-        try:
-            self.ps('shutdown.exe /s /t 0; if($LASTEXITCODE -notin @(0,1115)){exit $LASTEXITCODE}')
-        except (VmError, subprocess.TimeoutExpired):
-            # An idle guest may not serve SSH. ACPI requests normal OS shutdown,
-            # unlike poweroff, and remains useful without the guest network.
-            self.vbox('controlvm', self.p['vm'], 'acpipowerbutton')
-        end = time.monotonic() + int(self.p.get('shutdown_timeout', 180))
+        # Shutdown/reset must not wait on the SSH connection that just failed.
+        self.vbox('controlvm', self.p['vm'], 'acpipowerbutton')
+        end = time.monotonic() + int(self.p.get('shutdown_timeout', 10))
         while time.monotonic() < end:
             if self.state()['VMState'] == 'poweroff':
                 return
             time.sleep(2)
-        raise VmError('Normal shutdown did not complete; VM preserved. Inspect blockers instead of forcing poweroff.')
+        raise VmError('Normal shutdown deadline exceeded; reset may power off the disposable guest')
+
+    def shutdown_current(self):
+        state = self.state()['VMState']
+        if state == 'poweroff':
+            return
+        if state != 'running':
+            raise VmError(f'Preserving shutdown requires running/poweroff, not {state}')
+        previous = json.loads(self.reservation.read_text()) if self.reservation is not None and self.reservation.exists() else None
+        self.begin_operation('shutdown_current', previous_operation=previous)
+        try:
+            # One normal request, without /f. Lost acknowledgment is not a
+            # reason to replay shutdown or force off a maintenance disk.
+            result = self.capture(self.ssh_args() + ['shutdown.exe /s /t 0'], timeout=10, check=False)
+        except VmError as error:
+            if not error.uncertain:
+                raise
+        else:
+            if result.returncode not in (0, 124, 125, 255) and 0 < result.returncode < 128:
+                raise VmError(f'Windows rejected shutdown with exit {result.returncode}', 'failed')
+        end = time.monotonic() + int(self.p.get('maintenance_shutdown_timeout', 120))
+        while time.monotonic() < end:
+            if self.state()['VMState'] == 'poweroff':
+                return
+            time.sleep(2)
+        raise VmError('Preserving shutdown is unconfirmed; inspect current disk before retry', uncertain=True)
+
+    def snapshot(self, name):
+        before = self.state()
+        if before['VMState'] != 'poweroff':
+            raise VmError('Baseline capture requires a powered-off guest')
+        self.begin_operation('snapshot', snapshot=name, previous_snapshot=before.get('CurrentSnapshotUUID'))
+        self.vbox('snapshot', self.p['vm'], 'take', name, '--description', 'Verified powered-off maintenance baseline')
+        after = self.state()
+        if (after['VMState'] != 'poweroff' or after.get('CurrentSnapshotName') != name or
+                not after.get('CurrentSnapshotUUID') or after['CurrentSnapshotUUID'] == before.get('CurrentSnapshotUUID')):
+            raise VmError('New powered-off snapshot identity is unconfirmed; inspect before retry', uncertain=True)
+        self.finish_operation()
+        return {'name': name, 'uuid': after['CurrentSnapshotUUID'], 'previous_uuid': before.get('CurrentSnapshotUUID')}
+
+    def reset(self, reason, graceful=False, snapshot=None):
+        snapshot = snapshot or self.p.get('snapshot')
+        if not snapshot or not reason.strip():
+            raise VmError('Reset requires a configured baseline snapshot and a reason')
+        record = {'reason': reason, 'snapshot': snapshot, 'task_status': 'running'}
+        if self.reservation is not None and self.reservation.exists():
+            record['interrupted_operation'] = json.loads(self.reservation.read_text())
+        self.resets.append(record)
+        self.begin_operation('reset', reason=reason, snapshot=snapshot)
+        try:
+            # Reserve cleanup before even its first query can fail, but validate
+            # the target before discarding any current state.
+            self.vbox('snapshot', self.p['vm'], 'showvminfo', snapshot)
+            state = self.state()['VMState']
+            if graceful and state == 'running':
+                try:
+                    self.shutdown()
+                except VmError as error:
+                    record['normal_shutdown_error'] = str(error)
+                state = self.state()['VMState']
+            if state == 'saved':
+                self.vbox('discardstate', self.p['vm'])
+            elif state in ('running', 'paused'):
+                self.vbox('controlvm', self.p['vm'], 'poweroff')
+            elif state not in ('poweroff', 'aborted'):
+                raise VmError(f'Cannot reset during VM state {state}', uncertain=True)
+            self.vbox('snapshot', self.p['vm'], 'restore', snapshot)
+            after = self.state()
+            if after['VMState'] == 'saved':
+                self.vbox('discardstate', self.p['vm'])
+                after = self.state()
+            if after['VMState'] != 'poweroff' or snapshot.lower() not in (
+                    str(after.get('CurrentSnapshotUUID', '')).lower(),
+                    str(after.get('CurrentSnapshotName', '')).lower()):
+                raise VmError('Baseline restore was not confirmed', uncertain=True)
+            record.update(task_status='succeeded', after=after)
+            self.finish_operation()
+            return record
+        except BaseException as error:
+            record.update(task_status='failed', error=str(error))
+            raise
+
+    @contextlib.contextmanager
+    def clean_run(self, keep=False, continuing=False, mode='verification'):
+        self.session_mode = mode
+        if not continuing:
+            self.reset('clean start')
+        try:
+            yield
+        except BaseException as original:
+            if mode == 'maintenance':
+                # Keep task/process evidence if completion is unknown. A known
+                # completed failure may already have cleared its operation.
+                if self.reservation is not None and not self.reservation.exists():
+                    self.begin_operation('session', last_error=str(original))
+                raise
+            # Record the original execution failure even if recovery succeeds.
+            try:
+                self.reset('failed run; discard guest immediately')
+            except (VmError, OSError) as recovery:
+                raise VmError(f'{original}; baseline recovery also failed: {recovery}', uncertain=True) from original
+            raise
+        else:
+            if keep or mode == 'maintenance':
+                self.begin_operation('session', workspace=str(ROOT), mode=mode)
+            else:
+                self.reset('finished run', graceful=True)
 
     def recover_poweroff(self, reason):
-        if self.p.get('role') not in ('build', 'disposable') or not reason.strip():
-            raise VmError('Explicit poweroff recovery is limited to an owned build/disposable profile with a recorded reason')
-        result = {'recovery_reason': reason}
-        if self.reservation is not None and self.reservation.exists():
-            result['interrupted_operation'] = json.loads(self.reservation.read_text())
-        try:
-            self.shutdown()
-            result['recovery_method'] = 'normal_shutdown'
-        except VmError as error:
-            result['normal_shutdown_error'] = str(error)
-            self.vbox('controlvm', self.p['vm'], 'poweroff')
-            result['recovery_method'] = 'poweroff'
-        if self.state()['VMState'] != 'poweroff':
-            raise VmError('Recovery poweroff did not complete', 'failed')
-        # A confirmed powered-off guest cannot leave remote work running.
-        self.finish_operation()
-        return result
+        return self.reset(reason)
 
-    def transfer(self, source, destination, download=False):
+    def transfer(self, source, destination, download=False, timeout=120, prepared=None):
         # OpenSSH Windows accepts /C:/... paths; no remote shell quoting or relative ambiguity.
-        remote = source if download else destination
-        if not re.match(r'^[A-Za-z]:[\\/]', remote):
-            raise VmError('Remote transfer path must be an absolute Windows path')
-        remote = '/' + remote.replace('\\', '/')
+        local, remote = prepared if prepared is not None else transfer_artifact(source, destination, download)
         endpoint = f'{self.p["user"]}@{self.p["host"]}:{remote}'
-        local = str(Path(destination if download else source).resolve())
-        if download:
-            Path(local).parent.mkdir(parents=True, exist_ok=True)
-        elif not Path(local).is_file():
-            raise VmError(f'Upload source does not exist: {local}')
+        previous = self.reservation.read_bytes() if self.reservation is not None and self.reservation.exists() else None
+        self.begin_operation('download' if download else 'upload', local_file=local, remote_file=remote)
+        def completed():
+            if previous is None:
+                self.finish_operation()
+            else:
+                temporary = self.reservation.with_suffix('.tmp')
+                temporary.write_bytes(previous)
+                temporary.replace(self.reservation)
         argv = ['scp', '-i', self.p['key'], '-P', str(self.p['port']), '-o', 'BatchMode=yes',
-                '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=8']
-        self.run(argv + ([endpoint, local] if download else [local, endpoint]), timeout=600)
+                '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=5',
+                '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2']
+        try:
+            self.run(argv + ([endpoint, local] if download else [local, endpoint]),
+                     timeout=timeout, idle_timeout=timeout)
+        except VmError as error:
+            if not error.uncertain:
+                completed()
+            raise
+        else:
+            completed()
 
-    def script(self, source, arguments=None, interactive=False, timeout=1800, hold_pending=False):
-        token = 'azookey-vm-' + uuid.uuid4().hex
+    def script(self, source, arguments=None, interactive=False, timeout=120, hold_pending=False, prepared=None):
+        token, normalized = prepared if prepared is not None else script_artifact(source, self.directory)
         remote = self.remote + '\\' + token + '.ps1'
-        # Windows PowerShell 5.1 reads BOM-less scripts using the ANSI code page.
-        # Validate UTF-8 before touching the guest and upload an explicit UTF-8 BOM.
-        normalized = self.directory / (token + '.ps1')
-        normalized.write_text(Path(source).read_text(encoding='utf-8-sig'), encoding='utf-8-sig')
         self.start()
         self.transfer(str(normalized), remote)
         # PowerShell parameters are quoted as data; not concatenated shell syntax.
@@ -314,7 +501,7 @@ class VM:
                     f"$a=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File \"'+{ps_quote(wrapper)}+'\"'); "
                     f"$p=New-ScheduledTaskPrincipal -UserId ($env:COMPUTERNAME+'\\'+{ps_quote(self.p['user'])}) -LogonType Interactive -RunLevel Limited; "
                     f"$s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds {timeout}); "
-                    f"Register-ScheduledTask -TaskName '{token}' -Action $a -Principal $p -Settings $s | Out-Null; Start-ScheduledTask -TaskName '{token}'")
+                    f"Register-ScheduledTask -TaskName '{token}' -Action $a -Principal $p -Settings $s | Out-Null; Start-ScheduledTask -TaskName '{token}'", timeout=30)
         except VmError as error:
             if error.uncertain:
                 raise
@@ -326,7 +513,7 @@ class VM:
             response = self.ps(f"if(Test-Path {ps_quote(done)}){{ @{{code=[IO.File]::ReadAllText({ps_quote(done)});output=[IO.File]::ReadAllText({ps_quote(output)})}} | ConvertTo-Json -Compress }}")
             if response.strip():
                 value = json.loads(response.lstrip('\ufeff'))
-                self.ps(f"Unregister-ScheduledTask -TaskName '{token}' -Confirm:$false")
+                self.ps(f"Unregister-ScheduledTask -TaskName '{token}' -Confirm:$false", timeout=30)
                 self.finish_operation()
                 if value['code'] != '0':
                     raise VmError(f'Interactive script failed; see {output} and {self.log}', 'failed')
@@ -355,26 +542,40 @@ class VM:
                    RESTORE_AFTER_TEST='0', PRUNE_ORPHAN_MEDIA_AFTER_RESTORE='0', VM_LIFECYCLE_EXTERNAL='1')
         return env
 
-    def stage(self, installer, leave_running):
-        installer = Path(installer).resolve()
-        if not installer.is_file():
-            raise VmError('Installer file not found; select an exact artifact')
-        metadata = installer.with_suffix('.build-info.json')
-        if not metadata.exists():
-            metadata = installer.parent / 'build-info.json'
-        expected = json.loads(metadata.read_text())
-        for key in ('version', 'channel', 'revision', 'installerGeneration'):
-            if key not in expected:
-                raise VmError(f'Missing build identity: {key}')
-        with installer.open('rb') as stream:
-            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    def stage(self, installer, leave_running, prepared=None):
+        installer, expected, digest = prepared if prepared is not None else installer_artifact(installer)
         self.start()
         remote = self.remote + '\\azookey-install-' + uuid.uuid4().hex + '.exe'
         self.transfer(str(installer), remote)
-        result = self.guest('install', Installer=remote, Sha256=digest,
-                            Expected=json.dumps({key: expected[key] for key in ('version', 'channel', 'revision', 'installerGeneration')}))
-        if not leave_running:
-            self.shutdown()
+        evidence = {'kind': 'installer log', 'remote': remote + '.log',
+                    'path': str(self.directory / 'installer.log'), 'task_status': 'not_run'}
+        self.evidence.append(evidence)
+        def recover_log():
+            try:
+                self.transfer(evidence['remote'], evidence['path'], download=True, timeout=15)
+                if not Path(evidence['path']).is_file():
+                    raise VmError('Installer log was not recovered')
+                evidence['task_status'] = 'succeeded'
+            except (VmError, OSError) as error:
+                evidence.update(task_status='failed', error=str(error))
+                if isinstance(error, VmError) and error.uncertain:
+                    raise
+        try:
+            result = self.guest('install', Installer=remote, Sha256=digest,
+                                Expected=json.dumps({key: expected[key] for key in ('version', 'channel', 'revision', 'installerGeneration')}))
+        except (VmError, ValueError) as error:
+            if isinstance(error, VmError) and not error.uncertain:
+                try:
+                    recover_log()
+                except VmError as collection:
+                    raise VmError(f'{error}; installer log collection also failed: {collection}',
+                                  error.status, uncertain=True) from error
+            else:
+                evidence['reason'] = 'Completion/transport unknown; reset promptly without further guest collection'
+            raise
+        evidence['installation'] = {key: result.get(key) for key in ('installed', 'installer_exit', 'reboot_required')}
+        recover_log()
+        result['install_log_recovery'] = evidence
         return result
 
 
@@ -400,13 +601,18 @@ def parser():
     p.add_argument('--config', default=str(ROOT / '.local/vm.json'))
     p.add_argument('--profile', required=True)
     subs = p.add_subparsers(dest='command', required=True)
-    for name in ('status', 'shutdown', 'doctor', 'prepare', 'handoff', 'diagnostics', 'operation-status', 'wake'):
+    for name in ('status', 'reboot', 'doctor', 'prepare', 'handoff', 'diagnostics', 'operation-status', 'wake'):
         subs.add_parser(name)
+    reset = subs.add_parser('reset')
+    reset.add_argument('--discard-session', action='store_true', help='Explicitly discard another workspace\'s idle session; active controller locks are never bypassed')
+    stop = subs.add_parser('shutdown')
+    stop.add_argument('--keep-current', action='store_true', help='Maintenance only: stop without restoring so a new baseline can be captured')
     resolve = subs.add_parser('resolve-operation', help='Explicitly release an inspected unresolved operation')
     resolve.add_argument('--reason', required=True)
     start = subs.add_parser('start')
     start.add_argument('--gui', action='store_true')
-    recovery = subs.add_parser('recover-poweroff', help='Explicit recovery of an owned build/disposable guest, never an automatic fallback')
+    start.add_argument('--keep-current', action='store_true', help='Explicit maintenance: cold boot current disk without resetting')
+    recovery = subs.add_parser('recover-poweroff', help='Compatibility alias for immediate baseline reset')
     recovery.add_argument('--reason', required=True)
     media = subs.add_parser('detach-install-media', help='Detach an ISO/VISO from a powered-off VM')
     media.add_argument('--controller', required=True)
@@ -424,7 +630,7 @@ def parser():
     execute = subs.add_parser('exec')
     execute.add_argument('--script', required=True)
     execute.add_argument('--interactive', action='store_true')
-    execute.add_argument('--timeout', type=int, default=1800)
+    execute.add_argument('--timeout', type=int, default=120)
     build = subs.add_parser('build')
     build.add_argument('branch')
     test = subs.add_parser('test')
@@ -438,6 +644,103 @@ def parser():
     return p
 
 
+def execute(vm, args, result):
+    profile, cmd = vm.p, args.command
+    validate_command_profile(profile, cmd)
+    if cmd == 'start':
+        vm.start(args.gui, cold=args.keep_current)
+    elif cmd == 'reboot':
+        vm.shutdown_current()
+        vm.begin_operation('reboot')
+        vm.start()
+    elif cmd in ('shutdown', 'reset', 'recover-poweroff'):
+        if cmd == 'shutdown' and args.keep_current:
+            vm.shutdown_current()
+            vm.begin_operation('session', workspace=str(ROOT), mode='maintenance')
+        else:
+            vm.reset(getattr(args, 'reason', 'requested baseline reset'), graceful=(cmd == 'shutdown'))
+    elif cmd == 'wake':
+        if vm.state()['VMState'] != 'running':
+            raise VmError('Wake requires a running VM; it never starts or resets a guest')
+        vm.vbox('controlvm', profile['vm'], 'keyboardputscancode', '1d', '9d')
+    elif cmd == 'diagnostics':
+        vm.vbox('showvminfo', profile['vm'], '--log', '0')
+    elif cmd in ('operation-status', 'resolve-operation'):
+        result['operation_status'] = vm.operation_status()
+        if cmd == 'resolve-operation':
+            guest = result['operation_status'].get('guest', {})
+            pending = result['operation_status']['pending'] or {}
+            processes = guest.get('processes') if pending.get('operation') != 'interactive' else []
+            if not args.reason.strip() or processes or guest.get('running_tasks'):
+                raise VmError('Resolution requires a reason and no active assigned guest work; use reset for a stalled disposable guest')
+            if pending.get('task') and vm.state()['VMState'] == 'running':
+                vm.remove_inactive_task(pending['task'])
+            result['resolution_reason'] = args.reason
+            if pending.get('mode') == 'maintenance':
+                vm.begin_operation('session', mode='maintenance', resolved_run_directory=pending.get('run_directory'))
+            else:
+                vm.finish_operation()
+    elif cmd == 'detach-install-media':
+        if vm.state()['VMState'] != 'poweroff':
+            raise VmError('Media maintenance requires poweroff')
+        raw = vm.vbox('showvminfo', profile['vm'], '--machinereadable')
+        key = f'"{args.controller}-{args.port}-{args.device}"'
+        devices = dict(re.findall(r'^([^=]+)="(.*)"$', raw, re.M))
+        medium = devices.get(key, '')
+        if not medium.lower().endswith(('.iso', '.viso')):
+            raise VmError('Selected device is not an attached ISO/VISO; refusing disk detachment')
+        result['detached_medium'] = medium
+        vm.vbox('storageattach', profile['vm'], '--storagectl', args.controller,
+                '--port', str(args.port), '--device', str(args.device), '--type', 'dvddrive', '--medium', 'none')
+    elif cmd in ('doctor', 'prepare'):
+        import tomllib
+        pin = tomllib.loads((ROOT / 'rust-toolchain.toml').read_text())['toolchain']['channel']
+        result['guest'] = vm.guest(cmd, RustVersion=pin, HostUtc=dt.datetime.now(dt.timezone.utc).isoformat())
+    elif cmd == 'handoff':
+        result['guest'] = vm.guest('identity')
+        if vm.session_mode == 'maintenance':
+            vm.shutdown_current()
+    elif cmd in ('restore', 'snapshot'):
+        if cmd == 'restore':
+            vm.reset('requested snapshot restore', snapshot=args.snapshot)
+        else:
+            result['snapshot'] = vm.snapshot(args.snapshot)
+    elif cmd == 'screenshot':
+        target = Path(args.path).resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target_arg = str(target)
+        if profile['vbox'].endswith('.exe'):
+            target_arg = vm.capture(['wslpath', '-w', str(target)]).stdout.strip()
+        vm.vbox('controlvm', profile['vm'], 'screenshotpng', target_arg)
+        result['screenshot'] = str(target)
+    elif cmd in ('upload', 'download'):
+        vm.start()
+        vm.transfer(args.source, args.destination, cmd == 'download', prepared=getattr(args, 'transfer_artifact', None))
+    elif cmd == 'exec':
+        result['output'] = vm.script(Path(args.script).resolve(), interactive=args.interactive, timeout=args.timeout,
+                                     prepared=getattr(args, 'script_artifact', None))
+    elif cmd in ('build', 'test'):
+        vm.start()
+        command = ['bash', str(ROOT / 'scripts' / ('vm_build.sh' if cmd == 'build' else 'vm_test_client_composition.sh')), args.branch]
+        if cmd == 'test':
+            command += [args.cargo_filter, args.swift_filter]
+        vm.run_operation(cmd, command, timeout=14400, env=vm.environment(), branch=args.branch)
+        if cmd == 'build':
+            log = vm.log.read_text(errors='replace')
+            matches = re.findall(r'\[vm-build\] 完了: (.+\.exe) \((.+\.build-info\.json)\)', log)
+            if not matches:
+                raise VmError('Build exited zero without recovered artifact evidence', 'failed')
+            installer, metadata = map(Path, matches[-1])
+            if not installer.is_file() or not metadata.is_file():
+                raise VmError('Recovered build files are missing', 'failed')
+            with installer.open('rb') as stream:
+                digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+            result['artifact'] = {'installer': str(installer), 'sha256': digest,
+                                  'build_info': json.loads(metadata.read_text())}
+    elif cmd in ('stage', 'install'):
+        result['guest'] = vm.stage(args.installer, args.leave_running, prepared=getattr(args, 'installer_artifact', None))
+
+
 def main():
     args = parser().parse_args()
     run_id = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S') + '-' + uuid.uuid4().hex[:8]
@@ -445,113 +748,54 @@ def main():
     result = {'task_status': 'running', 'profile': args.profile, 'operation': args.command, 'run_id': run_id}
     vm = None
     try:
+        # Validate local inputs before acquiring or resetting the guest. Reuse
+        # the same identity/hash for transfer and installed-identity checks.
+        if args.command in ('stage', 'install'):
+            args.installer_artifact = installer_artifact(args.installer)
+        if args.command == 'exec':
+            args.script_artifact = script_artifact(args.script, directory)
+        if args.command in ('upload', 'download'):
+            args.transfer_artifact = transfer_artifact(args.source, args.destination, args.command == 'download')
         profile = load_profile(args.config, args.profile)
+        validate_command_profile(profile, args.command)
         vm = VM(profile, directory)
         identity = {**profile, 'vm': vm.state()['UUID'] or profile['vm']}
         lock = contextlib.nullcontext() if args.command == 'status' else ownership(
             identity, Path.home() / '.cache/azookey-vm-locks',
-            allow_pending=args.command in ('operation-status', 'resolve-operation', 'diagnostics', 'screenshot', 'wake', 'recover-poweroff'))
+            allow_pending=args.command != 'detach-install-media')
         with lock as reservation:
             vm.reservation = reservation
             result['before'] = vm.state()
             result_path = directory / 'result.json'
             result_path.write_text(json.dumps(result, indent=2))
             cmd = args.command
-            if cmd == 'start':
-                vm.start(args.gui)
-            elif cmd == 'shutdown':
-                vm.shutdown()
-            elif cmd == 'wake':
-                if vm.state()['VMState'] != 'running':
-                    raise VmError('Wake requires a running VM; it never starts or resets a guest')
-                vm.vbox('controlvm', profile['vm'], 'keyboardputscancode', '1d', '9d')
-            elif cmd == 'diagnostics':
-                vm.vbox('showvminfo', profile['vm'], '--log', '0')
-            elif cmd in ('operation-status', 'resolve-operation'):
-                result['operation_status'] = vm.operation_status()
-                if cmd == 'resolve-operation':
-                    guest = result['operation_status'].get('guest', {})
-                    pending = result['operation_status']['pending'] or {}
-                    processes = guest.get('processes') if pending.get('operation') != 'interactive' else []
-                    if not args.reason.strip() or processes or guest.get('running_tasks'):
-                        raise VmError('Resolution requires a reason and no active assigned guest work; inspect before retry')
-                    if pending.get('task') and vm.state()['VMState'] == 'running':
-                        vm.remove_inactive_task(pending['task'])
-                    result['resolution_reason'] = args.reason
-                    vm.finish_operation()
-            elif cmd == 'recover-poweroff':
-                result.update(vm.recover_poweroff(args.reason))
-            elif cmd == 'detach-install-media':
-                if vm.state()['VMState'] != 'poweroff':
-                    raise VmError('Media maintenance requires poweroff')
-                raw = vm.vbox('showvminfo', profile['vm'], '--machinereadable')
-                key = f'"{args.controller}-{args.port}-{args.device}"'
-                devices = dict(re.findall(r'^([^=]+)="(.*)"$', raw, re.M))
-                medium = devices.get(key, '')
-                if not medium.lower().endswith(('.iso', '.viso')):
-                    raise VmError('Selected device is not an attached ISO/VISO; refusing disk detachment')
-                result['detached_medium'] = medium
-                vm.vbox('storageattach', profile['vm'], '--storagectl', args.controller,
-                        '--port', str(args.port), '--device', str(args.device), '--type', 'dvddrive', '--medium', 'none')
-            elif cmd in ('doctor', 'prepare'):
-                if cmd == 'prepare' and profile.get('role') != 'build':
-                    raise VmError('Toolchain preparation requires a build profile')
-                import tomllib
-                pin = tomllib.loads((ROOT / 'rust-toolchain.toml').read_text())['toolchain']['channel']
-                result['guest'] = vm.guest(cmd, RustVersion=pin, HostUtc=dt.datetime.now(dt.timezone.utc).isoformat())
-            elif cmd == 'handoff':
-                result['guest'] = vm.guest('identity')
-                vm.shutdown()
-            elif cmd in ('restore', 'snapshot'):
-                if vm.state()['VMState'] != 'poweroff':
-                    raise VmError('Snapshot operations require normal shutdown first; no live/saved-state snapshots')
-                if cmd == 'snapshot':
-                    # Existing snapshots are retained. Promotion to the profile is a separate explicit edit.
-                    vm.vbox('snapshot', profile['vm'], 'take', args.snapshot, '--description', 'Verified powered-off maintenance baseline')
-                else:
-                    vm.vbox('snapshot', profile['vm'], 'restore', args.snapshot)
-            elif cmd == 'screenshot':
-                target = Path(args.path).resolve()
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target_arg = str(target)
-                if profile['vbox'].endswith('.exe'):
-                    target_arg = vm.capture(['wslpath', '-w', str(target)]).stdout.strip()
-                vm.vbox('controlvm', profile['vm'], 'screenshotpng', target_arg)
-                result['screenshot'] = str(target)
-            elif cmd in ('upload', 'download'):
-                vm.start()
-                vm.transfer(args.source, args.destination, cmd == 'download')
-            elif cmd == 'exec':
-                result['output'] = vm.script(Path(args.script).resolve(), interactive=args.interactive, timeout=args.timeout)
-            elif cmd in ('build', 'test'):
-                if profile.get('role') != 'build':
-                    raise VmError('Build/test commands require a build profile')
-                vm.start()
-                command = ['bash', str(ROOT / 'scripts' / ('vm_build.sh' if cmd == 'build' else 'vm_test_client_composition.sh')), args.branch]
-                if cmd == 'test':
-                    command += [args.cargo_filter, args.swift_filter]
-                vm.run_operation(cmd, command, timeout=14400, env=vm.environment(), branch=args.branch)
-                if cmd == 'build':
-                    # The helper names the recovered pair in its terminal completion line.
-                    log = vm.log.read_text(errors='replace')
-                    matches = re.findall(r'\[vm-build\] 完了: (.+\.exe) \((.+\.build-info\.json)\)', log)
-                    if not matches:
-                        raise VmError('Build exited zero without recovered artifact evidence', 'failed')
-                    installer, metadata = map(Path, matches[-1])
-                    if not installer.is_file() or not metadata.is_file():
-                        raise VmError('Recovered build files are missing', 'failed')
-                    with installer.open('rb') as stream:
-                        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-                    result['artifact'] = {'installer': str(installer), 'sha256': digest,
-                                          'build_info': json.loads(metadata.read_text())}
-                vm.shutdown()
-            elif cmd in ('stage', 'install'):
-                if profile.get('role') not in ('manual', 'disposable'):
-                    raise VmError('Installation requires a manual or disposable profile')
-                result['guest'] = vm.stage(args.installer, args.leave_running)
+            managed = cmd in ('start', 'reboot', 'prepare', 'build', 'test', 'stage', 'install', 'exec', 'doctor', 'upload', 'download', 'handoff')
+            pending = json.loads(reservation.read_text()) if reservation is not None and reservation.exists() else {}
+            session = pending.get('operation') == 'session'
+            protected_maintenance = pending.get('mode') == 'maintenance'
+            if (session or protected_maintenance) and pending.get('workspace') != str(ROOT) and cmd not in ('status', 'operation-status', 'diagnostics', 'screenshot'):
+                if not (cmd == 'reset' and args.discard_session):
+                    raise VmError('Another workspace owns this session; its owner must finish it, or explicitly reset --discard-session')
+            inspection_or_recovery = cmd in ('status', 'operation-status', 'diagnostics', 'screenshot', 'wake', 'resolve-operation', 'reset', 'restore', 'recover-poweroff')
+            if pending and not session and pending.get('mode') == 'maintenance' and not inspection_or_recovery:
+                raise VmError('Unresolved maintenance operation; inspect and resolve or explicitly reset before continuing')
+            if cmd == 'reboot' and not session:
+                raise VmError('Reboot requires an open verification or maintenance session')
+            preserve = cmd in ('start', 'shutdown') and args.keep_current
+            if (preserve or cmd == 'snapshot') and pending and not session:
+                raise VmError('Unresolved guest operation; reset or confirm resolution before preserving current state')
+            continuing = session and cmd in ('reboot', 'prepare', 'exec', 'doctor', 'upload', 'download', 'handoff')
+            if cmd == 'prepare' and pending.get('mode') != 'maintenance':
+                continuing = False
+            keep = cmd in ('start', 'reboot', 'prepare', 'upload') or (cmd in ('stage', 'install') and args.leave_running) or (continuing and cmd != 'handoff')
+            mode = 'maintenance' if cmd in ('prepare', 'snapshot') or preserve else (pending.get('mode', 'verification') if continuing else 'verification')
+            vm.session_mode = mode
+            lifecycle = vm.clean_run(keep=keep, continuing=continuing or preserve or cmd in ('handoff', 'download'), mode=mode) if managed else contextlib.nullcontext()
+            with lifecycle:
+                execute(vm, args, result)
             result['task_status'] = 'succeeded'
             result['after'] = vm.state()
-    except (VmError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
+    except (VmError, OSError, ValueError, KeyError, subprocess.TimeoutExpired, KeyboardInterrupt) as error:
         result['task_status'] = error.status if isinstance(error, VmError) else 'failed'
         result['error'] = str(error)
         if vm:
@@ -562,6 +806,8 @@ def main():
     directory.mkdir(parents=True, exist_ok=True)
     result['log'] = str(directory / 'commands.log')
     result['commands'] = vm.commands if vm else []
+    result['resets'] = vm.resets if vm else []
+    result['evidence'] = vm.evidence if vm else []
     (directory / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n')
     # Full command evidence stays in result.json; avoid dumping encoded PowerShell
     # and repeated polling commands into the caller's conversation.
@@ -570,4 +816,7 @@ def main():
 
 
 if __name__ == '__main__':
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt(f'Interrupted by signal {signum}')
+    signal.signal(signal.SIGTERM, interrupted)
     raise SystemExit(main())

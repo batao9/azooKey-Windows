@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch, Mock
@@ -23,7 +24,7 @@ class VmTests(unittest.TestCase):
         self.key = self.root / 'key'
         self.key.write_text('test fixture, not a real key')
         self.profile = dict(vm='vm-uuid', host='127.0.0.1', port=12345, user='guest',
-                            key=str(self.key), vbox='not-a-real-vbox', role='build')
+                            key=str(self.key), vbox='not-a-real-vbox', role='build', snapshot='baseline-id')
         self.machine = vm.VM(self.profile, self.root / 'log')
 
     def test_explicit_connection_values_required(self):
@@ -87,6 +88,27 @@ class VmTests(unittest.TestCase):
             self.machine.start()
         self.machine.vbox.assert_not_called()
 
+    def test_start_keep_current_discards_saved_memory_before_boot_without_restore(self):
+        self.machine.state = Mock(side_effect=[{'VMState': 'saved'}, {'VMState': 'poweroff'}])
+        self.machine.vbox = Mock()
+        self.machine.ready = Mock()
+        self.machine.ps = Mock()
+        args = vm.parser().parse_args(['--profile', 'build', 'start', '--keep-current'])
+        vm.execute(self.machine, args, {})
+        self.assertEqual([call.args for call in self.machine.vbox.call_args_list], [
+            ('discardstate', 'vm-uuid'), ('startvm', 'vm-uuid', '--type', 'headless')])
+
+    def test_uncertain_saved_memory_discard_is_reserved_and_not_booted_again(self):
+        self.machine.session_mode = 'maintenance'
+        self.machine.state = Mock(return_value={'VMState': 'saved'})
+        self.machine.vbox = Mock(side_effect=vm.VmError('discard completion unknown', uncertain=True))
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            with self.assertRaises(vm.VmError):
+                self.machine.start(cold=True)
+            self.assertEqual(json.loads(reservation.read_text())['operation'], 'start_current')
+        self.machine.vbox.assert_called_once_with('discardstate', 'vm-uuid')
+
     def test_ready_does_not_send_keys_to_responsive_guest(self):
         self.machine.capture = Mock(return_value=subprocess.CompletedProcess(['ssh'], 0))
         self.machine.vbox = Mock()
@@ -101,15 +123,15 @@ class VmTests(unittest.TestCase):
             self.machine.ready()
         self.machine.vbox.assert_called_once_with('controlvm', 'vm-uuid', 'keyboardputscancode', '1d', '9d')
 
-    def test_shutdown_timeout_never_force_powers_off_or_restores(self):
+    def test_shutdown_has_short_deadline_and_never_waits_for_ssh(self):
         self.machine.state = Mock(return_value={'VMState': 'running'})
         self.machine.ps = Mock()
         self.machine.vbox = Mock()
-        with patch.object(vm.time, 'monotonic', side_effect=[0, 181]):
+        with patch.object(vm.time, 'monotonic', side_effect=[0, 11]):
             with self.assertRaisesRegex(vm.VmError, 'Normal shutdown'):
                 self.machine.shutdown()
-        self.machine.vbox.assert_not_called()
-        self.assertNotIn('/f', self.machine.ps.call_args.args[0])
+        self.machine.vbox.assert_called_once_with('controlvm', 'vm-uuid', 'acpipowerbutton')
+        self.machine.ps.assert_not_called()
 
     def test_powered_off_shutdown_is_idempotent(self):
         self.machine.state = Mock(return_value={'VMState': 'poweroff'})
@@ -117,49 +139,474 @@ class VmTests(unittest.TestCase):
         self.machine.shutdown()
         self.machine.ps.assert_not_called()
 
-    def test_recovery_prefers_normal_shutdown_and_clears_confirmed_reservation(self):
-        self.machine.shutdown = Mock()
+    def restored_state(self):
+        return {'VMState': 'poweroff', 'CurrentSnapshotUUID': 'baseline-id', 'CurrentSnapshotName': 'baseline'}
+
+    def test_abnormal_reset_powers_off_and_restores_without_ssh(self):
         self.machine.vbox = Mock()
-        self.machine.state = Mock(return_value={'VMState': 'poweroff'})
+        self.machine.ps = Mock()
+        self.machine.state = Mock(side_effect=[{'VMState': 'running'}, self.restored_state()])
         with vm.ownership(self.profile, self.root / 'locks') as reservation:
             self.machine.reservation = reservation
             self.machine.begin_operation('build')
-            result = self.machine.recover_poweroff('owned stalled build')
+            result = self.machine.reset('owned stalled build')
             self.assertFalse(reservation.exists())
-        self.machine.shutdown.assert_called_once()
-        self.machine.vbox.assert_not_called()
-        self.assertEqual(result['recovery_method'], 'normal_shutdown')
+        self.machine.ps.assert_not_called()
+        self.assertEqual([call.args for call in self.machine.vbox.call_args_list], [
+            ('snapshot', 'vm-uuid', 'showvminfo', 'baseline-id'),
+            ('controlvm', 'vm-uuid', 'poweroff'),
+            ('snapshot', 'vm-uuid', 'restore', 'baseline-id')])
+        self.assertEqual(result['task_status'], 'succeeded')
         self.assertEqual(result['interrupted_operation']['operation'], 'build')
 
-    def test_explicit_recovery_forces_only_after_normal_shutdown_fails(self):
-        order = []
-        def blocked_shutdown():
-            order.append('normal')
-            raise vm.VmError('shutdown blocked')
-        self.machine.shutdown = Mock(side_effect=blocked_shutdown)
-        self.machine.vbox = Mock(side_effect=lambda *args: order.append(args[-1]))
-        self.machine.state = Mock(return_value={'VMState': 'poweroff'})
-        result = self.machine.recover_poweroff('owned unresponsive build guest')
-        self.assertEqual(order, ['normal', 'poweroff'])
-        self.assertEqual(result['recovery_method'], 'poweroff')
-
-    def test_unconfirmed_recovery_preserves_pending_reservation(self):
-        self.machine.shutdown = Mock(side_effect=vm.VmError('shutdown blocked'))
+    def test_normal_cleanup_falls_back_to_poweroff_and_restore(self):
+        self.machine.shutdown = Mock(side_effect=vm.VmError('shutdown deadline'))
         self.machine.vbox = Mock()
-        self.machine.state = Mock(return_value={'VMState': 'running'})
+        self.machine.state = Mock(side_effect=[{'VMState': 'running'}, {'VMState': 'running'}, self.restored_state()])
+        result = self.machine.reset('finished run', graceful=True)
+        self.machine.shutdown.assert_called_once()
+        self.assertIn('normal_shutdown_error', result)
+        self.assertIn(('controlvm', 'vm-uuid', 'poweroff'), [call.args for call in self.machine.vbox.call_args_list])
+
+    def test_unconfirmed_restore_preserves_pending_reservation(self):
+        self.machine.vbox = Mock()
+        self.machine.state = Mock(return_value={'VMState': 'poweroff', 'CurrentSnapshotUUID': 'wrong-baseline'})
         with vm.ownership(self.profile, self.root / 'locks') as reservation:
             self.machine.reservation = reservation
             self.machine.begin_operation('build')
-            with self.assertRaisesRegex(vm.VmError, 'did not complete'):
-                self.machine.recover_poweroff('owned stalled build')
+            with self.assertRaisesRegex(vm.VmError, 'not confirmed'):
+                self.machine.reset('owned stalled build')
             self.assertTrue(reservation.exists())
 
-    def test_explicit_recovery_refuses_manual_vm(self):
+    def test_script_completion_inspection_does_not_depend_on_task_scheduler(self):
+        self.machine.state = Mock(return_value={'VMState': 'running'})
+        def inspect(code, **kwargs):
+            if 'Get-ScheduledTask' in code:
+                raise vm.VmError('Task Scheduler inspection unavailable', uncertain=True)
+            return json.dumps({'processes': [], 'running_tasks': []})
+        self.machine.ps = Mock(side_effect=inspect)
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            self.machine.session_mode = 'maintenance'
+            self.machine.begin_operation('script', remote_script='fixture.ps1')
+            result = self.machine.operation_status()
+        self.assertEqual(result['guest'], {'processes': [], 'running_tasks': []})
+        self.assertEqual(result['pending']['mode'], 'maintenance')
+
+    def test_manual_vm_is_also_disposable_and_saved_memory_is_discarded(self):
         self.machine.p['role'] = 'manual'
-        self.machine.shutdown = Mock()
-        with self.assertRaisesRegex(vm.VmError, 'build/disposable'):
-            self.machine.recover_poweroff('not a disposable guest')
-        self.machine.shutdown.assert_not_called()
+        self.machine.vbox = Mock()
+        self.machine.state = Mock(side_effect=[{'VMState': 'saved'}, self.restored_state()])
+        self.machine.reset('new installation')
+        self.assertIn(('discardstate', 'vm-uuid'), [call.args for call in self.machine.vbox.call_args_list])
+
+    def test_missing_snapshot_does_not_discard_current_state(self):
+        self.machine.vbox = Mock(side_effect=vm.VmError('snapshot missing'))
+        self.machine.state = Mock()
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            with self.assertRaises(vm.VmError):
+                self.machine.reset('new run')
+            self.assertTrue(reservation.exists())
+            self.assertEqual(self.machine.resets[-1]['task_status'], 'failed')
+        self.machine.vbox.assert_called_once_with('snapshot', 'vm-uuid', 'showvminfo', 'baseline-id')
+        self.machine.state.assert_not_called()
+
+    def test_clean_run_restores_before_and_after_work(self):
+        events = []
+        self.machine.reset = Mock(side_effect=lambda reason, **kw: events.append(reason))
+        with self.machine.clean_run():
+            events.append('work')
+        self.assertEqual(events, ['clean start', 'work', 'finished run'])
+
+    def test_failed_run_resets_immediately_without_retrying_work(self):
+        self.machine.reset = Mock()
+        with self.assertRaisesRegex(vm.VmError, 'SSH hung'):
+            with self.machine.clean_run():
+                raise vm.VmError('SSH hung', uncertain=True)
+        self.assertEqual(self.machine.reset.call_args_list[-1].args, ('failed run; discard guest immediately',))
+        self.assertNotIn('graceful', self.machine.reset.call_args.kwargs)
+
+    def test_failed_reset_does_not_hide_execution_failure(self):
+        self.machine.reset = Mock(side_effect=[None, vm.VmError('restore failed')])
+        with self.assertRaisesRegex(vm.VmError, 'SSH hung; baseline recovery also failed: restore failed'):
+            with self.machine.clean_run():
+                raise vm.VmError('SSH hung', uncertain=True)
+
+    def test_ui_session_continues_without_erasing_installed_state(self):
+        self.machine.reset = Mock()
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            with self.machine.clean_run(keep=True):
+                pass
+            self.assertEqual(json.loads(reservation.read_text())['operation'], 'session')
+            with self.machine.clean_run(keep=True, continuing=True):
+                pass
+            self.assertEqual(self.machine.reset.call_count, 1)
+            with self.machine.clean_run(continuing=True):
+                pass
+            self.assertEqual(self.machine.reset.call_args.args, ('finished run',))
+
+    def test_helper_output_stall_is_bounded_and_kills_its_process_group(self):
+        child = ('import subprocess,sys,time; '
+                 'p=subprocess.Popen([sys.executable,"-c","import time; time.sleep(60)"]); '
+                 'print(p.pid,flush=True); time.sleep(60)')
+        with self.assertRaises(vm.VmError) as caught:
+            self.machine.run(['bash', '-c', 'timeout --foreground 60s "$@"; wait', 'nested-timeout',
+                              sys.executable, '-c', child], timeout=10, idle_timeout=0.5)
+        self.assertTrue(caught.exception.uncertain)
+        self.assertEqual(self.machine.commands[-1]['status'], 'timeout')
+        child_pid = next(line for line in self.machine.log.read_text().splitlines() if line.isdecimal())
+        proc_stat = Path('/proc') / child_pid / 'stat'
+        for _ in range(100):
+            try:
+                dead = proc_stat.read_text().split()[2] == 'Z'
+            except FileNotFoundError:
+                dead = True
+            if dead:
+                break
+            vm.time.sleep(0.01)
+        else:
+            self.fail('helper child survived the deadline')
+
+    def test_helper_that_continues_to_report_progress_can_finish(self):
+        self.assertEqual(self.machine.run([sys.executable, '-c', 'print("finished", flush=True)'],
+                                         timeout=10, idle_timeout=5), 0)
+
+    def lifecycle_command(self, arguments, pending=None, failure=None, real_dispatch=False,
+                          failure_pending=None, clear_before_failure=False, profile_role=None):
+        arguments = list(arguments)
+        if arguments[0] in ('stage', 'install') and arguments[1] == 'fixture.exe':
+            installer = self.root / 'fixture.exe'
+            installer.write_bytes(b'installer fixture')
+            installer.with_suffix('.build-info.json').write_text(json.dumps(dict(
+                version='test-version', channel='validation', revision='test-sha', installerGeneration=2)))
+            arguments[1] = str(installer)
+        if arguments[0] == 'exec':
+            source_index = arguments.index('--script') + 1
+            if arguments[source_index] in ('probe.ps1', 'next.ps1'):
+                source = self.root / arguments[source_index]
+                source.write_text("Write-Output 'fixture'\n", encoding='utf-8')
+                arguments[source_index] = str(source)
+        profile = {**self.profile, 'role': profile_role or ('manual' if arguments[0] in ('stage', 'install') else 'build')}
+        locks = self.root / '.cache/azookey-vm-locks'
+        with vm.ownership(self.profile, locks, allow_pending=True) as reservation:
+            if pending:
+                reservation.write_text(json.dumps(pending))
+        events, output = [], io.StringIO()
+        implementation = vm.execute
+        def reset(machine, reason, **kwargs):
+            events.append(reason)
+            machine.finish_operation()
+        def work(machine, args, result):
+            events.append(args.command)
+            if failure_pending:
+                machine.begin_operation(**failure_pending)
+            if failure:
+                if clear_before_failure:
+                    machine.finish_operation()
+                raise failure
+            if real_dispatch:
+                implementation(machine, args, result)
+        with patch.object(vm, 'ROOT', self.root), \
+                patch.object(vm.Path, 'home', return_value=self.root), \
+                patch.object(vm, 'load_profile', return_value=profile), \
+                patch.object(vm.VM, 'state', return_value={'VMState': 'running', 'UUID': self.profile['vm']}), \
+                patch.object(vm.VM, 'reset', autospec=True, side_effect=reset), \
+                patch.object(vm.VM, 'shutdown'), patch.object(vm.VM, 'shutdown_current'), patch.object(vm.VM, 'start'), \
+                patch.object(vm.VM, 'guest', return_value={'installed': None}), \
+                patch.object(vm, 'execute', side_effect=work), \
+                patch.object(vm.sys, 'argv', ['vm.py', '--profile', 'build', *arguments]), \
+                contextlib.redirect_stdout(output):
+            code = vm.main()
+        return code, json.loads(output.getvalue()), reservation, events
+
+    def test_cli_build_test_install_and_standalone_probe_start_and_finish_clean(self):
+        for args in (['build', 'feature/example'], ['test', 'feature/example'],
+                     ['stage', 'fixture.exe'], ['install', 'fixture.exe'], ['exec', '--script', 'probe.ps1'], ['doctor']):
+            with self.subTest(args=args):
+                code, result, reservation, events = self.lifecycle_command(args)
+                self.assertEqual(code, 0)
+                self.assertEqual(events, ['clean start', args[0], 'finished run'])
+                self.assertFalse(reservation.exists())
+
+    def test_cli_stale_timeout_reservation_is_reset_for_next_clean_run(self):
+        code, _, reservation, events = self.lifecycle_command(['test', 'feature/example'], {'operation': 'build'})
+        self.assertEqual(code, 0)
+        self.assertEqual(events[0], 'clean start')
+        self.assertFalse(reservation.exists())
+
+    def test_cli_failure_is_not_success_after_reset(self):
+        code, result, reservation, events = self.lifecycle_command(
+            ['test', 'feature/example'], failure=vm.VmError('SSH failed', 'failed', uncertain=True))
+        self.assertEqual(code, 1)
+        self.assertEqual(result['task_status'], 'failed')
+        self.assertEqual(events, ['clean start', 'test', 'failed run; discard guest immediately'])
+        self.assertFalse(reservation.exists())
+
+    def test_cli_stage_session_keeps_state_until_handoff(self):
+        code, _, reservation, events = self.lifecycle_command(['stage', 'fixture.exe', '--leave-running'])
+        self.assertEqual(code, 0)
+        self.assertEqual(events, ['clean start', 'stage'])
+        session = json.loads(reservation.read_text())
+        code, _, reservation, events = self.lifecycle_command(['exec', '--script', 'probe.ps1'], session)
+        self.assertEqual(code, 0)
+        self.assertEqual(events, ['exec'])
+        code, _, reservation, events = self.lifecycle_command(['handoff'], session)
+        self.assertEqual(code, 0)
+        self.assertEqual(events, ['handoff', 'finished run'])
+        self.assertFalse(reservation.exists())
+
+    def test_cli_does_not_reset_another_workspaces_ui_session(self):
+        session = {'operation': 'session', 'workspace': 'other-workspace'}
+        for args in (['test', 'feature/example'], ['shutdown'], ['shutdown', '--keep-current']):
+            with self.subTest(args=args):
+                code, _, reservation, events = self.lifecycle_command(args, session, real_dispatch=True)
+                self.assertEqual(code, 1)
+                self.assertEqual(events, [])
+                self.assertEqual(json.loads(reservation.read_text()), session)
+
+    def test_cli_maintenance_prepare_validate_stop_and_cold_boot_do_not_reset(self):
+        code, _, reservation, events = self.lifecycle_command(['prepare'])
+        self.assertEqual(code, 0)
+        self.assertEqual(events, ['clean start', 'prepare'])
+        session = json.loads(reservation.read_text())
+        self.assertEqual(session['mode'], 'maintenance')
+        for args in (['doctor'], ['exec', '--script', 'probe.ps1'], ['shutdown', '--keep-current'], ['start', '--keep-current']):
+            code, _, reservation, events = self.lifecycle_command(args, session,
+                                                                 real_dispatch=args[0] in ('start', 'shutdown'))
+            self.assertEqual(code, 0)
+            self.assertEqual(events, [args[0]])
+            session = json.loads(reservation.read_text())
+            self.assertEqual(session['mode'], 'maintenance')
+
+    def test_prepare_continues_only_an_existing_maintenance_session(self):
+        for mode in ('verification', 'maintenance'):
+            with self.subTest(mode=mode):
+                pending = {'operation': 'session', 'workspace': str(self.root), 'mode': mode}
+                code, _, reservation, events = self.lifecycle_command(['prepare'], pending)
+                self.assertEqual(code, 0)
+                self.assertEqual(events, ['prepare'] if mode == 'maintenance' else ['clean start', 'prepare'])
+                self.assertEqual(json.loads(reservation.read_text())['mode'], 'maintenance')
+
+    def test_invalid_local_installer_cannot_reset_or_replace_open_session(self):
+        for command in ('stage', 'install'):
+            for mode in ('verification', 'maintenance'):
+                for case in ('missing_installer', 'missing_metadata', 'bad_json', 'missing_identity', 'non_object', 'invalid_fields', 'invalid_generation'):
+                    with self.subTest(command=command, mode=mode, case=case):
+                        installer = self.root / (case + '.exe')
+                        if case != 'missing_installer':
+                            installer.write_bytes(b'installer fixture')
+                        if case not in ('missing_installer', 'missing_metadata'):
+                            metadata = {
+                                'bad_json': '{', 'missing_identity': '{}', 'non_object': 'null',
+                                'invalid_fields': '{"version":null,"channel":"validation","revision":"test-sha","installerGeneration":2}',
+                                'invalid_generation': '{"version":"test-version","channel":"validation","revision":"test-sha","installerGeneration":"2"}',
+                            }[case]
+                            installer.with_suffix('.build-info.json').write_text(metadata)
+                        pending = {'operation': 'session', 'workspace': str(self.root), 'mode': mode}
+                        code, result, reservation, events = self.lifecycle_command([command, str(installer)], pending)
+                        self.assertEqual(code, 1)
+                        self.assertNotEqual(result['task_status'], 'succeeded')
+                        self.assertEqual(events, [])
+                        self.assertEqual(json.loads(reservation.read_text()), pending)
+
+    def test_installer_hash_read_failure_preserves_open_session(self):
+        installer = self.root / 'unreadable.exe'
+        installer.write_bytes(b'installer fixture')
+        installer.with_suffix('.build-info.json').write_text(json.dumps(dict(
+            version='test-version', channel='validation', revision='test-sha', installerGeneration=2)))
+        pending = {'operation': 'session', 'workspace': str(self.root), 'mode': 'verification'}
+        with patch.object(vm.hashlib, 'file_digest', side_effect=OSError('artifact read failed')):
+            code, result, reservation, events = self.lifecycle_command(['stage', str(installer)], pending)
+        self.assertEqual(code, 1)
+        self.assertIn('artifact read failed', result['error'])
+        self.assertEqual(events, [])
+        self.assertEqual(json.loads(reservation.read_text()), pending)
+
+    def test_incompatible_profile_cannot_reset_or_replace_open_session(self):
+        for command, role in ((['prepare'], 'manual'), (['build', 'feature/example'], 'manual'),
+                              (['test', 'feature/example'], 'manual'), (['stage', 'fixture.exe'], 'build'),
+                              (['install', 'fixture.exe'], 'build')):
+            for mode in ('verification', 'maintenance'):
+                with self.subTest(command=command, role=role, mode=mode):
+                    pending = {'operation': 'session', 'workspace': str(self.root), 'mode': mode}
+                    code, _, reservation, events = self.lifecycle_command(command, pending, profile_role=role)
+                    self.assertEqual(code, 1)
+                    self.assertEqual(events, [])
+                    self.assertEqual(json.loads(reservation.read_text()), pending)
+
+    def test_invalid_exec_source_cannot_reset_or_replace_open_session(self):
+        for case in ('missing', 'invalid_utf8'):
+            for mode in ('verification', 'maintenance'):
+                with self.subTest(case=case, mode=mode):
+                    source = self.root / (case + '.ps1')
+                    if case == 'invalid_utf8':
+                        source.write_bytes(b'\xff\xfeinvalid UTF8')
+                    pending = {'operation': 'session', 'workspace': str(self.root), 'mode': mode}
+                    code, _, reservation, events = self.lifecycle_command(['exec', '--script', str(source)], pending)
+                    self.assertEqual(code, 1)
+                    self.assertEqual(events, [])
+                    self.assertEqual(json.loads(reservation.read_text()), pending)
+
+    def test_invalid_transfer_paths_preserve_open_session(self):
+        parent_file = self.root / 'not-a-directory'
+        parent_file.write_text('fixture')
+        cases = (
+            ['upload', str(self.root / 'missing.bin'), r'C:\target.bin'],
+            ['upload', str(self.key), 'relative.bin'],
+            ['download', 'relative.bin', str(self.root / 'download.bin')],
+            ['download', r'C:\source.bin', str(parent_file / 'download.bin')],
+        )
+        for args in cases:
+            for mode in ('verification', 'maintenance'):
+                with self.subTest(args=args, mode=mode):
+                    pending = {'operation': 'session', 'workspace': str(self.root), 'mode': mode}
+                    code, _, reservation, events = self.lifecycle_command(args, pending)
+                    self.assertEqual(code, 1)
+                    self.assertEqual(events, [])
+                    self.assertEqual(json.loads(reservation.read_text()), pending)
+
+    def test_cli_reboot_keeps_installed_verification_session(self):
+        session = {'operation': 'session', 'workspace': str(self.root), 'mode': 'verification'}
+        code, _, reservation, events = self.lifecycle_command(['reboot'], session, real_dispatch=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(events, ['reboot'])
+        self.assertEqual(json.loads(reservation.read_text())['mode'], 'verification')
+
+    def test_preserve_current_cannot_replace_an_unresolved_operation_with_a_session(self):
+        pending = {'operation': 'interactive', 'task': 'azookey-vm-test', 'remote_script': 'fixture.ps1'}
+        for args in (['start', '--keep-current'], ['shutdown', '--keep-current'], ['snapshot', 'new-baseline']):
+            with self.subTest(args=args):
+                code, _, reservation, events = self.lifecycle_command(args, pending, real_dispatch=True)
+                self.assertEqual(code, 1)
+                self.assertEqual(events, [])
+                self.assertEqual(json.loads(reservation.read_text()), pending)
+
+    def maintenance_session(self):
+        return {'operation': 'session', 'workspace': str(self.root), 'mode': 'maintenance'}
+
+    def test_maintenance_known_completed_failure_preserves_session_and_next_probe(self):
+        code, result, reservation, events = self.lifecycle_command(
+            ['exec', '--script', 'probe.ps1'], self.maintenance_session(),
+            failure=vm.VmError('known script failure', 'failed'), clear_before_failure=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(result['task_status'], 'failed')
+        self.assertEqual(events, ['exec'])
+        pending = json.loads(reservation.read_text())
+        self.assertEqual(pending['mode'], 'maintenance')
+        self.assertEqual(pending['operation'], 'session')
+        code, _, _, events = self.lifecycle_command(['doctor'], pending)
+        self.assertEqual(code, 0)
+        self.assertEqual(events, ['doctor'])
+
+    def test_uncertain_maintenance_work_is_preserved_and_next_invocation_cannot_reset_it(self):
+        for failure in (vm.VmError('timeout', uncertain=True), KeyboardInterrupt('interrupted')):
+            with self.subTest(failure=failure):
+                code, _, reservation, events = self.lifecycle_command(
+                    ['exec', '--script', 'probe.ps1'], self.maintenance_session(), failure=failure,
+                    failure_pending={'operation': 'interactive', 'task': 'azookey-vm-test'})
+                self.assertEqual(code, 1)
+                self.assertEqual(events, ['exec'])
+                pending = json.loads(reservation.read_text())
+                self.assertEqual(pending['operation'], 'interactive')
+                self.assertEqual(pending['task'], 'azookey-vm-test')
+                self.assertEqual(pending['mode'], 'maintenance')
+                for args in (['doctor'], ['exec', '--script', 'next.ps1'], ['test', 'feature/example']):
+                    code, _, reservation, events = self.lifecycle_command(args, pending)
+                    self.assertEqual(code, 1)
+                    self.assertEqual(events, [])
+                    self.assertEqual(json.loads(reservation.read_text()), pending)
+
+    def test_fresh_verification_does_not_inherit_previous_maintenance_failure_policy(self):
+        code, _, reservation, events = self.lifecycle_command(
+            ['test', 'feature/example'], self.maintenance_session(), failure=vm.VmError('test failed', 'failed'))
+        self.assertEqual(code, 1)
+        self.assertEqual(events, ['clean start', 'test', 'failed run; discard guest immediately'])
+        self.assertFalse(reservation.exists())
+
+    def test_maintenance_handoff_preserves_current_disk_for_capture(self):
+        code, _, reservation, events = self.lifecycle_command(['handoff'], self.maintenance_session(), real_dispatch=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(events, ['handoff'])
+        self.assertEqual(json.loads(reservation.read_text())['mode'], 'maintenance')
+
+    def test_foreign_uncertain_maintenance_requires_explicit_discard(self):
+        pending = {'operation': 'script', 'workspace': 'other-workspace', 'mode': 'maintenance', 'remote_script': 'fixture.ps1'}
+        code, _, reservation, events = self.lifecycle_command(['reset'], pending, real_dispatch=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(events, [])
+        self.assertEqual(json.loads(reservation.read_text()), pending)
+        code, _, reservation, events = self.lifecycle_command(['reset', '--discard-session'], pending, real_dispatch=True)
+        self.assertEqual(code, 0)
+        self.assertFalse(reservation.exists())
+
+    def test_preserving_shutdown_observes_poweroff_after_lost_ack_without_replaying(self):
+        self.machine.session_mode = 'maintenance'
+        self.machine.state = Mock(side_effect=[{'VMState': 'running'}, {'VMState': 'poweroff'}])
+        self.machine.capture = Mock(side_effect=vm.VmError('SSH disconnected', uncertain=True))
+        self.machine.vbox = Mock()
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            self.machine.begin_operation('session')
+            self.machine.shutdown_current()
+            self.assertEqual(json.loads(reservation.read_text())['operation'], 'shutdown_current')
+        self.machine.capture.assert_called_once()
+        self.assertEqual(self.machine.capture.call_args.args[0][-1], 'shutdown.exe /s /t 0')
+        self.machine.vbox.assert_not_called()
+
+    def test_preserving_shutdown_deadline_retains_uncertain_operation_and_never_forces(self):
+        self.machine.session_mode = 'maintenance'
+        self.machine.state = Mock(return_value={'VMState': 'running'})
+        self.machine.capture = Mock(return_value=subprocess.CompletedProcess(['ssh'], 0))
+        self.machine.vbox = Mock()
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            with patch.object(vm.time, 'monotonic', side_effect=[0, 121]):
+                with self.assertRaises(vm.VmError) as caught:
+                    self.machine.shutdown_current()
+            self.assertTrue(caught.exception.uncertain)
+            self.assertEqual(json.loads(reservation.read_text())['operation'], 'shutdown_current')
+        self.machine.capture.assert_called_once()
+        self.machine.vbox.assert_not_called()
+
+    def test_snapshot_capture_releases_only_after_new_poweredoff_identity(self):
+        self.machine.session_mode = 'maintenance'
+        self.machine.state = Mock(side_effect=[self.restored_state(),
+            {'VMState': 'poweroff', 'CurrentSnapshotName': 'new-baseline', 'CurrentSnapshotUUID': 'new-id'}])
+        self.machine.vbox = Mock()
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            result = self.machine.snapshot('new-baseline')
+            self.assertEqual(result['uuid'], 'new-id')
+            self.assertFalse(reservation.exists())
+
+    def test_snapshot_timeout_and_interrupt_keep_capture_reservation(self):
+        for failure in (vm.VmError('snapshot timed out', uncertain=True), KeyboardInterrupt('interrupted')):
+            with self.subTest(failure=failure):
+                self.machine.session_mode = 'maintenance'
+                self.machine.state = Mock(return_value=self.restored_state())
+                self.machine.vbox = Mock(side_effect=failure)
+                with vm.ownership(self.profile, self.root / 'locks', allow_pending=True) as reservation:
+                    self.machine.reservation = reservation
+                    with self.assertRaises(type(failure)):
+                        self.machine.snapshot('new-baseline')
+                    pending = json.loads(reservation.read_text())
+                    self.assertEqual(pending['operation'], 'snapshot')
+                    self.assertEqual(pending['previous_snapshot'], 'baseline-id')
+                    self.assertEqual(pending['mode'], 'maintenance')
+                with self.assertRaises(vm.VmError):
+                    with vm.ownership(self.profile, self.root / 'locks'):
+                        self.fail('Unconfirmed capture must block another mutation')
+
+    def test_snapshot_unchanged_identity_does_not_release_capture(self):
+        self.machine.state = Mock(return_value=self.restored_state())
+        self.machine.vbox = Mock()
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            with self.assertRaisesRegex(vm.VmError, 'identity is unconfirmed'):
+                self.machine.snapshot('new-baseline')
+            self.assertTrue(reservation.exists())
 
     def test_one_owner_per_vm_even_with_different_profile_aliases(self):
         with vm.ownership(self.profile, self.root / 'locks'):
@@ -194,7 +641,7 @@ class VmTests(unittest.TestCase):
     def test_known_helper_failure_releases_operation_reservation(self):
         with vm.ownership(self.profile, self.root / 'locks') as reservation:
             self.machine.reservation = reservation
-            with patch.object(vm.subprocess, 'run', return_value=subprocess.CompletedProcess(['helper'], 7)):
+            with patch.object(self.machine, 'run', side_effect=vm.VmError('helper exit7', 'failed')):
                 with self.assertRaises(vm.VmError) as caught:
                     self.machine.run_operation('test', ['helper'])
             self.assertFalse(caught.exception.uncertain)
@@ -208,7 +655,7 @@ class VmTests(unittest.TestCase):
                 locks = self.root / ('locks-' + str(code))
                 with vm.ownership(self.profile, locks) as reservation:
                     self.machine.reservation = reservation
-                    with patch.object(vm.subprocess, 'run', return_value=subprocess.CompletedProcess(['helper'], code)):
+                    with patch.object(self.machine, 'run', side_effect=vm.VmError(f'helper exit{code}', uncertain=True)):
                         with self.assertRaises(vm.VmError) as caught:
                             self.machine.run_operation('test', ['helper'])
                     self.assertTrue(caught.exception.uncertain)
@@ -221,14 +668,14 @@ class VmTests(unittest.TestCase):
     def test_successful_helper_releases_operation_reservation(self):
         with vm.ownership(self.profile, self.root / 'locks') as reservation:
             self.machine.reservation = reservation
-            with patch.object(vm.subprocess, 'run', return_value=subprocess.CompletedProcess(['helper'], 0)):
+            with patch.object(self.machine, 'run', return_value=0):
                 self.machine.run_operation('build', ['helper'])
             self.assertFalse(reservation.exists())
 
     def test_local_helper_launch_failure_releases_operation_reservation(self):
         with vm.ownership(self.profile, self.root / 'locks') as reservation:
             self.machine.reservation = reservation
-            with patch.object(vm.subprocess, 'run', side_effect=FileNotFoundError('helper missing')):
+            with patch.object(self.machine, 'run', side_effect=FileNotFoundError('helper missing')):
                 with self.assertRaises(FileNotFoundError):
                     self.machine.run_operation('test', ['helper'])
             self.assertFalse(reservation.exists())
@@ -306,11 +753,12 @@ class VmTests(unittest.TestCase):
             self.assertTrue(caught.exception.uncertain)
             self.assertTrue(reservation.exists())
 
-    def resolve_interactive(self, responses):
+    def resolve_interactive(self, responses, mode='verification'):
         locks = self.root / '.cache/azookey-vm-locks'
         with vm.ownership(self.profile, locks, allow_pending=True) as reservation:
             self.machine.reservation = reservation
-            self.machine.begin_operation('interactive', task='azookey-vm-test')
+            self.machine.session_mode = mode
+            self.machine.begin_operation('interactive', task='azookey-vm-test', workspace=str(self.root))
             pending = json.loads(reservation.read_text())
         output = io.StringIO()
         with patch.object(vm, 'ROOT', self.root), \
@@ -362,6 +810,21 @@ class VmTests(unittest.TestCase):
         ps.assert_called_once()
         self.assertNotIn('Unregister-ScheduledTask', ps.call_args.args[0])
 
+    def test_resolved_maintenance_operation_keeps_session_for_next_probes(self):
+        code, result, reservation, _ = self.resolve_interactive(['absent'], mode='maintenance')
+        self.assertEqual(code, 0)
+        self.assertEqual(result['task_status'], 'succeeded')
+        session = json.loads(reservation.read_text())
+        self.assertEqual(session['operation'], 'session')
+        self.assertEqual(session['mode'], 'maintenance')
+        self.assertEqual(session['workspace'], str(self.root))
+        for args in (['doctor'], ['exec', '--script', 'probe.ps1']):
+            code, _, reservation, events = self.lifecycle_command(args, session)
+            self.assertEqual(code, 0)
+            self.assertEqual(events, [args[0]])
+            session = json.loads(reservation.read_text())
+            self.assertEqual(session['mode'], 'maintenance')
+
     def test_script_uploads_japanese_utf8_with_bom(self):
         source = self.root / 'probe.ps1'
         source.write_text("Write-Output '日本語確認'\n", encoding='utf-8')
@@ -379,6 +842,19 @@ class VmTests(unittest.TestCase):
         with self.assertRaises(UnicodeError):
             self.machine.script(source)
         self.machine.start.assert_not_called()
+
+    def test_exec_uses_prepared_bom_script_after_original_is_removed(self):
+        source = self.root / 'source.ps1'
+        content = "Write-Output '日本語確認'\n"
+        source.write_text(content, encoding='utf-8')
+        prepared = vm.script_artifact(source, self.root / 'prepared')
+        source.unlink()
+        self.machine.start = Mock()
+        self.machine.transfer = Mock()
+        self.machine.ps = Mock(return_value='日本語確認')
+        self.assertEqual(self.machine.script(source, prepared=prepared), '日本語確認')
+        uploaded = Path(self.machine.transfer.call_args.args[0])
+        self.assertEqual(uploaded.read_bytes(), b'\xef\xbb\xbf' + content.encode('utf-8'))
 
     def test_script_exit_failure_releases_but_disconnect_retains_reservation(self):
         source = self.root / 'probe.ps1'
@@ -428,7 +904,22 @@ class VmTests(unittest.TestCase):
             self.machine.stage(installer, False)
         self.machine.start.assert_not_called()
 
-    def test_stage_preserves_disk_and_shuts_down_by_default(self):
+    def test_stage_uses_preflight_identity_and_hash_without_rereading_metadata(self):
+        installer = self.root / 'prepared.exe'
+        installer.write_bytes(b'prepared installer fixture')
+        metadata = installer.with_suffix('.build-info.json')
+        identity = dict(version='test-version', channel='validation', revision='test-sha', installerGeneration=2)
+        metadata.write_text(json.dumps(identity))
+        prepared = vm.installer_artifact(installer)
+        metadata.write_text('no longer valid JSON')
+        self.machine.start = Mock()
+        self.machine.transfer = Mock()
+        self.machine.guest = Mock(return_value={'installed': identity})
+        self.machine.stage(installer, False, prepared=prepared)
+        self.assertEqual(json.loads(self.machine.guest.call_args.kwargs['Expected']), identity)
+        self.assertEqual(self.machine.guest.call_args.kwargs['Sha256'], prepared[2])
+
+    def test_stage_reports_identity_before_outer_lifecycle_resets(self):
         installer = self.root / 'setup.exe'
         installer.write_bytes(b'installer fixture')
         identity = dict(version='test-version', channel='validation', revision='test-sha', installerGeneration=2)
@@ -439,12 +930,87 @@ class VmTests(unittest.TestCase):
         self.machine.shutdown = Mock()
         self.machine.vbox = Mock()
         self.machine.stage(installer, False)
-        self.machine.shutdown.assert_called_once()
+        self.machine.shutdown.assert_not_called()
         self.machine.vbox.assert_not_called()
         self.assertEqual(json.loads(self.machine.guest.call_args.kwargs['Expected']), identity)
-        self.machine.shutdown.reset_mock()
         self.machine.stage(installer, True)
         self.machine.shutdown.assert_not_called()
+
+    def test_stage_recovers_log_for_completed_install_but_not_ssh_failure(self):
+        installer = self.root / 'setup.exe'
+        installer.write_bytes(b'installer fixture')
+        identity = dict(version='test-version', channel='validation', revision='test-sha', installerGeneration=2)
+        installer.with_suffix('.build-info.json').write_text(json.dumps(identity))
+        for error in (None, vm.VmError('installer exit7', 'failed'), vm.VmError('SSH failed', uncertain=True)):
+            with self.subTest(error=error):
+                self.machine.evidence = []
+                self.machine.start = Mock()
+                def transfer(source, destination, download=False, **kwargs):
+                    if download:
+                        Path(destination).write_text('installer diagnostic evidence')
+                self.machine.transfer = Mock(side_effect=transfer)
+                self.machine.guest = Mock(side_effect=error, return_value={'installed': identity})
+                if error:
+                    with self.assertRaises(vm.VmError) as caught:
+                        self.machine.stage(installer, False)
+                    self.assertIs(caught.exception, error)
+                else:
+                    self.machine.stage(installer, False)
+                recovered = error is None or not error.uncertain
+                self.assertEqual(self.machine.transfer.call_count, 2 if recovered else 1)
+                self.assertEqual(self.machine.evidence[-1]['task_status'], 'succeeded' if recovered else 'not_run')
+
+    def test_install_log_transport_timeout_fails_and_resets_instead_of_leaving_a_session(self):
+        installer = self.root / 'setup.exe'
+        installer.write_bytes(b'installer fixture')
+        identity = dict(version='test-version', channel='validation', revision='test-sha', installerGeneration=2)
+        installer.with_suffix('.build-info.json').write_text(json.dumps(identity))
+        self.machine.start = Mock()
+        self.machine.guest = Mock(return_value={'installed': identity, 'installer_exit': 0})
+        self.machine.transfer = Mock(side_effect=[None, vm.VmError('log SCP timed out', uncertain=True)])
+        self.machine.reset = Mock(side_effect=lambda *args, **kwargs: self.machine.finish_operation())
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            with self.assertRaisesRegex(vm.VmError, 'log SCP timed out'):
+                with self.machine.clean_run(keep=True):
+                    self.machine.stage(installer, True)
+            self.assertFalse(reservation.exists())
+            self.assertEqual(self.machine.reset.call_args.args, ('failed run; discard guest immediately',))
+            self.assertEqual(self.machine.evidence[-1]['installation']['installed'], identity)
+
+    def test_controller_scp_timeout_also_terminates_ssh_child(self):
+        bin_dir = self.root / 'bin'
+        bin_dir.mkdir()
+        stub = bin_dir / 'scp'
+        stub.write_text('#!' + sys.executable + '\n'
+                        'import subprocess,sys,time\n'
+                        'p=subprocess.Popen([sys.executable,"-c","import time; time.sleep(60)"])\n'
+                        'print(p.pid,flush=True)\n'
+                        'time.sleep(60)\n')
+        stub.chmod(0o755)
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            self.machine.session_mode = 'maintenance'
+            self.machine.begin_operation('session')
+            with patch.dict(os.environ, {'PATH': str(bin_dir) + os.pathsep + os.environ['PATH']}):
+                with self.assertRaises(vm.VmError) as caught:
+                    self.machine.transfer(str(self.key), r'C:\fixture.bin', timeout=0.5)
+            pending = json.loads(reservation.read_text())
+            self.assertEqual(pending['operation'], 'upload')
+            self.assertEqual(pending['mode'], 'maintenance')
+        self.assertTrue(caught.exception.uncertain)
+        child_pid = next(line for line in self.machine.log.read_text().splitlines() if line.isdecimal())
+        proc_stat = Path('/proc') / child_pid / 'stat'
+        for _ in range(100):
+            try:
+                dead = proc_stat.read_text().split()[2] == 'Z'
+            except FileNotFoundError:
+                dead = True
+            if dead:
+                break
+            vm.time.sleep(0.01)
+        else:
+            self.fail('SCP SSH child survived the deadline')
 
     def test_powershell_quote_does_not_inject(self):
         self.assertEqual(vm.ps_quote("C:\\user's file.ps1"), "'C:\\user''s file.ps1'")
@@ -454,6 +1020,53 @@ class VmTests(unittest.TestCase):
         with self.assertRaisesRegex(vm.VmError, 'absolute Windows path'):
             self.machine.transfer(str(self.key), 'relative.txt')
         self.machine.run.assert_not_called()
+
+    def test_uncertain_transfer_retains_operation_and_blocks_maintenance_continuation(self):
+        for download in (False, True):
+            for failure in (vm.VmError('SCP timeout', uncertain=True), KeyboardInterrupt('interrupted'), OSError('transfer IO failed')):
+                with self.subTest(download=download, failure=failure):
+                    self.machine.session_mode = 'maintenance'
+                    self.machine.run = Mock(side_effect=failure)
+                    source, target = ((r'C:\source.bin', str(self.root / 'download.bin')) if download
+                                      else (str(self.key), r'C:\target.bin'))
+                    with vm.ownership(self.profile, self.root / 'locks', allow_pending=True) as reservation:
+                        self.machine.reservation = reservation
+                        with patch.object(vm, 'ROOT', self.root):
+                            self.machine.begin_operation('session', purpose='kept maintenance')
+                            with self.assertRaises(type(failure)):
+                                self.machine.transfer(source, target, download=download)
+                        pending = json.loads(reservation.read_text())
+                        self.assertEqual(pending['operation'], 'download' if download else 'upload')
+                        self.assertEqual(pending['mode'], 'maintenance')
+                        self.assertIn('remote_file', pending)
+                    code, result, next_reservation, events = self.lifecycle_command(['exec', '--script', 'probe.ps1'], pending)
+                    self.assertEqual(code, 1)
+                    self.assertIn('Unresolved maintenance operation', result['error'])
+                    self.assertEqual(events, [])
+                    self.assertEqual(json.loads(next_reservation.read_text()), pending)
+
+    def test_completed_transfer_restores_enclosing_operation_exactly(self):
+        for failure in (None, vm.VmError('SCP rejected path', 'failed')):
+            with self.subTest(failure=failure):
+                self.machine.session_mode = 'maintenance'
+                self.machine.run = Mock(side_effect=failure, return_value=0)
+                with vm.ownership(self.profile, self.root / 'locks', allow_pending=True) as reservation:
+                    self.machine.reservation = reservation
+                    self.machine.begin_operation('session', purpose='enclosing operation')
+                    previous = reservation.read_bytes()
+                    if failure:
+                        with self.assertRaises(vm.VmError):
+                            self.machine.transfer(str(self.key), r'C:\target.bin')
+                    else:
+                        self.machine.transfer(str(self.key), r'C:\target.bin')
+                    self.assertEqual(reservation.read_bytes(), previous)
+
+    def test_transfer_without_enclosing_operation_releases_only_after_success(self):
+        self.machine.run = Mock(return_value=0)
+        with vm.ownership(self.profile, self.root / 'locks') as reservation:
+            self.machine.reservation = reservation
+            self.machine.transfer(str(self.key), r'C:\target.bin')
+            self.assertFalse(reservation.exists())
 
 
 if __name__ == '__main__':
