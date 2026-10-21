@@ -310,7 +310,10 @@ pub fn candidate_window_position(
         )
     };
 
-    (x, y)
+    (
+        x,
+        clamp_start(y, window_size.height, work_area.top, work_area.bottom),
+    )
 }
 
 pub fn candidate_window_position_with_ruby_clearance(
@@ -336,13 +339,11 @@ pub fn candidate_window_position_with_ruby_clearance(
     let candidate_is_above_input = y < target_rect.top;
     let overlaps_ruby = ruby_y < candidate_bottom && ruby_bottom > y;
 
-    if ruby_is_below_input && candidate_is_below_input && overlaps_ruby {
+    let y = if ruby_is_below_input && candidate_is_below_input && overlaps_ruby {
         let shifted_below_ruby = ruby_bottom.saturating_add(RUBY_Y_GAP);
         let candidate_above_input =
             target_rect.top - candidate_window_size.height - CANDIDATE_Y_GAP;
-        let y = if shifted_below_ruby.saturating_add(candidate_window_size.height)
-            <= work_area.bottom
-        {
+        if shifted_below_ruby.saturating_add(candidate_window_size.height) <= work_area.bottom {
             shifted_below_ruby
         } else if candidate_above_input >= work_area.top {
             candidate_above_input
@@ -353,12 +354,11 @@ pub fn candidate_window_position_with_ruby_clearance(
                 work_area.top,
                 work_area.bottom,
             )
-        };
-        (x, y)
+        }
     } else if ruby_is_above_input && candidate_is_above_input && overlaps_ruby {
         let shifted_above_ruby = ruby_y - candidate_window_size.height - RUBY_Y_GAP;
         let candidate_below_input = target_rect.bottom.saturating_add(CANDIDATE_Y_GAP);
-        let y = if shifted_above_ruby >= work_area.top {
+        if shifted_above_ruby >= work_area.top {
             shifted_above_ruby
         } else if candidate_below_input.saturating_add(candidate_window_size.height)
             <= work_area.bottom
@@ -371,11 +371,20 @@ pub fn candidate_window_position_with_ruby_clearance(
                 work_area.top,
                 work_area.bottom,
             )
-        };
-        (x, y)
+        }
     } else {
-        (x, y)
-    }
+        y
+    };
+
+    (
+        x,
+        clamp_start(
+            y,
+            candidate_window_size.height,
+            work_area.top,
+            work_area.bottom,
+        ),
+    )
 }
 
 pub fn ruby_window_position(
@@ -407,7 +416,10 @@ pub fn ruby_window_position(
         clamp_start(below, window_size.height, work_area.top, work_area.bottom)
     };
 
-    (x, y)
+    (
+        x,
+        clamp_start(y, window_size.height, work_area.top, work_area.bottom),
+    )
 }
 
 fn clamp_start(preferred: i32, length: i32, min: i32, max: i32) -> i32 {
@@ -639,6 +651,83 @@ mod tests {
         );
 
         assert_eq!(pos, (85, 394));
+    }
+
+    #[test]
+    fn keeps_search_taskbar_popups_inside_work_area_with_ruby_clearance() {
+        let work_area = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 907,
+        };
+        let target = CandidateRect::new(914, 94, 940, 164);
+        let ruby_size = CandidateWindowSize::new(103, 41);
+        let candidate_size = CandidateWindowSize::new(225, 243);
+
+        assert_eq!(
+            ruby_window_position(target, ruby_size, work_area, READING_LEFT_INSET, 0),
+            (74, 866),
+        );
+        assert_eq!(
+            candidate_window_position_with_ruby_clearance(
+                target,
+                candidate_size,
+                ruby_size,
+                work_area,
+                0,
+            ),
+            (79, 621),
+        );
+    }
+
+    #[test]
+    fn clamps_popups_when_input_extents_are_outside_work_area() {
+        // Include taskbars on either edge and monitors with negative origins.
+        for work_area in [
+            work_area(),
+            RECT {
+                left: -800,
+                top: -600,
+                right: 0,
+                bottom: 0,
+            },
+        ] {
+            for top in [work_area.top - 100, work_area.bottom + 100] {
+                let target =
+                    CandidateRect::new(top, work_area.left + 100, top + 26, work_area.right);
+                let candidate_size = CandidateWindowSize::new(225, 243);
+                let ruby_size = CandidateWindowSize::new(103, 41);
+                for (position, size) in [
+                    (
+                        candidate_window_position(target, candidate_size, work_area),
+                        candidate_size,
+                    ),
+                    (
+                        ruby_window_position(target, ruby_size, work_area, READING_LEFT_INSET, 0),
+                        ruby_size,
+                    ),
+                    (
+                        candidate_window_position_with_ruby_clearance(
+                            target,
+                            candidate_size,
+                            ruby_size,
+                            work_area,
+                            0,
+                        ),
+                        candidate_size,
+                    ),
+                ] {
+                    assert!(
+                        position.0 >= work_area.left && position.0 + size.width <= work_area.right
+                    );
+                    assert!(
+                        position.1 >= work_area.top && position.1 + size.height <= work_area.bottom,
+                        "popup {position:?}, size {size:?}, target {target:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
