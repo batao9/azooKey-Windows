@@ -35,8 +35,8 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         tracing::debug!("Activated with tid: {tid}");
 
         // add reference to the dll instance to prevent it from being unloaded
-        let mut dll_instance = DllModule::get()?;
-        dll_instance.add_ref();
+        // Release the module mutex before COM callbacks or native UI initialization.
+        DllModule::get()?.add_ref();
 
         let mut text_service = self.borrow_mut()?;
 
@@ -119,6 +119,9 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
                 .AddItem(&text_service.this::<ITfLangBarItemButton>()?)?;
         };
         drop(text_service);
+        if let Err(error) = super::candidate_ui::initialize(thread_mgr) {
+            tracing::warn!(?error, "Native candidate UI initialization failed");
+        }
         self.set_keyboard_disabled_for_document_mgr(doc_mgr.as_ref())?;
         match IMEState::ensure_ipc_service() {
             Ok(true) => tracing::debug!("Initialized IPC service during Activate"),
@@ -145,13 +148,11 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         tracing::debug!("Deactivated");
         self.clear_tracked_modifier_key_state();
 
-        // remove reference to the dll instance
-        let mut dll_instance = DllModule::get()?;
-        dll_instance.release();
-
-        // End composition before borrowing TextService for sink teardown. The event helper
-        // needs a mutable borrow to invalidate pending mode switches and clear local state.
+        // End composition and destroy thread-owned candidate windows before releasing
+        // the DLL reference: their window procedures live in this module.
         self.end_composition_for_tsf_event();
+        super::candidate_ui::shutdown();
+        DllModule::get()?.release();
 
         {
             let text_service = self.borrow()?;

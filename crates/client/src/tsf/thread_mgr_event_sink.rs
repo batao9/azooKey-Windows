@@ -84,6 +84,9 @@ impl ITfThreadMgrEventSink_Impl for TextServiceFactory_Impl {
             self.borrow_mut()?.advise_text_layout_sink(focus.clone())?;
         }
         self.end_composition_for_tsf_event();
+        if let Err(error) = super::candidate_ui::set_document_manager(focus) {
+            tracing::warn!(?error, "Native candidate UI focus update failed");
+        }
         self.set_keyboard_disabled_for_document_mgr(focus)?;
         ensure_ipc_service_for_tsf_event("OnSetFocus");
 
