@@ -110,18 +110,54 @@ class VmTests(unittest.TestCase):
         self.machine.vbox.assert_called_once_with('discardstate', 'vm-uuid')
 
     def test_ready_does_not_send_keys_to_responsive_guest(self):
-        self.machine.capture = Mock(return_value=subprocess.CompletedProcess(['ssh'], 0))
+        self.machine.capture = Mock(return_value=subprocess.CompletedProcess(['ssh'], 0, stdout='VM_READY\r\n'))
         self.machine.vbox = Mock()
         self.machine.ready()
         self.machine.vbox.assert_not_called()
 
     def test_ready_wakes_once_without_shift_after_failed_probe(self):
         self.machine.capture = Mock(side_effect=[subprocess.CompletedProcess(['ssh'], 255),
-                                                subprocess.CompletedProcess(['ssh'], 0)])
+                                                subprocess.CompletedProcess(['ssh'], 0, stdout='VM_READY\r\n')])
         self.machine.vbox = Mock()
         with patch.object(vm.time, 'sleep'):
             self.machine.ready()
         self.machine.vbox.assert_called_once_with('controlvm', 'vm-uuid', 'keyboardputscancode', '1d', '9d')
+
+    def test_ready_requires_powershell_execution_and_marker(self):
+        # An authenticated cmd.exe echo can succeed before the PowerShell path
+        # required by start/exec/install can run after a cold boot.
+        self.machine.capture = Mock(side_effect=[
+            subprocess.CompletedProcess(['ssh'], 0, stdout=''),
+            subprocess.CompletedProcess(['ssh'], 0, stdout='VM_READY\r\n')])
+        self.machine.vbox = Mock()
+        with patch.object(vm.time, 'sleep'):
+            self.machine.ready()
+        self.assertEqual(self.machine.capture.call_count, 2)
+        for call in self.machine.capture.call_args_list:
+            self.assertIn('powershell -NoProfile -NonInteractive', call.args[0][-1])
+
+    def test_ready_powershell_timeouts_remain_bounded(self):
+        self.machine.capture = Mock(side_effect=vm.VmError('PowerShell startup timeout', uncertain=True))
+        self.machine.vbox = Mock()
+        with patch.object(vm.time, 'sleep'), patch.object(vm.time, 'monotonic', side_effect=[0, 0, 0, 91]):
+            with self.assertRaisesRegex(vm.VmError, 'readiness deadline'):
+                self.machine.ready(seconds=90)
+        self.assertEqual(self.machine.capture.call_count, 1)
+        self.assertLessEqual(self.machine.capture.call_args.kwargs['timeout'], 15)
+
+    def test_install_guest_budget_covers_installer_wait_without_widening_identity(self):
+        self.machine.script = Mock(return_value='{"installed": null}')
+        self.machine.finish_operation = Mock()
+        self.machine.guest('install', Installer='C:\\setup.exe')
+        install = self.machine.script.call_args
+        # vm-guest.ps1 allows the installer to run for 1,200 seconds;
+        # the controller must also leave a bounded setup/identity margin.
+        self.assertGreater(install.kwargs.get('timeout', 120), 1200)
+        self.assertLessEqual(install.kwargs['timeout'], 1260)
+        self.assertTrue(install.kwargs['hold_pending'])
+        self.machine.finish_operation.assert_called_once()
+        self.machine.guest('identity')
+        self.assertEqual(self.machine.script.call_args.kwargs.get('timeout', 120), 120)
 
     def test_shutdown_has_short_deadline_and_never_waits_for_ssh(self):
         self.machine.state = Mock(return_value={'VMState': 'running'})

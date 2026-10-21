@@ -25,7 +25,7 @@ Python 3.11以降、OpenSSH、VirtualBox CLI を使う Linux/WSL ホスト用。
 buildとSwift testは共通のruntime helperを使い、固定版packageの依存DLLを含めて検証する。buildは検証済みruntimeをpackaging treeへ配置するため、不完全なcache/sourceをそのままinstallerへ取り込まない。
 controller経由ではVirtualBoxの実行ファイルもprofileから渡す。旧helperを直接使う場合は`VBOX_MANAGE`を明示するか`VBoxManage`を`PATH`に置く。
 
-SSH準備完了は認証済みコマンドで確認する。NATの転送ポートだけが先に開き、ゲストOS起動中はbannerが返らない場合がある。省電力についても`powercfg /a`の対応状態と設定値を分けて確認する。スリープ非対応ならGUIに項目が出ないことがあり、保存されているタイムアウト値だけからSSH停止原因を断定しない。
+SSH準備完了は、後続操作と同じPowerShellからの認証済み応答で確認する。`cmd.exe`のechoだけの成功では、cold boot直後のPowerShell起動完了を示さない。確認は`ready_timeout`全体の期限内、1回最大15秒の読み取り専用probeで行う。NATの転送ポートだけが先に開き、ゲストOS起動中はbannerが返らない場合がある。省電力についても`powercfg /a`の対応状態と設定値を分けて確認する。スリープ非対応ならGUIに項目が出ないことがあり、保存されているタイムアウト値だけからSSH停止原因を断定しない。
 
 ```sh
 python3 scripts/vm.py --profile build status
@@ -92,6 +92,7 @@ python3 scripts/vm.py --profile manual handoff
 - 保存確認はdisk保存とserver反映を分ける。APIキー等の実値を読み出してレポートへ出さない。
 - インストーラーは同一Windowsユーザーの昇格済みSSHから実行する。通常権限のinteractiveタスクを流用しない。
 - `stage`は`/RESTARTEXITCODE=3010`で`reboot_required`を記録する。インストール識別子の一致は実行中DLLの更新証拠ではない。3010の確認は`stage --leave-running`→`reboot`→UI/IME probe→`handoff`で行う。`runtime_verification`は標準stageでは`not_checked`。
+- `stage`のゲストinstaller待機は最大1200秒、ホスト側script予算は準備・identity確認の余裕を含む1260秒。通常のscript/identity照会は120秒のまま。SSH切断検知と、完了不明時の即時復元・再実行抑止は維持する。
 - installerログは完了が既知なら復元前に一度だけ、15秒以内の転送でホストへ回収し、成功/未回収を`evidence`に記録する。通信・完了が不明なら回収を反復せず即時復元する。ログ回収中の通信timeoutもrun失敗とし、既知のインストール結果を別に記録して即時復元する。
 - インストール前のsettingsはguest内へ退避する。結果はbytes変更の有無を記録するが、移行や通常の再serializeがあり得るため変更だけで内容消失とは断定しない。
 - 資格情報について、`cmdkey`出力全体の対象名部分一致を存在・保全証拠にしない。標準stageはcredential保全を未検証と明示する。
