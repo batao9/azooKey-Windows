@@ -607,20 +607,24 @@ impl IPCService {
             SERVER_PIPE_BUSY_TIMEOUT,
             Some(transport.clone()),
         )?;
-        let window_client = match Self::connect_named_pipe_channel(
-            &runtime,
-            "http://[::]:50052",
-            shared::ui_pipe_path()?,
-            UI_PIPE_BUSY_TIMEOUT,
-            None,
-        ) {
-            Ok(ui_channel) => Some(WindowServiceClient::new(ui_channel)),
-            Err(error) => {
-                tracing::warn!(
-                    ?error,
-                    "Candidate window IPC is unavailable; continuing without UI connection"
-                );
-                None
+        let window_client = if crate::tsf::candidate_ui::is_active() {
+            None
+        } else {
+            match Self::connect_named_pipe_channel(
+                &runtime,
+                "http://[::]:50052",
+                shared::ui_pipe_path()?,
+                UI_PIPE_BUSY_TIMEOUT,
+                None,
+            ) {
+                Ok(ui_channel) => Some(WindowServiceClient::new(ui_channel)),
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        "Candidate window IPC is unavailable; continuing without UI connection"
+                    );
+                    None
+                }
             }
         };
 
@@ -2633,23 +2637,56 @@ impl IPCService {
     ) -> anyhow::Result<WindowRpcDelivery> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
+        // AppContainer hosts own their candidate UI on the TSF thread, where it
+        // can participate in host UI-element negotiation instead of being covered
+        // by the shell's higher window band. Desktop apps retain the external UI.
+        let native_result = crate::tsf::candidate_ui::update(
+            visible,
+            position.as_ref(),
+            candidates.as_deref(),
+            selected_index,
+            reading,
+            candidate_list_visible,
+            reading_vertical_adjustment,
+        )
+        .and_then(|handled| {
+            if handled {
+                if let Some(mode) = input_mode {
+                    crate::tsf::candidate_ui::show_input_mode(mode)?;
+                }
+            }
+            Ok(handled)
+        });
+        let fallback = match native_result {
+            Ok(true) => return Ok(WindowRpcDelivery::Sent),
+            Ok(false) => None,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "Native candidate UI update failed; restoring external UI state"
+                );
+                crate::tsf::candidate_ui::take_fallback_request(input_mode)
+            }
+        };
         let position_present = performance_start.map(|_| position.is_some());
         let candidate_count = performance_start.map(|_| candidates.as_ref().map(Vec::len));
         let input_mode_present = performance_start.map(|_| input_mode.is_some());
         let reading_present =
             performance_start.map(|_| reading.is_some_and(|value| !value.is_empty()));
         let result: anyhow::Result<WindowRpcDelivery> = {
-            let mut request = tonic::Request::new(shared::proto::UpdateCandidateWindowRequest {
-                visible,
-                position,
-                candidates: candidates
-                    .map(|candidates| shared::proto::CandidateList { candidates }),
-                selected_index,
-                input_mode: input_mode.map(ToString::to_string),
-                reading: reading.map(ToString::to_string),
-                candidate_list_visible,
-                reading_vertical_adjustment,
-            });
+            let mut request = tonic::Request::new(fallback.unwrap_or_else(|| {
+                shared::proto::UpdateCandidateWindowRequest {
+                    visible,
+                    position,
+                    candidates: candidates
+                        .map(|candidates| shared::proto::CandidateList { candidates }),
+                    selected_index,
+                    input_mode: input_mode.map(ToString::to_string),
+                    reading: reading.map(ToString::to_string),
+                    candidate_list_visible,
+                    reading_vertical_adjustment,
+                }
+            }));
             request.set_timeout(UI_RPC_DEADLINE);
             self.with_window_client_delivery(
                 "ui_update_candidate_window",

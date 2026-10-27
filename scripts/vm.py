@@ -278,7 +278,13 @@ class VM:
         woke = False
         while time.monotonic() < end:
             try:
-                if self.capture(self.ssh_args() + ['echo VM_READY'], timeout=min(6, max(0.1, end-time.monotonic())), check=False).returncode == 0:
+                # cmd.exe echo can work while the first PowerShell launch still
+                # stalls during cold boot. Probe the interpreter used by the
+                # following operations, within the same readiness deadline.
+                result = self.capture(
+                    self.ssh_args() + ['powershell -NoProfile -NonInteractive -Command "Write-Output VM_READY"'],
+                    timeout=min(15, max(0.1, end-time.monotonic())), check=False)
+                if result.returncode == 0 and result.stdout.strip() == 'VM_READY':
                     return
             except VmError as error:
                 if not error.uncertain:
@@ -522,8 +528,12 @@ class VM:
         raise VmError(f'Interactive task {token} did not finish; inspect it before retry', uncertain=True)
 
     def guest(self, action, **kwargs):
+        # The guest installer has its own 1,200-second WaitForExit bound.
+        # Cover that wait plus setup/identity work; short queries stay bounded
+        # by the normal script budget, and SSH keepalive still detects loss.
+        timeout = 1260 if action == 'install' else 120
         result = json.loads(self.script(ROOT / 'scripts/vm-guest.ps1', {'Action': action, **kwargs},
-                                       hold_pending=(action == 'install')).lstrip('\ufeff'))
+                                       timeout=timeout, hold_pending=(action == 'install')).lstrip('\ufeff'))
         if action == 'install':
             self.finish_operation()
         return result
