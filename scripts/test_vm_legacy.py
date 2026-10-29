@@ -53,6 +53,14 @@ class VmLegacyScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn('valid Cargo package name', result.stdout)
 
+    def test_invalid_real_zenzai_flag_rejected_before_vm_operations(self):
+        env = sanitized_env()
+        env['SWIFT_TEST_REAL_ZENZAI'] = 'unexpected'
+        result = subprocess.run(['bash', str(SCRIPTS / 'vm_test_client_composition.sh'), 'feature/example', 'skip', 'all'],
+                                cwd=ROOT, env=env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('SWIFT_TEST_REAL_ZENZAI must be 0 or 1', result.stdout)
+
     def make_python_stub(self, temp_dir):
         bin_dir = temp_dir / "bin"
         bin_dir.mkdir()

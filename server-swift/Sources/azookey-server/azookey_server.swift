@@ -2258,7 +2258,7 @@ func shouldKeepZenzaiAlternativeCandidate(candidate: Candidate, hiragana: String
     return text != hiragana && text != hiraganaToKatakana(hiragana)
 }
 
-private func displayRubyForKeyboardTypoLookup(_ ruby: String) -> String {
+func displayRubyForKeyboardTypoLookup(_ ruby: String) -> String {
     var displayRuby = ruby.replacingOccurrences(of: "-", with: "ー")
     if displayRuby.last == "n" {
         displayRuby.removeLast()
@@ -2341,8 +2341,16 @@ func confidentKeyboardTypoCorrectionForZenzaiMerge(
     }
 
     let hiraganaCharacters = Array(hiragana)
+    var automaticCorrection: KeyboardTypoAutomaticConversion?
+    func allowsAutomaticSelection(_ candidate: Candidate) -> Bool {
+        if automaticCorrection == nil {
+            automaticCorrection = KeyboardTypoAutomaticConversion(hiragana: hiragana)
+        }
+        return automaticCorrection!.allowsAutomaticSelection(candidate)
+    }
     func canPromoteRewriteCandidate(_ candidate: Candidate) -> Bool {
         guard candidate.keyboardTypoCorrections.count == 1,
+              allowsAutomaticSelection(candidate),
               let correction = candidate.keyboardTypoCorrections.first,
               correction.originalSurfaceRange.lowerBound >= 0,
               correction.originalSurfaceRange.upperBound <= hiraganaCharacters.count
@@ -2371,15 +2379,19 @@ func confidentKeyboardTypoCorrectionForZenzaiMerge(
     }
 
     guard let normalTop = normalNBestResults.first,
-          let correctionEntry = keyboardTypoDictionaryEntry(in: normalTop)
+          let correction = keyboardTypoDictionaryCorrectionForAutomaticSelection(in: normalTop),
+          allowsAutomaticSelection(normalTop)
     else {
         return nil
     }
 
-    let rawTypoSpan = displayRubyForKeyboardTypoLookup(correctionEntry.ruby)
-    let hasWholeSpanLexicalAlternative = hasLexicalAlternativeAcrossWholeSpan(
+    let rawTypoSpan = displayRubyForKeyboardTypoLookup(correction.entry.ruby)
+    // Segmentation is not lexical evidence: ご格 + に must not veto
+    // ごかくに -> ご確認. A real word covering this exact original span
+    // (including a longer user-dictionary word) still protects model output.
+    let hasWholeSpanLexicalAlternative = hasSingleLexicalAlternativeCoveringTypoSpan(
         candidate: zenzaiTop,
-        rawTypoSpan: rawTypoSpan
+        originalSurfaceRange: correction.originalSurfaceRange
     )
     guard !rawTypoSpan.isEmpty, !hasWholeSpanLexicalAlternative else {
         return nil
@@ -3280,9 +3292,9 @@ public func free_candidate_list(
             hiragana: previewHiragana
         )
     } ?? converted.mainResults
-    let mainResults = prioritizeLearningSelectionOverrides(
-        mergedMainResults,
-        ruby: previewHiragana
+    let mainResults = prioritizeAutomaticKeyboardTypoCandidates(
+        prioritizeLearningSelectionOverrides(mergedMainResults, ruby: previewHiragana) { $0 },
+        hiragana: previewHiragana
     ) { $0 }
     if let normalNBestConverted {
         serverLog(
@@ -3627,9 +3639,9 @@ public func free_candidate_list(
             previewHiragana: previewPrefixHiragana,
             resolutionCache: &cursorPrefixResolutionCache
         )
-    let cursorPrefixResults = prioritizeLearningSelectionOverrides(
-        rawCursorPrefixResults,
-        ruby: previewPrefixHiragana
+    let cursorPrefixResults = prioritizeAutomaticKeyboardTypoCandidates(
+        prioritizeLearningSelectionOverrides(rawCursorPrefixResults, ruby: previewPrefixHiragana) { $0.candidate },
+        hiragana: previewPrefixHiragana + suffixAfterCursor
     ) { $0.candidate }
     let totalMs = elapsedPerformanceMilliseconds(since: totalStart)
     performanceLog(

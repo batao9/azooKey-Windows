@@ -32,8 +32,11 @@ python3 scripts/vm.py --profile build status
 python3 scripts/vm.py --profile build doctor
 python3 scripts/vm.py --profile build build <branch>
 python3 scripts/vm.py --profile build test <branch> composition all
+SWIFT_TEST_REAL_ZENZAI=1 python3 scripts/vm.py --profile build test <branch> skip all
 python3 scripts/vm.py --profile manual stage .local/artifacts/<exact-installer>.exe
 ```
+
+`SWIFT_TEST_REAL_ZENZAI=1` はbuild profileのcacheにある実配布モデル `zenz.gguf` を使う任意のSwiftテストを有効にする。モデルのSHA256をログへ記録し、モデル読み込み失敗による通常KKCへのfallbackを成功と扱わない。モデルがなければ明示的に失敗する。既定ではモデルを必要としないテストだけを実行する。
 
 `stage` / `install` は同じ入口。隣の `<installer>.build-info.json` または `build-info.json` が必須。`latest` という曖昧な成果物識別子ではなく、ビルド結果の具体的なファイルを渡す。SHA256で転送物を検証し、インストール後の version / channel / revision / installerGeneration を照合する。このidentityは検証時の版であり、終了後に復元したベースの版とは区別する。
 ファイル・metadata・identity・SHA256のローカル事前検査は、VMのクリーン開始より先に行う。不正な成果物では、開いているセッションを復元・破棄しない。

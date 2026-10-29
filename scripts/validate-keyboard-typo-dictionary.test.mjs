@@ -16,7 +16,9 @@ import {
 } from "./validate-keyboard-typo-dictionary.mjs";
 import {
   generateSwift,
+  loadProtectedReadings,
   lookupReadings,
+  protectedReadings,
   scoreFor,
 } from "./generate-keyboard-typo-dictionary-swift.mjs";
 
@@ -65,10 +67,11 @@ test("curated keyboard typo dictionary satisfies its rewrite-aware contract", as
 
 test("generated Swift dictionary stays synchronized with the reviewed TSV", async () => {
   const { rows } = await loadSelection();
-  const generated = generateSwift(rows);
+  const generated = generateSwift(rows, await loadProtectedReadings(rows));
   assert.equal(await readFile(generatedSwiftFile, "utf8"), generated);
   assert.match(generated, /let keyboardTypoDictionarySelectionCount = 92/u);
   assert.match(generated, /let keyboardTypoDictionaryEntryCount = 104/u);
+  assert.match(generated, /let keyboardComposerNormalizationReadings: Set<String>/u);
   assert.match(generated, /word: "しました",\n\s+ruby: "シマスタ"/u);
   assert.match(generated, /word: "ご確認",\n\s+ruby: "ゴカクニ"/u);
   assert.match(generated, /word: "ファッション",\n\s+ruby: "ファショn"/u);
@@ -78,6 +81,29 @@ test("generated Swift dictionary stays synchronized with the reviewed TSV", asyn
   assert.equal(scoreFor({ selection_tier: "required", reference_value: "-7.4169" }), "-8.4169");
   assert.equal(scoreFor({ selection_tier: "core", reference_value: "-8.2538" }), "-9.7538");
   assert.equal(scoreFor({ selection_tier: "candidate", reference_value: "-11.2573" }), "-13.7573");
+});
+
+test("automatic correction protects longer lexical readings without blocking the intended completion", async () => {
+  const { rows } = await loadSelection();
+  const protections = await loadProtectedReadings(rows);
+  assert.ok(protections.get("キュリ").some(({ reading, typoOffset }) => reading === "セキュリティ" && typoOffset === 1));
+  assert.ok(protections.get("デキス").some(({ reading }) => reading === "デキストリン"));
+  assert.ok(protections.get("アタナ").some(({ reading }) => reading === "アタナシウス"));
+  assert.equal(protections.has("シマスタ"), false);
+  assert.equal(protections.has("ゴカクニ"), false);
+  assert.equal(protections.has("ドンア"), false);
+  assert.equal(protections.has("オンア"), false);
+
+  const fixture = new Map([
+    ["ご確認", new Map([["ゴカクニン", {}]])],
+    ["別の語", new Map([["キュリキュリ", {}]])],
+  ]);
+  const result = protectedReadings(rows, fixture);
+  assert.deepEqual(result.get("キュリ"), [
+    { reading: "キュリキュリ", typoOffset: 0 },
+    { reading: "キュリキュリ", typoOffset: 3 },
+  ]);
+  assert.equal(result.has("ゴカクニ"), false);
 });
 
 test("terminal n entries use the unresolved roman-composer surface", () => {

@@ -1,4 +1,4 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -7,6 +7,7 @@ import {
   keyboardTypoScore,
   parseTsv,
 } from "./validate-keyboard-typo-dictionary.mjs";
+import { parseLoudstxt3 } from "./generate-reverse-dictionary.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const inputPath = join(repoRoot, "data", "keyboard-typo-dictionary.tsv");
@@ -17,6 +18,47 @@ const outputPath = join(
   "azookey-server",
   "KeyboardTypoDictionary.swift",
 );
+const dictionaryDirectory = join(repoRoot, "server-swift", "azooKey_dictionary_storage", "Dictionary", "louds");
+
+// A whole-span typo match can also be inside an ordinary word, including an
+// unfinished word. Compute these ambiguities offline, not on the typing path.
+function protectedReadings(rows, readingsBySurface) {
+  const result = new Map();
+  for (const row of rows) {
+    // NN/M/NI composer fallbacks do not change the physical keys: e.g. donna
+    // is already the intended spelling of どんな. Do not treat a transient
+    // composer surface (どんあ) as evidence of a misspelled ordinary word.
+    if (row.typed_keys === row.corrected_keys) continue;
+    const typed = katakana(row.typed_reading);
+    const matches = new Map();
+    for (const [surface, readings] of readingsBySurface) {
+      // Completing ごかくに to ご確認 is the intended correction, not a
+      // competing interpretation of the user's input.
+      for (const reading of readings.keys()) {
+        if (surface.includes(row.expected_candidate) && reading.includes(katakana(row.corrected_reading))) continue;
+        if (reading.length <= typed.length) continue;
+        for (let offset = reading.indexOf(typed); offset !== -1; offset = reading.indexOf(typed, offset + 1)) {
+          matches.set(`${reading}\u0000${offset}`, { reading, typoOffset: offset });
+        }
+      }
+    }
+    if (matches.size) {
+      result.set(typed, [...matches.values()].sort((a, b) =>
+        a.reading < b.reading ? -1 : a.reading > b.reading ? 1 : a.typoOffset - b.typoOffset));
+    }
+  }
+  return result;
+}
+
+async function loadProtectedReadings(rows, directory = dictionaryDirectory) {
+  const readingsBySurface = new Map();
+  const files = (await readdir(directory)).filter((file) => file.endsWith(".loudstxt3")).sort();
+  if (!files.length) throw new Error(`No bundled dictionary files found under ${directory}`);
+  for (const file of files) {
+    parseLoudstxt3(await readFile(join(directory, file)), file, readingsBySurface);
+  }
+  return protectedReadings(rows, readingsBySurface);
+}
 
 function swiftString(value) {
   return JSON.stringify(value)
@@ -51,7 +93,7 @@ function lookupReadings(row) {
     : [canonicalReading, rawReading];
 }
 
-function generateSwift(rows) {
+function generateSwift(rows, protections = new Map()) {
   const entries = rows.flatMap((row) => lookupReadings(row).map((reading) => {
     return [
       "        DicdataElement(",
@@ -74,6 +116,18 @@ import KanaKanjiConverterModule
 
 let keyboardTypoDictionarySelectionCount = ${rows.length}
 let keyboardTypoDictionaryEntryCount = ${entries.length}
+
+// Correct physical keys whose composer surface needs normalization. These do
+// not consume the automatic typing-error budget (e.g. minna + simasuta).
+let keyboardComposerNormalizationReadings: Set<String> = [
+${rows.filter((row) => row.typed_keys === row.corrected_keys).flatMap(lookupReadings).map((ruby) => `    ${swiftString(ruby)},`).join("\n")}
+]
+
+// Known ordinary readings that overlap a correction. Shared by all candidates
+// and initialized once; no dictionary I/O is needed during conversion.
+let keyboardTypoProtectedReadings: [String: [KeyboardTypoProtectedReading]] = [
+${[...protections].map(([ruby, matches]) => `    ${swiftString(ruby)}: [\n${matches.map(({ reading, typoOffset }) => `        .init(reading: ${swiftString(reading)}, typoOffset: ${typoOffset}),`).join("\n")}\n    ],`).join("\n")}
+]
 
 func makeKeyboardTypoDictionaryEntries() -> [DicdataElement] {
     [
@@ -131,7 +185,7 @@ func disableLearningForKeyboardTypoCorrectionCandidates(
 
 async function main() {
   const rows = parseTsv(await readFile(inputPath, "utf8"));
-  const generated = generateSwift(rows);
+  const generated = generateSwift(rows, await loadProtectedReadings(rows));
   const lookupEntryCount = rows.reduce((count, row) => count + lookupReadings(row).length, 0);
   if (process.argv.includes("--check")) {
     const current = await readFile(outputPath, "utf8").catch(() => "");
@@ -149,7 +203,7 @@ async function main() {
   );
 }
 
-export { generateSwift, lookupReadings, scoreFor };
+export { generateSwift, loadProtectedReadings, lookupReadings, protectedReadings, scoreFor };
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   await main();

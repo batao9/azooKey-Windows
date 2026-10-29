@@ -36,6 +36,7 @@ CARGO_TEST_FILTER="${2:-composition}"
 CARGO_TEST_PACKAGE="${CARGO_TEST_PACKAGE:-azookey-windows}"
 SWIFT_TEST_FILTER="${3:-}"
 SWIFT_TEST_ITERATIONS="${SWIFT_TEST_ITERATIONS:-1}"
+SWIFT_TEST_REAL_ZENZAI="${SWIFT_TEST_REAL_ZENZAI:-0}"
 
 if [[ "$CARGO_TEST_FILTER" == "-" ]]; then
   CARGO_TEST_FILTER="skip"
@@ -49,6 +50,10 @@ if [[ ! "$CARGO_TEST_PACKAGE" =~ ^[A-Za-z0-9_-]+$ ]]; then
 fi
 if [[ ! "$SWIFT_TEST_ITERATIONS" =~ ^[1-9][0-9]*$ ]]; then
   echo "SWIFT_TEST_ITERATIONS must be a positive integer"
+  exit 1
+fi
+if [[ "$SWIFT_TEST_REAL_ZENZAI" != "0" && "$SWIFT_TEST_REAL_ZENZAI" != "1" ]]; then
+  echo "SWIFT_TEST_REAL_ZENZAI must be 0 or 1"
   exit 1
 fi
 
@@ -438,7 +443,8 @@ param(
   [Parameter(Mandatory = $false)][string]$SwiftTestFilter = "",
   [Parameter(Mandatory = $false)][int]$SwiftTestIterations = 1,
   [Parameter(Mandatory = $false)][string]$SwiftVendorTarPath = "",
-  [string]$CacheRootBase64 = ""
+  [string]$CacheRootBase64 = "",
+  [switch]$UseZenzaiModel
 )
 
 $ErrorActionPreference = "Stop"
@@ -520,6 +526,14 @@ function Initialize-SwiftTestEnvironment {
   Copy-Item $llamaLibCache -Destination $llamaLibDest -Force
   $env:Path = $script:llamaCpuRuntimeDir + ";" + $env:Path
   Write-Host "prepared llama CPU runtime and linker input"
+  if ($UseZenzaiModel) {
+    $model = Join-Path $cacheRoot 'zenz.gguf'
+    if (!(Test-Path -LiteralPath $model -PathType Leaf)) {
+      throw "Real Zenzai tests require the cached zenz.gguf model"
+    }
+    $env:AZOOKEY_ZENZAI_TEST_MODEL = $model
+    Write-Host "real Zenzai test model sha256=$((Get-FileHash -LiteralPath $model -Algorithm SHA256).Hash)"
+  }
 
   $emojiDictDir = Join-Path $SourceDir "server-swift\azooKey_emoji_dictionary_storage\EmojiDictionary"
   $mainDictDir = Join-Path $SourceDir "server-swift\azooKey_dictionary_storage\Dictionary"
@@ -911,7 +925,11 @@ main() {
   fi
 
   log "VM 上で test を実行します"
-  ssh_run_test "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -SourceTarPath \"$REMOTE_TAR_WIN\" -SourceDir \"$REMOTE_SRC_WIN\" -HostTimestampUtc \"$HOST_TIMESTAMP_UTC\" -CargoTestPackage \"$CARGO_TEST_PACKAGE\" -CargoTestFilter \"$CARGO_TEST_FILTER\" -SwiftTestFilter \"$SWIFT_TEST_FILTER\" -SwiftTestIterations \"$SWIFT_TEST_ITERATIONS\"$swift_vendor_arg$cache_root_arg"
+  local model_arg=""
+  if [[ "$SWIFT_TEST_REAL_ZENZAI" == "1" ]]; then
+    model_arg=" -UseZenzaiModel"
+  fi
+  ssh_run_test "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -SourceTarPath \"$REMOTE_TAR_WIN\" -SourceDir \"$REMOTE_SRC_WIN\" -HostTimestampUtc \"$HOST_TIMESTAMP_UTC\" -CargoTestPackage \"$CARGO_TEST_PACKAGE\" -CargoTestFilter \"$CARGO_TEST_FILTER\" -SwiftTestFilter \"$SWIFT_TEST_FILTER\" -SwiftTestIterations \"$SWIFT_TEST_ITERATIONS\"$swift_vendor_arg$cache_root_arg$model_arg"
 
   if [[ "$VM_LIFECYCLE_EXTERNAL" != "1" ]]; then
     shutdown_vm_normally
