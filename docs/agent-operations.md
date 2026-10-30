@@ -31,6 +31,20 @@ Treat both build and manual VMs as disposable. Recover artifacts/evidence to the
 
 Explicit baseline/OS-update maintenance is the exception to disposable recovery. Start it with `start --keep-current` or `prepare`; keep the current disk even when a command fails. Known completed failures may continue as maintenance; uncertain operations retain their evidence and block subsequent ordinary dispatch until explicitly resolved. Preserving shutdown/reboot issues one normal Windows shutdown and observes power-off with its own bound, without force/reset or replay on lost SSH acknowledgment. A maintenance `handoff` preserves the disk and stops normally. Snapshot capture reserves ownership before mutation and verifies a new powered-off identity before release. VM display names, UUIDs, local snapshot inventory and promotion receipts stay under ignored `.local/`; public profiles describe roles, not a particular machine.
 
+## Local workspace layout
+
+`.local/` はGit管理しない作業領域であり、実行手順の正本ではありません。
+
+- `vm.json`: VM controllerの機械固有設定。既定パスを維持し、認証情報を共有しない。
+- `cache/`: 再利用する依存source・データ・ツールのキャッシュ。
+- `artifacts/`、`release/<tag>/`: 検証成果物と正式リリースの検証記録。公開スクリプト・release workflowの既定パスを維持する。
+- `logs/`: VM controller等が出力する実行ログ。操作中・未解決の証拠は削除しない。
+- `reports/<topic>/`: 調査結果・測定値・必要な証拠。課題番号は `reports/issues/<number>/`、関連する測定生データは各topic配下にまとめる。
+- `private/`: 設定・認証関連のバックアップ。内容をログへ出したり、Gitへ追加したりしない。
+- `tmp/<task>/`: 単発probe・PSスクリプト・一時checkout。作業終了時に結果をreportへ回収して削除する。`.local/` 直下へ増殖させない。
+
+共有する仕様・列定義は `docs/`、配布データ・NOTICEは `data/`、再利用する自動化は `scripts/` に置く。過去のベンチマークや実行メモを `data/` へ置かない。整理時は稼働中の作業・Git worktree・認証情報・controllerの状態/lockを保護し、実行時に参照される既定パスを移さない。
+
 ## References
 
 - [Repository review procedure](agent-review.md)
