@@ -1,10 +1,8 @@
 # PCキーボード誤入力辞書（rewrite併用選定版）
 
-`keyboard-typo-dictionary.tsv` は、ローマ字QWERTY入力で生じる打鍵ミスと、ローマ字かな変換時の曖昧性を補う92件の候補です。Mozc型rewriteの `SmallTSU` と `DoubleNN` を同時に有効化する前提で、両規則が処理できる候補は辞書から除いています。
+[`data/keyboard-typo-dictionary.tsv`](../data/keyboard-typo-dictionary.tsv) は、ローマ字QWERTY入力で生じる打鍵ミスと、ローマ字かな変換時の曖昧性を補う92件の候補です。Mozc型rewriteの `SmallTSU` と `DoubleNN` を同時に有効化する前提で、両規則が処理できる候補は辞書から除いています。
 
-この辞書は、全般設定末尾の実験的機能「誤入力の補正機能」を有効にした場合だけサーバーへ読み込まれます。デフォルトはOFFです。Windows VM上の製品実装では、削減前の96 lookup entry辞書とSmallTSU・DoubleNNを一括でOFF/ONして計測しました。30物理キーのclean missにおける3プロセスのpaired p50中央値は、フル変換`+1.852 ms/request`、1キーごとの変換累積`+13.906 ms/30 keys`（約`+0.464 ms/key`）でした。文中接続対応後は92選定行から104 lookup entryを生成するため、この値は近似的な参考値であり最終構成の上限値ではありません。
-
-測定条件とp50/p95の全結果は `keyboard-typo-performance.md` に記録しています。
+この辞書は、全般設定末尾の実験的機能「誤入力の補正機能」を有効にした場合だけサーバーへ読み込まれます。デフォルトはOFFです。この文書は共有するデータ定義・実装契約を扱います。特定の環境・revisionでの性能計測や候補順位の記録はGit管理せず、ローカルの調査レポートとして扱います。
 
 ## 構成
 
@@ -18,7 +16,7 @@
 | `Yu` | rewriteは見送り | 26 | 意味がほぼ固定できる語全体だけ辞書候補化 |
 | `NI` | rewriteは見送り | 8 | 正しい別単語との衝突を避けた語全体だけ辞書候補化 |
 
-rewriteの状態、調査値、実装時に必要な負例は `keyboard-typo-rewrite-rules.tsv` に分離しています。候補数を性能・順位評価後に減らしても、規則の採否とは独立して変更できます。
+rewriteの状態、採否の根拠、実装時に必要な負例は [`data/keyboard-typo-rewrite-rules.tsv`](../data/keyboard-typo-rewrite-rules.tsv) に分離しています。候補数を減らしても、規則の採否とは独立して変更できます。
 
 ## 有効にするrewrite
 
@@ -46,12 +44,28 @@ rewriteの状態、調査値、実装時に必要な負例は `keyboard-typo-rew
 - 辞書由来の補正候補は学習対象外とし、機能をOFFにした後に学習メモリから再出現させない。
 - 辞書エントリは誤入力補正用metadataで識別し、ローマ字互換区間の原surface lookup、または誤り訂正を介さないraw input lookupだけに許可する。直接かな・再変換・別の補正で生成した経路には適用しない。
 - 単純な部分文字列置換、無制限な前方一致、入力途中での強制置換には使わない。
-- 1回の入力で適用する辞書補正は最大1件とする。
+- 1候補で自動採用する実打鍵ミスの補正は辞書・rewriteを合わせて最大1件とする。同じ物理キーのcomposer補完はこの件数に含めない。複数の実打鍵ミスを補正する候補は明示的な候補選択用に残す。
 - `expected_candidate` と `corrected_reading` がバンドル辞書の1エントリとして完全一致する場合だけ採用し、その `lcid` / `rcid` / `mid` / 語彙スコアを静的に再利用する。複数ノードを1語へ圧縮しない。
 - 語彙スコアにはTier別の補正ペナルティ（`required=1.0`、`core=1.5`、`candidate=2.5`）を加える。前後の品詞接続は通常辞書と同じコストで評価する。
 - `M` 由来候補、物理キー列が `n` で終わる候補、長音キー `-` を含む候補は、未確定ASCIIを含む `raw_lattice_span_exact` とする。canonicalな読みは文中surfaceとの照合に、末尾 `ん→n`・長音 `ー→-` のraw variantはcomposition末のinput照合に使う。92選定行のうち12行が2 variantとなり、実行時は104 lookup entryになる。
 
 この契約により、`ごかくにおねがいします` の先頭spanを補正して `ご確認お願いします` を生成しつつ、ユーザーが意図した原入力の候補も残せます。
+
+### 入力途中の語との曖昧性
+
+補正spanとの完全一致だけでは、入力途中の語を誤入力と区別できません。例えば `せ[きゅり]` は `きゅり→きゅうり` と一致しますが、`セキュリティ` の入力途中でもあります。
+
+生成スクリプトは、バンドル辞書のより長い読みについて、補正spanの出現位置を含む保護情報を事前計算します。ライブ変換では、実際の補正位置から照合し、入力がその語の先頭部分または語全体と一致する間、該当する補正候補を自動採用可能な上位3候補の後ろへ移します。補正候補は削除せず、明示的に選択できます。末尾の未確定ローマ字は、語との不一致の根拠にしません。
+
+`きゅりをたべる` のように後続で曖昧さが解消すれば、自動補正を再び許可します。`ごかくに→ご確認` に対する通常辞書の `ご確認` / `ご確認ください` など、訂正後の読みと期待表記を含む語は競合解釈から除外します。これにより主要な補正を保ちます。
+
+`typed_keys` と `corrected_keys` が同一のNN・M・NI候補は、打鍵ミスではなくcomposer中間表現の補完なので、この語彙保護から除外します。例えば `donna` は既に正しい「どんな」の打鍵列です。中間の読み `どんあ` と通常辞書の別の読みが重なることを理由に、自動補完を抑止しません。
+
+同じ理由で、`minna` の補完と `simasuta→しました` のような実打鍵ミスの補正を併用できます。Zenzaiとの比較では、補正範囲を覆う単一の語彙候補を保護し、`ご格＋に` のように無関係な断片をつないだだけの出力を「ごかくに」の正しい別単語とは扱いません。rewriteの語彙衝突判定は別に維持します。
+
+この判定はZenzaiへの補正候補の昇格、通常のライブ変換、カーソル前方の候補出力で共通に使用します。カーソル前方の判定にも後方の入力を含め、単語の内部で切っただけで誤補正を復活させません。元入力・消費文字数・学習対象外の扱いは補正候補自体に保持します。
+
+保護情報はバンドル辞書に基づくため、未登録の新語や固有名詞の意図までは保証しません。構造検証に加えて、一打ずつの正例・負例、Backspace、カーソル移動、主要補正とZenzai統合の回帰を `KeyboardTypoAutomaticConversionTests.swift` で確認します。打鍵中に辞書ファイルの読み出しや全辞書走査は行いません。
 
 ## 広いrewriteから辞書へ移した候補
 
@@ -104,7 +118,7 @@ NN・NIの `typed_reading` はローマ字composerの中間キーを表します
 | `reference_lcid` / `reference_rcid` / `reference_mid` | `corrected_reading` と `expected_candidate` が完全一致するバンドル辞書エントリの品詞・意味ID |
 | `reference_value` | 同じバンドル辞書エントリの語彙スコア。生成時にTier別ペナルティを差し引く |
 
-## 現在の検証値
+## データの由来と検証
 
 - 辞書候補92選定行（実行時104 lookup entry）: JWTD由来52件、手動candidate 38件、製品seed 2件。
 - JWTD由来候補はtrainで合計971差分、testで合計17差分。
@@ -113,9 +127,14 @@ NN・NIの `typed_reading` はローマ字composerの中間キーを表します
 - `タクス→タスク`（託す）、`ちゅおう→中央`（中欧）、`しゅちゅう→集中`（手中）、`しにゅう→親友`（刺入）、`せにゅう→専有`（施入）、`ちゅもん→注文`（朱蒙）は候補から除外した。
 - SmallTSU・DoubleNNが完全に処理できる辞書候補は0件。
 - 打鍵列とmechanism、rewrite状態、candidate由来、matching layerを検証スクリプトで固定している。
-- 固定の固有名詞CIDで実施した旧96件版の到達性確認では全件が1位だったが、これは文中の自然さを評価した値ではない。スコア見直しでは、訂正後の語がバンドル辞書の1エントリとして存在しない `平和観音寺`（旧ID 48）と `専用品`（旧ID 98）、正しい「中欧」と衝突する `ちゅおう→中央`（ID 61）を除外した。
+- 訂正後の語がバンドル辞書の1エントリとして存在しない `平和観音寺`（旧ID 48）と `専用品`（旧ID 98）、正しい「中欧」と衝突する `ちゅおう→中央`（ID 61）は採用対象外。
 
-これらは候補抽出・構造検証と採用候補への到達性の値で、実利用コーパス全体のTop-N精度や誤補正率ではありません。削減前96件構成のconverter局所レイテンシには件数を50件へ削る必要があるほどの悪化は見つかりませんでした。Windows VMの結合テストでは、設定のデフォルトOFF、ON/OFF切替、必須2例、SmallTSU・DoubleNN、直接かな入力への非適用を確認しています。文中順位の評価は `keyboard-typo-context-ranking.md` に分離します。
+これらはデータの集計・構造検証の値で、実利用コーパス全体のTop-N精度や誤補正率ではありません。変更時には次の共有テスト・生成物同期チェックを実行します。実モデルを使う任意のWindowsテストは [VM operations](vm-operations.md) を参照してください。
+
+```sh
+node --test scripts/validate-keyboard-typo-dictionary.test.mjs
+node scripts/generate-keyboard-typo-dictionary-swift.mjs --check
+```
 
 ## 出典とライセンス
 
@@ -127,4 +146,4 @@ JWTD v2 の統計は、Yu Tanaka、Yugo Murawaki、Daisuke Kawahara、Sadao Kuro
 
 このTSV、rewrite調査表、本文中のJWTD由来の集計・選定データは [CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/) で提供します。リポジトリ内のプログラム本体に適用されるMIT Licenseとは別です。検証コードにはリポジトリのMIT Licenseが適用されます。
 
-JWTD由来データの帰属表示は `keyboard-typo-dictionary-NOTICE.md`、MozcのBSD-3-Clause表示は `keyboard-typo-rewrite-NOTICE.md` に保持し、インストーラーにも同梱します。GitHub Typo Corpusは公式配布先から元データを取得できなかったため、この候補の根拠には使用していません。MSR Spelling Correction Dataは非商用条件のため、配布辞書の派生元には使用していません。
+JWTD由来データの帰属表示は [`data/keyboard-typo-dictionary-NOTICE.md`](../data/keyboard-typo-dictionary-NOTICE.md)、MozcのBSD-3-Clause表示は [`data/keyboard-typo-rewrite-NOTICE.md`](../data/keyboard-typo-rewrite-NOTICE.md) に保持し、インストーラーにも同梱します。GitHub Typo Corpusは公式配布先から元データを取得できなかったため、この候補の根拠には使用していません。MSR Spelling Correction Dataは非商用条件のため、配布辞書の派生元には使用していません。
