@@ -253,6 +253,10 @@ pub(crate) fn is_ipc_deadline(error: &anyhow::Error) -> bool {
         || error
             .downcast_ref::<tonic::Status>()
             .is_some_and(|status| status.code() == tonic::Code::DeadlineExceeded)
+        // Tonic 0.12 reports its local request timeout as Cancelled, retaining
+        // TimeoutExpired in the source chain. It is still an ambiguous deadline,
+        // not a cancellation that can safely use immediate mutation replay.
+        || error.chain().any(|cause| cause.is::<tonic::TimeoutExpired>())
 }
 
 pub(crate) fn is_non_destructive_ipc_error(error: &anyhow::Error) -> bool {
@@ -588,6 +592,14 @@ impl IPCService {
     }
 
     #[cfg(test)]
+    pub(crate) fn unavailable_for_test() -> (
+        Self,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
+        tests::unavailable_rpc_service()
+    }
+
+    #[cfg(test)]
     pub(crate) fn complete_restart_for_test(&self) {
         self.recovery.restart_completed_generation.store(
             self.recovery.generation.load(Ordering::Acquire),
@@ -779,7 +791,8 @@ impl IPCService {
             return Err(self.recovery_pending_error());
         }
         self.reconnect_transport()?;
-        self.send_replace_composition(&ledger, current_or_next_request_id())?;
+        self.send_replace_composition(&ledger, current_or_next_request_id())
+            .map_err(|error| self.defer_failed_reconnect("reconnect_composition", error))?;
         self.server_reset_recovered = false;
         Ok(())
     }
@@ -797,7 +810,8 @@ impl IPCService {
         if self.recovery_error_for_test {
             return Err(self.recovery_pending_error());
         }
-        let refreshed = Self::new()?;
+        let refreshed = Self::new()
+            .map_err(|error| self.defer_failed_reconnect("reconnect_transport", error))?;
         self.connection_id = refreshed.connection_id;
         self.azookey_client = refreshed.azookey_client;
         self.window_client = refreshed.window_client;
@@ -805,6 +819,24 @@ impl IPCService {
         self.performance_log_tx = refreshed.performance_log_tx;
         self.transport = refreshed.transport;
         Ok(())
+    }
+
+    fn defer_failed_reconnect(
+        &self,
+        operation: &'static str,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        if Self::should_reconnect_rpc_error(&error) {
+            // The immediate recovery attempt also failed. Keep the acknowledged
+            // ledger and let the action layer queue the failed edit; a raw
+            // transport error would otherwise abort and erase the local preedit.
+            if !self.recovery_pending() {
+                self.require_server_recovery(operation);
+            }
+            preserve_recovery_error(error)
+        } else {
+            error
+        }
     }
 
     fn mark_server_recovery_required(recovery: &Arc<ServerRecoveryState>, operation: &'static str) {
@@ -1023,7 +1055,7 @@ impl IPCService {
 
     fn run_rpc_with_reconnect<T>(
         &mut self,
-        operation: &str,
+        operation: &'static str,
         mut send: impl FnMut(&mut Self) -> anyhow::Result<T>,
     ) -> anyhow::Result<(T, bool)> {
         match send(self) {
@@ -1061,7 +1093,7 @@ impl IPCService {
                         tracing::error!(
                             "{operation} retry failed after IPC reconnect: {retry_error:?}"
                         );
-                        Err(retry_error)
+                        Err(self.defer_failed_reconnect(operation, retry_error))
                     }
                 }
             }
@@ -1101,7 +1133,7 @@ impl IPCService {
 
     fn run_non_idempotent_edit_with_reconnect<T>(
         &mut self,
-        operation: &str,
+        operation: &'static str,
         mut send: impl FnMut(&mut Self) -> anyhow::Result<T>,
     ) -> anyhow::Result<(T, NonIdempotentEditRecovery)> {
         match Self::classify_non_idempotent_edit_attempt(operation, send(self))? {
@@ -1126,7 +1158,7 @@ impl IPCService {
                 // ReplaceComposition rebuilt the acknowledged pre-edit ledger,
                 // so replay exactly once even if the old transport applied it.
                 Ok((
-                    send(self)?,
+                    send(self).map_err(|error| self.defer_failed_reconnect(operation, error))?,
                     NonIdempotentEditRecovery::RetriedAfterReconstruction,
                 ))
             }
@@ -1796,7 +1828,7 @@ impl IPCService {
 
                 // The old input ledger survived the ambiguous failure and has
                 // now been replaced absolutely. Append the new input once.
-                send(self)?
+                send(self).map_err(|error| self.defer_failed_reconnect("append_text", error))?
             }
         };
         let candidates = Self::candidates_from_composing_text(response.composing_text)?;
@@ -2102,9 +2134,9 @@ impl IPCService {
                 }
 
                 if reconnected {
-                    let refreshed = self
-                        .send_move_cursor(0, request_id)
-                        .map_err(preserve_recovery_error)?;
+                    let refreshed = self.send_move_cursor(0, request_id).map_err(|error| {
+                        self.defer_failed_reconnect("prepare_future_clauses_refresh", error)
+                    })?;
                     if !Self::prepare_future_clauses_reconnect_state_is_valid(
                         previous_candidates,
                         &refreshed,
@@ -2253,7 +2285,10 @@ impl IPCService {
                         self.require_server_recovery("reconnect_lost_snapshots");
                         return Err(self.recovery_pending_error());
                     }
-                    self.send_update_composition_snapshot(operation, 0, request_id)?;
+                    self.send_update_composition_snapshot(operation, 0, request_id)
+                        .map_err(|error| {
+                            self.defer_failed_reconnect("update_composition_snapshot", error)
+                        })?;
                     Ok(NonIdempotentEditRecovery::RetriedAfterReconstruction)
                 }
             })();
@@ -2888,6 +2923,8 @@ mod tests {
         unavailable: Arc<AtomicBool>,
         missing_raw_input: Arc<AtomicBool>,
         append_requests: Arc<AtomicUsize>,
+        stall_appends: Arc<AtomicBool>,
+        fail_replacements: Arc<AtomicBool>,
     }
     impl tonic::server::NamedService for Probe {
         const NAME: &'static str = "azookey.AzookeyService";
@@ -2908,7 +2945,11 @@ mod tests {
             };
             self.requests.lock().unwrap().push(request);
             let denied = self.deny.load(Ordering::Acquire);
+            let unavailable = self.fail_replacements.load(Ordering::Acquire);
             Box::pin(async move {
+                if unavailable {
+                    return Err(tonic::Status::unavailable("server is still starting"));
+                }
                 if denied {
                     return Err(tonic::Status::permission_denied("another live owner"));
                 }
@@ -3013,6 +3054,7 @@ mod tests {
         ) -> Self::Future {
             self.append_requests.fetch_add(1, Ordering::Relaxed);
             let empty = request.into_inner().text_to_append.is_empty();
+            let stalled = self.stall_appends.load(Ordering::Acquire);
             let status = if empty {
                 if self.unavailable.swap(false, Ordering::AcqRel) {
                     Err(tonic::Status::unavailable("handshake response lost"))
@@ -3023,6 +3065,9 @@ mod tests {
                 self.mutation_status()
             };
             Box::pin(async move {
+                if stalled {
+                    std::future::pending::<()>().await;
+                }
                 status?;
                 Ok(tonic::Response::new(shared::proto::AppendTextResponse {
                     composing_text: Some(if empty {
@@ -3134,6 +3179,8 @@ mod tests {
             unavailable: Arc::new(AtomicBool::new(false)),
             missing_raw_input: Arc::new(AtomicBool::new(false)),
             append_requests: Arc::default(),
+            stall_appends: Arc::default(),
+            fail_replacements: Arc::default(),
         };
         let listener = service
             .runtime
@@ -3157,6 +3204,122 @@ mod tests {
         service.azookey_client =
             shared::proto::azookey_service_client::AzookeyServiceClient::new(channel);
         (service, probe, server)
+    }
+
+    pub(super) fn unavailable_rpc_service() -> (
+        IPCService,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
+        let (service, probe, server) = recovery_rpc_service();
+        probe.deny.store(false, Ordering::Release);
+        probe.unavailable.store(true, Ordering::Release);
+        probe.fail_replacements.store(true, Ordering::Release);
+        (service, server)
+    }
+
+    #[test]
+    fn load_failure_tonic_timeout_preserves_input_without_immediate_replay() {
+        let (mut service, probe, server) = recovery_rpc_service();
+        probe.deny.store(false, Ordering::Release);
+        probe.stall_appends.store(true, Ordering::Release);
+        service.record_successful_append("na", INPUT_STYLE_ROMAN2KANA);
+        let before = service.input_ledger_snapshot().0;
+        let mut request = tonic::Request::new(shared::proto::AppendTextRequest {
+            text_to_append: "k".into(),
+            input_style: INPUT_STYLE_ROMAN2KANA,
+            request_id: 1,
+        });
+        // Make Tonic's own timer expire before the outer watchdog, as can happen
+        // when the input thread resumes after a period of heavy startup load.
+        request.set_timeout(Duration::from_millis(20));
+        let error = IPCService::block_on_server_rpc(
+            service.runtime.as_ref(),
+            &service.recovery,
+            "append_text",
+            Duration::from_secs(2),
+            service.azookey_client.append_text(request),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.downcast_ref::<tonic::Status>().unwrap().code(),
+            tonic::Code::Cancelled
+        );
+        assert!(super::is_ipc_deadline(&error));
+        assert!(is_non_destructive_ipc_error(&error));
+        assert!(!IPCService::should_reconnect_rpc_error(&error));
+        assert!(service.recovery_pending());
+        assert_eq!(service.input_ledger_snapshot().0, before);
+        assert_eq!(probe.append_requests.load(Ordering::Relaxed), 1);
+        assert!(probe.requests.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[test]
+    fn load_failure_failed_reconstruction_keeps_acknowledged_input_for_recovery() {
+        let (mut service, probe, server) = recovery_rpc_service();
+        probe.deny.store(false, Ordering::Release);
+        probe.unavailable.store(true, Ordering::Release);
+        probe.fail_replacements.store(true, Ordering::Release);
+        service.record_successful_append("na", INPUT_STYLE_ROMAN2KANA);
+        let before = service.input_ledger_snapshot().0;
+
+        let error = service.append_text("k".into()).unwrap_err();
+        assert!(is_non_destructive_ipc_error(&error));
+        assert!(requires_ipc_recovery(&error));
+        assert!(service.recovery_pending());
+        assert_eq!(service.input_ledger_snapshot().0, before);
+        assert_eq!(probe.append_requests.load(Ordering::Relaxed), 1);
+
+        probe.fail_replacements.store(false, Ordering::Release);
+        probe.unavailable.store(false, Ordering::Release);
+        service.complete_restart_for_test();
+        let recovered = service
+            .recover_composition_if_needed("na", "な")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.candidates.hiragana, "な");
+        assert_eq!(service.append_text("k".into()).unwrap().hiragana, "なk");
+        let mut expected = before;
+        append_input_segment(&mut expected, "k", INPUT_STYLE_ROMAN2KANA);
+        assert_eq!(service.input_ledger_snapshot().0, expected);
+        assert!(!service.recovery_pending());
+        server.abort();
+    }
+
+    #[test]
+    fn load_failure_exhausted_retries_defer_instead_of_discarding_input() {
+        for operation in ["append_text", "remove_text", "set_context"] {
+            let (mut service, probe, server) = recovery_rpc_service();
+            probe.deny.store(false, Ordering::Release);
+            probe.unavailable.store(true, Ordering::Release);
+            service.record_successful_append("na", INPUT_STYLE_ROMAN2KANA);
+            let before = service.input_ledger_snapshot().0;
+            let mut attempts = 0;
+            let mut fail = |_: &mut IPCService| -> anyhow::Result<()> {
+                attempts += 1;
+                Err(tonic::Status::unavailable("server remains overloaded").into())
+            };
+            let error = match operation {
+                "append_text" => service.append_text("k".into()).unwrap_err(),
+                "remove_text" => service
+                    .run_non_idempotent_edit_with_reconnect(operation, &mut fail)
+                    .unwrap_err(),
+                _ => service
+                    .run_rpc_with_reconnect(operation, &mut fail)
+                    .unwrap_err(),
+            };
+            assert!(is_non_destructive_ipc_error(&error), "{operation}: {error}");
+            assert!(requires_ipc_recovery(&error), "{operation}: {error}");
+            assert!(service.recovery_pending(), "{operation}");
+            assert_eq!(service.input_ledger_snapshot().0, before, "{operation}");
+            if operation == "append_text" {
+                assert_eq!(probe.append_requests.load(Ordering::Relaxed), 2);
+            } else {
+                assert_eq!(attempts, 2, "{operation}");
+            }
+            server.abort();
+        }
     }
 
     #[test]

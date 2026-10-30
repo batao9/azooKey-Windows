@@ -187,6 +187,72 @@ fn fake_replay(
 }
 
 #[test]
+fn load_failure_failed_reconnect_preserves_preedit_and_later_physical_keys() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _restore = RestoreGlobals::new();
+    let (service, server) = IPCService::unavailable_for_test();
+    IMEState::set_ipc_service(service).expect("unavailable transport");
+
+    unsafe {
+        let context = test_context::new(false);
+        let processor =
+            TextServiceFactory::create::<ITfTextInputProcessor>().expect("text service");
+        let factory = processor.as_impl();
+        {
+            let service = factory.borrow().unwrap();
+            let mut composition = service.borrow_mut_composition().unwrap();
+            composition.state = CompositionState::Composing;
+            composition.raw_input = "kana".into();
+            composition.raw_hiragana = "かな".into();
+            composition.preview = "かな".into();
+            composition.corresponding_count = 4;
+            composition.candidates = candidates(&["かな"], &[""], "かな", &[4]);
+        }
+        let sink: ITfKeyEventSink = processor.cast().unwrap();
+        let before = snapshot(factory);
+        assert!(sink
+            .OnTestKeyDown(Some(&context), WPARAM(0x08), LPARAM(0))
+            .unwrap()
+            .as_bool());
+        assert!(sink
+            .OnKeyDown(Some(&context), WPARAM(0x08), LPARAM(0))
+            .unwrap()
+            .as_bool());
+        let after = snapshot(factory);
+        assert_eq!(after.raw_input, before.raw_input);
+        assert_eq!(after.preview, before.preview);
+        assert_eq!(after.candidates, before.candidates);
+        assert_eq!(after.state, CompositionState::Composing);
+        assert_eq!(after.deferred_actions[0].action, ClientAction::RemoveText);
+        assert!(IMEState::ipc_service().unwrap().unwrap().recovery_pending());
+
+        for (index, (key, action)) in [
+            (0x4E, UserAction::Input('n')),
+            (0x41, UserAction::Input('a')),
+            (0x0D, UserAction::Enter),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(sink
+                .OnKeyDown(Some(&context), WPARAM(key), LPARAM(0))
+                .unwrap()
+                .as_bool());
+            let queued = snapshot(factory);
+            assert_eq!(queued.raw_input, before.raw_input);
+            assert_eq!(queued.preview, before.preview);
+            assert_eq!(queued.deferred_actions, after.deferred_actions);
+            assert_eq!(queued.deferred_inputs.len(), index + 1);
+            let DeferredInputEvent::User { input, .. } = &queued.deferred_inputs[index] else {
+                panic!("physical key must remain queued")
+            };
+            assert_eq!(input.action, action);
+        }
+    }
+    server.abort();
+}
+
+#[test]
 fn pending_recovery_callbacks_replay_keys_once_and_preserve_shift_chords() {
     let _lock = TEST_LOCK.lock().unwrap();
     let _restore = RestoreGlobals::new();
