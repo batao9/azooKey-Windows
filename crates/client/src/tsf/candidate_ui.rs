@@ -685,7 +685,7 @@ mod tests {
 
     #[test]
     fn host_takes_rows_but_reading_and_full_fallback_state_are_preserved() {
-        let snapshot = Snapshot {
+        let mut snapshot = Snapshot {
             visible: true,
             position: Some(WindowPosition {
                 left: 90,
@@ -705,11 +705,14 @@ mod tests {
         assert!(reading_only.candidates.is_empty());
         assert_eq!(reading_only.reading, snapshot.reading);
         assert_eq!(reading_only.position, snapshot.position);
+        let (flags, changed) = snapshot.merge(None, None, None, Some(0), None, None, None);
+        assert!(changed);
+        assert_eq!(flags, TF_CLUIE_SELECTION);
         let handoff = snapshot.fallback_request(Some("あ"));
         assert_eq!(handoff.visible, Some(true));
         assert_eq!(handoff.position, snapshot.position);
         assert_eq!(handoff.candidates.unwrap().candidates, snapshot.candidates);
-        assert_eq!(handoff.selected_index, Some(1));
+        assert_eq!(handoff.selected_index, Some(0));
         assert_eq!(handoff.reading.as_deref(), Some("こうほ"));
         assert_eq!(handoff.candidate_list_visible, Some(true));
         assert_eq!(handoff.reading_vertical_adjustment, Some(4));

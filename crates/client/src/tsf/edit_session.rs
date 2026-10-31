@@ -18,7 +18,11 @@ use std::{cell::Cell, fmt, mem::ManuallyDrop, rc::Rc, time::Instant};
 use anyhow::Result;
 
 use crate::{
-    engine::{ipc_service::current_input_trace_request_id, state::IMEState},
+    engine::{
+        ipc_service::current_input_trace_request_id,
+        state::IMEState,
+        window_state::{CandidateWindowUpdate, CandidateWindowUpdateKind},
+    },
     extension::{utf16_code_unit_len, StringExt as _},
     globals::GUID_DISPLAY_ATTRIBUTE,
 };
@@ -1333,13 +1337,27 @@ impl TextServiceFactory {
                             bottom: rect.bottom,
                             right: rect.right,
                         };
-                        ipc_service.update_candidate_window(
-                            None,
-                            Some(position),
-                            None,
-                            None,
-                            None,
+                        if !factory.is_current_update_pos_request(
+                            generation,
+                            &context,
+                            &tip_composition,
+                        ) {
+                            return Ok(());
+                        }
+                        factory.remember_candidate_window_metadata(None, Some(position), None)?;
+                        let scope = factory.candidate_window_request_scope()?;
+                        let delivery = ipc_service.update_candidate_window_scoped(
+                            CandidateWindowUpdate {
+                                position: Some(position),
+                                ..Default::default()
+                            },
+                            CandidateWindowUpdateKind::Unconditional,
+                            || factory.candidate_window_request_is_current(scope),
+                            || None,
                         )?;
+                        if factory.candidate_window_request_is_current(scope) {
+                            factory.remember_candidate_window_visibility_if_sent(delivery, None);
+                        }
                         IMEState::set_ipc_service(ipc_service)?;
                     }
                     Ok(())
@@ -1361,9 +1379,25 @@ impl TextServiceFactory {
 
     #[tracing::instrument]
     pub fn update_pos(&self) -> Result<()> {
+        let scope = self.candidate_window_request_scope()?;
         if let Some(position) = self.candidate_window_position_for_update()? {
+            if !self.candidate_window_request_is_current(scope) {
+                return Ok(());
+            }
             if let Some(mut ipc_service) = IMEState::ipc_service()? {
-                ipc_service.update_candidate_window(None, Some(position), None, None, None)?;
+                self.remember_candidate_window_metadata(None, Some(position), None)?;
+                let delivery = ipc_service.update_candidate_window_scoped(
+                    CandidateWindowUpdate {
+                        position: Some(position),
+                        ..Default::default()
+                    },
+                    CandidateWindowUpdateKind::Unconditional,
+                    || self.candidate_window_request_is_current(scope),
+                    || None,
+                )?;
+                if self.candidate_window_request_is_current(scope) {
+                    self.remember_candidate_window_visibility_if_sent(delivery, None);
+                }
                 IMEState::set_ipc_service(ipc_service)?;
             }
         }

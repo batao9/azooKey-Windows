@@ -32,6 +32,7 @@ private let fallbackDictionaryURL =
 @MainActor var learningCandidateCache = LearningCandidateCache()
 @MainActor var learningSelectionOverrides: [String: String] = [:]
 @MainActor var reconversionDictionary = ReconversionDictionary()
+@MainActor var emojiTextReplacerCache = EmojiTextReplacerCache()
 
 @MainActor var execURL = URL(filePath: "")
 @MainActor var config: [String : Any] = [
@@ -1149,7 +1150,7 @@ private func makeConvertRequestOptions(
     context: String,
     zenzaiEnabled: Bool,
     runtimeDirectoryURL: URL,
-    emojiDictionaryURL: URL,
+    textReplacer: TextReplacer,
     zenzaiWeightURL: URL,
     profile: String,
     learningType: LearningType = .nothing,
@@ -1163,9 +1164,7 @@ private func makeConvertRequestOptions(
         learningType: learningType,
         memoryDirectoryURL: learningMemoryDirectoryURL ?? runtimeDirectoryURL,
         sharedContainerURL: runtimeDirectoryURL,
-        textReplacer: .init {
-            return emojiDictionaryURL
-        },
+        textReplacer: textReplacer,
         specialCandidateProviders: nil,
         zenzaiMode: zenzaiEnabled ? .on(
             weight: zenzaiWeightURL,
@@ -1874,6 +1873,13 @@ private func preferCursorPrefixBoundary(
     )
 }
 
+@MainActor private func currentEmojiTextReplacer() -> TextReplacer {
+    emojiTextReplacerCache.value(
+        for: execURL.appendingPathComponent("EmojiDictionary")
+            .appendingPathComponent("emoji_all_E15.1.txt")
+    )
+}
+
 @MainActor func getOptions(
     context: String = "",
     zenzaiEnabled: Bool
@@ -1883,9 +1889,7 @@ private func preferCursorPrefixBoundary(
         context: context,
         zenzaiEnabled: zenzaiEnabled,
         runtimeDirectoryURL: converterRuntimeDirectoryURL(),
-        emojiDictionaryURL: execURL
-            .appendingPathComponent("EmojiDictionary")
-            .appendingPathComponent("emoji_all_E15.1.txt"),
+        textReplacer: currentEmojiTextReplacer(),
         zenzaiWeightURL: execURL.appendingPathComponent("zenz.gguf"),
         profile: (config["profile"] as? String) ?? "",
         learningType: currentLearningType,
@@ -2003,7 +2007,7 @@ private struct WarmupExecutionSnapshot: Sendable {
     let dictionaryURL: URL
     let preloadDictionary: Bool
     let runtimeDirectoryURL: URL
-    let emojiDictionaryURL: URL
+    let textReplacer: TextReplacer
     let zenzaiWeightURL: URL
     let profile: String
     let context: String
@@ -2057,7 +2061,7 @@ private final class BackgroundWarmupRunner: @unchecked Sendable {
             context: snapshot.context,
             zenzaiEnabled: snapshot.useZenzai,
             runtimeDirectoryURL: snapshot.runtimeDirectoryURL,
-            emojiDictionaryURL: snapshot.emojiDictionaryURL,
+            textReplacer: snapshot.textReplacer,
             zenzaiWeightURL: snapshot.zenzaiWeightURL,
             profile: snapshot.profile
         )
@@ -2177,9 +2181,7 @@ private let backgroundWarmupRunner = BackgroundWarmupRunner()
         dictionaryURL: converterDictionaryURL,
         preloadDictionary: backgroundWarmupPreloadsDictionary,
         runtimeDirectoryURL: converterRuntimeDirectoryURL(),
-        emojiDictionaryURL: execURL
-            .appendingPathComponent("EmojiDictionary")
-            .appendingPathComponent("emoji_all_E15.1.txt"),
+        textReplacer: currentEmojiTextReplacer(),
         zenzaiWeightURL: execURL.appendingPathComponent("zenz.gguf"),
         profile: (config["profile"] as? String) ?? "",
         context: contextString,
@@ -2474,6 +2476,10 @@ func cursorPrefixBoundaryFirstClauseResults(
 
 @_silgen_name("LoadConfig")
 @MainActor public func load_config() {
+    // Resource contents are immutable between explicit reloads. In particular,
+    // retry a missing resource here instead of reopening it on every input.
+    emojiTextReplacerCache.invalidate()
+    _ = currentEmojiTextReplacer()
     let loadedSettingsPath = settingsPath()
     var loadedSettings: AppSettings?
     var settingsLoadError: Error?

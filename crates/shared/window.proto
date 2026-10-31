@@ -49,6 +49,20 @@ message UpdateCandidateWindowRequest {
 // 候補ウィンドウ制御に対する空のレスポンス
 message EmptyResponse {}
 
+// A guarded delta must never be applied to a different candidate generation.
+// Older UIs reject this separate RPC before changing any window state.
+message SyncCandidateWindowRequest {
+  UpdateCandidateWindowRequest update = 1;
+  optional uint64 expected_server_session_id = 2;
+  optional uint64 expected_candidate_revision = 3;
+}
+
+message SyncCandidateWindowResponse {
+  uint64 server_session_id = 1;
+  uint64 candidate_revision = 2;
+  bool applied = 3;
+}
+
 // 候補ウィンドウの制御サービス定義
 service WindowService {
   rpc ShowWindow (EmptyResponse) returns (EmptyResponse); // ウィンドウを表示
@@ -58,4 +72,5 @@ service WindowService {
   rpc SetWindowPosition (SetPositionRequest) returns (EmptyResponse); // ウィンドウの位置を設定
   rpc SetInputMode (SetInputModeRequest) returns (EmptyResponse); // 変換モードの設定
   rpc UpdateCandidateWindow (UpdateCandidateWindowRequest) returns (EmptyResponse); // 候補ウィンドウ状態をまとめて更新
+  rpc SyncCandidateWindow (SyncCandidateWindowRequest) returns (SyncCandidateWindowResponse);
 }

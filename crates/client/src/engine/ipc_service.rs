@@ -1,3 +1,6 @@
+use super::window_state::{
+    CandidateWindowRevision, CandidateWindowUpdate, CandidateWindowUpdateKind,
+};
 use anyhow::Result;
 use hyper_util::rt::TokioIo;
 use shared::{
@@ -71,6 +74,7 @@ pub struct IPCService {
     azookey_client: AzookeyServiceClient<Channel>,
     // candidate window server client
     window_client: Option<WindowServiceClient<Channel>>,
+    window_sync_supported: Option<bool>,
     runtime: Arc<tokio::runtime::Runtime>,
     performance_log_tx: tokio::sync::mpsc::Sender<PerformanceLogRequest>,
     server_session_id: Option<u64>,
@@ -81,6 +85,8 @@ pub struct IPCService {
     recovery_error_for_test: bool,
     #[cfg(test)]
     reconnect_channel_for_test: Option<Channel>,
+    #[cfg(test)]
+    window_reconnect_channel_for_test: Option<Channel>,
 }
 
 #[derive(Debug, Default)]
@@ -253,6 +259,10 @@ pub(crate) fn is_ipc_deadline(error: &anyhow::Error) -> bool {
         || error
             .downcast_ref::<tonic::Status>()
             .is_some_and(|status| status.code() == tonic::Code::DeadlineExceeded)
+        // Tonic 0.12 reports its local request timeout as Cancelled, retaining
+        // TimeoutExpired in the source chain. It is still an ambiguous deadline,
+        // not a cancellation that can safely use immediate mutation replay.
+        || error.chain().any(|cause| cause.is::<tonic::TimeoutExpired>())
 }
 
 pub(crate) fn is_non_destructive_ipc_error(error: &anyhow::Error) -> bool {
@@ -441,20 +451,35 @@ impl NonIdempotentEditRecovery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WindowRpcDelivery {
     Sent,
+    SentWithRevision(CandidateWindowRevision),
     SkippedUnavailable,
 }
 
 impl WindowRpcDelivery {
     pub(crate) fn was_sent(self) -> bool {
-        matches!(self, Self::Sent)
+        matches!(self, Self::Sent | Self::SentWithRevision(_))
+    }
+
+    pub(crate) fn candidate_revision(self) -> Option<CandidateWindowRevision> {
+        match self {
+            Self::SentWithRevision(revision) => Some(revision),
+            _ => None,
+        }
     }
 
     fn log_status(self) -> &'static str {
         match self {
-            Self::Sent => "success",
+            Self::Sent | Self::SentWithRevision(_) => "success",
             Self::SkippedUnavailable => "skipped_unavailable",
         }
     }
+}
+
+enum WindowUpdateAttempt {
+    Applied(WindowRpcDelivery),
+    FullStateRequired,
+    LegacyRequired,
+    Unavailable,
 }
 
 fn next_request_id() -> u64 {
@@ -570,6 +595,7 @@ impl IPCService {
             connection_id: 0,
             azookey_client: AzookeyServiceClient::new(channel),
             window_client: None,
+            window_sync_supported: None,
             runtime,
             performance_log_tx,
             server_session_id: None,
@@ -583,8 +609,17 @@ impl IPCService {
             }),
             recovery_error_for_test: true,
             reconnect_channel_for_test: None,
+            window_reconnect_channel_for_test: None,
             transport: Arc::new(TransportLifecycle::default()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unavailable_for_test() -> (
+        Self,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
+        tests::unavailable_rpc_service()
     }
 
     #[cfg(test)]
@@ -653,6 +688,7 @@ impl IPCService {
             connection_id,
             azookey_client,
             window_client,
+            window_sync_supported: None,
             runtime,
             performance_log_tx,
             server_session_id: None,
@@ -663,6 +699,8 @@ impl IPCService {
             recovery_error_for_test: false,
             #[cfg(test)]
             reconnect_channel_for_test: None,
+            #[cfg(test)]
+            window_reconnect_channel_for_test: None,
         })
     }
 
@@ -779,7 +817,8 @@ impl IPCService {
             return Err(self.recovery_pending_error());
         }
         self.reconnect_transport()?;
-        self.send_replace_composition(&ledger, current_or_next_request_id())?;
+        self.send_replace_composition(&ledger, current_or_next_request_id())
+            .map_err(|error| self.defer_failed_reconnect("reconnect_composition", error))?;
         self.server_reset_recovered = false;
         Ok(())
     }
@@ -797,14 +836,34 @@ impl IPCService {
         if self.recovery_error_for_test {
             return Err(self.recovery_pending_error());
         }
-        let refreshed = Self::new()?;
+        let refreshed = Self::new()
+            .map_err(|error| self.defer_failed_reconnect("reconnect_transport", error))?;
         self.connection_id = refreshed.connection_id;
         self.azookey_client = refreshed.azookey_client;
         self.window_client = refreshed.window_client;
+        self.window_sync_supported = refreshed.window_sync_supported;
         self.runtime = refreshed.runtime;
         self.performance_log_tx = refreshed.performance_log_tx;
         self.transport = refreshed.transport;
         Ok(())
+    }
+
+    fn defer_failed_reconnect(
+        &self,
+        operation: &'static str,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        if Self::should_reconnect_rpc_error(&error) {
+            // The immediate recovery attempt also failed. Keep the acknowledged
+            // ledger and let the action layer queue the failed edit; a raw
+            // transport error would otherwise abort and erase the local preedit.
+            if !self.recovery_pending() {
+                self.require_server_recovery(operation);
+            }
+            preserve_recovery_error(error)
+        } else {
+            error
+        }
     }
 
     fn mark_server_recovery_required(recovery: &Arc<ServerRecoveryState>, operation: &'static str) {
@@ -1023,7 +1082,7 @@ impl IPCService {
 
     fn run_rpc_with_reconnect<T>(
         &mut self,
-        operation: &str,
+        operation: &'static str,
         mut send: impl FnMut(&mut Self) -> anyhow::Result<T>,
     ) -> anyhow::Result<(T, bool)> {
         match send(self) {
@@ -1061,7 +1120,7 @@ impl IPCService {
                         tracing::error!(
                             "{operation} retry failed after IPC reconnect: {retry_error:?}"
                         );
-                        Err(retry_error)
+                        Err(self.defer_failed_reconnect(operation, retry_error))
                     }
                 }
             }
@@ -1101,7 +1160,7 @@ impl IPCService {
 
     fn run_non_idempotent_edit_with_reconnect<T>(
         &mut self,
-        operation: &str,
+        operation: &'static str,
         mut send: impl FnMut(&mut Self) -> anyhow::Result<T>,
     ) -> anyhow::Result<(T, NonIdempotentEditRecovery)> {
         match Self::classify_non_idempotent_edit_attempt(operation, send(self))? {
@@ -1126,7 +1185,7 @@ impl IPCService {
                 // ReplaceComposition rebuilt the acknowledged pre-edit ledger,
                 // so replay exactly once even if the old transport applied it.
                 Ok((
-                    send(self)?,
+                    send(self).map_err(|error| self.defer_failed_reconnect(operation, error))?,
                     NonIdempotentEditRecovery::RetriedAfterReconstruction,
                 ))
             }
@@ -1796,7 +1855,7 @@ impl IPCService {
 
                 // The old input ledger survived the ambiguous failure and has
                 // now been replaced absolutely. Append the new input once.
-                send(self)?
+                send(self).map_err(|error| self.defer_failed_reconnect("append_text", error))?
             }
         };
         let candidates = Self::candidates_from_composing_text(response.composing_text)?;
@@ -2102,9 +2161,9 @@ impl IPCService {
                 }
 
                 if reconnected {
-                    let refreshed = self
-                        .send_move_cursor(0, request_id)
-                        .map_err(preserve_recovery_error)?;
+                    let refreshed = self.send_move_cursor(0, request_id).map_err(|error| {
+                        self.defer_failed_reconnect("prepare_future_clauses_refresh", error)
+                    })?;
                     if !Self::prepare_future_clauses_reconnect_state_is_valid(
                         previous_candidates,
                         &refreshed,
@@ -2253,7 +2312,10 @@ impl IPCService {
                         self.require_server_recovery("reconnect_lost_snapshots");
                         return Err(self.recovery_pending_error());
                     }
-                    self.send_update_composition_snapshot(operation, 0, request_id)?;
+                    self.send_update_composition_snapshot(operation, 0, request_id)
+                        .map_err(|error| {
+                            self.defer_failed_reconnect("update_composition_snapshot", error)
+                        })?;
                     Ok(NonIdempotentEditRecovery::RetriedAfterReconstruction)
                 }
             })();
@@ -2311,6 +2373,12 @@ impl IPCService {
         operation: &str,
     ) -> Option<&mut WindowServiceClient<Channel>> {
         if self.window_client.is_none() {
+            #[cfg(test)]
+            if let Some(channel) = self.window_reconnect_channel_for_test.as_ref() {
+                self.window_client = Some(WindowServiceClient::new(channel.clone()));
+                self.window_sync_supported = None;
+                return self.window_client.as_mut();
+            }
             match Self::connect_named_pipe_channel(
                 self.runtime.as_ref(),
                 "http://[::]:50052",
@@ -2324,6 +2392,7 @@ impl IPCService {
                         "Candidate window IPC connected after deferred retry"
                     );
                     self.window_client = Some(WindowServiceClient::new(ui_channel));
+                    self.window_sync_supported = None;
                 }
                 Err(error) => {
                     tracing::debug!(
@@ -2347,16 +2416,35 @@ impl IPCService {
             &mut WindowServiceClient<Channel>,
         ) -> anyhow::Result<()>,
     ) -> anyhow::Result<WindowRpcDelivery> {
+        self.with_window_client_response(operation, send)
+            .map(|response| {
+                if response.is_some() {
+                    WindowRpcDelivery::Sent
+                } else {
+                    WindowRpcDelivery::SkippedUnavailable
+                }
+            })
+    }
+
+    fn with_window_client_response<T>(
+        &mut self,
+        operation: &str,
+        send: impl FnOnce(
+            &tokio::runtime::Runtime,
+            &mut WindowServiceClient<Channel>,
+        ) -> anyhow::Result<T>,
+    ) -> anyhow::Result<Option<T>> {
         let runtime = self.runtime.clone();
         let Some(window_client) = self.ensure_window_client(operation) else {
-            return Ok(WindowRpcDelivery::SkippedUnavailable);
+            return Ok(None);
         };
 
         let result = send(runtime.as_ref(), window_client);
         if result.is_err() {
             self.window_client = None;
+            self.window_sync_supported = None;
         }
-        result.map(|()| WindowRpcDelivery::Sent)
+        result.map(Some)
     }
 
     fn with_window_client(
@@ -2605,7 +2693,7 @@ impl IPCService {
         &mut self,
         visible: Option<bool>,
         position: Option<shared::proto::WindowPosition>,
-        candidates: Option<Vec<String>>,
+        candidates: Option<&[String]>,
         selected_index: Option<i32>,
         input_mode: Option<&str>,
     ) -> anyhow::Result<WindowRpcDelivery> {
@@ -2628,78 +2716,229 @@ impl IPCService {
         &mut self,
         visible: Option<bool>,
         position: Option<shared::proto::WindowPosition>,
-        candidates: Option<Vec<String>>,
+        candidates: Option<&[String]>,
         selected_index: Option<i32>,
         input_mode: Option<&str>,
         reading: Option<&str>,
         candidate_list_visible: Option<bool>,
         reading_vertical_adjustment: Option<i32>,
     ) -> anyhow::Result<WindowRpcDelivery> {
+        self.update_candidate_window_scoped(
+            CandidateWindowUpdate {
+                visible,
+                position,
+                candidates,
+                selected_index,
+                input_mode,
+                reading,
+                candidate_list_visible,
+                reading_vertical_adjustment,
+            },
+            CandidateWindowUpdateKind::Unconditional,
+            || true,
+            || None,
+        )
+    }
+
+    fn send_window_update(
+        &mut self,
+        update: shared::proto::UpdateCandidateWindowRequest,
+        expected: Option<CandidateWindowRevision>,
+    ) -> anyhow::Result<WindowUpdateAttempt> {
+        let legacy = self.window_sync_supported == Some(false);
+        if legacy && expected.is_some() {
+            return Ok(WindowUpdateAttempt::FullStateRequired);
+        }
+        let response =
+            self.with_window_client_response("ui_update_candidate_window", |runtime, client| {
+                if legacy {
+                    let mut request = tonic::Request::new(update);
+                    request.set_timeout(UI_RPC_DEADLINE);
+                    Self::block_on_window_rpc(
+                        runtime,
+                        "ui_update_candidate_window",
+                        client.update_candidate_window(request),
+                    )?;
+                    return Ok(WindowUpdateAttempt::Applied(WindowRpcDelivery::Sent));
+                }
+                let mut request = tonic::Request::new(shared::proto::SyncCandidateWindowRequest {
+                    update: Some(update),
+                    expected_server_session_id: expected.map(|revision| revision.server_session_id),
+                    expected_candidate_revision: expected
+                        .map(|revision| revision.candidate_revision),
+                });
+                request.set_timeout(UI_RPC_DEADLINE);
+                match Self::block_on_window_rpc(
+                    runtime,
+                    "ui_update_candidate_window",
+                    client.sync_candidate_window(request),
+                ) {
+                    Err(error)
+                        if error
+                            .downcast_ref::<tonic::Status>()
+                            .is_some_and(|status| status.code() == tonic::Code::Unimplemented) =>
+                    {
+                        // A separate RPC fails before an old UI can apply a delta.
+                        Ok(WindowUpdateAttempt::LegacyRequired)
+                    }
+                    Err(error) => Err(error),
+                    Ok(response) => {
+                        let response = response.into_inner();
+                        if !response.applied {
+                            return Ok(WindowUpdateAttempt::FullStateRequired);
+                        }
+                        let delivery = if response.server_session_id != 0
+                            && response.candidate_revision != 0
+                        {
+                            WindowRpcDelivery::SentWithRevision(CandidateWindowRevision {
+                                server_session_id: response.server_session_id,
+                                candidate_revision: response.candidate_revision,
+                            })
+                        } else {
+                            WindowRpcDelivery::Sent
+                        };
+                        Ok(WindowUpdateAttempt::Applied(delivery))
+                    }
+                }
+            })?;
+        let Some(response) = response else {
+            return Ok(WindowUpdateAttempt::Unavailable);
+        };
+        if !legacy {
+            self.window_sync_supported =
+                Some(!matches!(response, WindowUpdateAttempt::LegacyRequired));
+        }
+        Ok(response)
+    }
+
+    /// Only the exceptional path materializes the selection's full repair list.
+    /// The scope is rechecked after every fallible/COM prerequisite and before
+    /// sending, so focus loss cannot resurrect an old candidate window.
+    pub(crate) fn update_candidate_window_scoped(
+        &mut self,
+        update: CandidateWindowUpdate<'_>,
+        kind: CandidateWindowUpdateKind,
+        is_current: impl Fn() -> bool,
+        mut repair: impl FnMut() -> Option<shared::proto::UpdateCandidateWindowRequest>,
+    ) -> anyhow::Result<WindowRpcDelivery> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
+        if !is_current() {
+            return Ok(WindowRpcDelivery::SkippedUnavailable);
+        }
         // AppContainer hosts own their candidate UI on the TSF thread, where it
         // can participate in host UI-element negotiation instead of being covered
         // by the shell's higher window band. Desktop apps retain the external UI.
         let native_result = crate::tsf::candidate_ui::update(
-            visible,
-            position.as_ref(),
-            candidates.as_deref(),
-            selected_index,
-            reading,
-            candidate_list_visible,
-            reading_vertical_adjustment,
+            update.visible,
+            update.position.as_ref(),
+            update.candidates,
+            update.selected_index,
+            update.reading,
+            update.candidate_list_visible,
+            update.reading_vertical_adjustment,
         )
         .and_then(|handled| {
             if handled {
-                if let Some(mode) = input_mode {
+                if let Some(mode) = update.input_mode {
                     crate::tsf::candidate_ui::show_input_mode(mode)?;
                 }
             }
             Ok(handled)
         });
         let fallback = match native_result {
-            Ok(true) => return Ok(WindowRpcDelivery::Sent),
+            Ok(true) => {
+                return Ok(if is_current() {
+                    WindowRpcDelivery::Sent
+                } else {
+                    WindowRpcDelivery::SkippedUnavailable
+                })
+            }
             Ok(false) => None,
             Err(error) => {
                 tracing::warn!(
                     ?error,
                     "Native candidate UI update failed; restoring external UI state"
                 );
-                crate::tsf::candidate_ui::take_fallback_request(input_mode)
+                crate::tsf::candidate_ui::take_fallback_request(update.input_mode)
             }
         };
-        let position_present = performance_start.map(|_| position.is_some());
-        let candidate_count = performance_start.map(|_| candidates.as_ref().map(Vec::len));
-        let input_mode_present = performance_start.map(|_| input_mode.is_some());
+        let position_present = performance_start.map(|_| update.position.is_some());
+        let mut candidate_count = update.candidates.map(<[String]>::len);
+        let input_mode_present = performance_start.map(|_| update.input_mode.is_some());
         let reading_present =
-            performance_start.map(|_| reading.is_some_and(|value| !value.is_empty()));
-        let result: anyhow::Result<WindowRpcDelivery> = {
-            let mut request = tonic::Request::new(fallback.unwrap_or_else(|| {
-                shared::proto::UpdateCandidateWindowRequest {
-                    visible,
-                    position,
-                    candidates: candidates
-                        .map(|candidates| shared::proto::CandidateList { candidates }),
-                    selected_index,
-                    input_mode: input_mode.map(ToString::to_string),
-                    reading: reading.map(ToString::to_string),
-                    candidate_list_visible,
-                    reading_vertical_adjustment,
+            performance_start.map(|_| update.reading.is_some_and(|value| !value.is_empty()));
+        let mut repaired = false;
+        let mut delta = false;
+        let result: anyhow::Result<WindowRpcDelivery> = (|| {
+            let expected = if fallback.is_some() {
+                None
+            } else {
+                match kind {
+                    CandidateWindowUpdateKind::Unconditional => None,
+                    CandidateWindowUpdateKind::Selection(revision) => revision,
                 }
-            }));
-            request.set_timeout(UI_RPC_DEADLINE);
-            self.with_window_client_delivery(
-                "ui_update_candidate_window",
-                |runtime, window_client| {
-                    Self::block_on_window_rpc(
-                        runtime,
-                        "ui_update_candidate_window",
-                        window_client.update_candidate_window(request),
-                    )?;
-                    Ok(())
-                },
-            )
-        };
+            };
+            let first = if let Some(fallback) = &fallback {
+                fallback.clone()
+            } else if matches!(kind, CandidateWindowUpdateKind::Selection(None)) {
+                repaired = true;
+                let Some(full) = repair() else {
+                    return Ok(WindowRpcDelivery::SkippedUnavailable);
+                };
+                full
+            } else {
+                update.to_request()
+            };
+            if !is_current() {
+                return Ok(WindowRpcDelivery::SkippedUnavailable);
+            }
+            candidate_count = first.candidates.as_ref().map(|list| list.candidates.len());
+            delta = expected.is_some();
+            let attempt = self.send_window_update(first, expected);
+            match attempt {
+                Ok(WindowUpdateAttempt::Applied(delivery)) => return Ok(delivery),
+                Ok(WindowUpdateAttempt::Unavailable) => {
+                    return Ok(WindowRpcDelivery::SkippedUnavailable)
+                }
+                Ok(
+                    WindowUpdateAttempt::LegacyRequired | WindowUpdateAttempt::FullStateRequired,
+                ) => {}
+                Err(error) if delta => {
+                    tracing::debug!(?error, "Repair candidate UI after failed delta");
+                }
+                Err(error) => return Err(error),
+            }
+            repaired = true;
+            if !is_current() {
+                return Ok(WindowRpcDelivery::SkippedUnavailable);
+            }
+            let full = if let Some(fallback) = &fallback {
+                Some(fallback.clone())
+            } else if matches!(kind, CandidateWindowUpdateKind::Selection(_)) {
+                repair()
+            } else {
+                Some(update.to_request())
+            };
+            let Some(full) = full else {
+                return Ok(WindowRpcDelivery::SkippedUnavailable);
+            };
+            if !is_current() {
+                return Ok(WindowRpcDelivery::SkippedUnavailable);
+            }
+            candidate_count = full.candidates.as_ref().map(|list| list.candidates.len());
+            match self.send_window_update(full, None)? {
+                WindowUpdateAttempt::Applied(delivery) => Ok(delivery),
+                _ => Ok(WindowRpcDelivery::SkippedUnavailable),
+            }
+        })();
+        let CandidateWindowUpdate {
+            visible,
+            selected_index,
+            candidate_list_visible,
+            reading_vertical_adjustment,
+            ..
+        } = update;
         self.log_client_performance_from_start(
             performance_start,
             request_id,
@@ -2707,12 +2946,11 @@ impl IPCService {
             "rpc_total",
             || {
                 let position_present = position_present.unwrap_or_default();
-                let candidate_count = candidate_count.unwrap_or_default();
                 let input_mode_present = input_mode_present.unwrap_or_default();
                 let reading_present = reading_present.unwrap_or_default();
                 match &result {
                     Ok(delivery) => format!(
-                        "status={};visible={visible:?};position_present={position_present};candidate_count={candidate_count:?};selected_index={selected_index:?};input_mode_present={input_mode_present};reading_present={reading_present};candidate_list_visible={candidate_list_visible:?};reading_vertical_adjustment={reading_vertical_adjustment:?}",
+                        "status={};visible={visible:?};position_present={position_present};candidate_count={candidate_count:?};selected_index={selected_index:?};input_mode_present={input_mode_present};reading_present={reading_present};candidate_list_visible={candidate_list_visible:?};reading_vertical_adjustment={reading_vertical_adjustment:?};delta={delta};repaired={repaired}",
                         delivery.log_status()
                     ),
                     Err(error) => format!(
@@ -2724,6 +2962,9 @@ impl IPCService {
         Self::ignore_window_rpc_delivery_error("ui_update_candidate_window", result)
     }
 }
+
+#[cfg(test)]
+mod window_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2888,6 +3129,8 @@ mod tests {
         unavailable: Arc<AtomicBool>,
         missing_raw_input: Arc<AtomicBool>,
         append_requests: Arc<AtomicUsize>,
+        stall_appends: Arc<AtomicBool>,
+        fail_replacements: Arc<AtomicBool>,
     }
     impl tonic::server::NamedService for Probe {
         const NAME: &'static str = "azookey.AzookeyService";
@@ -2908,7 +3151,11 @@ mod tests {
             };
             self.requests.lock().unwrap().push(request);
             let denied = self.deny.load(Ordering::Acquire);
+            let unavailable = self.fail_replacements.load(Ordering::Acquire);
             Box::pin(async move {
+                if unavailable {
+                    return Err(tonic::Status::unavailable("server is still starting"));
+                }
                 if denied {
                     return Err(tonic::Status::permission_denied("another live owner"));
                 }
@@ -3013,6 +3260,7 @@ mod tests {
         ) -> Self::Future {
             self.append_requests.fetch_add(1, Ordering::Relaxed);
             let empty = request.into_inner().text_to_append.is_empty();
+            let stalled = self.stall_appends.load(Ordering::Acquire);
             let status = if empty {
                 if self.unavailable.swap(false, Ordering::AcqRel) {
                     Err(tonic::Status::unavailable("handshake response lost"))
@@ -3023,6 +3271,9 @@ mod tests {
                 self.mutation_status()
             };
             Box::pin(async move {
+                if stalled {
+                    std::future::pending::<()>().await;
+                }
                 status?;
                 Ok(tonic::Response::new(shared::proto::AppendTextResponse {
                     composing_text: Some(if empty {
@@ -3134,6 +3385,8 @@ mod tests {
             unavailable: Arc::new(AtomicBool::new(false)),
             missing_raw_input: Arc::new(AtomicBool::new(false)),
             append_requests: Arc::default(),
+            stall_appends: Arc::default(),
+            fail_replacements: Arc::default(),
         };
         let listener = service
             .runtime
@@ -3157,6 +3410,122 @@ mod tests {
         service.azookey_client =
             shared::proto::azookey_service_client::AzookeyServiceClient::new(channel);
         (service, probe, server)
+    }
+
+    pub(super) fn unavailable_rpc_service() -> (
+        IPCService,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
+        let (service, probe, server) = recovery_rpc_service();
+        probe.deny.store(false, Ordering::Release);
+        probe.unavailable.store(true, Ordering::Release);
+        probe.fail_replacements.store(true, Ordering::Release);
+        (service, server)
+    }
+
+    #[test]
+    fn load_failure_tonic_timeout_preserves_input_without_immediate_replay() {
+        let (mut service, probe, server) = recovery_rpc_service();
+        probe.deny.store(false, Ordering::Release);
+        probe.stall_appends.store(true, Ordering::Release);
+        service.record_successful_append("na", INPUT_STYLE_ROMAN2KANA);
+        let before = service.input_ledger_snapshot().0;
+        let mut request = tonic::Request::new(shared::proto::AppendTextRequest {
+            text_to_append: "k".into(),
+            input_style: INPUT_STYLE_ROMAN2KANA,
+            request_id: 1,
+        });
+        // Make Tonic's own timer expire before the outer watchdog, as can happen
+        // when the input thread resumes after a period of heavy startup load.
+        request.set_timeout(Duration::from_millis(20));
+        let error = IPCService::block_on_server_rpc(
+            service.runtime.as_ref(),
+            &service.recovery,
+            "append_text",
+            Duration::from_secs(2),
+            service.azookey_client.append_text(request),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.downcast_ref::<tonic::Status>().unwrap().code(),
+            tonic::Code::Cancelled
+        );
+        assert!(super::is_ipc_deadline(&error));
+        assert!(is_non_destructive_ipc_error(&error));
+        assert!(!IPCService::should_reconnect_rpc_error(&error));
+        assert!(service.recovery_pending());
+        assert_eq!(service.input_ledger_snapshot().0, before);
+        assert_eq!(probe.append_requests.load(Ordering::Relaxed), 1);
+        assert!(probe.requests.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[test]
+    fn load_failure_failed_reconstruction_keeps_acknowledged_input_for_recovery() {
+        let (mut service, probe, server) = recovery_rpc_service();
+        probe.deny.store(false, Ordering::Release);
+        probe.unavailable.store(true, Ordering::Release);
+        probe.fail_replacements.store(true, Ordering::Release);
+        service.record_successful_append("na", INPUT_STYLE_ROMAN2KANA);
+        let before = service.input_ledger_snapshot().0;
+
+        let error = service.append_text("k".into()).unwrap_err();
+        assert!(is_non_destructive_ipc_error(&error));
+        assert!(requires_ipc_recovery(&error));
+        assert!(service.recovery_pending());
+        assert_eq!(service.input_ledger_snapshot().0, before);
+        assert_eq!(probe.append_requests.load(Ordering::Relaxed), 1);
+
+        probe.fail_replacements.store(false, Ordering::Release);
+        probe.unavailable.store(false, Ordering::Release);
+        service.complete_restart_for_test();
+        let recovered = service
+            .recover_composition_if_needed("na", "な")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.candidates.hiragana, "な");
+        assert_eq!(service.append_text("k".into()).unwrap().hiragana, "なk");
+        let mut expected = before;
+        append_input_segment(&mut expected, "k", INPUT_STYLE_ROMAN2KANA);
+        assert_eq!(service.input_ledger_snapshot().0, expected);
+        assert!(!service.recovery_pending());
+        server.abort();
+    }
+
+    #[test]
+    fn load_failure_exhausted_retries_defer_instead_of_discarding_input() {
+        for operation in ["append_text", "remove_text", "set_context"] {
+            let (mut service, probe, server) = recovery_rpc_service();
+            probe.deny.store(false, Ordering::Release);
+            probe.unavailable.store(true, Ordering::Release);
+            service.record_successful_append("na", INPUT_STYLE_ROMAN2KANA);
+            let before = service.input_ledger_snapshot().0;
+            let mut attempts = 0;
+            let mut fail = |_: &mut IPCService| -> anyhow::Result<()> {
+                attempts += 1;
+                Err(tonic::Status::unavailable("server remains overloaded").into())
+            };
+            let error = match operation {
+                "append_text" => service.append_text("k".into()).unwrap_err(),
+                "remove_text" => service
+                    .run_non_idempotent_edit_with_reconnect(operation, &mut fail)
+                    .unwrap_err(),
+                _ => service
+                    .run_rpc_with_reconnect(operation, &mut fail)
+                    .unwrap_err(),
+            };
+            assert!(is_non_destructive_ipc_error(&error), "{operation}: {error}");
+            assert!(requires_ipc_recovery(&error), "{operation}: {error}");
+            assert!(service.recovery_pending(), "{operation}");
+            assert_eq!(service.input_ledger_snapshot().0, before, "{operation}");
+            if operation == "append_text" {
+                assert_eq!(probe.append_requests.load(Ordering::Relaxed), 2);
+            } else {
+                assert_eq!(attempts, 2, "{operation}");
+            }
+            server.abort();
+        }
     }
 
     #[test]

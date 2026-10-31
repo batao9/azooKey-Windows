@@ -25,7 +25,7 @@ impl TextServiceFactory {
 
         if let Some(mut ipc_service) = ipc_service {
             if let Ok(delivery) =
-                ipc_service.update_candidate_window(Some(false), None, Some(vec![]), Some(0), None)
+                ipc_service.update_candidate_window(Some(false), None, Some(&[]), Some(0), None)
             {
                 self.remember_candidate_window_visibility_if_sent(delivery, Some(false));
             }
