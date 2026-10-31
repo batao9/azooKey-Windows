@@ -3,7 +3,6 @@
 use std::{fs, sync::Arc};
 
 use azookey_server::TonicNamedPipeServer;
-use ipc::{WindowAction, WindowController, WindowService};
 use shared::{
     proto::window_service_server::WindowServiceServer, ui_pipe_path,
     LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_DEFAULT,
@@ -17,6 +16,7 @@ use tao::{
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
+use ui::ipc::{WindowAction, WindowController, WindowService};
 use uiaccess::prepare_uiaccess_token;
 use utils::{
     get_candidate_window_position, get_candidate_window_position_with_ruby_clearance,
@@ -34,7 +34,6 @@ use wry::WebContext;
 pub mod candidate;
 pub mod data_paths;
 pub mod indicator;
-pub mod ipc;
 pub mod ruby;
 pub mod uiaccess;
 pub mod utils;
@@ -328,7 +327,6 @@ pub enum UserEvent {
         height: f64,
     },
     UpdateCandidates(String),
-    UpdateSelection(i32),
     UpdateInputMethod(String),
     WindowAction(WindowAction),
 }
@@ -350,9 +348,7 @@ async fn main() -> anyhow::Result<()> {
     // initialize window controller
     let (tx, mut rx) = mpsc::channel(32);
     let window_controller = WindowController::new(tx.clone());
-    let grpc_service = WindowService {
-        controller: window_controller.clone(),
-    };
+    let grpc_service = WindowService::new(window_controller.clone());
 
     // start grpc server
     let incoming = TonicNamedPipeServer::new(ui_pipe_path()?)?;
@@ -456,9 +452,6 @@ async fn main() -> anyhow::Result<()> {
                         &candidate_webview,
                         &format!("updateCandidates({})", candidates),
                     );
-                }
-                UserEvent::UpdateSelection(index) => {
-                    evaluate_script(&candidate_webview, &format!("updateSelection({})", index));
                 }
                 UserEvent::UpdateInputMethod(input_method) => {
                     update_indicator(&indicator_webview, &input_method);
@@ -655,7 +648,7 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                         WindowAction::SetSelection { index } => {
-                            send_user_event(&event_loop_proxy, UserEvent::UpdateSelection(index));
+                            evaluate_script(&candidate_webview, &format!("updateSelection({})", index));
                         }
                         WindowAction::SetInputMode(input_method) => {
                             update_indicator(&indicator_webview, &input_method);

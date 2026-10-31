@@ -11,7 +11,9 @@ use windows::{
 
 use anyhow::{Context, Result};
 
-use crate::engine::{composition::Composition, input_mode::InputMode};
+use crate::engine::{
+    composition::Composition, input_mode::InputMode, window_state::CandidateWindowSyncState,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UpdatePosState {
@@ -139,6 +141,7 @@ pub struct TextService {
     pending_mode_switch: Option<InputMode>,
     pub candidate_window_position_state: CandidateWindowPositionState,
     pub candidate_window_visibility_state: CandidateWindowVisibilityState,
+    pub(crate) candidate_window_sync_state: CandidateWindowSyncState,
     pub surrounding_text_context_state: SurroundingTextContextState,
     pub sink_cookies: HashMap<GUID, u32>,
     pub display_attribute_atom: HashMap<GUID, u32>,
@@ -192,6 +195,11 @@ impl TextService {
     pub(crate) fn invalidate_mode_switch_requests(&mut self) {
         self.advance_mode_switch_generation();
         self.pending_mode_switch = None;
+        // These are composition-lifetime boundaries, including reentrant focus
+        // loss. Neither late acknowledgements nor repairs may revive old rows.
+        self.candidate_window_sync_state.invalidate();
+        self.candidate_window_sync_state.visible = false;
+        self.candidate_window_sync_state.position = None;
     }
 
     pub(crate) fn pending_mode_switch(&self) -> Option<InputMode> {
@@ -278,11 +286,20 @@ mod tests {
     fn composition_lifecycle_invalidates_pending_mode_switches() {
         let mut text_service = TextService::default();
         let generation = text_service.begin_mode_switch(InputMode::Kana);
+        text_service.candidate_window_sync_state.visible = true;
+        text_service.candidate_window_sync_state.revision =
+            Some(crate::engine::window_state::CandidateWindowRevision {
+                server_session_id: 1,
+                candidate_revision: 2,
+            });
 
         text_service.invalidate_mode_switch_requests();
 
         assert_eq!(generation, 1);
         assert_eq!(text_service.mode_switch_generation, 2);
         assert_eq!(text_service.pending_mode_switch(), None);
+        assert!(!text_service.candidate_window_sync_state.visible);
+        assert_eq!(text_service.candidate_window_sync_state.revision, None);
+        assert_eq!(text_service.candidate_window_sync_state.generation, 1);
     }
 }

@@ -1,3 +1,6 @@
+use super::window_state::{
+    CandidateWindowRevision, CandidateWindowUpdate, CandidateWindowUpdateKind,
+};
 use anyhow::Result;
 use hyper_util::rt::TokioIo;
 use shared::{
@@ -71,6 +74,7 @@ pub struct IPCService {
     azookey_client: AzookeyServiceClient<Channel>,
     // candidate window server client
     window_client: Option<WindowServiceClient<Channel>>,
+    window_sync_supported: Option<bool>,
     runtime: Arc<tokio::runtime::Runtime>,
     performance_log_tx: tokio::sync::mpsc::Sender<PerformanceLogRequest>,
     server_session_id: Option<u64>,
@@ -81,6 +85,8 @@ pub struct IPCService {
     recovery_error_for_test: bool,
     #[cfg(test)]
     reconnect_channel_for_test: Option<Channel>,
+    #[cfg(test)]
+    window_reconnect_channel_for_test: Option<Channel>,
 }
 
 #[derive(Debug, Default)]
@@ -445,20 +451,35 @@ impl NonIdempotentEditRecovery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WindowRpcDelivery {
     Sent,
+    SentWithRevision(CandidateWindowRevision),
     SkippedUnavailable,
 }
 
 impl WindowRpcDelivery {
     pub(crate) fn was_sent(self) -> bool {
-        matches!(self, Self::Sent)
+        matches!(self, Self::Sent | Self::SentWithRevision(_))
+    }
+
+    pub(crate) fn candidate_revision(self) -> Option<CandidateWindowRevision> {
+        match self {
+            Self::SentWithRevision(revision) => Some(revision),
+            _ => None,
+        }
     }
 
     fn log_status(self) -> &'static str {
         match self {
-            Self::Sent => "success",
+            Self::Sent | Self::SentWithRevision(_) => "success",
             Self::SkippedUnavailable => "skipped_unavailable",
         }
     }
+}
+
+enum WindowUpdateAttempt {
+    Applied(WindowRpcDelivery),
+    FullStateRequired,
+    LegacyRequired,
+    Unavailable,
 }
 
 fn next_request_id() -> u64 {
@@ -574,6 +595,7 @@ impl IPCService {
             connection_id: 0,
             azookey_client: AzookeyServiceClient::new(channel),
             window_client: None,
+            window_sync_supported: None,
             runtime,
             performance_log_tx,
             server_session_id: None,
@@ -587,6 +609,7 @@ impl IPCService {
             }),
             recovery_error_for_test: true,
             reconnect_channel_for_test: None,
+            window_reconnect_channel_for_test: None,
             transport: Arc::new(TransportLifecycle::default()),
         }
     }
@@ -665,6 +688,7 @@ impl IPCService {
             connection_id,
             azookey_client,
             window_client,
+            window_sync_supported: None,
             runtime,
             performance_log_tx,
             server_session_id: None,
@@ -675,6 +699,8 @@ impl IPCService {
             recovery_error_for_test: false,
             #[cfg(test)]
             reconnect_channel_for_test: None,
+            #[cfg(test)]
+            window_reconnect_channel_for_test: None,
         })
     }
 
@@ -815,6 +841,7 @@ impl IPCService {
         self.connection_id = refreshed.connection_id;
         self.azookey_client = refreshed.azookey_client;
         self.window_client = refreshed.window_client;
+        self.window_sync_supported = refreshed.window_sync_supported;
         self.runtime = refreshed.runtime;
         self.performance_log_tx = refreshed.performance_log_tx;
         self.transport = refreshed.transport;
@@ -2346,6 +2373,12 @@ impl IPCService {
         operation: &str,
     ) -> Option<&mut WindowServiceClient<Channel>> {
         if self.window_client.is_none() {
+            #[cfg(test)]
+            if let Some(channel) = self.window_reconnect_channel_for_test.as_ref() {
+                self.window_client = Some(WindowServiceClient::new(channel.clone()));
+                self.window_sync_supported = None;
+                return self.window_client.as_mut();
+            }
             match Self::connect_named_pipe_channel(
                 self.runtime.as_ref(),
                 "http://[::]:50052",
@@ -2359,6 +2392,7 @@ impl IPCService {
                         "Candidate window IPC connected after deferred retry"
                     );
                     self.window_client = Some(WindowServiceClient::new(ui_channel));
+                    self.window_sync_supported = None;
                 }
                 Err(error) => {
                     tracing::debug!(
@@ -2382,16 +2416,35 @@ impl IPCService {
             &mut WindowServiceClient<Channel>,
         ) -> anyhow::Result<()>,
     ) -> anyhow::Result<WindowRpcDelivery> {
+        self.with_window_client_response(operation, send)
+            .map(|response| {
+                if response.is_some() {
+                    WindowRpcDelivery::Sent
+                } else {
+                    WindowRpcDelivery::SkippedUnavailable
+                }
+            })
+    }
+
+    fn with_window_client_response<T>(
+        &mut self,
+        operation: &str,
+        send: impl FnOnce(
+            &tokio::runtime::Runtime,
+            &mut WindowServiceClient<Channel>,
+        ) -> anyhow::Result<T>,
+    ) -> anyhow::Result<Option<T>> {
         let runtime = self.runtime.clone();
         let Some(window_client) = self.ensure_window_client(operation) else {
-            return Ok(WindowRpcDelivery::SkippedUnavailable);
+            return Ok(None);
         };
 
         let result = send(runtime.as_ref(), window_client);
         if result.is_err() {
             self.window_client = None;
+            self.window_sync_supported = None;
         }
-        result.map(|()| WindowRpcDelivery::Sent)
+        result.map(Some)
     }
 
     fn with_window_client(
@@ -2640,7 +2693,7 @@ impl IPCService {
         &mut self,
         visible: Option<bool>,
         position: Option<shared::proto::WindowPosition>,
-        candidates: Option<Vec<String>>,
+        candidates: Option<&[String]>,
         selected_index: Option<i32>,
         input_mode: Option<&str>,
     ) -> anyhow::Result<WindowRpcDelivery> {
@@ -2663,78 +2716,229 @@ impl IPCService {
         &mut self,
         visible: Option<bool>,
         position: Option<shared::proto::WindowPosition>,
-        candidates: Option<Vec<String>>,
+        candidates: Option<&[String]>,
         selected_index: Option<i32>,
         input_mode: Option<&str>,
         reading: Option<&str>,
         candidate_list_visible: Option<bool>,
         reading_vertical_adjustment: Option<i32>,
     ) -> anyhow::Result<WindowRpcDelivery> {
+        self.update_candidate_window_scoped(
+            CandidateWindowUpdate {
+                visible,
+                position,
+                candidates,
+                selected_index,
+                input_mode,
+                reading,
+                candidate_list_visible,
+                reading_vertical_adjustment,
+            },
+            CandidateWindowUpdateKind::Unconditional,
+            || true,
+            || None,
+        )
+    }
+
+    fn send_window_update(
+        &mut self,
+        update: shared::proto::UpdateCandidateWindowRequest,
+        expected: Option<CandidateWindowRevision>,
+    ) -> anyhow::Result<WindowUpdateAttempt> {
+        let legacy = self.window_sync_supported == Some(false);
+        if legacy && expected.is_some() {
+            return Ok(WindowUpdateAttempt::FullStateRequired);
+        }
+        let response =
+            self.with_window_client_response("ui_update_candidate_window", |runtime, client| {
+                if legacy {
+                    let mut request = tonic::Request::new(update);
+                    request.set_timeout(UI_RPC_DEADLINE);
+                    Self::block_on_window_rpc(
+                        runtime,
+                        "ui_update_candidate_window",
+                        client.update_candidate_window(request),
+                    )?;
+                    return Ok(WindowUpdateAttempt::Applied(WindowRpcDelivery::Sent));
+                }
+                let mut request = tonic::Request::new(shared::proto::SyncCandidateWindowRequest {
+                    update: Some(update),
+                    expected_server_session_id: expected.map(|revision| revision.server_session_id),
+                    expected_candidate_revision: expected
+                        .map(|revision| revision.candidate_revision),
+                });
+                request.set_timeout(UI_RPC_DEADLINE);
+                match Self::block_on_window_rpc(
+                    runtime,
+                    "ui_update_candidate_window",
+                    client.sync_candidate_window(request),
+                ) {
+                    Err(error)
+                        if error
+                            .downcast_ref::<tonic::Status>()
+                            .is_some_and(|status| status.code() == tonic::Code::Unimplemented) =>
+                    {
+                        // A separate RPC fails before an old UI can apply a delta.
+                        Ok(WindowUpdateAttempt::LegacyRequired)
+                    }
+                    Err(error) => Err(error),
+                    Ok(response) => {
+                        let response = response.into_inner();
+                        if !response.applied {
+                            return Ok(WindowUpdateAttempt::FullStateRequired);
+                        }
+                        let delivery = if response.server_session_id != 0
+                            && response.candidate_revision != 0
+                        {
+                            WindowRpcDelivery::SentWithRevision(CandidateWindowRevision {
+                                server_session_id: response.server_session_id,
+                                candidate_revision: response.candidate_revision,
+                            })
+                        } else {
+                            WindowRpcDelivery::Sent
+                        };
+                        Ok(WindowUpdateAttempt::Applied(delivery))
+                    }
+                }
+            })?;
+        let Some(response) = response else {
+            return Ok(WindowUpdateAttempt::Unavailable);
+        };
+        if !legacy {
+            self.window_sync_supported =
+                Some(!matches!(response, WindowUpdateAttempt::LegacyRequired));
+        }
+        Ok(response)
+    }
+
+    /// Only the exceptional path materializes the selection's full repair list.
+    /// The scope is rechecked after every fallible/COM prerequisite and before
+    /// sending, so focus loss cannot resurrect an old candidate window.
+    pub(crate) fn update_candidate_window_scoped(
+        &mut self,
+        update: CandidateWindowUpdate<'_>,
+        kind: CandidateWindowUpdateKind,
+        is_current: impl Fn() -> bool,
+        mut repair: impl FnMut() -> Option<shared::proto::UpdateCandidateWindowRequest>,
+    ) -> anyhow::Result<WindowRpcDelivery> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
+        if !is_current() {
+            return Ok(WindowRpcDelivery::SkippedUnavailable);
+        }
         // AppContainer hosts own their candidate UI on the TSF thread, where it
         // can participate in host UI-element negotiation instead of being covered
         // by the shell's higher window band. Desktop apps retain the external UI.
         let native_result = crate::tsf::candidate_ui::update(
-            visible,
-            position.as_ref(),
-            candidates.as_deref(),
-            selected_index,
-            reading,
-            candidate_list_visible,
-            reading_vertical_adjustment,
+            update.visible,
+            update.position.as_ref(),
+            update.candidates,
+            update.selected_index,
+            update.reading,
+            update.candidate_list_visible,
+            update.reading_vertical_adjustment,
         )
         .and_then(|handled| {
             if handled {
-                if let Some(mode) = input_mode {
+                if let Some(mode) = update.input_mode {
                     crate::tsf::candidate_ui::show_input_mode(mode)?;
                 }
             }
             Ok(handled)
         });
         let fallback = match native_result {
-            Ok(true) => return Ok(WindowRpcDelivery::Sent),
+            Ok(true) => {
+                return Ok(if is_current() {
+                    WindowRpcDelivery::Sent
+                } else {
+                    WindowRpcDelivery::SkippedUnavailable
+                })
+            }
             Ok(false) => None,
             Err(error) => {
                 tracing::warn!(
                     ?error,
                     "Native candidate UI update failed; restoring external UI state"
                 );
-                crate::tsf::candidate_ui::take_fallback_request(input_mode)
+                crate::tsf::candidate_ui::take_fallback_request(update.input_mode)
             }
         };
-        let position_present = performance_start.map(|_| position.is_some());
-        let candidate_count = performance_start.map(|_| candidates.as_ref().map(Vec::len));
-        let input_mode_present = performance_start.map(|_| input_mode.is_some());
+        let position_present = performance_start.map(|_| update.position.is_some());
+        let mut candidate_count = update.candidates.map(<[String]>::len);
+        let input_mode_present = performance_start.map(|_| update.input_mode.is_some());
         let reading_present =
-            performance_start.map(|_| reading.is_some_and(|value| !value.is_empty()));
-        let result: anyhow::Result<WindowRpcDelivery> = {
-            let mut request = tonic::Request::new(fallback.unwrap_or_else(|| {
-                shared::proto::UpdateCandidateWindowRequest {
-                    visible,
-                    position,
-                    candidates: candidates
-                        .map(|candidates| shared::proto::CandidateList { candidates }),
-                    selected_index,
-                    input_mode: input_mode.map(ToString::to_string),
-                    reading: reading.map(ToString::to_string),
-                    candidate_list_visible,
-                    reading_vertical_adjustment,
+            performance_start.map(|_| update.reading.is_some_and(|value| !value.is_empty()));
+        let mut repaired = false;
+        let mut delta = false;
+        let result: anyhow::Result<WindowRpcDelivery> = (|| {
+            let expected = if fallback.is_some() {
+                None
+            } else {
+                match kind {
+                    CandidateWindowUpdateKind::Unconditional => None,
+                    CandidateWindowUpdateKind::Selection(revision) => revision,
                 }
-            }));
-            request.set_timeout(UI_RPC_DEADLINE);
-            self.with_window_client_delivery(
-                "ui_update_candidate_window",
-                |runtime, window_client| {
-                    Self::block_on_window_rpc(
-                        runtime,
-                        "ui_update_candidate_window",
-                        window_client.update_candidate_window(request),
-                    )?;
-                    Ok(())
-                },
-            )
-        };
+            };
+            let first = if let Some(fallback) = &fallback {
+                fallback.clone()
+            } else if matches!(kind, CandidateWindowUpdateKind::Selection(None)) {
+                repaired = true;
+                let Some(full) = repair() else {
+                    return Ok(WindowRpcDelivery::SkippedUnavailable);
+                };
+                full
+            } else {
+                update.to_request()
+            };
+            if !is_current() {
+                return Ok(WindowRpcDelivery::SkippedUnavailable);
+            }
+            candidate_count = first.candidates.as_ref().map(|list| list.candidates.len());
+            delta = expected.is_some();
+            let attempt = self.send_window_update(first, expected);
+            match attempt {
+                Ok(WindowUpdateAttempt::Applied(delivery)) => return Ok(delivery),
+                Ok(WindowUpdateAttempt::Unavailable) => {
+                    return Ok(WindowRpcDelivery::SkippedUnavailable)
+                }
+                Ok(
+                    WindowUpdateAttempt::LegacyRequired | WindowUpdateAttempt::FullStateRequired,
+                ) => {}
+                Err(error) if delta => {
+                    tracing::debug!(?error, "Repair candidate UI after failed delta");
+                }
+                Err(error) => return Err(error),
+            }
+            repaired = true;
+            if !is_current() {
+                return Ok(WindowRpcDelivery::SkippedUnavailable);
+            }
+            let full = if let Some(fallback) = &fallback {
+                Some(fallback.clone())
+            } else if matches!(kind, CandidateWindowUpdateKind::Selection(_)) {
+                repair()
+            } else {
+                Some(update.to_request())
+            };
+            let Some(full) = full else {
+                return Ok(WindowRpcDelivery::SkippedUnavailable);
+            };
+            if !is_current() {
+                return Ok(WindowRpcDelivery::SkippedUnavailable);
+            }
+            candidate_count = full.candidates.as_ref().map(|list| list.candidates.len());
+            match self.send_window_update(full, None)? {
+                WindowUpdateAttempt::Applied(delivery) => Ok(delivery),
+                _ => Ok(WindowRpcDelivery::SkippedUnavailable),
+            }
+        })();
+        let CandidateWindowUpdate {
+            visible,
+            selected_index,
+            candidate_list_visible,
+            reading_vertical_adjustment,
+            ..
+        } = update;
         self.log_client_performance_from_start(
             performance_start,
             request_id,
@@ -2742,12 +2946,11 @@ impl IPCService {
             "rpc_total",
             || {
                 let position_present = position_present.unwrap_or_default();
-                let candidate_count = candidate_count.unwrap_or_default();
                 let input_mode_present = input_mode_present.unwrap_or_default();
                 let reading_present = reading_present.unwrap_or_default();
                 match &result {
                     Ok(delivery) => format!(
-                        "status={};visible={visible:?};position_present={position_present};candidate_count={candidate_count:?};selected_index={selected_index:?};input_mode_present={input_mode_present};reading_present={reading_present};candidate_list_visible={candidate_list_visible:?};reading_vertical_adjustment={reading_vertical_adjustment:?}",
+                        "status={};visible={visible:?};position_present={position_present};candidate_count={candidate_count:?};selected_index={selected_index:?};input_mode_present={input_mode_present};reading_present={reading_present};candidate_list_visible={candidate_list_visible:?};reading_vertical_adjustment={reading_vertical_adjustment:?};delta={delta};repaired={repaired}",
                         delivery.log_status()
                     ),
                     Err(error) => format!(
@@ -2759,6 +2962,9 @@ impl IPCService {
         Self::ignore_window_rpc_delivery_error("ui_update_candidate_window", result)
     }
 }
+
+#[cfg(test)]
+mod window_tests;
 
 #[cfg(test)]
 mod tests {

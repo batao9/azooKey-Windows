@@ -31,6 +31,7 @@ use super::{
     state::{keyboard_disabled_from_context, AppConfigSnapshot, IMEState},
     text_util::{to_half_katakana, to_katakana},
     user_action::{Function, Navigation},
+    window_state::{CandidateWindowUpdate, CandidateWindowUpdateKind},
 };
 #[cfg(test)]
 use shared::RomajiRule;
@@ -83,6 +84,12 @@ struct ModifierState {
     ctrl: bool,
     alt: bool,
     win: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CandidateWindowRequestScope {
+    composition_generation: u64,
+    candidate_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2027,6 +2034,118 @@ impl TextServiceFactory {
             .effect
     }
 
+    pub(crate) fn candidate_window_request_scope(&self) -> Result<CandidateWindowRequestScope> {
+        let service = self.borrow()?;
+        Ok(CandidateWindowRequestScope {
+            composition_generation: service.mode_switch_generation,
+            candidate_generation: service.candidate_window_sync_state.generation,
+        })
+    }
+
+    pub(crate) fn candidate_window_request_is_current(
+        &self,
+        scope: CandidateWindowRequestScope,
+    ) -> bool {
+        self.borrow().is_ok_and(|service| {
+            service.mode_switch_generation == scope.composition_generation
+                && service.candidate_window_sync_state.generation == scope.candidate_generation
+        })
+    }
+
+    pub(crate) fn remember_candidate_window_metadata(
+        &self,
+        visible: Option<bool>,
+        position: Option<shared::proto::WindowPosition>,
+        candidate_list_visible: Option<bool>,
+    ) -> Result<()> {
+        self.borrow_mut()?.candidate_window_sync_state.merge(
+            visible,
+            position,
+            candidate_list_visible,
+        );
+        Ok(())
+    }
+
+    fn finish_candidate_window_request(
+        &self,
+        scope: CandidateWindowRequestScope,
+        delivery: WindowRpcDelivery,
+        visible: Option<bool>,
+    ) -> Result<()> {
+        let mut service = self.borrow_mut()?;
+        if service.mode_switch_generation == scope.composition_generation {
+            service
+                .candidate_window_sync_state
+                .acknowledge(scope.candidate_generation, delivery.candidate_revision());
+            if service.candidate_window_sync_state.generation == scope.candidate_generation
+                && delivery.was_sent()
+            {
+                service
+                    .candidate_window_visibility_state
+                    .apply_visibility_update(visible);
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sync_candidate_selection_ui(
+        &self,
+        preview: &str,
+        suffix: &str,
+        candidates: &Candidates,
+        selection_index: i32,
+        ipc_service: &mut IPCService,
+        reading: Option<&str>,
+        reading_vertical_adjustment: Option<i32>,
+    ) -> Result<()> {
+        let scope = self.candidate_window_request_scope()?;
+        self.set_text(preview, suffix)?;
+        if !self.candidate_window_request_is_current(scope) {
+            return Ok(());
+        }
+        let revision = self.borrow()?.candidate_window_sync_state.revision;
+        let delivery = ipc_service.update_candidate_window_scoped(
+            CandidateWindowUpdate {
+                selected_index: Some(selection_index),
+                reading,
+                reading_vertical_adjustment,
+                ..Default::default()
+            },
+            CandidateWindowUpdateKind::Selection(revision),
+            || self.candidate_window_request_is_current(scope),
+            || {
+                if !self.candidate_window_request_is_current(scope) {
+                    return None;
+                }
+                let state = self.borrow().ok()?.candidate_window_sync_state;
+                let position = if state.position.is_none() && state.visible {
+                    self.candidate_window_position().ok().flatten()
+                } else {
+                    state.position
+                };
+                if !self.candidate_window_request_is_current(scope) {
+                    return None;
+                }
+                let _ = self.remember_candidate_window_metadata(None, position, None);
+                Some(
+                    CandidateWindowUpdate {
+                        visible: Some(state.visible),
+                        position,
+                        candidates: Some(&candidates.texts),
+                        selected_index: Some(selection_index),
+                        reading: Some(reading.unwrap_or("")),
+                        candidate_list_visible: Some(state.candidate_list_visible),
+                        reading_vertical_adjustment,
+                        ..Default::default()
+                    }
+                    .to_request(),
+                )
+            },
+        )?;
+        self.finish_candidate_window_request(scope, delivery, None)
+    }
+
     #[inline]
     #[allow(clippy::too_many_arguments)]
     fn sync_clause_action_ui(
@@ -2127,6 +2246,9 @@ impl TextServiceFactory {
         candidate_list_visible: Option<bool>,
         reading_vertical_adjustment: Option<i32>,
     ) -> Result<()> {
+        self.borrow_mut()?.candidate_window_sync_state.invalidate();
+        self.remember_candidate_window_metadata(visible, None, candidate_list_visible)?;
+        let scope = self.candidate_window_request_scope()?;
         let reading = if visible == Some(false) && reading.is_none() {
             Some("")
         } else {
@@ -2167,17 +2289,26 @@ impl TextServiceFactory {
                 }
                 None
             };
-            let delivery = ipc_service.update_candidate_window_with_reading(
-                visible,
-                position,
-                Some(candidates.texts.clone()),
-                Some(selection_index),
-                None,
-                reading,
-                candidate_list_visible,
-                reading_vertical_adjustment,
+            if !self.candidate_window_request_is_current(scope) {
+                return Ok(());
+            }
+            self.remember_candidate_window_metadata(None, position, None)?;
+            let delivery = ipc_service.update_candidate_window_scoped(
+                CandidateWindowUpdate {
+                    visible,
+                    position,
+                    candidates: Some(&candidates.texts),
+                    selected_index: Some(selection_index),
+                    reading,
+                    candidate_list_visible,
+                    reading_vertical_adjustment,
+                    ..Default::default()
+                },
+                CandidateWindowUpdateKind::Unconditional,
+                || self.candidate_window_request_is_current(scope),
+                || None,
             )?;
-            self.remember_candidate_window_visibility_if_sent(delivery, visible);
+            self.finish_candidate_window_request(scope, delivery, visible)?;
             Ok(())
         })();
 
@@ -2208,9 +2339,25 @@ impl TextServiceFactory {
 
     #[inline]
     fn hide_candidate_window_ui(&self, ipc_service: &mut IPCService) -> Result<WindowRpcDelivery> {
-        let delivery =
-            ipc_service.update_candidate_window(Some(false), None, Some(vec![]), Some(0), None)?;
-        self.remember_candidate_window_visibility_if_sent(delivery, Some(false));
+        self.borrow_mut()?.candidate_window_sync_state.invalidate();
+        self.remember_candidate_window_metadata(Some(false), None, Some(false))?;
+        let scope = self.candidate_window_request_scope()?;
+        let delivery = ipc_service.update_candidate_window_scoped(
+            CandidateWindowUpdate {
+                visible: Some(false),
+                candidates: Some(&[]),
+                selected_index: Some(0),
+                reading: Some(""),
+                candidate_list_visible: Some(false),
+                ..Default::default()
+            },
+            CandidateWindowUpdateKind::Unconditional,
+            || self.candidate_window_request_is_current(scope),
+            || None,
+        )?;
+        if self.candidate_window_request_is_current(scope) {
+            self.remember_candidate_window_visibility_if_sent(delivery, Some(false));
+        }
         Ok(delivery)
     }
 
@@ -2247,6 +2394,11 @@ impl TextServiceFactory {
         delivery: WindowRpcDelivery,
         visible: Option<bool>,
     ) {
+        if !delivery.was_sent() {
+            if let Ok(mut service) = self.borrow_mut() {
+                service.candidate_window_sync_state.revision = None;
+            }
+        }
         self.remember_candidate_window_visibility(Self::delivered_candidate_window_visibility(
             delivery, visible,
         ));
@@ -6437,7 +6589,8 @@ impl TextServiceFactory {
             return;
         }
 
-        if let Ok(text_service) = self.borrow() {
+        if let Ok(mut text_service) = self.borrow_mut() {
+            text_service.invalidate_mode_switch_requests();
             if let Ok(mut composition) = text_service.borrow_mut_composition() {
                 *composition = Composition::default();
             }
@@ -6446,7 +6599,7 @@ impl TextServiceFactory {
         if let Ok(Some(mut ipc_service)) = IMEState::ipc_service() {
             ipc_service.discard_input_ledger();
             if let Ok(delivery) =
-                ipc_service.update_candidate_window(Some(false), None, Some(vec![]), Some(0), None)
+                ipc_service.update_candidate_window(Some(false), None, Some(&[]), Some(0), None)
             {
                 self.remember_candidate_window_visibility_if_sent(delivery, Some(false));
             }
@@ -6467,6 +6620,9 @@ impl TextServiceFactory {
     }
 
     fn cancel_composition_for_disabled_context(&self) {
+        if let Ok(mut service) = self.borrow_mut() {
+            service.invalidate_mode_switch_requests();
+        }
         let reconversion_original = self.borrow().ok().and_then(|text_service| {
             text_service
                 .borrow_composition()
@@ -6490,7 +6646,7 @@ impl TextServiceFactory {
 
         if let Some(mut ipc_service) = ipc_service {
             if let Ok(delivery) =
-                ipc_service.update_candidate_window(Some(false), None, Some(vec![]), Some(0), None)
+                ipc_service.update_candidate_window(Some(false), None, Some(&[]), Some(0), None)
             {
                 self.remember_candidate_window_visibility_if_sent(delivery, Some(false));
             }
@@ -6555,7 +6711,7 @@ impl TextServiceFactory {
         if let Some(mut ipc_service) = ipc_service {
             ipc_service.discard_input_ledger();
             if let Ok(delivery) =
-                ipc_service.update_candidate_window(Some(false), None, Some(vec![]), Some(0), None)
+                ipc_service.update_candidate_window(Some(false), None, Some(&[]), Some(0), None)
             {
                 self.remember_candidate_window_visibility_if_sent(delivery, Some(false));
             }
@@ -6578,6 +6734,7 @@ impl TextServiceFactory {
             tracing::debug!("Skip superseded deferred input mode switch");
             return;
         }
+        text_service.candidate_window_sync_state.invalidate();
         if let Ok(mut composition) = text_service.borrow_mut_composition() {
             *composition = Composition::default();
         }
@@ -7128,26 +7285,37 @@ impl TextServiceFactory {
                         }
                     }
                     ClientAction::ShowCandidateWindow => {
+                        let scope = self.candidate_window_request_scope()?;
                         let position = self.candidate_window_position()?;
-                        let delivery = ipc_service.update_candidate_window_with_reading(
-                            Some(true),
-                            position,
-                            None,
-                            None,
-                            None,
-                            Self::live_conversion_reading_update(
-                                app_config,
-                                &candidates,
-                                &transition,
-                            ),
-                            Some(true),
-                            Self::live_conversion_reading_vertical_adjustment_for_update(
-                                app_config,
-                                &candidates,
-                                &transition,
-                            ),
+                        if !self.candidate_window_request_is_current(scope) {
+                            continue;
+                        }
+                        self.remember_candidate_window_metadata(Some(true), position, Some(true))?;
+                        let delivery = ipc_service.update_candidate_window_scoped(
+                            CandidateWindowUpdate {
+                                visible: Some(true),
+                                position,
+                                reading: Self::live_conversion_reading_update(
+                                    app_config,
+                                    &candidates,
+                                    &transition,
+                                ),
+                                candidate_list_visible: Some(true),
+                                reading_vertical_adjustment:
+                                    Self::live_conversion_reading_vertical_adjustment_for_update(
+                                        app_config,
+                                        &candidates,
+                                        &transition,
+                                    ),
+                                ..Default::default()
+                            },
+                            CandidateWindowUpdateKind::Unconditional,
+                            || self.candidate_window_request_is_current(scope),
+                            || None,
                         )?;
-                        self.remember_candidate_window_visibility_if_sent(delivery, Some(true));
+                        if self.candidate_window_request_is_current(scope) {
+                            self.remember_candidate_window_visibility_if_sent(delivery, Some(true));
+                        }
                     }
                     ClientAction::CommitLearning {
                         scope,
@@ -8230,20 +8398,17 @@ impl TextServiceFactory {
                         };
 
                         if effect.applied {
-                            self.sync_clause_action_ui(
+                            self.sync_candidate_selection_ui(
                                 &preview,
                                 &suffix,
                                 &candidates,
                                 selection_index,
                                 &mut ipc_service,
-                                None,
-                                effect.update_pos,
                                 Self::live_conversion_reading_update(
                                     app_config,
                                     &candidates,
                                     &transition,
                                 ),
-                                None,
                                 Self::live_conversion_reading_vertical_adjustment_for_update(
                                     app_config,
                                     &candidates,
