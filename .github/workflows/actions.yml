@@ -207,7 +207,14 @@ jobs:
         node-version: 22
 
     - name: Generate indexed English dictionaries for Swift tests
-      run: node scripts/generate-english-dictionary.mjs
+      shell: pwsh
+      run: |
+        # Rust's target cache can retain partial non-Cargo outputs without their
+        # generation marker. Regenerate this owned build tree from source.
+        if (Test-Path -LiteralPath "target/azookey-english-dictionary") {
+          Remove-Item -LiteralPath "target/azookey-english-dictionary" -Recurse -Force
+        }
+        node scripts/generate-english-dictionary.mjs
 
     - name: Run all Swift tests in parallel
       run: swift test --package-path server-swift -c release --verbose -Xcc -D_CRT_USE_C_COMPLEX_H -Xcxx -D_CRT_USE_C_COMPLEX_H
@@ -331,7 +338,13 @@ jobs:
       run: npm ci --prefer-offline --no-audit
 
     - name: Build
-      run: cargo make build --release
+      shell: pwsh
+      run: |
+        # Do not reuse dictionary fragments restored by the Cargo target cache.
+        if (Test-Path -LiteralPath "target/azookey-english-dictionary") {
+          Remove-Item -LiteralPath "target/azookey-english-dictionary" -Recurse -Force
+        }
+        cargo make build --release
 
     - name: Verify installer metadata
       shell: pwsh
