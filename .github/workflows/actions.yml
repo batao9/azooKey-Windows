@@ -216,8 +216,28 @@ jobs:
         }
         node scripts/generate-english-dictionary.mjs
 
-    - name: Run all Swift tests in parallel
-      run: swift test --package-path server-swift -c release --verbose -Xcc -D_CRT_USE_C_COMPLEX_H -Xcxx -D_CRT_USE_C_COMPLEX_H
+    - name: Build and run all Swift tests
+      shell: pwsh
+      run: |
+        swift build --package-path server-swift --build-tests -c release --verbose -Xswiftc -enable-testing -Xcc -D_CRT_USE_C_COMPLEX_H -Xcxx -D_CRT_USE_C_COMPLEX_H
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        # Use the same explicit Windows runner as the verified VM test helper.
+        # A successful SwiftPM process alone is not evidence of test execution.
+        $releaseDir = (Resolve-Path "server-swift/.build/x86_64-unknown-windows-msvc/release").Path
+        $bundles = @(Get-ChildItem -LiteralPath $releaseDir -Filter "*.xctest" -File)
+        if ($bundles.Count -ne 1) { throw "Expected exactly one Swift test bundle" }
+        $runner = [IO.Path]::ChangeExtension($bundles[0].FullName, ".exe")
+        Copy-Item -LiteralPath $bundles[0].FullName -Destination $runner -Force
+        $env:Path = $releaseDir + ";" + (Resolve-Path "llama_cpu").Path + ";" + $env:Path
+        Push-Location $releaseDir
+        try {
+          & $runner --testing-library swift-testing 2>&1 | Tee-Object -Variable testOutput
+          $testExit = $LASTEXITCODE
+        } finally { Pop-Location }
+        if ($testExit -ne 0) { exit $testExit }
+        if (($testOutput -join "`n") -notmatch 'Test run with [1-9][0-9]* tests? passed') {
+          throw "Swift runner exited without a nonempty successful test summary"
+        }
 
     - name: Prepare Rust linker input
       shell: pwsh
