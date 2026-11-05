@@ -1277,7 +1277,7 @@ private func cpuZenzaiBackendSupportedFromEnvironment() -> Bool {
     customRomajiTableEnabled = false
 }
 
-@MainActor private func setCustomRomajiInputStyle(rows: [RomajiTableRow]?) {
+@MainActor func setCustomRomajiInputStyle(rows: [RomajiTableRow]?) {
     guard let rows, let content = buildCustomRomajiTableContent(rows: rows) else {
         setRoman2KanaInputStyle()
         return
@@ -1302,6 +1302,9 @@ private func cpuZenzaiBackendSupportedFromEnvironment() -> Bool {
         InputStyleManager.registerInputStyle(table: table, for: tableName)
         currentInputStyle = .mapped(id: .tableName(tableName))
         customRomajiTableEnabled = true
+        // This registry ID is stable across saves, but eligibility/edge caches
+        // and editing aliases belong to the table contents, not just its ID.
+        mixedInputConversionCache = nil
     } catch {
         serverLog("ERROR", "Failed to apply custom romaji table: \(error)")
         setRoman2KanaInputStyle()

@@ -375,6 +375,69 @@ private struct MixedInputCandidate {
     }
 }
 
+@Test func mixedInputReloadsCustomTableContentsUnderTheSameStyle() async {
+    await MainActor.run {
+        let savedCustom = customRomajiTableEnabled
+        let savedCache = mixedInputConversionCache
+        let savedTable = currentRomajiInputTable
+        defer {
+            customRomajiTableEnabled = savedCustom
+            mixedInputConversionCache = savedCache
+            for name in ["azookey-windows-custom-romaji", "azookey-windows-mixed-barrier-a", "azookey-windows-mixed-barrier-b"] {
+                InputStyleManager.registerInputStyle(table: savedTable, for: name)
+            }
+        }
+        withMixedInputServer {
+            let common = [RomajiTableRow(input: "a", output: "あ", next_input: nil), RomajiTableRow(input: "i", output: "い", next_input: nil)]
+            let first = common + [RomajiTableRow(input: "api", output: "あ", next_input: nil), RomajiTableRow(input: "ka", output: "か", next_input: nil)]
+            let second = common + [RomajiTableRow(input: "ka", output: "き", next_input: nil)]
+            setCustomRomajiInputStyle(rows: first)
+            #expect(customRomajiTableEnabled)
+            let style = currentInputStyle
+            prepareMixedInputConversion(reset: true)
+            typeMixedInput("api")
+            #expect(composingText.convertTarget == "あ")
+            #expect(mixedInputRaw() == "api" && composingText.input.count == 3)
+            clear_text()
+            typeMixedInput("kagoogle")
+            #expect(composingText.convertTarget == "かgoogle")
+            clear_text()
+
+            // Both saves remain custom and reuse the production registry ID.
+            // api is shorter than the bulk lexicon's minimum, so that lexicon
+            // cannot mask a stale seed-eligibility decision from the first table.
+            setCustomRomajiInputStyle(rows: second)
+            #expect(customRomajiTableEnabled && currentInputStyle == style)
+            prepareMixedInputConversion()
+            typeMixedInput("api")
+            #expect(composingText.convertTarget == "api")
+            #expect(mixedInputRaw() == "api" && composingText.input.count == 3)
+            clear_text()
+            typeMixedInput("kagoogle")
+            #expect(composingText.convertTarget == "きgoogle")
+            clear_text()
+
+            // Editing separators must be replaced with aliases of the new table,
+            // without changing the reading or leaving an extra canonical element.
+            composingText.insertAtCursorPosition("ka", inputStyle: style)
+            composingText.insertAtCursorPosition([.init(piece: .compositionSeparator, inputStyle: .mapped(id: .empty))])
+            composingText.insertAtCursorPosition("ka", inputStyle: style)
+            #expect(composingText.convertTarget == "きき")
+            removeMixedInputEditingSeparators()
+            #expect(composingText.convertTarget == "きき")
+            #expect(mixedInputRaw() == "kaka" && composingText.input.count == 4)
+            clear_text()
+
+            setCustomRomajiInputStyle(rows: first)
+            #expect(currentInputStyle == style)
+            prepareMixedInputConversion()
+            typeMixedInput("api")
+            #expect(composingText.convertTarget == "あ")
+            #expect(mixedInputRaw() == "api" && composingText.input.count == 3)
+        }
+    }
+}
+
 @Test func mixedInputRecoveryReplaysEditingAndClauseHistoryWithoutLosingStyles() async {
     await MainActor.run {
         withMixedInputServer {
