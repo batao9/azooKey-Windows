@@ -31,6 +31,7 @@ message AppendTextRequest {
 message AppendTextResponse {
   ComposingText composing_text = 1; // The resulting text and suggestions.
   uint64 server_session_id = 2; // Identifies the current server process session.
+  optional string raw_input = 3; // Canonical order after interior insertion.
 }
 
 // A client-observed successful mutation used to rebuild server composition
@@ -40,6 +41,12 @@ enum CompositionOperationKind {
   COMPOSITION_OPERATION_KIND_APPEND = 0;
   COMPOSITION_OPERATION_KIND_REMOVE = 1;
   COMPOSITION_OPERATION_KIND_MOVE_CURSOR = 2;
+  // Preserve canonical literal styles and snapshot history across clause edits.
+  // SHRINK uses cursor_offset as the number of raw input elements to consume.
+  COMPOSITION_OPERATION_KIND_SHRINK = 3;
+  COMPOSITION_OPERATION_KIND_SNAPSHOT_CLEAR = 4;
+  COMPOSITION_OPERATION_KIND_SNAPSHOT_PUSH = 5;
+  COMPOSITION_OPERATION_KIND_SNAPSHOT_POP = 6;
 }
 
 message CompositionOperation {
@@ -57,6 +64,7 @@ message ReplaceCompositionRequest {
 message ReplaceCompositionResponse {
   ComposingText composing_text = 1;
   uint64 server_session_id = 2;
+  optional string raw_input = 3;
 }
 
 // Starts reverse conversion from a finalized surface string. The operation is
@@ -144,6 +152,7 @@ message ShrinkTextRequest {
 message ShrinkTextResponse {
   ComposingText composing_text = 1; // The resulting text and suggestions.
   uint64 server_session_id = 2; // Identifies the current server process session.
+  optional string raw_input = 3; // Canonical remainder with original input identity.
 }
 
 // Advances clause navigation as one server-side transaction. The snapshot is

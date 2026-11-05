@@ -24,3 +24,8 @@ features = [
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ]
+
+[dev-dependencies]
+hyper-util = { version = "0.1.10", features = ["tokio"] }
+tower = { version = "0.4.13", features = ["util"] }
+tempfile = "3.14.0"

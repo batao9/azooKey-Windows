@@ -12,7 +12,8 @@ use super::{
 };
 use crate::engine::{
     client_action::{
-        ClientAction, LearningCommitKind, LearningCommitScope, SetSelectionType, SetTextType,
+        ClientAction, LearningCommitKind, LearningCommitScope, PreviewInputKind, SetSelectionType,
+        SetTextType,
     },
     input_mode::InputMode,
     ipc_service::{ClauseSnapshotOperation, WindowRpcDelivery},
@@ -783,6 +784,7 @@ pub(super) fn candidates(
         hiragana: hiragana.to_string(),
         corresponding_count: corresponding_count.to_vec(),
         candidate_ids: (1..=texts.len() as u64).collect(),
+        canonical_raw_input: None,
     }
 }
 
@@ -792,6 +794,33 @@ fn learning_action(scope: LearningCommitScope, kind: LearningCommitKind) -> Clie
         kind,
         was_temporary_latin: false,
     }
+}
+
+#[test]
+fn mixed_input_edit_postamble_adopts_canonical_order_and_partial_commit_identity() {
+    let mut inserted = candidates(&["gooxgle"], &[""], "gooxgle", &[7]);
+    inserted.canonical_raw_input = Some("gooxgle".into());
+    let mut local_prediction = "googlex".to_string();
+    TextServiceFactory::reconcile_canonical_input_after_edit(
+        &ClientAction::AppendText("x".into()),
+        &inserted,
+        &mut local_prediction,
+    );
+    assert_eq!(local_prediction, "gooxgle");
+
+    let mut remainder = candidates(&["gleで検索"], &[""], "gleでけんさく", &[12]);
+    remainder.canonical_raw_input = Some("gledekensaku".into());
+    TextServiceFactory::reconcile_canonical_input_after_edit(
+        &ClientAction::ShrinkTextRaw(String::new()),
+        &remainder,
+        &mut local_prediction,
+    );
+    assert_eq!(local_prediction, "gledekensaku");
+    assert_eq!(local_prediction.chars().count(), 12);
+    assert_eq!(
+        TextServiceFactory::current_raw_input_suffix("inputdesu", 3),
+        "utdesu"
+    );
 }
 
 pub(super) fn actual_future_snapshot(
@@ -1301,7 +1330,7 @@ fn skipped_candidate_window_update_does_not_remember_visibility() {
 }
 
 #[test]
-fn input_after_space_conversion_commits_preview_before_starting_new_composition() {
+fn input_after_space_conversion_commits_preview_without_ending_tsf_composition() {
     let composition = Composition {
         state: CompositionState::Previewing,
         preview: "今日は".to_string(),
@@ -1319,16 +1348,17 @@ fn input_after_space_conversion_commits_preview_before_starting_new_composition(
         &AppConfig::default(),
         false,
     )
-    .expect("input should commit preview and start new composition");
+    .expect("input should commit preview and keep a live TSF composition");
 
     assert_eq!(transition, CompositionState::Composing);
     assert_eq!(
         actions,
-        vec![
-            ClientAction::EndComposition,
-            ClientAction::StartComposition,
-            ClientAction::AppendText("a".to_string())
-        ]
+        vec![ClientAction::CommitPreviewAndAppend {
+            committed: "今日は".into(),
+            text: "a".to_string(),
+            kind: PreviewInputKind::Romaji,
+            temporary_latin: false,
+        }]
     );
 }
 
@@ -1356,12 +1386,12 @@ fn temporary_latin_after_space_conversion_starts_new_direct_composition() {
     assert_eq!(transition, CompositionState::Composing);
     assert_eq!(
         actions,
-        vec![
-            ClientAction::EndComposition,
-            ClientAction::StartComposition,
-            ClientAction::SetTemporaryLatin(true),
-            ClientAction::AppendTextDirect("A".to_string())
-        ]
+        vec![ClientAction::CommitPreviewAndAppend {
+            committed: "今日は".into(),
+            text: "A".to_string(),
+            kind: PreviewInputKind::Direct,
+            temporary_latin: true,
+        }]
     );
 }
 
@@ -1390,12 +1420,102 @@ fn existing_temporary_latin_after_space_conversion_preserves_direct_composition(
     assert_eq!(transition, CompositionState::Composing);
     assert_eq!(
         actions,
-        vec![
-            ClientAction::EndComposition,
-            ClientAction::StartComposition,
-            ClientAction::SetTemporaryLatin(true),
-            ClientAction::AppendTextDirect("c".to_string())
-        ]
+        vec![ClientAction::CommitPreviewAndAppend {
+            committed: "AB".into(),
+            text: "c".to_string(),
+            kind: PreviewInputKind::Direct,
+            temporary_latin: true,
+        }]
+    );
+}
+
+#[test]
+fn f10_api_continuation_projects_only_the_uncommitted_w_then_wo() {
+    let config = AppConfig::default();
+    let lookup = super::RomajiLookup::from_rows(&config.romaji_table.rows);
+    let mut composition = Composition {
+        state: CompositionState::Composing,
+        preview: "あぴ".into(),
+        raw_input: "api".into(),
+        raw_hiragana: "あぴ".into(),
+        corresponding_count: 3,
+        ..Composition::default()
+    };
+    let (state, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Function(Function::Ten),
+        &InputMode::Kana,
+        false,
+        &config,
+        false,
+    )
+    .expect("F10");
+    assert_eq!(
+        actions,
+        [ClientAction::SetTextWithType(SetTextType::HalfLatin)]
+    );
+    composition.state = state;
+    composition.preview = "api".into();
+    let (state, actions) = TextServiceFactory::plan_actions_for_user_action(
+        &composition,
+        &UserAction::Input('w'),
+        &InputMode::Kana,
+        false,
+        &config,
+        false,
+    )
+    .expect("continue after F10");
+    assert_eq!(
+        actions,
+        [ClientAction::CommitPreviewAndAppend {
+            committed: "api".into(),
+            text: "w".into(),
+            kind: PreviewInputKind::Romaji,
+            temporary_latin: false,
+        }]
+    );
+    composition.deferred_actions = actions
+        .into_iter()
+        .map(|action| DeferredClientAction {
+            action,
+            transition: state.clone(),
+        })
+        .collect();
+    let mut projection = TextServiceFactory::deferred_projection(&composition, InputMode::Kana);
+    assert_eq!(projection.raw_input, "w");
+    assert!(projection.reliable);
+    assert!(!projection.temporary_latin);
+    let mut projected = composition.clone();
+    projected.state = projection.state.clone();
+    projected.raw_input.clone_from(&projection.raw_input);
+    let (state, actions) = TextServiceFactory::plan_deferred_user_action(
+        &projected,
+        &DeferredUserAction {
+            action: UserAction::Input('o'),
+            is_shift_pressed: false,
+            is_shift_key: false,
+            shift_alphabet_shortcut: false,
+        },
+        &InputMode::Kana,
+        &config,
+        &lookup,
+    )
+    .expect("o extends the new composition");
+    assert_eq!(actions, [ClientAction::AppendText("o".into())]);
+    TextServiceFactory::apply_actions_to_deferred_projection(
+        &mut projection,
+        &actions
+            .into_iter()
+            .map(|action| DeferredClientAction {
+                action,
+                transition: state.clone(),
+            })
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(projection.raw_input, "wo");
+    assert_eq!(
+        composition.raw_input, "api",
+        "the old document remains intact until execution"
     );
 }
 

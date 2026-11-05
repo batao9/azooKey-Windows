@@ -130,17 +130,26 @@ impl TextServiceFactory {
     }
 
     pub fn update_context(&self, preview: &str) -> Result<Option<String>> {
-        self.update_context_with_scope_check(preview, false)
+        self.update_context_with_scope_check(preview, false, None)
+    }
+
+    pub(crate) fn update_context_for_preview_continuation(
+        &self,
+        current_display: &str,
+        committed: &str,
+    ) -> Result<Option<String>> {
+        self.update_context_with_scope_check(current_display, false, Some(committed))
     }
 
     pub(crate) fn update_context_for_jev(&self, preview: &str) -> Result<Option<String>> {
-        self.update_context_with_scope_check(preview, true)
+        self.update_context_with_scope_check(preview, true, None)
     }
 
     fn update_context_with_scope_check(
         &self,
         preview: &str,
         for_jev: bool,
+        committed: Option<&str>,
     ) -> Result<Option<String>> {
         let trace_request_id = current_input_trace_request_id();
         let total_start = trace_request_id.map(|_| Instant::now());
@@ -154,7 +163,7 @@ impl TextServiceFactory {
 
             let edit_session_start = trace_request_id.map(|_| Instant::now());
             let preview_end_shift = preview_end_shift(preview)?;
-            let preceding_text = read_edit_session::<String>(
+            let mut preceding_text = read_edit_session::<String>(
                 tid,
                 parent_context.clone(),
                 Rc::new({
@@ -245,6 +254,9 @@ impl TextServiceFactory {
             // or issue the normal synchronous set_context RPC.
             if for_jev {
                 return Ok(Some(preceding_text));
+            }
+            if let Some(committed) = committed {
+                preceding_text.push_str(committed);
             }
 
             let Some(mut ipc_service) = IMEState::ipc_service()? else {

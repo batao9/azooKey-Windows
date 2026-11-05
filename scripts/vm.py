@@ -40,6 +40,9 @@ def load_profile(config, name):
         raise VmError('SSH user must be an explicit Windows account name')
     if not 1 <= int(profile['port']) <= 65535:
         raise VmError('Invalid SSH port')
+    for key in ('ssh_connect_timeout', 'query_timeout'):
+        if key in profile and (type(profile[key]) is not int or profile[key] <= 0):
+            raise VmError(f'{key} must be a positive integer number of seconds')
     for key in ('key', 'vbox'):
         profile[key] = os.path.expandvars(os.path.expanduser(profile[key]))
     if not Path(profile['key']).is_file():
@@ -223,15 +226,22 @@ class VM:
         self.finish_operation()
 
     def capture(self, argv, timeout=60, check=True):
+        started = time.monotonic()
         try:
             proc = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True,
                                   encoding='utf-8', errors='replace', timeout=timeout,
                                   stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired as error:
-            self.commands.append({'command': argv, 'exit_code': None, 'status': 'timeout'})
+            elapsed = time.monotonic() - started
+            self.commands.append({'command': argv, 'exit_code': None, 'status': 'timeout',
+                                  'timeout_seconds': timeout, 'elapsed_seconds': round(elapsed, 3)})
             with self.log.open('a') as log:
                 log.write(json.dumps(self.commands[-1]) + '\n')
-            raise VmError('Command timed out; remote work may still be active. Inspect before retry.', uncertain=True) from error
+                for output in (error.stdout, error.stderr):
+                    if output:
+                        log.write(output.decode('utf-8', errors='replace') if isinstance(output, bytes) else output)
+                        log.write('\n')
+            raise VmError(f'Command timed out after {timeout}s ({elapsed:.1f}s elapsed); remote work may still be active. Inspect before retry.', uncertain=True) from error
         self.commands.append({'command': argv, 'exit_code': proc.returncode})
         with self.log.open('a') as log:
             log.write(json.dumps({'command': argv, 'exit_code': proc.returncode}, ensure_ascii=False) + '\n')
@@ -264,11 +274,13 @@ class VM:
 
     def ssh_args(self):
         return ['ssh', '-i', self.p['key'], '-p', str(self.p['port']), '-o', 'BatchMode=yes',
-                '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=5',
+                 '-o', 'StrictHostKeyChecking=accept-new', '-o', f'ConnectTimeout={self.p.get("ssh_connect_timeout", 5)}',
                 '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2',
                 f'{self.p["user"]}@{self.p["host"]}']
 
-    def ps(self, code, timeout=15):
+    def ps(self, code, timeout=None):
+        if timeout is None:
+            timeout = self.p.get('query_timeout', 15)
         code = "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=New-Object Text.UTF8Encoding($false); " + code
         encoded = base64.b64encode(code.encode('utf-16le')).decode()
         return self.capture(self.ssh_args() + ['powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand ' + encoded], timeout).stdout
@@ -283,7 +295,7 @@ class VM:
                 # following operations, within the same readiness deadline.
                 result = self.capture(
                     self.ssh_args() + ['powershell -NoProfile -NonInteractive -Command "Write-Output VM_READY"'],
-                    timeout=min(15, max(0.1, end-time.monotonic())), check=False)
+                    timeout=min(self.p.get('query_timeout', 15), max(0.1, end-time.monotonic())), check=False)
                 if result.returncode == 0 and result.stdout.strip() == 'VM_READY':
                     return
             except VmError as error:
@@ -454,7 +466,7 @@ class VM:
                 temporary.write_bytes(previous)
                 temporary.replace(self.reservation)
         argv = ['scp', '-i', self.p['key'], '-P', str(self.p['port']), '-o', 'BatchMode=yes',
-                '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=5',
+                '-o', 'StrictHostKeyChecking=accept-new', '-o', f'ConnectTimeout={self.p.get("ssh_connect_timeout", 5)}',
                 '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2']
         try:
             self.run(argv + ([endpoint, local] if download else [local, endpoint]),
@@ -475,9 +487,10 @@ class VM:
         args = ''.join(' -' + key + ' ' + ps_quote(value) for key, value in (arguments or {}).items())
         if interactive:
             return self.interactive(remote, args, token, timeout)
-        code = ("Add-Type 'using System.Runtime.InteropServices; public static class RunAwake { [DllImport(\"kernel32.dll\")] public static extern uint SetThreadExecutionState(uint flags); }'; "
+        code = ("[Console]::Error.WriteLine('VM_SCRIPT_PHASE=awake_setup'); "
+                "Add-Type 'using System.Runtime.InteropServices; public static class RunAwake { [DllImport(\"kernel32.dll\")] public static extern uint SetThreadExecutionState(uint flags); }'; "
                 "if([RunAwake]::SetThreadExecutionState([uint32]2147483649) -eq 0){throw 'Sleep prevention failed'}; "
-                f"try {{ $global:LASTEXITCODE=0; & {ps_quote(remote)}{args}; $ok=$?; if($LASTEXITCODE -ne 0){{exit $LASTEXITCODE}}; if(!$ok){{exit 1}} }} finally {{ [void][RunAwake]::SetThreadExecutionState([uint32]2147483648) }}")
+                f"try {{ [Console]::Error.WriteLine('VM_SCRIPT_PHASE=run'); $global:LASTEXITCODE=0; & {ps_quote(remote)}{args}; $ok=$?; if($LASTEXITCODE -ne 0){{exit $LASTEXITCODE}}; if(!$ok){{exit 1}} }} finally {{ [void][RunAwake]::SetThreadExecutionState([uint32]2147483648) }}")
         self.begin_operation('script', remote_script=remote)
         try:
             output = self.ps(code, timeout=timeout)
@@ -498,7 +511,7 @@ class VM:
                    "try { if([TaskAwake]::SetThreadExecutionState([uint32]2147483649) -eq 0){throw 'Sleep prevention failed'}; "
                    f"$global:LASTEXITCODE=0; & {ps_quote(remote)}{args} *>&1 | Out-File {ps_quote(output)} -Encoding UTF8; "
                    f"if(!$? -or $LASTEXITCODE -ne 0){{throw 'Guest script failed'}}; [IO.File]::WriteAllText({ps_quote(done)},'0') }} catch {{ "
-                   f"$_ | Out-File {ps_quote(output)} -Encoding UTF8; [IO.File]::WriteAllText({ps_quote(done)},'1') }} "
+                    f"$_ | Out-File {ps_quote(output)} -Encoding UTF8 -Append; [IO.File]::WriteAllText({ps_quote(done)},'1') }} "
                    "finally { [void][TaskAwake]::SetThreadExecutionState([uint32]2147483648) }")
         encoded = base64.b64encode(content.encode('utf-8-sig')).decode()
         self.begin_operation('interactive', task=token, remote_script=remote, output=output, done=done)
@@ -735,6 +748,21 @@ def execute(vm, args, result):
         if cmd == 'test':
             command += [args.cargo_filter, args.swift_filter]
         vm.run_operation(cmd, command, timeout=14400, env=vm.environment(), branch=args.branch)
+        if cmd == 'test' and args.cargo_filter == 'dictionary_settings_rpc' and os.environ.get('CARGO_TEST_PACKAGE') == 'azookey-server':
+            log = vm.log.read_text(errors='replace')
+            probes = re.findall(r'^\[vm-client-test\] interactive_probe_ready=(.+\.ps1)\r?$', log, re.MULTILINE)
+            if len(probes) != 1:
+                raise VmError('RPC fixture compilation returned without exactly one interactive probe', 'failed')
+            wrapper = vm.directory / 'dictionary-rpc-interactive-wrapper.ps1'
+            wrapper.write_text("$ErrorActionPreference='Stop'; & " + ps_quote(probes[0]) +
+                               "; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}", encoding='utf-8')
+            output = vm.script(wrapper, interactive=True, timeout=180)
+            required = ('DICTIONARY_SETTINGS_RPC_CONCURRENCY succeeded',
+                        'DICTIONARY_SETTINGS_INVALID_CONFIG_PRESERVED succeeded',
+                        'DICTIONARY_SETTINGS_RUST_STARTUP_MISSING_RESOURCE succeeded')
+            if not all(marker in output for marker in required):
+                raise VmError('RPC probe exited without complete concurrency/startup evidence', 'failed')
+            result['dictionary_rpc_probe'] = {'task_status': 'succeeded', 'output': output}
         if cmd == 'build':
             log = vm.log.read_text(errors='replace')
             matches = re.findall(r'\[vm-build\] 完了: (.+\.exe) \((.+\.build-info\.json)\)', log)

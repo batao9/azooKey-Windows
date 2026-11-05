@@ -40,6 +40,30 @@ class VmTests(unittest.TestCase):
         self.assertEqual(argv[argv.index('-p') + 1], '12345')
         self.assertIn('BatchMode=yes', argv)
 
+    def test_slow_boot_connection_budget_applies_to_ssh_and_scp(self):
+        self.machine.p['ssh_connect_timeout'] = 15
+        self.assertIn('ConnectTimeout=15', self.machine.ssh_args())
+        self.machine.run = Mock()
+        self.machine.transfer(str(self.key), r'C:\Temp\fixture')
+        self.assertIn('ConnectTimeout=15', self.machine.run.call_args.args[0])
+
+    def test_configurable_timeouts_reject_unbounded_or_invalid_values(self):
+        config = self.root / 'vm.json'
+        for key in ('ssh_connect_timeout', 'query_timeout'):
+            for value in (0, -1, True, '45'):
+                with self.subTest(key=key, value=value):
+                    config.write_text(json.dumps({'profiles': {'build': {**self.profile, key: value}}}))
+                    with self.assertRaisesRegex(vm.VmError, key):
+                        vm.load_profile(config, 'build')
+
+    def test_query_budget_uses_profile_but_respects_explicit_script_deadline(self):
+        self.machine.p['query_timeout'] = 45
+        self.machine.capture = Mock(return_value=subprocess.CompletedProcess(['ssh'], 0, stdout='ok'))
+        self.machine.ps('read-only query')
+        self.assertEqual(self.machine.capture.call_args.args[1], 45)
+        self.machine.ps('bounded task', timeout=120)
+        self.assertEqual(self.machine.capture.call_args.args[1], 120)
+
     def test_state_recovers_only_transient_read_errors(self):
         for message in ('The object is not ready: E_ACCESSDENIED (0x80070005)',
                         'Machine already has a lock request pending: VBOX_E_INVALID_OBJECT_STATE (0x80bb0007)'):
@@ -87,6 +111,27 @@ class VmTests(unittest.TestCase):
         with self.assertRaises(vm.VmError):
             self.machine.start()
         self.machine.vbox.assert_not_called()
+
+    def test_dictionary_rpc_probe_uses_interactive_owner_and_requires_complete_evidence(self):
+        args = vm.parser().parse_args(['--profile', 'build', 'test', 'feature/dictionaries',
+                                       'dictionary_settings_rpc', 'englishDictionaryResourceValidationAndDefaults'])
+        self.machine.start = Mock()
+        self.machine.run_operation = Mock()
+        remote = r'C:\w\owned\dictionary-rpc-interactive.ps1'
+        self.machine.log.write_text('[vm-client-test] interactive_probe_ready=' + remote + '\n')
+        markers = ('DICTIONARY_SETTINGS_RPC_CONCURRENCY succeeded\n'
+                   'DICTIONARY_SETTINGS_INVALID_CONFIG_PRESERVED succeeded\n'
+                   'DICTIONARY_SETTINGS_RUST_STARTUP_MISSING_RESOURCE succeeded')
+        self.machine.script = Mock(return_value=markers)
+        with patch.dict(os.environ, {'CARGO_TEST_PACKAGE': 'azookey-server'}):
+            result = {}
+            vm.execute(self.machine, args, result)
+            self.assertEqual(result['dictionary_rpc_probe']['task_status'], 'succeeded')
+            self.assertTrue(self.machine.script.call_args.kwargs['interactive'])
+            self.assertIn(remote, self.machine.script.call_args.args[0].read_text())
+            self.machine.script.return_value = 'process exited zero without test evidence'
+            with self.assertRaisesRegex(vm.VmError, 'complete concurrency/startup evidence'):
+                vm.execute(self.machine, args, {})
 
     def test_start_keep_current_discards_saved_memory_before_boot_without_restore(self):
         self.machine.state = Mock(side_effect=[{'VMState': 'saved'}, {'VMState': 'poweroff'}])
@@ -144,6 +189,29 @@ class VmTests(unittest.TestCase):
                 self.machine.ready(seconds=90)
         self.assertEqual(self.machine.capture.call_count, 1)
         self.assertLessEqual(self.machine.capture.call_args.kwargs['timeout'], 15)
+
+    def test_slow_boot_can_become_ready_after_old_deadline(self):
+        self.machine.p.update(ready_timeout=300, query_timeout=45)
+        self.machine.state = Mock(return_value={'VMState': 'poweroff'})
+        self.machine.vbox = Mock()
+        self.machine.ps = Mock()
+        def delayed_interpreter(*args, **kwargs):
+            self.assertGreaterEqual(kwargs['timeout'], 30)
+            return subprocess.CompletedProcess(['ssh'], 0, stdout='VM_READY\r\n')
+        self.machine.capture = Mock(side_effect=delayed_interpreter)
+        with patch.object(vm.time, 'monotonic', side_effect=[0, 180, 180]):
+            self.machine.start()
+        self.machine.capture.assert_called_once()
+        self.assertEqual(self.machine.capture.call_args.kwargs['timeout'], 45)
+
+    def test_long_probe_never_exceeds_remaining_overall_boot_deadline(self):
+        self.machine.p['query_timeout'] = 45
+        self.machine.capture = Mock(side_effect=vm.VmError('startup timeout', uncertain=True))
+        self.machine.vbox = Mock()
+        with patch.object(vm.time, 'sleep'), patch.object(vm.time, 'monotonic', side_effect=[0, 293, 293, 301]):
+            with self.assertRaisesRegex(vm.VmError, 'readiness deadline'):
+                self.machine.ready(seconds=300)
+        self.assertEqual(self.machine.capture.call_args.kwargs['timeout'], 7)
 
     def test_install_guest_budget_covers_installer_wait_without_widening_identity(self):
         self.machine.script = Mock(return_value='{"installed": null}')
@@ -925,11 +993,18 @@ class VmTests(unittest.TestCase):
         self.assertEqual(caught.exception.status, 'blocked')
 
     def test_capture_timeout_records_indeterminate_outcome(self):
-        with patch.object(vm.subprocess, 'run', side_effect=subprocess.TimeoutExpired(['ssh'], 1)):
+        timeout = subprocess.TimeoutExpired(['ssh'], 1, output=b'partial stdout', stderr=b'VM_INSTALL_PHASE=wait')
+        with patch.object(vm.subprocess, 'run', side_effect=timeout):
             with self.assertRaises(vm.VmError) as caught:
                 self.machine.capture(['ssh'], timeout=1)
         self.assertTrue(caught.exception.uncertain)
         self.assertEqual(self.machine.commands[-1]['status'], 'timeout')
+        self.assertEqual(self.machine.commands[-1]['timeout_seconds'], 1)
+        self.assertIn('elapsed_seconds', self.machine.commands[-1])
+        evidence = self.machine.log.read_text()
+        self.assertIn('partial stdout', evidence)
+        self.assertIn('VM_INSTALL_PHASE=wait', evidence)
+        self.assertIn('after 1s', str(caught.exception))
 
     def test_stage_checks_metadata_before_mutation(self):
         installer = self.root / 'setup.exe'

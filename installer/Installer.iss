@@ -68,6 +68,11 @@ Source: "./Azookey Startup.xml"; DestDir: "{app}"; DestName: ".azookey-startup-t
 Name: "{userdesktop}\{#MyAppName}"; Filename: "{app}\{#MySettingsAppName}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [InstallDelete]
+; Immutable generated indexes are replaced as a set. In particular, remove
+; old case-insensitive ASCII filenames before installing escaped identifiers.
+; User settings and learning data live outside these payload directories.
+Type: filesandordirs; Name: "{app}\Dictionary\louds"
+Type: filesandordirs; Name: "{app}\Dictionary\Variants"
 Type: files; Name: "{app}\uninstall.exe"
 Type: files; Name: "{app}\launch.vbs"
 Type: files; Name: "{app}\build-info.json"

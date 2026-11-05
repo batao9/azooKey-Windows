@@ -37,6 +37,8 @@ CARGO_TEST_PACKAGE="${CARGO_TEST_PACKAGE:-azookey-windows}"
 SWIFT_TEST_FILTER="${3:-}"
 SWIFT_TEST_ITERATIONS="${SWIFT_TEST_ITERATIONS:-1}"
 SWIFT_TEST_REAL_ZENZAI="${SWIFT_TEST_REAL_ZENZAI:-0}"
+SWIFT_TEST_JOBS="${SWIFT_TEST_JOBS:-2}"
+SWIFT_TEST_SINGLE_DICTIONARY="${SWIFT_TEST_SINGLE_DICTIONARY:-0}"
 
 if [[ "$CARGO_TEST_FILTER" == "-" ]]; then
   CARGO_TEST_FILTER="skip"
@@ -50,6 +52,14 @@ if [[ ! "$CARGO_TEST_PACKAGE" =~ ^[A-Za-z0-9_-]+$ ]]; then
 fi
 if [[ ! "$SWIFT_TEST_ITERATIONS" =~ ^[1-9][0-9]*$ ]]; then
   echo "SWIFT_TEST_ITERATIONS must be a positive integer"
+  exit 1
+fi
+if [[ ! "$SWIFT_TEST_JOBS" =~ ^([1-9]|1[0-6])$ ]]; then
+  echo "SWIFT_TEST_JOBS must be an integer from 1 to 16"
+  exit 1
+fi
+if [[ "$SWIFT_TEST_SINGLE_DICTIONARY" != "0" && "$SWIFT_TEST_SINGLE_DICTIONARY" != "1" ]]; then
+  echo "SWIFT_TEST_SINGLE_DICTIONARY must be 0 or 1"
   exit 1
 fi
 if [[ "$SWIFT_TEST_REAL_ZENZAI" != "0" && "$SWIFT_TEST_REAL_ZENZAI" != "1" ]]; then
@@ -442,6 +452,8 @@ param(
   [Parameter(Mandatory = $false)][string]$CargoTestFilter = "composition",
   [Parameter(Mandatory = $false)][string]$SwiftTestFilter = "",
   [Parameter(Mandatory = $false)][int]$SwiftTestIterations = 1,
+  [Parameter(Mandatory = $false)][ValidateRange(1,16)][int]$SwiftTestJobs = 2,
+  [Parameter(Mandatory = $false)][ValidateSet(0,1)][int]$SingleDictionary = 0,
   [Parameter(Mandatory = $false)][string]$SwiftVendorTarPath = "",
   [string]$CacheRootBase64 = "",
   [switch]$UseZenzaiModel
@@ -546,6 +558,11 @@ function Initialize-SwiftTestEnvironment {
   if (!(Replace-TreeFromCache -CacheDir $cachedMainDictDir -DestDir $mainDictDir -Label "main dictionary")) {
     Write-Host "main dictionary cache not found; using extracted source files"
   }
+
+  $dictionaryArgs = @('--source', $mainDictDir, '--output', (Join-Path $SourceDir 'target/azookey-english-dictionary/Dictionary'))
+  if ($SingleDictionary -eq 1) { $dictionaryArgs += '--single-mode' }
+  & node (Join-Path $SourceDir "scripts/generate-english-dictionary.mjs") @dictionaryArgs
+  if ($LASTEXITCODE -ne 0) { throw "English dictionary generation failed: $LASTEXITCODE" }
 
   $cachedSwiftBuildDir = Join-Path $cacheRoot "server-swift\.build"
   $sourceSwiftBuildDir = Join-Path $SourceDir "server-swift\.build"
@@ -711,7 +728,9 @@ function Invoke-SwiftPackageTests {
   }
 
   $runnerExe = [System.IO.Path]::ChangeExtension($testBundle.FullName, ".exe")
-  Copy-Item $testBundle.FullName -Destination $runnerExe -Force
+  # The bundle is compiled once in this fresh source tree. Do not rewrite its
+  # executable between benchmark launches while Windows may still scan/map it.
+  if (!(Test-Path $runnerExe)) { Copy-Item $testBundle.FullName -Destination $runnerExe }
 
   $swiftRoot = Join-Path $env:LOCALAPPDATA "Programs\Swift"
   $runtimeDir = Get-ChildItem -Path (Join-Path $swiftRoot "Runtimes") -Directory -ErrorAction SilentlyContinue |
@@ -768,6 +787,33 @@ function Invoke-SwiftPackageTests {
       throw "swift test runner iteration $iteration/$Iterations failed with exit code $LASTEXITCODE"
     }
   }
+  if ($TestFilter -match 'englishDictionary' -and $TestFilter -ne 'englishDictionaryPerformance') {
+    $probeRoot = Join-Path $SwiftSourceDir '.build\distribution-resource-probe'
+    New-Item -ItemType Directory -Path $probeRoot -Force | Out-Null
+    $probeExe = Join-Path $probeRoot 'dictionary-resource-probe.exe'
+    Copy-Item $runnerExe $probeExe -Force
+    Copy-Item (Join-Path $releaseDir 'azookey-server.dll') $probeRoot -Force
+    $resourceName = 'azookey-server_azookey-server.resources'
+    $probeResources = Join-Path $probeRoot $resourceName
+    if (Test-Path $probeResources) { Remove-Item $probeResources -Recurse -Force }
+    Copy-Item (Join-Path $releaseDir $resourceName) $probeResources -Recurse -Force
+    Push-Location $env:TEMP
+    try {
+      & $probeExe --testing-library swift-testing --filter englishDictionaryResourceValidationAndDefaults
+      if ($LASTEXITCODE -ne 0) { throw 'Distribution-layout resource probe failed' }
+      Move-Item $probeResources ($probeResources + '-held')
+      $env:AZOOKEY_RESOURCE_MISSING_PROBE = '1'
+      try {
+        & $probeExe --testing-library swift-testing --filter englishDictionaryMissingResourceFailsWithoutCrash
+        if ($LASTEXITCODE -ne 0) { throw 'Missing-resource graceful failure probe failed' }
+      } finally {
+        Remove-Item Env:AZOOKEY_RESOURCE_MISSING_PROBE -ErrorAction SilentlyContinue
+        Move-Item ($probeResources + '-held') $probeResources
+      }
+      Write-Host 'ENGLISH_RESOURCE_DISTRIBUTION_PROBE succeeded present_and_missing different_cwd'
+      $script:englishResourceProbeCompleted = $true
+    } finally { Pop-Location }
+  }
 }
 
 if (Test-Path $SourceDir) {
@@ -807,7 +853,10 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
   throw "cargo command not found"
 }
 
-if (![string]::IsNullOrWhiteSpace($CargoTestFilter) -and $CargoTestFilter -ne "skip") {
+$deferServerTests = $CargoTestPackage -eq 'azookey-server' -and $SwiftTestFilter -ne 'skip' -and ![string]::IsNullOrWhiteSpace($SwiftTestFilter)
+if ($deferServerTests) {
+  Write-Host 'deferring server tests until the current Swift import library is built'
+} elseif (![string]::IsNullOrWhiteSpace($CargoTestFilter) -and $CargoTestFilter -ne "skip") {
   Write-Host "running cargo test -p $CargoTestPackage $CargoTestFilter -- --nocapture"
   cargo test -p $CargoTestPackage $CargoTestFilter -- --nocapture
   if ($LASTEXITCODE -ne 0) {
@@ -821,29 +870,73 @@ if (![string]::IsNullOrWhiteSpace($SwiftTestFilter) -and $SwiftTestFilter -ne "s
   Initialize-SwiftTestEnvironment
   $swiftSourceDir = Join-Path $SourceDir "server-swift"
   Set-Location $swiftSourceDir
-  if ($SwiftTestFilter -eq "all") {
-    Write-Host "running swift test -c release --verbose -Xcc -D_CRT_USE_C_COMPLEX_H"
-    swift test -c release --verbose -Xcc -D_CRT_USE_C_COMPLEX_H
-  } else {
-    Write-Host "running swift test -c release --verbose -Xcc -D_CRT_USE_C_COMPLEX_H --filter $SwiftTestFilter"
-    swift test -c release --verbose -Xcc -D_CRT_USE_C_COMPLEX_H --filter $SwiftTestFilter
+  # Build separately and use the explicit Windows runner once. A real test
+  # failure must not be retried as though it were an .xctest launch problem.
+  Write-Host "building Swift test bundle release jobs=$SwiftTestJobs"
+  swift build --build-tests -c release --jobs $SwiftTestJobs --verbose -Xswiftc -enable-testing -Xcc -D_CRT_USE_C_COMPLEX_H
+  if ($LASTEXITCODE -ne 0) { throw "Swift test compilation failed: $LASTEXITCODE" }
+  $env:AZOOKEY_DICTIONARY_MODEL_OUTPUT = Join-Path $SourceDir 'dictionary-model-switch.json'
+  Invoke-SwiftPackageTests -SwiftSourceDir $swiftSourceDir -TestFilter $SwiftTestFilter -Iterations $SwiftTestIterations
+  if (Test-Path $env:AZOOKEY_DICTIONARY_MODEL_OUTPUT) {
+    Write-Host ('ENGLISH_DICTIONARY_MODEL_SWITCH_JSON ' + [IO.File]::ReadAllText($env:AZOOKEY_DICTIONARY_MODEL_OUTPUT))
   }
-  if ($LASTEXITCODE -eq 0) {
-    Write-Host "swift test completed without Windows runner workaround"
-    for ($iteration = 2; $iteration -le $SwiftTestIterations; $iteration++) {
-      Write-Host "running swift test iteration $iteration/$SwiftTestIterations with --skip-build"
-      if ($SwiftTestFilter -eq "all") {
-        swift test -c release --skip-build --verbose -Xcc -D_CRT_USE_C_COMPLEX_H
-      } else {
-        swift test -c release --skip-build --verbose -Xcc -D_CRT_USE_C_COMPLEX_H --filter $SwiftTestFilter
-      }
-      if ($LASTEXITCODE -ne 0) {
-        throw "swift test iteration $iteration/$SwiftTestIterations failed with exit code $LASTEXITCODE"
-      }
+  Remove-Item Env:AZOOKEY_DICTIONARY_MODEL_OUTPUT -ErrorAction SilentlyContinue
+  if ($SwiftTestFilter -match 'englishDictionary') {
+    if (!$script:englishResourceProbeCompleted) {
+      Invoke-SwiftPackageTests -SwiftSourceDir $swiftSourceDir -TestFilter 'englishDictionaryResourceValidationAndDefaults' -Iterations 1
     }
-  } else {
-    Write-Host "swift test returned exit code $LASTEXITCODE; retrying with Windows runner workaround"
-    Invoke-SwiftPackageTests -SwiftSourceDir $swiftSourceDir -TestFilter $SwiftTestFilter -Iterations $SwiftTestIterations
+    if ($SwiftTestFilter -ne 'englishDictionaryResourceValidationAndDefaults') {
+    try {
+      $benchmarkIndex = 0
+      foreach ($mode in @('base', 'kana', 'spelling', 'both', 'both', 'spelling', 'kana', 'base')) {
+        $env:AZOOKEY_DICTIONARY_BENCHMARK_MODE = $mode
+        $env:AZOOKEY_DICTIONARY_BENCHMARK_OUTPUT = Join-Path $SourceDir "dictionary-performance-$benchmarkIndex-$mode.json"
+        Invoke-SwiftPackageTests -SwiftSourceDir $swiftSourceDir -TestFilter 'englishDictionaryPerformance' -Iterations 1
+        if (!(Test-Path $env:AZOOKEY_DICTIONARY_BENCHMARK_OUTPUT)) { throw "Missing benchmark evidence: $mode" }
+        Write-Host ('ENGLISH_DICTIONARY_PERFORMANCE ' + [IO.File]::ReadAllText($env:AZOOKEY_DICTIONARY_BENCHMARK_OUTPUT))
+        $benchmarkIndex++
+      }
+    } finally {
+      Remove-Item Env:AZOOKEY_DICTIONARY_BENCHMARK_MODE -ErrorAction SilentlyContinue
+      Remove-Item Env:AZOOKEY_DICTIONARY_BENCHMARK_OUTPUT -ErrorAction SilentlyContinue
+    }
+    }
+  }
+  if ($deferServerTests -and $CargoTestFilter -ne 'skip') {
+    $releaseDir = Join-Path $swiftSourceDir '.build\x86_64-unknown-windows-msvc\release'
+    $serverLinkDir = Join-Path $SourceDir 'crates\server\target'
+    New-Item -ItemType Directory -Path $serverLinkDir -Force | Out-Null
+    Copy-Item (Join-Path $releaseDir 'azookey-server.lib') $serverLinkDir -Force
+    Set-Location $SourceDir
+    if ($CargoTestFilter -eq 'dictionary_settings_rpc') {
+      if (!$env:AZOOKEY_ZENZAI_TEST_MODEL) { throw 'The dictionary RPC probe requires SWIFT_TEST_REAL_ZENZAI=1' }
+      $runtime = Join-Path $SourceDir 'target\debug'
+      New-Item -ItemType Directory -Path $runtime -Force | Out-Null
+      foreach ($name in @('Dictionary', 'azookey-server_azookey-server.resources')) {
+        $destination = Join-Path $runtime $name
+        if (Test-Path $destination) { Remove-Item $destination -Recurse -Force }
+        $source = if ($name -eq 'Dictionary') { Join-Path $SourceDir 'target\azookey-english-dictionary\Dictionary' } else { Join-Path $releaseDir $name }
+        Copy-Item -LiteralPath $source -Destination $runtime -Recurse -Force
+      }
+      Copy-Item (Join-Path $releaseDir 'azookey-server.dll') $runtime -Force
+      Copy-Item -LiteralPath $env:AZOOKEY_ZENZAI_TEST_MODEL -Destination (Join-Path $runtime 'zenz.gguf') -Force
+      cargo test -p azookey-server --test dictionary_settings_rpc --no-run
+      if ($LASTEXITCODE -ne 0) { throw "RPC fixture compilation failed: $LASTEXITCODE" }
+      $probe = @(Get-ChildItem (Join-Path $runtime 'deps') -Filter 'dictionary_settings_rpc-*.exe' -File)
+      if ($probe.Count -ne 1) { throw 'Expected exactly one owned RPC test executable' }
+      # The production pipe intentionally denies network-logon tokens (SSH).
+      # The controller runs this prepared fixture through its normal interactive
+      # interface while retaining the same single-owner disposable VM lifecycle.
+      $probeScript = Join-Path $SourceDir 'dictionary-rpc-interactive.ps1'
+      $pathLiteral = $env:Path.Replace("'", "''")
+      $exeLiteral = $probe[0].FullName.Replace("'", "''")
+      $content = "`$ErrorActionPreference='Stop'`r`n`$env:Path='$pathLiteral'`r`n& '$exeLiteral' --ignored --nocapture`r`nif (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }`r`n"
+      [IO.File]::WriteAllText($probeScript, $content, [Text.UTF8Encoding]::new($true))
+      Write-Host "[vm-client-test] interactive_probe_ready=$probeScript"
+    } else {
+      cargo test -p $CargoTestPackage $CargoTestFilter -- --nocapture
+    }
+    if ($LASTEXITCODE -ne 0) { throw "deferred server tests failed: $LASTEXITCODE" }
   }
 } else {
   Write-Host "skipping swift test"
@@ -929,7 +1022,7 @@ main() {
   if [[ "$SWIFT_TEST_REAL_ZENZAI" == "1" ]]; then
     model_arg=" -UseZenzaiModel"
   fi
-  ssh_run_test "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -SourceTarPath \"$REMOTE_TAR_WIN\" -SourceDir \"$REMOTE_SRC_WIN\" -HostTimestampUtc \"$HOST_TIMESTAMP_UTC\" -CargoTestPackage \"$CARGO_TEST_PACKAGE\" -CargoTestFilter \"$CARGO_TEST_FILTER\" -SwiftTestFilter \"$SWIFT_TEST_FILTER\" -SwiftTestIterations \"$SWIFT_TEST_ITERATIONS\"$swift_vendor_arg$cache_root_arg$model_arg"
+  ssh_run_test "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REMOTE_PS_WIN\" -SourceTarPath \"$REMOTE_TAR_WIN\" -SourceDir \"$REMOTE_SRC_WIN\" -HostTimestampUtc \"$HOST_TIMESTAMP_UTC\" -CargoTestPackage \"$CARGO_TEST_PACKAGE\" -CargoTestFilter \"$CARGO_TEST_FILTER\" -SwiftTestFilter \"$SWIFT_TEST_FILTER\" -SwiftTestIterations \"$SWIFT_TEST_ITERATIONS\" -SwiftTestJobs \"$SWIFT_TEST_JOBS\" -SingleDictionary \"$SWIFT_TEST_SINGLE_DICTIONARY\"$swift_vendor_arg$cache_root_arg$model_arg"
 
   if [[ "$VM_LIFECYCLE_EXTERNAL" != "1" ]]; then
     shutdown_vm_normally

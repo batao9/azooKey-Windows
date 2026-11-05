@@ -118,6 +118,9 @@ jobs:
     - name: Test reverse dictionary generator
       run: node --test scripts/generate-reverse-dictionary.test.mjs
 
+    - name: Test English dictionary generator
+      run: node --test scripts/generate-english-dictionary.test.mjs
+
   windows-tests:
     name: Windows Rust and Swift tests
     runs-on: windows-2022
@@ -198,6 +201,13 @@ jobs:
     - name: Prepare Swift linker input
       shell: pwsh
       run: Copy-Item "llama_cpu\llama.lib" -Destination "server-swift\" -Force
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    - name: Generate indexed English dictionaries for Swift tests
+      run: node scripts/generate-english-dictionary.mjs
 
     - name: Run all Swift tests in parallel
       run: swift test --package-path server-swift -c release --verbose -Xcc -D_CRT_USE_C_COMPLEX_H -Xcxx -D_CRT_USE_C_COMPLEX_H

@@ -620,6 +620,7 @@ mod tests {
             hiragana: "きしゃ".into(),
             corresponding_count: vec![5, 5, 5, 2],
             candidate_ids: vec![11, 12, 13, 14],
+            canonical_raw_input: None,
         }
     }
 

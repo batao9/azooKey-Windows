@@ -51,7 +51,7 @@ private let typoTestPackageRoot = URL(fileURLWithPath: #filePath)
     let name = "automatic-typo-regression-\(UUID().uuidString)"
     InputStyleManager.registerInputStyle(table: try InputStyleManager.loadTable(from: compiledURL), for: name)
     currentInputStyle = inputStyle ?? .mapped(id: .tableName(name))
-    let dictionary = typoTestPackageRoot.appendingPathComponent("azooKey_dictionary_storage/Dictionary")
+    let dictionary = typoTestPackageRoot.deletingLastPathComponent().appendingPathComponent("target/azookey-english-dictionary/Dictionary")
     converter = KanaKanjiConverter(dictionaryURL: dictionary, preloadDictionary: true)
     normalNBestSupplementConverter = KanaKanjiConverter(dictionaryURL: dictionary)
     let entries = makeKeyboardTypoDictionaryEntries()

@@ -149,12 +149,13 @@ fn fake_replay(
     factory.replay_deferred_user_actions(|actions, transition, _| {
         let composition = snapshot(factory);
         let mut transition = transition;
+        let mut effective = Vec::new();
         if first_execute {
             first_execute = false;
             if let Some(last) = composition.deferred_actions.last() {
                 transition = last.transition.clone();
             }
-            operations.extend(
+            effective.extend(
                 composition
                     .deferred_actions
                     .iter()
@@ -162,12 +163,22 @@ fn fake_replay(
             );
             let service = factory.borrow()?;
             service.borrow_mut_composition()?.deferred_actions.clear();
-        } else {
-            operations.extend_from_slice(actions);
         }
-        for action in actions {
+        effective.extend_from_slice(actions);
+        operations.extend_from_slice(&effective);
+        for action in &effective {
             match action {
-                ClientAction::AppendText(text) => raw_input.push_str(text),
+                ClientAction::AppendText(text)
+                | ClientAction::AppendTextRaw(text)
+                | ClientAction::AppendTextDirect(text) => raw_input.push_str(text),
+                ClientAction::CommitPreviewAndAppend {
+                    committed: display,
+                    text,
+                    ..
+                } => {
+                    committed.push(display.clone());
+                    raw_input.clone_from(text);
+                }
                 ClientAction::RemoveText => {
                     raw_input.pop();
                 }
@@ -184,6 +195,300 @@ fn fake_replay(
         composition.raw_input.clone_from(raw_input);
         Ok(())
     })
+}
+
+#[test]
+fn preview_continuation_transport_failure_preserves_selected_display_through_replay() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _restore = RestoreGlobals::new();
+    let (service, server) = IPCService::unavailable_for_test();
+    IMEState::set_ipc_service(service).expect("unavailable transport");
+    unsafe {
+        let context = test_context::new(false);
+        let processor =
+            TextServiceFactory::create::<ITfTextInputProcessor>().expect("text service");
+        let factory = processor.as_impl();
+        {
+            let service = factory.borrow().unwrap();
+            *service.borrow_mut_composition().unwrap() = Composition {
+                state: CompositionState::Previewing,
+                preview: "ニホンゴ".into(),
+                suffix: "です".into(),
+                raw_input: "nihongodesu".into(),
+                raw_hiragana: "にほんごです".into(),
+                corresponding_count: 7,
+                candidates: candidates(&["日本語"], &["です"], "にほんごです", &[7]),
+                ..Composition::default()
+            };
+        }
+        let sink: ITfKeyEventSink = processor.cast().unwrap();
+        assert!(sink
+            .OnKeyDown(Some(&context), WPARAM(0x57), LPARAM(0))
+            .unwrap()
+            .as_bool());
+        let failed = snapshot(factory);
+        assert_eq!(failed.preview, "ニホンゴ");
+        assert_eq!(failed.raw_input, "nihongodesu");
+        assert_eq!(failed.deferred_actions.len(), 1);
+        assert_eq!(
+            failed.deferred_actions[0].action,
+            ClientAction::CommitPreviewAndAppend {
+                committed: "ニホンゴです".into(),
+                text: "w".into(),
+                kind: PreviewInputKind::Romaji,
+                temporary_latin: false,
+            }
+        );
+        let before_test = snapshot(factory);
+        assert!(sink
+            .OnTestKeyDown(Some(&context), WPARAM(0x4f), LPARAM(0))
+            .unwrap()
+            .as_bool());
+        assert_unchanged(factory, &before_test);
+        assert!(sink
+            .OnKeyDown(Some(&context), WPARAM(0x4f), LPARAM(0))
+            .unwrap()
+            .as_bool());
+        let queued = snapshot(factory);
+        assert_eq!(queued.preview, "ニホンゴ");
+        assert_eq!(queued.raw_input, "nihongodesu");
+        assert_eq!(queued.deferred_actions, failed.deferred_actions);
+        assert_eq!(queued.deferred_projection.as_ref().unwrap().raw_input, "wo");
+        assert_eq!(queued.deferred_inputs.len(), 1);
+        // Reconnection can rebuild candidate zero instead of the selected F7
+        // display. The pending action must still commit the frozen full display.
+        factory
+            .borrow()
+            .unwrap()
+            .borrow_mut_composition()
+            .unwrap()
+            .preview = "日本語".into();
+        let (mut operations, mut input, mut committed) =
+            (Vec::new(), "nihongodesu".into(), Vec::new());
+        fake_replay(factory, &mut operations, &mut input, &mut committed)
+            .expect("resume queued input");
+        assert_eq!(committed, ["ニホンゴです"]);
+        assert_eq!(input, "wo");
+        assert!(!factory.has_deferred_input().unwrap());
+        let operation_count = operations.len();
+        fake_replay(factory, &mut operations, &mut input, &mut committed).expect("already resumed");
+        assert_eq!(operations.len(), operation_count);
+        assert_eq!(committed, ["ニホンゴです"]);
+    }
+    server.abort();
+}
+
+#[test]
+fn replay_prefix_checkpoint_blocks_current_key_and_eager_flush_even_after_late_ui_failure() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _restore = RestoreGlobals::new();
+    for late_failure in [false, true] {
+        IMEState::set_ipc_service(IPCService::recovery_for_test(false)).unwrap();
+        let context = test_context::new(false);
+        let processor = TextServiceFactory::create::<ITfTextInputProcessor>().unwrap();
+        let factory: &TextServiceFactory = unsafe { processor.as_impl() };
+        {
+            let mut service = factory.borrow_mut().unwrap();
+            service.context = Some(context.clone());
+            *service.borrow_mut_composition().unwrap() = Composition {
+                state: CompositionState::Previewing,
+                preview: "api".into(),
+                raw_input: "api".into(),
+                tip_composition: Some(test_context::composition_token()),
+                deferred_actions: vec![DeferredClientAction {
+                    action: ClientAction::CommitPreviewAndAppend {
+                        committed: "api".into(),
+                        text: "A".into(),
+                        kind: PreviewInputKind::Direct,
+                        temporary_latin: true,
+                    },
+                    transition: CompositionState::Composing,
+                }],
+                ..Composition::default()
+            };
+        }
+        let native_batch = factory.native_dispatch_guard().unwrap();
+        let mut prefix_commits = Vec::new();
+        let result = factory.replay_deferred_user_actions(|_, _, _| {
+            // Model the production native checkpoint; actual native range/result
+            // delivery is covered separately by COM fixtures and the GUI probe.
+            prefix_commits.push("api");
+            let mut service = factory.borrow_mut()?;
+            service.native_preview_commit_generation += 1;
+            let mut composition = service.borrow_mut_composition()?;
+            composition.raw_input = "A".into();
+            composition.preview = "A".into();
+            composition.state = CompositionState::Composing;
+            composition.temporary_latin = true;
+            composition.deferred_actions.clear();
+            if late_failure {
+                Err(anyhow::Error::new(EditSessionFailure::Request(
+                    windows::Win32::UI::TextServices::TF_E_LOCKED,
+                )))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result.is_err(), late_failure);
+        assert!(factory.native_replay_pending().unwrap());
+        assert!(!factory.deferred_input_ready().unwrap());
+        let sink: ITfKeyEventSink = processor.cast().unwrap();
+        unsafe {
+            assert!(sink
+                .OnTestKeyDown(Some(&context), WPARAM(0x42), LPARAM(0))
+                .unwrap()
+                .as_bool());
+            assert!(sink
+                .OnKeyDown(Some(&context), WPARAM(0x42), LPARAM(0))
+                .unwrap()
+                .as_bool());
+        }
+        factory.flush_deferred_user_actions().unwrap();
+        factory
+            .handle_action(
+                &[ClientAction::AppendTextDirect("c".into())],
+                CompositionState::Composing,
+            )
+            .unwrap();
+        let pending = snapshot(factory);
+        assert_eq!(pending.raw_input, "A");
+        assert_eq!(pending.deferred_inputs.len(), 2);
+        assert_eq!(prefix_commits, ["api"]);
+
+        // Simulate entry into the next message turn without executing mock IPC.
+        factory.cancel_native_replay();
+        let mut replayed = Vec::new();
+        factory
+            .replay_deferred_user_actions(|actions, _, _| {
+                // The production executor combines its saved action suffix
+                // with the caller's actions, including an empty caller slice.
+                let service = factory.borrow()?;
+                let mut composition = service.borrow_mut_composition()?;
+                let mut effective = std::mem::take(&mut composition.deferred_actions)
+                    .into_iter()
+                    .map(|entry| entry.action)
+                    .collect::<Vec<_>>();
+                effective.extend_from_slice(actions);
+                for action in effective {
+                    let ClientAction::AppendTextDirect(text) = action else {
+                        panic!("unexpected replay action: {action:?}")
+                    };
+                    composition.raw_input.push_str(&text);
+                    replayed.push(text);
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(replayed, ["b", "c"]);
+        assert_eq!(snapshot(factory).raw_input, "Abc");
+        assert_eq!(prefix_commits, ["api"]);
+        drop(native_batch);
+        let replay = factory.borrow_mut().unwrap().native_replay.take();
+        drop(replay);
+    }
+}
+
+#[test]
+fn native_window_preflight_failure_keeps_queued_preview_letter_until_retry() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _restore = RestoreGlobals::new();
+    let processor = TextServiceFactory::create::<ITfTextInputProcessor>().unwrap();
+    let factory: &TextServiceFactory = unsafe { processor.as_impl() };
+    {
+        let mut service = factory.borrow_mut().unwrap();
+        service.context = Some(test_context::new(false));
+        service.native_replay_creation_failure_for_test = true;
+        *service.borrow_mut_composition().unwrap() = Composition {
+            state: CompositionState::Previewing,
+            preview: "api".into(),
+            raw_input: "api".into(),
+            tip_composition: Some(test_context::composition_token()),
+            ..Composition::default()
+        };
+    }
+    factory
+        .enqueue_deferred_user_action(
+            &snapshot(factory),
+            DeferredUserAction {
+                action: UserAction::Input('Ａ'),
+                is_shift_pressed: true,
+                is_shift_key: false,
+                shift_alphabet_shortcut: true,
+            },
+            &IMEState::app_config_snapshot().unwrap(),
+            false,
+        )
+        .unwrap();
+    let before = snapshot(factory);
+    assert_eq!(before.deferred_inputs.len(), 1);
+    assert!(factory
+        .replay_deferred_user_actions(|_, _, _| panic!("executor must not run before preflight"))
+        .is_err());
+    assert_unchanged(factory, &before);
+    assert_eq!(snapshot(factory).preview, "api");
+
+    factory
+        .borrow_mut()
+        .unwrap()
+        .native_replay_creation_failure_for_test = false;
+    let mut commits = Vec::new();
+    factory
+        .replay_deferred_user_actions(|actions, _, _| {
+            assert_eq!(
+                actions,
+                [ClientAction::CommitPreviewAndAppend {
+                    committed: "api".into(),
+                    text: "A".into(),
+                    kind: PreviewInputKind::Direct,
+                    temporary_latin: true,
+                }]
+            );
+            commits.push("api");
+            let service = factory.borrow()?;
+            let mut composition = service.borrow_mut_composition()?;
+            composition.raw_input = "A".into();
+            composition.preview = "A".into();
+            composition.state = CompositionState::Composing;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(commits, ["api"]);
+    assert_eq!(snapshot(factory).raw_input, "A");
+    assert!(!factory.has_deferred_input().unwrap());
+    factory
+        .replay_deferred_user_actions(|_, _, _| panic!("accepted letter must not execute twice"))
+        .unwrap();
+    let replay = factory.borrow_mut().unwrap().native_replay.take();
+    drop(replay);
+}
+
+#[test]
+fn stale_termination_keeps_native_replay_but_current_termination_cancels_it() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    let _restore = RestoreGlobals::new();
+    let processor = TextServiceFactory::create::<ITfTextInputProcessor>().unwrap();
+    let factory: &TextServiceFactory = unsafe { processor.as_impl() };
+    let current = test_context::composition_token();
+    factory
+        .borrow()
+        .unwrap()
+        .borrow_mut_composition()
+        .unwrap()
+        .tip_composition = Some(current.clone());
+    factory.ensure_native_replay().unwrap();
+    factory
+        .borrow()
+        .unwrap()
+        .native_replay
+        .as_ref()
+        .unwrap()
+        .post(|| panic!("cancelled native continuation"));
+    factory.handle_external_composition_terminated(Some(&test_context::composition_token()));
+    assert!(factory.native_replay_pending().unwrap());
+    factory.handle_external_composition_terminated(Some(&current));
+    assert!(!factory.native_replay_pending().unwrap());
+    let replay = factory.borrow_mut().unwrap().native_replay.take();
+    drop(replay);
 }
 
 #[test]

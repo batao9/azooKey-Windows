@@ -1,0 +1,16 @@
+{
+  "esdb_revision": "1e5b7d3a72f47a71da5d28686c1dd4b397178485",
+  "esdb_command": "./scowl word-list 50 A 1 --categories= --wo-poses=abbr",
+  "cspell_revision": "ae9c8d4dc15024377cc64b21d77ce863a35e0c9d",
+  "cspell_files_sha256": {
+    "software-tools.txt": "dc9036b00cf72b0881274207e3a9802c4b840c4560c14d43994b919cfaf47aa3",
+    "software-services.txt": "4125c5bd54e9435111dcb3d9c4f00b2998f391ea6421aac057287e5d23c6ff1f",
+    "network-protocols.txt": "b2b8f0f0cb21dce4b6c26ed8b044dc99b1ebae5e95e85bfff520265e8874f0eb"
+  },
+  "unidic_version": "2.1.2",
+  "unidic_sha256": "6cce98269214ce7de6159f61a25ffc5b436375c098cc86d6aa98c0605cbf90d4",
+  "katakana_pairs": 14195,
+  "spellings": 61050,
+  "katakana_sha256": "68a727bfe60753bae08a0e5c6b8a2e7c41fbb564be0e9c7a595a3b0c6b751761",
+  "spelling_sha256": "99dce2f6c30aaf5e68602ad21f117fe3bd141c82ab86b3ce80b6ccd5b0ac415e"
+}

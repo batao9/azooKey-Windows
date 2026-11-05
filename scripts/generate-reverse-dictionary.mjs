@@ -126,8 +126,7 @@ function makeBinary(entries) {
   return result;
 }
 
-async function main() {
-  const { source, output } = parseArguments(process.argv.slice(2));
+async function generateReverseDictionary({ source, output }) {
   const files = (await readdir(source))
     .filter((name) => name.endsWith(".loudstxt3"))
     .sort();
@@ -137,19 +136,25 @@ async function main() {
 
   const readingsBySurface = new Map();
   const sourceHash = createHash("sha256");
+  let completedFiles = 0;
   for (const file of files) {
     const data = await readFile(join(source, file));
     sourceHash.update(file, "utf8");
     sourceHash.update(data);
     parseLoudstxt3(data, file, readingsBySurface);
+    if (++completedFiles % 256 === 0) console.log(`Reverse dictionary: parsed=${completedFiles}/${files.length}`);
   }
+  console.log(`Reverse dictionary: sorting surfaces=${readingsBySurface.size}`);
   const entries = [...readingsBySurface.entries()]
-    .flatMap(([surface, readings]) => [...readings.values()].map((entry) => [surface, entry]))
+    .flatMap(([surface, readings]) => {
+      const surfaceBytes = Buffer.from(surface, "utf8");
+      return [...readings.values()].map((entry) => [surface, entry, surfaceBytes, Buffer.from(entry.reading, "utf8")]);
+    })
     .sort((left, right) => {
-      const surfaceOrder = Buffer.compare(Buffer.from(left[0], "utf8"), Buffer.from(right[0], "utf8"));
+      const surfaceOrder = Buffer.compare(left[2], right[2]);
       if (surfaceOrder !== 0) return surfaceOrder;
       if (left[1].score !== right[1].score) return right[1].score - left[1].score;
-      return Buffer.compare(Buffer.from(left[1].reading, "utf8"), Buffer.from(right[1].reading, "utf8"));
+      return Buffer.compare(left[3], right[3]);
     });
   const binary = makeBinary(entries);
   await mkdir(dirname(output), { recursive: true });
@@ -159,8 +164,8 @@ async function main() {
   );
 }
 
-export { makeBinary, parseLoudstxt3 };
+export { generateReverseDictionary, makeBinary, parseLoudstxt3 };
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  await main();
+  await generateReverseDictionary(parseArguments(process.argv.slice(2)));
 }

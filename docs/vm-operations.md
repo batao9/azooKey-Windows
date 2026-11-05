@@ -25,7 +25,7 @@ Python 3.11以降、OpenSSH、VirtualBox CLI を使う Linux/WSL ホスト用。
 buildとSwift testは共通のruntime helperを使い、固定版packageの依存DLLを含めて検証する。buildは検証済みruntimeをpackaging treeへ配置するため、不完全なcache/sourceをそのままinstallerへ取り込まない。
 controller経由ではVirtualBoxの実行ファイルもprofileから渡す。旧helperを直接使う場合は`VBOX_MANAGE`を明示するか`VBoxManage`を`PATH`に置く。
 
-SSH準備完了は、後続操作と同じPowerShellからの認証済み応答で確認する。`cmd.exe`のechoだけの成功では、cold boot直後のPowerShell起動完了を示さない。確認は`ready_timeout`全体の期限内、1回最大15秒の読み取り専用probeで行う。NATの転送ポートだけが先に開き、ゲストOS起動中はbannerが返らない場合がある。省電力についても`powercfg /a`の対応状態と設定値を分けて確認する。スリープ非対応ならGUIに項目が出ないことがあり、保存されているタイムアウト値だけからSSH停止原因を断定しない。
+SSH準備完了は、後続操作と同じPowerShellからの認証済み応答で確認する。`cmd.exe`のechoだけの成功では、cold boot直後のPowerShell起動完了を示さない。確認は`ready_timeout`全体の期限内、各回を`query_timeout`（既定15秒）と残りの全体期限で制限した読み取り専用probeで行う。NATの転送ポートだけが先に開き、ゲストOS起動中はbannerが返らない場合がある。省電力についても`powercfg /a`の対応状態と設定値を分けて確認する。スリープ非対応ならGUIに項目が出ないことがあり、保存されているタイムアウト値だけからSSH停止原因を断定しない。
 
 ```sh
 python3 scripts/vm.py --profile build status
@@ -116,7 +116,11 @@ installの既知の事前検証・終了済みinstallerの失敗も予約を解�
 
 低水準のhelperが不確実な終了を報告した時点では予約を保持する。通常検証は外側のlifecycleが停止・復元して解消するが、保守はそのまま保持する。`resolve-operation`は終了が既知の場合だけの手動解除。保守用shutdownのSSH応答喪失だけで要求を再送せず、host側のpoweroff観測で完了を判断する。snapshotのtimeoutも再captureせず、実体・CLI終了・電源状態を点検する。失敗を `tee` や復元成功で隠さない。CLI出力をパイプする場合は `set -o pipefail` を使う。
 
-待機の既定値はcold bootのSSH readiness90秒、通常のPowerShell照会15秒、task登録・点検30秒、`exec`120秒、build/testの無出力120秒、使い捨て終了時のACPI猶予10秒、保守用通常停止120秒、VirtualBoxコマンド20秒。scriptの完了点検では無関係なTask Scheduler照会をせず、予約にtaskがある場合だけその対象を点検する。SSH/SCPはBatchMode・接続5秒・keepalive5秒×2回で対話待ちと切断待ちを抑える。profileの`ready_timeout`/`shutdown_timeout`/`maintenance_shutdown_timeout`/`idle_timeout`は必要時だけ調整し、無期限待ちを導入しない。
+待機の既定値はcold bootのSSH readiness90秒、通常のPowerShell照会15秒、task登録・点検30秒、`exec`120秒、build/testの無出力120秒、使い捨て終了時のACPI猶予10秒、保守用通常停止120秒、VirtualBoxコマンド20秒。scriptの完了点検では無関係なTask Scheduler照会をせず、予約にtaskがある場合だけその対象を点検する。SSH/SCPはBatchMode・接続5秒・keepalive5秒×2回で対話待ちと切断待ちを抑える。
+
+遅いcold bootではローカルprofileの`ready_timeout`（起動待ち全体）、`ssh_connect_timeout`（SSH/SCP接続）、`query_timeout`（通常のPowerShell照会とreadinessの1回のprobe上限）を別々に調整できる。例えば300秒・15秒・45秒とする。probeは残りの起動待ち全体を超えず、明示したscript/task上限は`query_timeout`では延長しない。`shutdown_timeout`/`maintenance_shutdown_timeout`/`idle_timeout`も必要時だけ調整し、無期限待ちを導入しない。
+
+timeoutログには適用された上限・経過秒・取得済みの途中出力を残す。導入の段階はstderrの`VM_SCRIPT_PHASE`/`VM_INSTALL_PHASE`で確認する。起動待ち、接続失敗、導入の1,200秒待ちを区別し、上限延長だけで処理成功と判定しない。
 
 ## baseline更新（明示的な保守）
 

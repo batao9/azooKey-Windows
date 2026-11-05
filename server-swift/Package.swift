@@ -37,6 +37,7 @@ let package = Package(
                 .product(name: "KanaKanjiConverterModule", package: "azookeykanakanjiconverter"),
                 "ffi"
             ],
+            resources: [.copy("Resources/english-vocabulary.bin")],
             swiftSettings: swiftSettings
         ),
         .testTarget(

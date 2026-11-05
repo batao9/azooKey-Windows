@@ -21,7 +21,7 @@ use shared::{server_pipe_path, AppConfig};
 use std::{
     backtrace::Backtrace,
     collections::HashSet,
-    ffi::{c_char, c_int, CStr, CString, OsStr},
+    ffi::{c_char, c_int, c_void, CStr, CString, OsStr},
     fs::{self, File, OpenOptions},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
@@ -432,6 +432,7 @@ unsafe extern "C" {
     fn PinLearningCandidate(candidateId: u64) -> bool;
     fn ShrinkText(offset: c_int) -> *mut c_char;
     fn ClearText();
+    fn ResetTextForRecovery();
     fn Warmup() -> bool;
     fn HasActiveComposition() -> bool;
     fn InferReconversionReadings(surface: *const c_char) -> *mut c_char;
@@ -452,6 +453,10 @@ unsafe extern "C" {
     ) -> c_int;
     fn ResetLearningMemory() -> bool;
     fn LoadConfig();
+    fn GetConfigApplyStatus() -> i32;
+    fn TakeDictionaryModelPreparation(generation: *mut u64) -> *mut c_void;
+    fn RunDictionaryModelPreparation(job: *mut c_void) -> i32;
+    fn FinishDictionaryModelPreparation(generation: u64, succeeded: bool) -> i32;
     fn SetRequestId(request_id: u64);
     fn SetServerLogCallbacks(
         log_enabled: extern "C" fn() -> bool,
@@ -1222,6 +1227,9 @@ fn initialize(path: &str) -> Result<(), String> {
     let path = cstring_from_input("Initialize.path", path)?;
     unsafe {
         Initialize(path.as_ptr(), USE_ZENZAI);
+        if GetConfigApplyStatus() != 1 {
+            return Err("Swift engine initialization failed: bundled dictionary/config preparation did not succeed".to_string());
+        }
     }
     Ok(())
 }
@@ -1637,11 +1645,20 @@ fn valid_jev_request(request: &shared::proto::RerankCandidatesRequest) -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct MyAzookeyService {
     mutation_lock: Arc<tokio::sync::Mutex<CompositionOwner>>,
+    config_update_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 fn release_composition_state() {
     clear_text(); // Also clears snapshots and cached/pinned learning candidates.
     unsafe { SetContext(c"".as_ptr()) };
+    HAS_ACTIVE_COMPOSITION.store(false, Ordering::Relaxed);
+}
+
+fn release_composition_state_for_recovery() {
+    unsafe {
+        ResetTextForRecovery();
+        SetContext(c"".as_ptr());
+    }
     HAS_ACTIVE_COMPOSITION.store(false, Ordering::Relaxed);
 }
 
@@ -1705,6 +1722,7 @@ impl AzookeyService for MyAzookeyService {
             return Ok(Response::new(AppendTextResponse {
                 composing_text: Some(ComposingText::default()),
                 server_session_id: server_session_id(),
+                raw_input: None,
             }));
         }
         let mut mutation_guard = self.mutation_lock.lock().await;
@@ -1765,6 +1783,7 @@ impl AzookeyService for MyAzookeyService {
                 suggestions: composed_text.suggestions,
             }),
             server_session_id: server_session_id(),
+            raw_input: get_raw_input().ok(),
         }))
     }
 
@@ -1773,7 +1792,7 @@ impl AzookeyService for MyAzookeyService {
         request: Request<ReplaceCompositionRequest>,
     ) -> Result<Response<ReplaceCompositionResponse>, Status> {
         let mut mutation_guard = self.mutation_lock.lock().await;
-        mutation_guard.authorize(&request, true, release_composition_state)?;
+        mutation_guard.authorize(&request, true, release_composition_state_for_recovery)?;
         let request = request.into_inner();
         let _request_guard = ServerRequestGuard::begin(true);
         let request_id = request_id_or_next(request.request_id);
@@ -1783,7 +1802,7 @@ impl AzookeyService for MyAzookeyService {
         // This is an absolute-state operation: clear the old converter state and
         // replay the complete client-observed mutation log. It is safe to repeat after a
         // timeout whose server-side completion is unknown.
-        clear_text();
+        unsafe { ResetTextForRecovery() };
         let mut composing_text = RawComposingText {
             text: String::new(),
             cursor: 0,
@@ -1809,7 +1828,25 @@ impl AzookeyService for MyAzookeyService {
                     composing_text = move_cursor(operation.cursor_offset)
                         .map_err(|error| status_from_error("replace_composition", error))?;
                 }
+                CompositionOperationKind::Shrink => {
+                    let offset = validate_shrink_offset(operation.cursor_offset)?;
+                    composing_text = shrink_text(offset)
+                        .map_err(|error| status_from_error("replace_composition", error))?;
+                }
+                CompositionOperationKind::SnapshotClear => unsafe { ClearComposingTextSnapshots() },
+                CompositionOperationKind::SnapshotPush => unsafe { PushComposingTextSnapshot(0) },
+                CompositionOperationKind::SnapshotPop => {
+                    unsafe { PopComposingTextSnapshot(0) };
+                    composing_text = move_cursor(0)
+                        .map_err(|error| status_from_error("replace_composition", error))?;
+                }
             }
+        }
+        if request.operations.is_empty() {
+            // An absolute empty state is an ended composition, not a replay
+            // of an active one. Apply a deferred settings choice at this idle
+            // boundary as an explicit ClearText would.
+            clear_text();
         }
 
         let composed_text = if composing_text.text.is_empty() {
@@ -1839,6 +1876,7 @@ impl AzookeyService for MyAzookeyService {
                 suggestions: composed_text.suggestions,
             }),
             server_session_id: server_session_id(),
+            raw_input: get_raw_input().ok(),
         }))
     }
 
@@ -1882,6 +1920,9 @@ impl AzookeyService for MyAzookeyService {
         let mut best_surface_rank = usize::MAX;
         let mut conversions = Vec::with_capacity(readings.len());
         let mut last_composing_text = None;
+        // A supported reconversion starts a new logical composition. Select
+        // the prepared dictionary once before the internal candidate trials.
+        clear_text();
         for (reading_index, reading) in readings.iter().enumerate() {
             clear_text();
             let composing = match add_text_direct(reading) {
@@ -2368,6 +2409,7 @@ impl AzookeyService for MyAzookeyService {
                 suggestions: composed_text.suggestions,
             }),
             server_session_id: server_session_id(),
+            raw_input: get_raw_input().ok(),
         }))
     }
 
@@ -2603,15 +2645,60 @@ impl AzookeyService for MyAzookeyService {
         request: Request<shared::proto::UpdateConfigRequest>,
     ) -> Result<Response<shared::proto::UpdateConfigResponse>, Status> {
         PipeClient::authorize_management(&request)?;
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let config_guard = self.config_update_lock.clone().lock_owned().await;
         let request = request.into_inner();
-        let _request_guard = ServerRequestGuard::begin(false);
         let request_id = request_id_or_next(request.request_id);
-        let _log_paths = reload_server_logging_from_settings();
-        set_request_id(request_id);
         let handler_start = Instant::now();
         let load_config_start = Instant::now();
-        unsafe { LoadConfig() };
+        let job = {
+            let _mutation_guard = self.mutation_lock.lock().await;
+            let _request_guard = ServerRequestGuard::begin(false);
+            let _log_paths = reload_server_logging_from_settings();
+            set_request_id(request_id);
+            unsafe { LoadConfig() };
+            match unsafe { GetConfigApplyStatus() } {
+                1 => None,
+                2 => {
+                    let mut generation = 0;
+                    let pointer = unsafe { TakeDictionaryModelPreparation(&mut generation) };
+                    if pointer.is_null() {
+                        return Err(Status::internal("dictionary preparation job is missing"));
+                    }
+                    Some((pointer as usize, generation))
+                }
+                _ => {
+                    return Err(Status::failed_precondition("組み込み辞書を準備できませんでした。インストール済みの辞書データを確認してください。"));
+                }
+            }
+        };
+        let prepared = if let Some((address, generation)) = job {
+            let mutation_lock = self.mutation_lock.clone();
+            // This task owns the config guard and retained Swift job even if
+            // the caller disconnects. Preparation never holds the input mutex.
+            tokio::spawn(async move {
+                let _config_guard = config_guard;
+                let result = tokio::task::spawn_blocking(move || unsafe {
+                    RunDictionaryModelPreparation(address as *mut c_void)
+                })
+                .await
+                .unwrap_or(0);
+                let _mutation_guard = mutation_lock.lock().await;
+                set_request_id(request_id);
+                unsafe { FinishDictionaryModelPreparation(generation, result == 1) }
+            })
+            .await
+            .map_err(|_| Status::internal("dictionary preparation task failed"))?
+        } else {
+            drop(config_guard);
+            1
+        };
+        if prepared != 1 {
+            return Err(Status::failed_precondition(
+                "設定は保存されましたが、変換モデルを準備できませんでした。",
+            ));
+        }
+        let _mutation_guard = self.mutation_lock.lock().await;
+        set_request_id(request_id);
         let has_active_composition = query_active_composition_state();
         performance_event_lazy!(
             request_id,

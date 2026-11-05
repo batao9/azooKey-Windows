@@ -151,6 +151,8 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         // End composition and destroy thread-owned candidate windows before releasing
         // the DLL reference: their window procedures live in this module.
         self.end_composition_for_tsf_event();
+        let native_replay = self.borrow_mut()?.native_replay.take();
+        drop(native_replay);
         super::candidate_ui::shutdown();
         DllModule::get()?.release();
 

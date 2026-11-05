@@ -607,6 +607,7 @@ impl ClauseState {
             state.raw_hiragana,
         );
 
+        let navigation_raw_suffix = selected.sub_text.clone();
         *state.candidates = navigation_candidates;
         *state.selection_index = selected.index;
         *state.corresponding_count = selected.corresponding_count;
@@ -663,7 +664,8 @@ impl ClauseState {
             let suffix_raw_hiragana = state
                 .future_clause_snapshots
                 .last()
-                .map(|snapshot| snapshot.raw_hiragana.as_str());
+                .map(|snapshot| snapshot.raw_hiragana.as_str())
+                .or(Some(navigation_raw_suffix.as_str()));
             let (converted_text, converted_sub_text) =
                 TextServiceFactory::display_override_split_for_selected_candidate(
                     &set_type,

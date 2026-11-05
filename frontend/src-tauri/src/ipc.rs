@@ -14,6 +14,8 @@ use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERR
 const IPC_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const IPC_CONNECT_DEADLINE: Duration = Duration::from_secs(2);
 const SETTINGS_RPC_DEADLINE: Duration = Duration::from_secs(5);
+// Explicit model/dictionary preparation is separate from the input RPC budget.
+const CONFIG_PREPARATION_DEADLINE: Duration = Duration::from_secs(30);
 
 fn open_named_pipe_client(pipe_name: &str) -> std::io::Result<NamedPipeClient> {
     let handle = shared::open_named_pipe_client_handle(pipe_name)?;
@@ -131,10 +133,10 @@ fn should_retry_pipe_connect_error(
 impl IPCService {
     pub fn update_config(&mut self) -> anyhow::Result<()> {
         let mut request = tonic::Request::new(shared::proto::UpdateConfigRequest { request_id: 0 });
-        request.set_timeout(SETTINGS_RPC_DEADLINE);
+        request.set_timeout(CONFIG_PREPARATION_DEADLINE);
         self.runtime.clone().block_on(async {
             time::timeout(
-                SETTINGS_RPC_DEADLINE,
+                CONFIG_PREPARATION_DEADLINE,
                 self.azookey_client.update_config(request),
             )
             .await

@@ -452,6 +452,7 @@ fn candidates_owned(
         hiragana,
         corresponding_count,
         candidate_ids,
+        canonical_raw_input: None,
     }
 }
 
@@ -2256,6 +2257,59 @@ pub(super) fn run_from_auto_clause_ju(
     extra_actions: &[HarnessUserAction],
 ) -> (ClauseHarness, ScenarioBackend, Vec<HarnessUserAction>) {
     run_from_auto_clause(auto_clause_ju_spec_state(), extra_actions)
+}
+
+#[test]
+fn mixed_input_clause_edit_histories_keep_display_and_source_ranges_together() {
+    let spec = SimSpecState {
+        committed_clauses: Vec::new(),
+        clauses: vec![clause(vec![
+            unit("きょ", "kyo", "きょ", 20),
+            unit("う", "u", "う", 20),
+            unit("は", "ha", "は", 20),
+            unit("g", "g", "g", 21),
+            unit("o", "o", "o", 21),
+            unit("o", "o", "o", 21),
+            unit("g", "g", "g", 21),
+            unit("l", "l", "l", 21),
+            unit("e", "e", "e", 21),
+            unit("で", "de", "で", 22),
+            unit("け", "ke", "け", 22),
+            unit("ん", "n", "ん", 22),
+            unit("さ", "sa", "さ", 22),
+            unit("く", "ku", "く", 22),
+        ])],
+        current_index: 0,
+    };
+    use HarnessUserAction::*;
+    // Start automatic splitting from both arrows, then exercise a middle
+    // English clause with one-character boundaries and Japanese raw/kana gaps.
+    for actions in [
+        vec![
+            Right, Right, ShiftLeft, ShiftLeft, ShiftRight, ShiftRight, Left, Right, Enter,
+        ],
+        vec![
+            Left, Left, ShiftLeft, ShiftLeft, ShiftRight, ShiftRight, Right, Left, Enter,
+        ],
+    ] {
+        let _ = run_from_auto_clause(spec.clone(), &actions);
+    }
+}
+
+#[test]
+fn protected_english_to_kana_boundary_round_trip_keeps_exact_raw_suffix() {
+    let spec = SimSpecState {
+        committed_clauses: Vec::new(),
+        clauses: vec![clause(vec![
+            unit("i", "i", "i", 30),
+            unit("n", "n", "n", 30),
+            unit("p", "p", "p", 30),
+            unit("う", "u", "う", 31),
+        ])],
+        current_index: 0,
+    };
+    use HarnessUserAction::*;
+    let _ = run_from_auto_clause(spec, &[Right, ShiftLeft, ShiftRight, Right, Left, Enter]);
 }
 
 pub(super) fn run_from_auto_clause_tyu(
