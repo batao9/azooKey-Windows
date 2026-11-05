@@ -321,6 +321,9 @@ fn close_composition_callback_with_progress(
 }
 
 const RANGE_TEXT_CHUNK_CODE_UNITS: usize = 1024;
+
+#[cfg(test)]
+mod preview_continuation_tests;
 const MAX_RECONVERSION_UTF16_CODE_UNITS: usize = 256;
 
 pub(crate) enum SelectedText {
@@ -941,6 +944,85 @@ impl TextServiceFactory {
         }
 
         Ok(())
+    }
+
+    #[tracing::instrument]
+    pub(crate) fn commit_preview_and_continue(
+        &self,
+        committed: &str,
+        following: &str,
+    ) -> Result<()> {
+        let text_service = self.borrow()?;
+        let composition = text_service
+            .borrow_composition()?
+            .tip_composition
+            .clone()
+            .ok_or_else(|| anyhow::Error::new(EditSessionFailure::CallbackNotCompleted))?;
+        let context = text_service.context::<ITfContext>()?;
+        let (committed_len, text) = prepare_set_text(committed, following)?;
+        anyhow::ensure!(
+            !following.is_empty(),
+            "Preview continuation must retain live input"
+        );
+        let display_attribute_atom = text_service.display_attribute_atom.clone();
+        write_edit_session(
+            text_service.tid,
+            context.clone(),
+            Rc::new(move |cookie| unsafe {
+                // Publish exactly one TSF edit. A second SetText session can
+                // replace the IMM32 result buffer before its result notification
+                // is delivered, dropping the prefix even though ShiftStart succeeded.
+                let range = composition.GetRange()?;
+                range.SetText(cookie, TF_ST_CORRECTION, &text)?;
+                let prepared_range = composition.GetRange()?;
+                let readable = prepared_range.Clone()?;
+                anyhow::ensure!(
+                    read_range_text_prefix(cookie, &readable, text.len())? == text,
+                    "Prepared composition does not span the full preview continuation"
+                );
+                let following_range = prepared_range.Clone()?;
+                let mut shifted = 0;
+                following_range.ShiftStart(
+                    cookie,
+                    committed_len,
+                    &mut shifted,
+                    std::ptr::null(),
+                )?;
+                anyhow::ensure!(
+                    shifted == committed_len,
+                    "Preview boundary stopped before the committed prefix"
+                );
+                let comparison =
+                    following_range.CompareStart(cookie, &prepared_range, TF_ANCHOR_END)?;
+                anyhow::ensure!(
+                    comparison < 0,
+                    "Preview boundary must leave following text inside the composition"
+                );
+
+                let property = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
+                property.Clear(cookie, &prepared_range)?;
+                if let Some(atom) = display_attribute_atom.get(&GUID_DISPLAY_ATTRIBUTE) {
+                    property.SetValue(cookie, &following_range, &VARIANT::from(*atom as i32))?;
+                }
+                let boundary = following_range.Clone()?;
+                boundary.Collapse(cookie, TF_ANCHOR_START)?;
+                following_range.Collapse(cookie, TF_ANCHOR_END)?;
+                context.SetSelection(
+                    cookie,
+                    &[TF_SELECTION {
+                        range: ManuallyDrop::new(Some(following_range)),
+                        style: TF_SELECTIONSTYLE {
+                            ase: TF_AE_NONE,
+                            fInterimChar: false.into(),
+                        },
+                    }],
+                )?;
+                // This is the only irreversible change and remains last, so
+                // failed preparation cannot shift the committed prefix twice.
+                composition.ShiftStart(cookie, &boundary)?;
+                Ok(())
+            }),
+        )
     }
 
     #[tracing::instrument]

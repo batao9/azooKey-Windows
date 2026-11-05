@@ -647,6 +647,16 @@ pub struct GeneralConfig {
     pub live_conversion_reading_vertical_adjustment: i32,
     #[serde(default)]
     pub experimental_typo_correction: bool,
+    #[serde(default)]
+    pub experimental_mixed_input: bool,
+    #[serde(default = "default_bundled_dictionary_enabled")]
+    pub english_dictionary: bool,
+    #[serde(default = "default_bundled_dictionary_enabled")]
+    pub katakana_english_dictionary: bool,
+}
+
+fn default_bundled_dictionary_enabled() -> bool {
+    true
 }
 
 impl Default for GeneralConfig {
@@ -666,6 +676,9 @@ impl Default for GeneralConfig {
             live_conversion_reading_vertical_adjustment:
                 LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_DEFAULT,
             experimental_typo_correction: false,
+            experimental_mixed_input: false,
+            english_dictionary: true,
+            katakana_english_dictionary: true,
         }
     }
 }
@@ -873,6 +886,43 @@ mod tests {
         let enabled: GeneralConfig =
             serde_json::from_str(r#"{"experimental_typo_correction":true}"#).unwrap();
         assert!(enabled.experimental_typo_correction);
+    }
+
+    #[test]
+    fn experimental_mixed_input_defaults_off_and_round_trips_when_enabled() {
+        assert!(!GeneralConfig::default().experimental_mixed_input);
+        let mut config: GeneralConfig = serde_json::from_str("{}").unwrap();
+        assert!(!config.experimental_mixed_input);
+        config.experimental_mixed_input = true;
+        let saved = serde_json::to_string(&config).unwrap();
+        assert!(
+            serde_json::from_str::<GeneralConfig>(&saved)
+                .unwrap()
+                .experimental_mixed_input
+        );
+    }
+
+    #[test]
+    fn bundled_dictionaries_default_on_and_preserve_independent_opt_outs() {
+        let missing: GeneralConfig = serde_json::from_str("{}").unwrap();
+        assert!(missing.english_dictionary);
+        assert!(missing.katakana_english_dictionary);
+        assert!(GeneralConfig::default().english_dictionary);
+        assert!(GeneralConfig::default().katakana_english_dictionary);
+        for english in [false, true] {
+            for katakana in [false, true] {
+                let mut input = serde_json::to_value(AppConfig::default()).unwrap();
+                input["general"] = serde_json::json!({
+                        "english_dictionary": english,
+                        "katakana_english_dictionary": katakana
+                });
+                let parsed: AppConfig = serde_json::from_value(input).unwrap();
+                let roundtrip: AppConfig =
+                    serde_json::from_value(serde_json::to_value(parsed).unwrap()).unwrap();
+                assert_eq!(roundtrip.general.english_dictionary, english);
+                assert_eq!(roundtrip.general.katakana_english_dictionary, katakana);
+            }
+        }
     }
 
     #[test]

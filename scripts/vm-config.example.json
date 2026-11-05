@@ -5,6 +5,8 @@
     "user": "windows-user",
     "key": "~/.ssh/vm-key",
     "ready_timeout": 90,
+    "ssh_connect_timeout": 5,
+    "query_timeout": 15,
     "shutdown_timeout": 10,
     "maintenance_shutdown_timeout": 120,
     "idle_timeout": 120

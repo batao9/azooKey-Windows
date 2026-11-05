@@ -941,6 +941,26 @@ fn exact_suffix_does_not_trigger_single_n_recovery() {
 }
 
 #[test]
+fn protected_english_before_kana_does_not_trigger_legacy_n_recovery() {
+    let mut future = Vec::new();
+    TextServiceFactory::maybe_push_split_future_clause_snapshot(
+        &mut future,
+        "inpu",
+        "inpう",
+        3,
+        "う",
+        true,
+        Some(1),
+    );
+    let snapshot = future
+        .last()
+        .expect("Japanese suffix is a valid future clause");
+    assert_eq!(snapshot.raw_input, "u");
+    assert_eq!(snapshot.raw_hiragana, "う");
+    assert_eq!(snapshot.corresponding_count, 1);
+}
+
+#[test]
 fn auto_split_bootstrap_keeps_double_n_suffix_boundary() {
     let mut future = Vec::new();
 

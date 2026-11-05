@@ -39,6 +39,28 @@ pub(super) fn new_with_selection_probe(observer: Rc<dyn Fn()>) -> ITfContext {
     .into()
 }
 
+#[implement(windows::Win32::UI::TextServices::ITfComposition)]
+struct CompositionToken;
+
+pub(super) fn composition_token() -> windows::Win32::UI::TextServices::ITfComposition {
+    CompositionToken.into()
+}
+
+impl windows::Win32::UI::TextServices::ITfComposition_Impl for CompositionToken_Impl {
+    fn GetRange(&self) -> windows::core::Result<ITfRange> {
+        not_implemented()
+    }
+    fn ShiftStart(&self, _: u32, _: Option<&ITfRange>) -> windows::core::Result<()> {
+        not_implemented()
+    }
+    fn ShiftEnd(&self, _: u32, _: Option<&ITfRange>) -> windows::core::Result<()> {
+        not_implemented()
+    }
+    fn EndComposition(&self, _: u32) -> windows::core::Result<()> {
+        not_implemented()
+    }
+}
+
 impl ITfContext_Impl for TestContext_Impl {
     fn RequestEditSession(
         &self,

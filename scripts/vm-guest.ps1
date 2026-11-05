@@ -10,6 +10,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
 $env:Path += ";$env:USERPROFILE\.cargo\bin"
+[Console]::Error.WriteLine('VM_GUEST_PHASE=awake_setup action=' + $Action)
 Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class VmAwake { [DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint flags); }'
 if([VmAwake]::SetThreadExecutionState([uint32]2147483649) -eq 0){throw 'Sleep prevention failed'}
 function Identity {
@@ -30,11 +31,13 @@ try {
     if($Action -eq 'identity') {
         @{installed=Identity} | ConvertTo-Json -Depth 6 -Compress
     } elseif($Action -eq 'install') {
+        [Console]::Error.WriteLine('VM_INSTALL_PHASE=preflight')
         $completionKnown = $true
         try {
         $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
         if(!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Installation requires elevated same-user SSH, not a Limited interactive task'}
         if(@(Get-Process frontend -ErrorAction SilentlyContinue).Count){throw 'Close settings editor before install; drafts must not be discarded'}
+        [Console]::Error.WriteLine('VM_INSTALL_PHASE=hash')
         if((Get-FileHash $Installer -Algorithm SHA256).Hash -ne $Sha256){throw 'Transferred installer SHA256 mismatch'}
         $wanted = $Expected | ConvertFrom-Json
         $settings = Join-Path $env:APPDATA 'Azookey\settings.json'
@@ -48,13 +51,16 @@ try {
         $before = Identity
         $log = $Installer + '.log'
         $completionKnown = $false
+        [Console]::Error.WriteLine('VM_INSTALL_PHASE=launch')
         $p = Start-Process -FilePath $Installer -ArgumentList @('/SP-','/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/RESTARTEXITCODE=3010',('/LOG="'+$log+'"')) -PassThru
         $null = $p.Handle
+        [Console]::Error.WriteLine('VM_INSTALL_PHASE=wait pid=' + $p.Id + ' timeout_seconds=1200')
         if(!$p.WaitForExit(1200000)){
             [Console]::Error.WriteLine('Installer timeout; inspect running installer before retry')
             exit 124
         }
         $completionKnown = $true
+        [Console]::Error.WriteLine('VM_INSTALL_PHASE=exited code=' + $p.ExitCode)
         if($p.ExitCode -notin @(0,3010)){throw ('Installer exit '+$p.ExitCode+'; log '+$log)}
         $installed = Identity
         foreach($key in @('version','channel','revision','installerGeneration')){

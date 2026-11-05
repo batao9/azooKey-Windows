@@ -8,6 +8,7 @@ use std::{
 use crate::tsf::edit_session::SelectedText;
 use crate::tsf::edit_session::{
     is_edit_session_error, is_non_destructive_edit_session_error, read_edit_session,
+    EditSessionFailure,
 };
 use crate::{
     engine::user_action::UserAction,
@@ -18,7 +19,8 @@ use crate::{
 
 use super::{
     client_action::{
-        ClientAction, LearningCommitKind, LearningCommitScope, SetSelectionType, SetTextType,
+        ClientAction, LearningCommitKind, LearningCommitScope, PreviewInputKind, SetSelectionType,
+        SetTextType,
     },
     full_width::{convert_kana_symbol, to_fullwidth, to_halfwidth},
     input_mode::InputMode,
@@ -487,6 +489,118 @@ impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
 
 impl TextServiceFactory {
     const MOVE_CLAUSE_TO_LAST: i32 = i32::MAX;
+
+    fn native_dispatch_guard(&self) -> Result<crate::tsf::native_replay::NativeDispatchGuard> {
+        Ok(self.borrow()?.native_dispatch.enter())
+    }
+
+    fn native_replay_pending(&self) -> Result<bool> {
+        Ok(self
+            .borrow()?
+            .native_replay
+            .as_ref()
+            .is_some_and(|replay| replay.is_pending()))
+    }
+
+    fn ensure_native_replay(&self) -> Result<()> {
+        if self.borrow()?.native_replay.is_some() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if self.borrow()?.native_replay_creation_failure_for_test {
+            return Err(anyhow::Error::new(EditSessionFailure::CallbackNotCompleted));
+        }
+        let dispatch = self.borrow()?.native_dispatch.clone();
+        let replay = crate::tsf::native_replay::NativeReplay::new(dispatch).map_err(|error| {
+            tracing::warn!(?error, "Could not prepare native recovery continuation");
+            anyhow::Error::new(EditSessionFailure::CallbackNotCompleted)
+        })?;
+        self.borrow_mut()?.native_replay = Some(replay);
+        Ok(())
+    }
+
+    pub(crate) fn refresh_recovered_display_before_actions(
+        first_action: Option<&ClientAction>,
+        refresh: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        // The frozen continuation prepares the entire old display and new
+        // remainder atomically. A preceding recovery repaint would publish a
+        // second IMM32 notification that can erase its pending result buffer.
+        if first_action
+            .is_some_and(|action| matches!(action, ClientAction::CommitPreviewAndAppend { .. }))
+        {
+            return Ok(());
+        }
+        refresh()
+    }
+
+    fn cancel_native_replay(&self) {
+        if let Ok(service) = self.borrow() {
+            if let Some(replay) = &service.native_replay {
+                replay.cancel();
+            }
+        }
+    }
+
+    fn post_native_replay(&self) -> Result<()> {
+        let (this, context, composition, generation) = {
+            let service = self.borrow()?;
+            let composition = service.borrow_composition()?.tip_composition.clone();
+            (
+                service.this::<ITfTextInputProcessor>()?,
+                service.context.clone(),
+                composition,
+                service.native_preview_commit_generation,
+            )
+        };
+        let (Some(context), Some(composition)) = (context, composition) else {
+            return Ok(());
+        };
+        let callback = move || {
+            let factory: &TextServiceFactory = unsafe { this.as_impl() };
+            let Ok(_dispatch) = factory.native_dispatch_guard() else {
+                return;
+            };
+            let current = || {
+                factory.borrow().ok().is_some_and(|service| {
+                    service.native_preview_commit_generation == generation
+                        && !service.disabled_context_observed
+                        && service
+                            .context
+                            .as_ref()
+                            .is_some_and(|current| has_same_com_identity(current, &context))
+                        && service.borrow_composition().ok().is_some_and(|state| {
+                            state
+                                .tip_composition
+                                .as_ref()
+                                .is_some_and(|current| has_same_com_identity(current, &composition))
+                        })
+                })
+            };
+            if !current() {
+                return;
+            }
+            let blocked = keyboard_disabled_from_context(&context)
+                || factory.current_context_has_sensitive_input_scope();
+            if !current() {
+                return;
+            }
+            if blocked {
+                factory.cancel_composition_for_disabled_context();
+                return;
+            }
+            if let Err(error) = factory.flush_deferred_user_actions() {
+                tracing::warn!(
+                    ?error,
+                    "Deferred native recovery continuation remains queued"
+                );
+            }
+        };
+        if let Some(replay) = &self.borrow()?.native_replay {
+            replay.post(callback);
+        }
+        Ok(())
+    }
 
     fn log_client_performance(
         request_id: u64,
@@ -1459,6 +1573,7 @@ impl TextServiceFactory {
             hiragana: raw_hiragana.to_string(),
             corresponding_count: vec![corresponding_count],
             candidate_ids: vec![0],
+            canonical_raw_input: None,
         };
         FutureClauseSnapshot {
             clause_preview: clause_preview.to_string(),
@@ -1868,6 +1983,7 @@ impl TextServiceFactory {
             ClientAction::AppendText(_) => "AppendText",
             ClientAction::AppendTextRaw(_) => "AppendTextRaw",
             ClientAction::AppendTextDirect(_) => "AppendTextDirect",
+            ClientAction::CommitPreviewAndAppend { .. } => "CommitPreviewAndAppend",
             ClientAction::CommitTextDirect(_) => "CommitTextDirect",
             ClientAction::RestoreReconversionOriginal => "RestoreReconversionOriginal",
             ClientAction::RemoveText => "RemoveText",
@@ -2527,9 +2643,32 @@ impl TextServiceFactory {
     #[inline]
     fn current_raw_input_suffix(raw_input: &str, corresponding_count: i32) -> String {
         let split_at = Self::byte_index_after_chars(raw_input, corresponding_count.max(0) as usize);
-        let adjusted_split_at = Self::adjust_single_n_raw_input_boundary(raw_input, split_at);
+        raw_input[split_at..].to_string()
+    }
 
-        raw_input[adjusted_split_at..].to_string()
+    fn edit_requires_canonical_input(action: &ClientAction) -> bool {
+        matches!(
+            action,
+            ClientAction::AppendText(_)
+                | ClientAction::AppendTextRaw(_)
+                | ClientAction::AppendTextDirect(_)
+                | ClientAction::CommitPreviewAndAppend { .. }
+                | ClientAction::ShrinkText(_)
+                | ClientAction::ShrinkTextRaw(_)
+                | ClientAction::ShrinkTextDirect(_)
+        )
+    }
+
+    fn reconcile_canonical_input_after_edit(
+        action: &ClientAction,
+        candidates: &Candidates,
+        raw_input: &mut String,
+    ) {
+        if Self::edit_requires_canonical_input(action) {
+            if let Some(canonical) = &candidates.canonical_raw_input {
+                raw_input.clone_from(canonical);
+            }
+        }
     }
 
     #[inline]
@@ -3234,7 +3373,18 @@ impl TextServiceFactory {
         released_remainder_origin: Option<Arc<str>>,
         allow_released_origin_coalesce: bool,
     ) {
-        let raw_input_suffix = Self::current_raw_input_suffix(raw_input, corresponding_count);
+        // Legacy single-n recovery needs a Japanese suffix hint, not merely
+        // the spelling of a literal English boundary such as inp|ut.
+        let split_at = Self::byte_index_after_chars(raw_input, corresponding_count.max(0) as usize);
+        let split_at = if raw_hiragana
+            .strip_suffix(raw_suffix_hint)
+            .is_some_and(|prefix| prefix.ends_with('ん'))
+        {
+            Self::adjust_single_n_raw_input_boundary(raw_input, split_at)
+        } else {
+            split_at
+        };
+        let raw_input_suffix = raw_input[split_at..].to_string();
         let normalized_raw_suffix_hint = future_clause_snapshots
             .iter()
             .rev()
@@ -4823,17 +4973,22 @@ impl TextServiceFactory {
 
     #[inline]
     fn commit_preview_then_append_actions(
-        append_action: ClientAction,
-        start_temporary_latin: bool,
+        composition: &Composition,
+        text: String,
+        kind: PreviewInputKind,
+        temporary_latin: bool,
     ) -> (CompositionState, Vec<ClientAction>) {
-        let mut actions = Vec::with_capacity(4);
-        actions.push(ClientAction::EndComposition);
-        actions.push(ClientAction::StartComposition);
-        if start_temporary_latin {
-            actions.push(ClientAction::SetTemporaryLatin(true));
-        }
-        actions.push(append_action);
-        (CompositionState::Composing, actions)
+        (
+            CompositionState::Composing,
+            vec![ClientAction::CommitPreviewAndAppend {
+                // Keep the selected script/candidate even if preparation fails
+                // and server recovery rebuilds a different first candidate.
+                committed: format!("{}{}", composition.preview, composition.suffix),
+                text,
+                kind,
+                temporary_latin,
+            }],
+        )
     }
 
     #[inline]
@@ -5225,7 +5380,9 @@ impl TextServiceFactory {
                 {
                     let text = Self::direct_text_for_action(action)?;
                     Some(Self::commit_preview_then_append_actions(
-                        ClientAction::AppendTextDirect(text),
+                        composition,
+                        text,
+                        PreviewInputKind::Direct,
                         composition.temporary_latin || start_temporary_latin,
                     ))
                 }
@@ -5234,12 +5391,16 @@ impl TextServiceFactory {
                         Self::numpad_text_for_mode(*symbol, app_config.general.numpad_input, false)
                             .unwrap_or_else(|| symbol.to_string());
                     Some(Self::commit_preview_then_append_actions(
-                        ClientAction::AppendTextRaw(text),
+                        composition,
+                        text,
+                        PreviewInputKind::Raw,
                         false,
                     ))
                 }
                 UserAction::Input(char) => Some(Self::commit_preview_then_append_actions(
-                    ClientAction::AppendText(Self::input_text_for_mode(*char, mode)),
+                    composition,
+                    Self::input_text_for_mode(*char, mode),
+                    PreviewInputKind::Romaji,
                     false,
                 )),
                 UserAction::Number {
@@ -5251,12 +5412,16 @@ impl TextServiceFactory {
                         Self::numpad_text_for_mode(digit, app_config.general.numpad_input, false)
                             .unwrap_or_else(|| digit.to_string());
                     Some(Self::commit_preview_then_append_actions(
-                        ClientAction::AppendTextRaw(text),
+                        composition,
+                        text,
+                        PreviewInputKind::Raw,
                         false,
                     ))
                 }
                 UserAction::Number { value, .. } => Some(Self::commit_preview_then_append_actions(
-                    ClientAction::AppendText(value.to_string()),
+                    composition,
+                    value.to_string(),
+                    PreviewInputKind::Romaji,
                     false,
                 )),
                 UserAction::Backspace | UserAction::Delete => {
@@ -5412,6 +5577,16 @@ impl TextServiceFactory {
                 ClientAction::AppendText(text)
                 | ClientAction::AppendTextRaw(text)
                 | ClientAction::AppendTextDirect(text) => projection.raw_input.push_str(text),
+                ClientAction::CommitPreviewAndAppend {
+                    text,
+                    temporary_latin,
+                    ..
+                } => {
+                    projection.raw_input.clone_from(text);
+                    projection.temporary_latin = *temporary_latin;
+                    projection.temporary_latin_shift_pending = false;
+                    projection.reliable = true;
+                }
                 ClientAction::RemoveText => {
                     projection.raw_input.pop();
                     // A mapped kana can consume more than one raw input element.
@@ -5974,8 +6149,9 @@ impl TextServiceFactory {
                 let mode = IMEState::input_mode()?;
                 (composition, mode)
             };
-            let has_deferred_input =
-                !composition.deferred_actions.is_empty() || !composition.deferred_inputs.is_empty();
+            let has_deferred_input = self.native_replay_pending()?
+                || !composition.deferred_actions.is_empty()
+                || !composition.deferred_inputs.is_empty();
             let projected =
                 has_deferred_input.then(|| Self::deferred_projection(&composition, mode.clone()));
             let temporary_latin = projected
@@ -6120,7 +6296,10 @@ impl TextServiceFactory {
             composition
         };
 
-        if !composition.deferred_actions.is_empty() || !composition.deferred_inputs.is_empty() {
+        if self.native_replay_pending()?
+            || !composition.deferred_actions.is_empty()
+            || !composition.deferred_inputs.is_empty()
+        {
             let projection = Self::deferred_projection(&composition, IMEState::input_mode()?);
             if !projection.temporary_latin_shift_pending {
                 return Ok(None);
@@ -6165,18 +6344,28 @@ impl TextServiceFactory {
     pub(crate) fn has_deferred_input(&self) -> Result<bool> {
         let text_service = self.borrow()?;
         let composition = text_service.borrow_composition()?;
-        Ok(!composition.deferred_actions.is_empty() || !composition.deferred_inputs.is_empty())
+        Ok(text_service
+            .native_replay
+            .as_ref()
+            .is_some_and(|replay| replay.is_pending())
+            || !composition.deferred_actions.is_empty()
+            || !composition.deferred_inputs.is_empty())
     }
 
     pub(crate) fn deferred_input_ready(&self) -> Result<bool> {
         Ok(self.has_deferred_input()?
+            && !self.native_replay_pending()?
             && IMEState::ipc_service()?.is_none_or(|ipc_service| {
                 !ipc_service.recovery_pending() || ipc_service.recovery_restart_ready()
             }))
     }
 
     fn flush_deferred_user_actions(&self) -> Result<()> {
+        let _dispatch = self.native_dispatch_guard()?;
         self.cleanup_observed_disabled_context()?;
+        if self.native_replay_pending()? {
+            return Ok(());
+        }
         if let Some(ipc_service) = IMEState::ipc_service()? {
             ipc_service.ensure_server_restart_requested();
             if ipc_service.recovery_pending() && !ipc_service.recovery_restart_ready() {
@@ -6184,7 +6373,12 @@ impl TextServiceFactory {
             }
         }
         self.replay_deferred_user_actions(|actions, transition, config_snapshot| {
-            self.handle_action_with_config_snapshot(actions, transition, config_snapshot)
+            self.handle_action_with_config_snapshot_inner(
+                actions,
+                transition,
+                config_snapshot,
+                true,
+            )
         })
     }
 
@@ -6192,14 +6386,48 @@ impl TextServiceFactory {
         &self,
         mut execute: impl FnMut(&[ClientAction], CompositionState, AppConfigSnapshot) -> Result<()>,
     ) -> Result<()> {
+        if self.native_replay_pending()? {
+            return Ok(());
+        }
+        let mut execute_chunk = |actions: &[ClientAction],
+                                 transition: CompositionState,
+                                 config: AppConfigSnapshot|
+         -> Result<bool> {
+            let has_preview_commit = actions
+                .iter()
+                .any(|action| matches!(action, ClientAction::CommitPreviewAndAppend { .. }))
+                || self
+                    .borrow()?
+                    .borrow_composition()?
+                    .deferred_actions
+                    .iter()
+                    .any(|entry| {
+                        matches!(entry.action, ClientAction::CommitPreviewAndAppend { .. })
+                    });
+            if has_preview_commit {
+                self.ensure_native_replay()?;
+            }
+            let before = self.borrow()?.native_preview_commit_generation;
+            let result = execute(actions, transition, config);
+            let committed = self.borrow()?.native_preview_commit_generation != before;
+            // The boundary may already be committed even when a later UI call
+            // failed. Preserve the barrier before propagating that error.
+            if committed {
+                self.post_native_replay()?;
+            }
+            result?;
+            Ok(committed)
+        };
         loop {
             let composition = self.borrow()?.borrow_composition()?.clone();
             if !composition.deferred_actions.is_empty() {
-                execute(
+                if execute_chunk(
                     &[],
                     composition.state.clone(),
                     IMEState::app_config_snapshot()?,
-                )?;
+                )? {
+                    return Ok(());
+                }
                 continue;
             }
 
@@ -6228,12 +6456,24 @@ impl TextServiceFactory {
                         config_snapshot.app_config(),
                         config_snapshot.romaji_lookup(),
                     );
+                    // This preflight can fail before the executor has a chance
+                    // to retain actions. Keep the accepted physical event queued
+                    // until its native continuation resources are available.
+                    if planned.as_ref().is_some_and(|(_, actions)| {
+                        actions.iter().any(|action| {
+                            matches!(action, ClientAction::CommitPreviewAndAppend { .. })
+                        })
+                    }) {
+                        self.ensure_native_replay()?;
+                    }
                     self.borrow()?
                         .borrow_mut_composition()?
                         .deferred_inputs
                         .pop_front();
                     if let Some((transition, actions)) = planned {
-                        execute(&actions, transition, config_snapshot)?;
+                        if execute_chunk(&actions, transition, config_snapshot)? {
+                            return Ok(());
+                        }
                     } else {
                         self.borrow()?
                             .borrow_mut_composition()?
@@ -6252,6 +6492,7 @@ impl TextServiceFactory {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<bool> {
+        let _dispatch = self.native_dispatch_guard()?;
         self.cancel_jev_conversion();
         let input_trace = client_performance_log_enabled().then(ClientInputTraceGuard::begin);
         let total_start = input_trace.as_ref().map(|_| Instant::now());
@@ -6377,6 +6618,7 @@ impl TextServiceFactory {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<bool> {
+        let _dispatch = self.native_dispatch_guard()?;
         let input_trace = client_performance_log_enabled().then(ClientInputTraceGuard::begin);
         let total_start = input_trace.as_ref().map(|_| Instant::now());
         let result: Result<bool> = (|| {
@@ -6458,6 +6700,7 @@ impl TextServiceFactory {
 
     #[tracing::instrument]
     pub fn handle_preserved_eisu_shortcut(&self, context: Option<&ITfContext>) -> Result<bool> {
+        let _dispatch = self.native_dispatch_guard()?;
         let result: Result<bool> = (|| {
             self.cleanup_observed_disabled_context()?;
             let Some(context) = context else {
@@ -6509,7 +6752,10 @@ impl TextServiceFactory {
                 is_shift_key: false,
                 shift_alphabet_shortcut: false,
             };
-            if !composition.deferred_actions.is_empty() || !composition.deferred_inputs.is_empty() {
+            if self.native_replay_pending()?
+                || !composition.deferred_actions.is_empty()
+                || !composition.deferred_inputs.is_empty()
+            {
                 if !self.enqueue_deferred_user_action(
                     &composition,
                     deferred,
@@ -6588,6 +6834,7 @@ impl TextServiceFactory {
             tracing::debug!("Ignore termination callback for a stale TSF composition");
             return;
         }
+        self.cancel_native_replay();
 
         if let Ok(mut text_service) = self.borrow_mut() {
             text_service.invalidate_mode_switch_requests();
@@ -6620,6 +6867,7 @@ impl TextServiceFactory {
     }
 
     fn cancel_composition_for_disabled_context(&self) {
+        self.cancel_native_replay();
         if let Ok(mut service) = self.borrow_mut() {
             service.invalidate_mode_switch_requests();
         }
@@ -6657,6 +6905,7 @@ impl TextServiceFactory {
     }
 
     pub(crate) fn end_composition_for_tsf_event(&self) {
+        self.cancel_native_replay();
         self.cancel_jev_conversion();
         // Collect queued learning while the candidate IDs and owner are still
         // valid. Focus loss may terminate a deferred terminal action.
@@ -6914,6 +7163,7 @@ impl TextServiceFactory {
     }
 
     pub(crate) fn request_language_bar_input_mode_toggle(&self, mode: InputMode) -> Result<()> {
+        let _dispatch = self.native_dispatch_guard()?;
         self.cleanup_observed_disabled_context()?;
         let (composition, replaces_pending_mode_switch) = {
             let text_service = self.borrow()?;
@@ -6921,7 +7171,9 @@ impl TextServiceFactory {
             let replaces_pending_mode_switch = text_service.pending_mode_switch().is_some();
             (composition, replaces_pending_mode_switch)
         };
-        if !language_bar_toggle_requires_deferred_replay(&composition) {
+        if !self.native_replay_pending()?
+            && !language_bar_toggle_requires_deferred_replay(&composition)
+        {
             return self.request_input_mode_switch_after_composition(mode);
         }
 
@@ -6985,10 +7237,33 @@ impl TextServiceFactory {
         transition: CompositionState,
         config_snapshot: AppConfigSnapshot,
     ) -> Result<()> {
+        if self.native_replay_pending()? {
+            let composition = self.borrow()?.borrow_composition()?.clone();
+            return self.enqueue_deferred_actions(
+                &composition,
+                actions
+                    .iter()
+                    .cloned()
+                    .map(|action| DeferredClientAction {
+                        action,
+                        transition: transition.clone(),
+                    })
+                    .collect(),
+            );
+        }
+        self.handle_action_with_config_snapshot_inner(actions, transition, config_snapshot, false)
+    }
+
+    fn handle_action_with_config_snapshot_inner(
+        &self,
+        actions: &[ClientAction],
+        transition: CompositionState,
+        config_snapshot: AppConfigSnapshot,
+        yield_after_preview: bool,
+    ) -> Result<()> {
+        let _dispatch = self.native_dispatch_guard()?;
         self.cancel_jev_conversion();
-        let start_jev = actions
-            .iter()
-            .any(|action| matches!(action, ClientAction::StartJevConversion));
+        let mut start_jev = false;
         let trace_request_id = current_input_trace_request_id();
         let total_start = trace_request_id.map(|_| Instant::now());
         let requested_transition = transition.clone();
@@ -7220,6 +7495,9 @@ impl TextServiceFactory {
                     "Rebuilt server composition after IPC deadline"
                 );
                 candidates = recovered.candidates;
+                if let Some(canonical) = &candidates.canonical_raw_input {
+                    raw_input.clone_from(canonical);
+                }
                 clause_snapshots.clear();
                 future_clause_snapshots.clear();
                 current_clause_is_split_derived = false;
@@ -7234,20 +7512,27 @@ impl TextServiceFactory {
                 next_split_group_id = 0;
                 selection_index = 0;
                 if let Some(selected) = Self::select_candidate(&candidates, selection_index) {
-                    corresponding_count = selected.corresponding_count;
-                    preview = Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
-                    suffix = selected.sub_text.clone();
-                    raw_hiragana = selected.hiragana;
-                    if composition.tip_composition.is_some() {
-                        render_local_text!();
-                        self.sync_candidate_window_after_text_update(
-                            &mut ipc_service,
-                            &candidates,
-                            selection_index,
-                            app_config,
-                            &transition,
-                        )?;
-                    }
+                    Self::refresh_recovered_display_before_actions(
+                        actions.first().map(|entry| &entry.action),
+                        || {
+                            corresponding_count = selected.corresponding_count;
+                            preview =
+                                Self::merge_preview_with_prefix(&fixed_prefix, &selected.text);
+                            suffix = selected.sub_text.clone();
+                            raw_hiragana = selected.hiragana;
+                            if composition.tip_composition.is_some() {
+                                render_local_text!();
+                                self.sync_candidate_window_after_text_update(
+                                    &mut ipc_service,
+                                    &candidates,
+                                    selection_index,
+                                    app_config,
+                                    &transition,
+                                )?;
+                            }
+                            Ok(())
+                        },
+                    )?;
                 }
             }
 
@@ -7264,7 +7549,7 @@ impl TextServiceFactory {
 
                 match action {
                     // Start only after all local state has been persisted below.
-                    ClientAction::StartJevConversion => {}
+                    ClientAction::StartJevConversion => start_jev = true,
                     ClientAction::StartComposition => {
                         // start_composition closes any stale TIP handle and then starts a
                         // fresh composition. Merely seeing a handle is not sufficient: a
@@ -7403,6 +7688,120 @@ impl TextServiceFactory {
                         current_clause_remainder_origin = None;
                         next_split_group_id = 0;
                         ipc_service.clear_text()?;
+                    }
+                    ClientAction::CommitPreviewAndAppend {
+                        committed,
+                        text,
+                        kind,
+                        temporary_latin: next_temporary_latin,
+                    } => {
+                        let text = if *kind == PreviewInputKind::Romaji && mode == InputMode::Kana {
+                            Self::resolve_symbol_input_text_with_lookup(
+                                "",
+                                text,
+                                app_config,
+                                romaji_lookup,
+                            )
+                            .unwrap_or_else(|| text.clone())
+                        } else {
+                            text.clone()
+                        };
+                        Self::flush_pending_learning_commits(
+                            &mut ipc_service,
+                            &mut pending_learning_commits,
+                        );
+                        ipc_service.clear_text()?;
+                        // ClearText also clears context. Capture the document
+                        // before this composition, then add the frozen selected
+                        // display, rather than a recovery-generated candidate.
+                        IMEState::set_ipc_service(ipc_service.clone())?;
+                        self.update_context_for_preview_continuation(
+                            &format!("{preview}{suffix}"),
+                            committed,
+                        )?;
+                        ipc_service = IMEState::ipc_service()?.context("ipc_service is None")?;
+                        let next_candidates = if *kind == PreviewInputKind::Direct {
+                            ipc_service.append_text_direct_with_context(
+                                text.clone(),
+                                &Candidates::default(),
+                            )?
+                        } else {
+                            ipc_service
+                                .append_text_with_context(text.clone(), &Candidates::default())?
+                        };
+                        if app_config.general.experimental_mixed_input
+                            && next_candidates.canonical_raw_input.is_none()
+                        {
+                            ipc_service
+                                .require_server_recovery("missing_canonical_input_after_preview");
+                            return Err(ipc_service.recovery_pending_error());
+                        }
+                        let Some(selected) = Self::select_candidate(&next_candidates, 0) else {
+                            ipc_service.require_server_recovery("missing_candidate_after_preview");
+                            return Err(ipc_service.recovery_pending_error());
+                        };
+                        // Clear/Append may have observed a replacement server.
+                        // Its new input is authoritative now; a later ordinary
+                        // append must not reset this valid live TSF composition.
+                        ipc_service.take_server_reset_recovered();
+                        let next_preview =
+                            if app_config.general.jev_conversion && !next_temporary_latin {
+                                next_candidates
+                                    .hiragana
+                                    .strip_suffix(&selected.sub_text)
+                                    .unwrap_or(&selected.text)
+                                    .to_owned()
+                            } else {
+                                selected.text.clone()
+                            };
+                        let following = format!("{next_preview}{}", selected.sub_text);
+                        // Never expose an End/Start pair in one key. The IMM32
+                        // bridge can otherwise terminate the newly started input
+                        // when it delivers the preceding result/end messages.
+                        // Prepare and shift in one edit session, so the native
+                        // result prefix cannot be overwritten by another write.
+                        self.commit_preview_and_continue(committed, &following)?;
+                        {
+                            let mut service = self.borrow_mut()?;
+                            service.native_preview_commit_generation =
+                                service.native_preview_commit_generation.wrapping_add(1);
+                        }
+
+                        selection_index = selected.index;
+                        corresponding_count = selected.corresponding_count;
+                        temporary_latin = *next_temporary_latin;
+                        temporary_latin_shift_pending = false;
+                        reconversion_original = None;
+                        preview = next_preview;
+                        suffix = selected.sub_text;
+                        raw_hiragana = selected.hiragana;
+                        raw_input = next_candidates.canonical_raw_input.clone().unwrap_or(text);
+                        candidates = next_candidates;
+                        fixed_prefix.clear();
+                        clause_snapshots.clear();
+                        future_clause_snapshots.clear();
+                        current_clause_is_split_derived = false;
+                        current_clause_is_direct_split_remainder = false;
+                        current_clause_is_pending_remainder = false;
+                        current_clause_has_split_left_neighbor = false;
+                        current_clause_right_boundary_displacement = 0;
+                        current_clause_right_boundary_origin = None;
+                        current_clause_split_group_id = None;
+                        current_clause_consumed_prefix_restore = None;
+                        current_clause_remainder_origin = None;
+                        next_split_group_id = 0;
+                        // A later UI/IPC failure must not replay an already
+                        // committed prefix. Recover from the new input identity.
+                        persist_local_state!();
+                        failed_action_index = action_index + 1;
+                        failed_ledger_snapshot = Some(ipc_service.input_ledger_snapshot());
+                        self.sync_candidate_window_after_text_update(
+                            &mut ipc_service,
+                            &candidates,
+                            selection_index,
+                            app_config,
+                            &transition,
+                        )?;
                     }
                     ClientAction::AppendText(text) => {
                         Self::clear_clause_caches(
@@ -8838,15 +9237,26 @@ impl TextServiceFactory {
                         self.set_text(&preview, &suffix)?;
                     }
                 }
-                if matches!(
-                    action,
-                    ClientAction::ShrinkText(_)
-                        | ClientAction::ShrinkTextRaw(_)
-                        | ClientAction::ShrinkTextDirect(_)
-                ) {
-                    ipc_service.replace_input_ledger_direct(&raw_hiragana);
+                if app_config.general.experimental_mixed_input
+                    && Self::edit_requires_canonical_input(action)
+                    && candidates.canonical_raw_input.is_none()
+                {
+                    // A styled interior edit cannot be reconstructed from a
+                    // local append prediction. Preserve/replay the key instead
+                    // of treating failed canonical extraction like legacy data.
+                    ipc_service.require_server_recovery("missing_canonical_input_after_edit");
+                    return Err(ipc_service.recovery_pending_error());
                 }
+                Self::reconcile_canonical_input_after_edit(action, &candidates, &mut raw_input);
                 persist_local_state!();
+                if yield_after_preview
+                    && matches!(action, ClientAction::CommitPreviewAndAppend { .. })
+                {
+                    self.borrow()?.borrow_mut_composition()?.deferred_actions =
+                        deferred_action_suffix(actions, action_index + 1);
+                    IMEState::set_ipc_service(ipc_service)?;
+                    return Ok(());
+                }
             }
 
             persist_local_state!();

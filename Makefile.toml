@@ -38,8 +38,14 @@ args = ["scripts/sync-version.mjs"]
 
 [tasks.generate_reverse_dictionary]
 description = "Generate the compact surface-to-reading index"
+dependencies = ["generate_english_dictionary"]
 command = "node"
-args = ["scripts/generate-reverse-dictionary.mjs"]
+args = ["scripts/generate-reverse-dictionary.mjs", "--source", "target/azookey-english-dictionary/Dictionary/louds"]
+
+[tasks.generate_english_dictionary]
+description = "Merge the bundled English dictionaries into indexed build data"
+command = "node"
+args = ["scripts/generate-english-dictionary.mjs"]
 
 [tasks.build_installer]
 command = "iscc"
@@ -71,6 +77,10 @@ cp target/azookey-build/build-info.json build
 cp target/i686-pc-windows-msvc/$str/azookey_windows.dll build/x86
 
 cp server-swift/.build/x86_64-unknown-windows-msvc/release/azookey-server.dll build
+$englishResources = "server-swift/.build/x86_64-unknown-windows-msvc/release/azookey-server_azookey-server.resources"
+if (!(Test-Path "$englishResources/english-vocabulary.bin")) { throw "English vocabulary resource is missing" }
+if (Test-Path build/azookey-server_azookey-server.resources) { Remove-Item -Recurse -Force build/azookey-server_azookey-server.resources }
+cp -Recurse -Force $englishResources build
 
 cp -Recurse -Force llama_cpu build
 cp -Recurse -Force llama_cuda build
@@ -79,7 +89,8 @@ cp -Recurse -Force llama_vulkan build
 cp $env:APPDATA/../Local/Programs/Swift/Runtimes/*/usr/bin/* build
 
 cp -Recurse -Force server-swift/azooKey_emoji_dictionary_storage/EmojiDictionary build
-cp -Recurse -Force server-swift/azooKey_dictionary_storage/Dictionary build
+if (Test-Path build/Dictionary) { Remove-Item -Recurse -Force build/Dictionary }
+cp -Recurse -Force target/azookey-english-dictionary/Dictionary build
 mkdir build/Dictionary/Reverse -Force
 cp target/azookey-reverse-dictionary/reverse-v2.bin build/Dictionary/Reverse
 

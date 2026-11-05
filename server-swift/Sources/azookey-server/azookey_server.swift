@@ -14,6 +14,7 @@ private let fallbackDictionaryURL =
     ?? URL(filePath: FileManager.default.currentDirectoryPath)
 
 @MainActor var converterDictionaryURL = fallbackDictionaryURL
+@MainActor var converterBaseDictionaryURL = fallbackDictionaryURL
 @MainActor var converterPreloadDictionary = false
 @MainActor var converter = KanaKanjiConverter(
     dictionaryURL: fallbackDictionaryURL,
@@ -26,6 +27,7 @@ private let fallbackDictionaryURL =
 @MainActor var composingText = ComposingText()
 @MainActor var composingTextSnapshots: [ComposingText] = []
 @MainActor var currentInputStyle: InputStyle = .roman2kana
+@MainActor var currentRomajiInputTable: InputTable = .defaultRomanToKana
 @MainActor var customRomajiTableEnabled = false
 @MainActor var currentLearningType: LearningType = .inputAndOutput
 @MainActor var currentLearningMemoryDirectoryURL: URL?
@@ -493,7 +495,7 @@ private func serverLog(
     }
 }
 
-@MainActor private func serverLog(
+@MainActor func serverLog(
     _ level: String = "INFO",
     _ message: @autoclosure () -> String,
     flush: Bool = false
@@ -631,17 +633,6 @@ private func readAppSettings(at path: URL) throws -> AppSettings {
     return try JSONDecoder().decode(AppSettings.self, from: data)
 }
 
-@MainActor private func rebuildConverter() {
-    converter = KanaKanjiConverter(
-        dictionaryURL: converterDictionaryURL,
-        preloadDictionary: converterPreloadDictionary
-    )
-    normalNBestSupplementConverter = KanaKanjiConverter(
-        dictionaryURL: converterDictionaryURL,
-        preloadDictionary: converterPreloadDictionary
-    )
-}
-
 @MainActor private func converterRuntimeDirectoryURL() -> URL {
     engineRuntimeDirectoryURL(
         appDataPath: ProcessInfo.processInfo.environment["APPDATA"],
@@ -675,14 +666,17 @@ private func shouldOffloadZenzaiToGpu(zenzaiEnabled: Bool, backend: String?) -> 
     return zenzaiEnabled && !normalizedBackend.isEmpty && normalizedBackend != "cpu"
 }
 
-@MainActor private func configureEngineRuntime(zenzaiEnabled: Bool) {
+// Last configuration dispatched to the SDK, not a detected offload result.
+@MainActor var engineRuntimeGpuLayerCount: Int32 = 0
+
+@MainActor func configureEngineRuntime() {
     let shouldOffloadToGpu = shouldOffloadZenzaiToGpu(
-        zenzaiEnabled: zenzaiEnabled,
+        zenzaiEnabled: currentRuntimeZenzaiEnabled(),
         backend: config["backend"] as? String
     )
-    KanaKanjiConverterEngineRuntime.configure(
-        gpuLayerCount: shouldOffloadToGpu ? Int32.max : 0
-    )
+    let layers: Int32 = shouldOffloadToGpu ? Int32.max : 0
+    KanaKanjiConverterEngineRuntime.configure(gpuLayerCount: layers)
+    engineRuntimeGpuLayerCount = layers
 }
 
 @MainActor private func learningMemoryDirectoryURL(settingsPath: URL?) -> URL {
@@ -1191,9 +1185,16 @@ private struct AppSettings: Decodable {
     let general: GeneralSettings?
 }
 
-private struct GeneralSettings: Decodable {
+struct GeneralSettings: Decodable {
     let jev_conversion: Bool?
     let experimental_typo_correction: Bool?
+    let experimental_mixed_input: Bool?
+    let english_dictionary: Bool?
+    let katakana_english_dictionary: Bool?
+
+    var bundledDictionaries: BundledDictionaryMode {
+        .init(english: english_dictionary ?? true, katakana: katakana_english_dictionary ?? true)
+    }
 }
 
 private struct LearningSettings: Decodable {
@@ -1272,10 +1273,11 @@ private func cpuZenzaiBackendSupportedFromEnvironment() -> Bool {
 
 @MainActor private func setRoman2KanaInputStyle() {
     currentInputStyle = .roman2kana
+    currentRomajiInputTable = .defaultRomanToKana
     customRomajiTableEnabled = false
 }
 
-@MainActor private func setCustomRomajiInputStyle(rows: [RomajiTableRow]?) {
+@MainActor func setCustomRomajiInputStyle(rows: [RomajiTableRow]?) {
     guard let rows, let content = buildCustomRomajiTableContent(rows: rows) else {
         setRoman2KanaInputStyle()
         return
@@ -1296,9 +1298,13 @@ private func cpuZenzaiBackendSupportedFromEnvironment() -> Bool {
         }
         let tableName = "azookey-windows-custom-romaji"
         let table = try InputStyleManager.loadTable(from: fileURL)
+        currentRomajiInputTable = table
         InputStyleManager.registerInputStyle(table: table, for: tableName)
         currentInputStyle = .mapped(id: .tableName(tableName))
         customRomajiTableEnabled = true
+        // This registry ID is stable across saves, but eligibility/edge caches
+        // and editing aliases belong to the table contents, not just its ID.
+        mixedInputConversionCache = nil
     } catch {
         serverLog("ERROR", "Failed to apply custom romaji table: \(error)")
         setRoman2KanaInputStyle()
@@ -1386,6 +1392,9 @@ private func adjustedCorrespondingCountForDelayedSingleN(
     guard previousElement.inputStyle != .direct,
           consumedElement.inputStyle != .direct,
           nextElement.inputStyle != .direct,
+          !isMixedInputLiteralStyle(previousElement.inputStyle),
+          !isMixedInputLiteralStyle(consumedElement.inputStyle),
+          !isMixedInputLiteralStyle(nextElement.inputStyle),
           let previous = inputCharacter(previousElement),
           asciiLowercase(previous) == "n",
           let consumed = inputCharacter(consumedElement),
@@ -1884,8 +1893,8 @@ private func preferCursorPrefixBoundary(
     context: String = "",
     zenzaiEnabled: Bool
 ) -> ConvertRequestOptions {
-    configureEngineRuntime(zenzaiEnabled: zenzaiEnabled)
-    return makeConvertRequestOptions(
+    configureEngineRuntime()
+    var options = makeConvertRequestOptions(
         context: context,
         zenzaiEnabled: zenzaiEnabled,
         runtimeDirectoryURL: converterRuntimeDirectoryURL(),
@@ -1897,6 +1906,13 @@ private func preferCursorPrefixBoundary(
         experimentalKeyboardTypoCorrection:
             (config["experimentalTypoCorrection"] as? Bool) ?? false
     )
+    // The engine's English unknown-word nodes copy the original literal span
+    // as one word. This also covers fragments left by explicit clause edits.
+    if config["experimentalMixedInput"] as? Bool == true,
+       composingText.input.contains(where: { isMixedInputLiteralStyle($0.inputStyle) }) {
+        options.keyboardLanguage = .en_US
+    }
+    return options
 }
 
 @MainActor private func currentRuntimeZenzaiEnabled() -> Bool {
@@ -2167,7 +2183,7 @@ private let backgroundWarmupRunner = BackgroundWarmupRunner()
         inputCount: warmupComposingText.input.count,
         hiraganaCount: warmupComposingText.convertTarget.count
     )
-    configureEngineRuntime(zenzaiEnabled: useZenzai)
+    configureEngineRuntime()
     let diagnosticDetails = zenzaiDiagnosticDetails(
         snapshot: diagnosticSnapshot,
         contextLength: contextString.count,
@@ -2476,10 +2492,17 @@ func cursorPrefixBoundaryFirstClauseResults(
 
 @_silgen_name("LoadConfig")
 @MainActor public func load_config() {
-    // Resource contents are immutable between explicit reloads. In particular,
-    // retry a missing resource here instead of reopening it on every input.
-    emojiTextReplacerCache.invalidate()
-    _ = currentEmojiTextReplacer()
+    lastConfigApplySucceeded = applyLoadedConfig()
+}
+
+@MainActor var lastConfigApplySucceeded = true
+
+@_silgen_name("GetConfigApplyStatus")
+@MainActor public func get_config_apply_status() -> Int32 {
+    dictionaryModelPreparationInFlight ? 2 : (lastConfigApplySucceeded ? 1 : 0)
+}
+
+@MainActor private func applyLoadedConfig() -> Bool {
     let loadedSettingsPath = settingsPath()
     var loadedSettings: AppSettings?
     var settingsLoadError: Error?
@@ -2489,6 +2512,17 @@ func cursorPrefixBoundaryFirstClauseResults(
     } catch {
         settingsLoadError = error
     }
+    let missingSettings = (settingsLoadError as? CocoaError)?.code == .fileReadNoSuchFile
+    guard settingsLoadError == nil || missingSettings else {
+        // Never turn a failed read into a successful asynchronous defaults job.
+        // Preserve the active configuration, input and any last valid pending
+        // choice before touching globals or queuing replacement resources.
+        serverLog("ERROR", "LoadConfig: settings could not be read: \(settingsLoadError!)")
+        return false
+    }
+    // Resource contents are immutable between explicit reloads.
+    emojiTextReplacerCache.invalidate()
+    _ = currentEmojiTextReplacer()
 
     serverLog("INFO", "LoadConfig: start")
     let previousZenzaiEnabled = (config["enable"] as? Bool) ?? false
@@ -2496,6 +2530,7 @@ func cursorPrefixBoundaryFirstClauseResults(
     let previousBackend = (config["backend"] as? String) ?? "cpu"
     let previousExperimentalTypoCorrection =
         (config["experimentalTypoCorrection"] as? Bool) ?? false
+    let previousMixedInput = (config["experimentalMixedInput"] as? Bool) ?? false
     let previousEffectiveZenzaiEnabled = effectiveZenzaiRuntimeEnabled(
         isConfigured: previousZenzaiEnabled,
         backend: previousBackend,
@@ -2505,21 +2540,14 @@ func cursorPrefixBoundaryFirstClauseResults(
     let previousLearningType = currentLearningType
     let previousLearningMemoryDirectoryURL = currentLearningMemoryDirectoryURL
     var dynamicUserDictionary: [DicdataElement] = []
-    defer {
-        let conversionDictionary = makeConversionDictionaryEntries(
-            userEntries: dynamicUserDictionary,
-            experimentalTypoCorrectionEnabled:
-                (config["experimentalTypoCorrection"] as? Bool) ?? false
-        )
-        converter.importDynamicUserDictionary(conversionDictionary)
-        normalNBestSupplementConverter.importDynamicUserDictionary(conversionDictionary)
-        reconversionDictionary.replaceUserEntries(dynamicUserDictionary)
-    }
 
     config["enable"] = false
     config["profile"] = ""
     config["backend"] = "cpu"
     config["experimentalTypoCorrection"] = false
+    config["experimentalMixedInput"] = false
+    config["englishDictionary"] = true
+    config["katakanaEnglishDictionary"] = true
     setRoman2KanaInputStyle()
     currentLearningType = .inputAndOutput
     currentLearningMemoryDirectoryURL = learningMemoryDirectoryURL(settingsPath: loadedSettingsPath)
@@ -2550,6 +2578,9 @@ func cursorPrefixBoundaryFirstClauseResults(
         currentLearningType = learningType(for: settings.learning?.mode)
         config["experimentalTypoCorrection"] =
             settings.general?.experimental_typo_correction ?? false
+        config["experimentalMixedInput"] = settings.general?.experimental_mixed_input ?? false
+        config["englishDictionary"] = settings.general?.english_dictionary ?? true
+        config["katakanaEnglishDictionary"] = settings.general?.katakana_english_dictionary ?? true
 
         let sourceEntries = settings.user_dictionary?.entries ?? []
         var seen: Set<String> = []
@@ -2611,13 +2642,10 @@ func cursorPrefixBoundaryFirstClauseResults(
         || backendChanged
         || previousUsedCustomRomajiTable != currentUsedCustomRomajiTable
         || previousExperimentalTypoCorrection != currentExperimentalTypoCorrection
+        || previousMixedInput != ((config["experimentalMixedInput"] as? Bool) ?? false)
     {
-        if backendChanged {
-            rebuildConverter()
-        } else {
-            converter.stopComposition()
-            normalNBestSupplementConverter.stopComposition()
-        }
+        converter.stopComposition()
+        normalNBestSupplementConverter.stopComposition()
         composingText = ComposingText()
         composingTextSnapshots.removeAll()
         clearLearningCandidateCache()
@@ -2627,13 +2655,31 @@ func cursorPrefixBoundaryFirstClauseResults(
     {
         clearLearningCandidateCache()
     }
-    ensureLearningMemoryDirectoryIfNeeded()
-    loadLearningSelectionOverrides()
+    let conversionDictionary = makeConversionDictionaryEntries(userEntries: dynamicUserDictionary,
+        experimentalTypoCorrectionEnabled: currentExperimentalTypoCorrection)
+    let previousModelReady = converter.zenzStatus == "load \(execURL.appendingPathComponent("zenz.gguf").absoluteString)"
+    let dictionariesApplied = configureBundledDictionaries(
+        mode: .init(english: config["englishDictionary"] as? Bool ?? true,
+                    katakana: config["katakanaEnglishDictionary"] as? Bool ?? true),
+        force: backendChanged, userEntries: dynamicUserDictionary, conversionEntries: conversionDictionary,
+        warmupOptions: bundledDictionaryConfigurationInitialized && currentEffectiveZenzaiEnabled && previousModelReady && !backendChanged
+            ? getOptions(zenzaiEnabled: true) : nil,
+        prepareAsynchronously: bundledDictionaryConfigurationInitialized && !backendChanged)
+    converter.importDynamicUserDictionary(conversionDictionary)
+    normalNBestSupplementConverter.importDynamicUserDictionary(conversionDictionary)
+    reconversionDictionary.replaceUserEntries(dynamicUserDictionary)
+    prepareMixedInputConversion(reset: previousMixedInput != ((config["experimentalMixedInput"] as? Bool) ?? false)
+        || previousUsedCustomRomajiTable != currentUsedCustomRomajiTable)
+    if dictionariesApplied {
+        ensureLearningMemoryDirectoryIfNeeded()
+        loadLearningSelectionOverrides()
+    }
 
     serverLog(
         "INFO",
         "LoadConfig: completed enable=\(currentZenzaiEnabled) backend=\(currentBackend) effectiveEnable=\(currentEffectiveZenzaiEnabled) customRomaji=\(currentUsedCustomRomajiTable) learningType=\(currentLearningType) experimentalTypoCorrection=\(currentExperimentalTypoCorrection)"
     )
+    return dictionariesApplied
 }
 
 @_silgen_name("Initialize")
@@ -2645,23 +2691,20 @@ func cursorPrefixBoundaryFirstClauseResults(
     serverLog("INFO", "Initialize: start path=\(path) use_zenzai=\(use_zenzai)")
     execURL = URL(filePath: path)
     converterDictionaryURL = execURL.appendingPathComponent("Dictionary")
+    converterBaseDictionaryURL = converterDictionaryURL
     converterPreloadDictionary = true
+    composingText = ComposingText()
+    composingTextSnapshots.removeAll()
+    bundledDictionaryConfigurationInitialized = false
+    pendingBundledDictionaryConfiguration = nil
     ensureConverterRuntimeDirectory()
-    let reverseIndexStart = performanceNow()
-    do {
-        try reconversionDictionary.load(from: converterDictionaryURL)
-        serverLog(
-            "INFO",
-            "Initialize: reconversion dictionary loaded entries=\(reconversionDictionary.recordCount) elapsed_ms=\(elapsedPerformanceMilliseconds(since: reverseIndexStart))"
-        )
-    } catch {
-        reconversionDictionary = ReconversionDictionary()
-        serverLog("ERROR", "Initialize: failed to load reconversion dictionary: \(error)")
-    }
-    rebuildConverter()
     clearLearningCandidateCache()
 
     load_config()
+    guard lastConfigApplySucceeded else {
+        serverLog("ERROR", "Initialize: dictionary/config preparation failed; engine is not ready")
+        return
+    }
 
     let diagnosticSnapshot = zenzaiDiagnosticSnapshot()
     composingText = makeWarmupComposingText(
@@ -2731,7 +2774,10 @@ func cursorPrefixBoundaryFirstClauseResults(
     surface: UnsafePointer<CChar>
 ) -> UnsafeMutablePointer<CChar>? {
     let surfaceString = String(cString: surface)
-    let readings = reconversionDictionary.inferReadings(for: surfaceString)
+    // This read-only inference prepares a *new* reconversion composition.
+    // Unsupported selections leave the old composition and pending mode alone.
+    let dictionary = pendingBundledDictionaryConfiguration?.reverse ?? reconversionDictionary
+    let readings = dictionary.inferReadings(for: surfaceString)
     guard !readings.isEmpty else {
         serverLog("DEBUG", "InferReconversionReading: unsupported surfaceLength=\(surfaceString.count)")
         return nil
@@ -2757,7 +2803,11 @@ func cursorPrefixBoundaryFirstClauseResults(
     discardPinnedLearningCandidatesBeforeCompositionEdit()
     let inputString = String(cString: input)
     serverLog("DEBUG", "AppendText: start inputLength=\(inputString.count) inputStyle=\(String(describing: currentInputStyle))")
-    composingText.insertAtCursorPosition(inputString, inputStyle: currentInputStyle)
+    if !insertInsideMixedInputLiteral(inputString) {
+        composingText.insertAtCursorPosition(inputString, inputStyle: currentInputStyle)
+    }
+    removeMixedInputEditingSeparators()
+    normalizeMixedInputAfterEdit()
 
     cursorPtr.pointee = CInt(composingText.convertTargetCursorPosition)
     serverLog(
@@ -2776,6 +2826,7 @@ func cursorPrefixBoundaryFirstClauseResults(
     let inputString = String(cString: input)
     serverLog("DEBUG", "AppendTextDirect: start inputLength=\(inputString.count)")
     composingText.insertAtCursorPosition(inputString, inputStyle: .direct)
+    removeMixedInputEditingSeparators()
 
     cursorPtr.pointee = CInt(composingText.convertTargetCursorPosition)
     serverLog(
@@ -2791,7 +2842,11 @@ func cursorPrefixBoundaryFirstClauseResults(
 ) -> UnsafeMutablePointer<CChar> {
     discardPinnedLearningCandidatesBeforeCompositionEdit()
     serverLog("DEBUG", "RemoveText: start")
-    composingText.deleteBackwardFromCursorPosition(count: 1)
+    if !removeMixedInputLiteralBeforeCursor() {
+        composingText.deleteBackwardFromCursorPosition(count: 1)
+    }
+    removeMixedInputEditingSeparators()
+    normalizeMixedInputAfterEdit()
 
     cursorPtr.pointee = CInt(composingText.convertTargetCursorPosition)
     serverLog(
@@ -2854,6 +2909,7 @@ func cursorPrefixBoundaryFirstClauseResults(
 
         let firstElement = composingText.input[inputStart]
         guard firstElement.inputStyle != .direct,
+              !isMixedInputLiteralStyle(firstElement.inputStyle),
               let firstInput = inputCharacter(firstElement),
               asciiLowercase(firstInput) == "n",
               surfaceCharacters[surfaceStart] == "ん"
@@ -3017,13 +3073,24 @@ func cursorPrefixBoundaryFirstClauseResults(
 
 @_silgen_name("ClearText")
 @MainActor public func clear_text() {
-    serverLog("DEBUG", "ClearText: start")
+    resetComposingText(applyDictionaryChange: true)
+}
+
+@_silgen_name("ResetTextForRecovery")
+@MainActor public func reset_text_for_recovery() {
+    resetComposingText(applyDictionaryChange: false)
+}
+
+@MainActor private func resetComposingText(applyDictionaryChange: Bool) {
+    let operation = applyDictionaryChange ? "ClearText" : "ResetTextForRecovery"
+    serverLog("DEBUG", "\(operation): start")
     converter.stopComposition()
     normalNBestSupplementConverter.stopComposition()
     composingText = ComposingText()
     composingTextSnapshots.removeAll()
     clearLearningCandidateCache()
-    serverLog("DEBUG", "ClearText: completed")
+    if applyDictionaryChange { applyPendingBundledDictionaries() }
+    serverLog("DEBUG", "\(operation): completed")
 }
 
 @_silgen_name("CommitLearningCandidate")
@@ -3745,8 +3812,11 @@ public func free_candidate_list(
     serverLog("DEBUG", "ShrinkText: start offset=\(offset)")
     var afterComposingText = composingText
     let boundedOffset = min(max(Int(offset), 0), afterComposingText.input.count)
+    let clipsLiteral = boundedOffset > 0 && boundedOffset < afterComposingText.input.count
+        && isMixedInputLiteralStyle(afterComposingText.input[boundedOffset - 1].inputStyle)
+        && isMixedInputLiteralStyle(afterComposingText.input[boundedOffset].inputStyle)
     afterComposingText.prefixComplete(composingCount: .inputCount(boundedOffset))
-    composingText = afterComposingText
+    composingText = clipsLiteral ? protectMixedInputPrefixAfterShrink(afterComposingText) : afterComposingText
 
     serverLog("DEBUG", "ShrinkText: completed hiraganaLength=\(composingText.convertTarget.count) inputCount=\(composingText.input.count)")
     return _strdup(composingText.convertTarget)!

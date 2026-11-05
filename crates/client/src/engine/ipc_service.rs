@@ -201,6 +201,19 @@ enum CompositionOperation {
     Append { text: String, input_style: i32 },
     Remove,
     MoveCursor(i32),
+    Shrink(i32),
+    Snapshot(ClauseSnapshotOperation),
+}
+
+fn ledger_requires_clause_reconciliation(ledger: &InputLedger) -> bool {
+    ledger.operations.iter().any(|operation| {
+        matches!(
+            operation,
+            CompositionOperation::MoveCursor(_)
+                | CompositionOperation::Shrink(_)
+                | CompositionOperation::Snapshot(_)
+        )
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,6 +366,7 @@ fn move_input_cursor(ledger: &mut InputLedger, offset: i32) {
     }
 }
 
+#[cfg(test)]
 fn mark_input_ledger_incomplete(ledger: &mut InputLedger) {
     ledger.operations.clear();
     ledger.complete = false;
@@ -388,6 +402,7 @@ pub struct Candidates {
     pub hiragana: String,
     pub corresponding_count: Vec<i32>,
     pub candidate_ids: Vec<u64>,
+    pub canonical_raw_input: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -799,6 +814,7 @@ impl IPCService {
                     .iter()
                     .map(|s| s.candidate_id)
                     .collect(),
+                canonical_raw_input: None,
             })
         } else {
             anyhow::bail!("composing_text is None");
@@ -809,7 +825,7 @@ impl IPCService {
         // A new server-assigned transport identity cannot refresh the old
         // composition. Only a complete edit ledger is trustworthy for replay.
         let ledger = self.input_ledger_snapshot().0;
-        if !ledger.complete {
+        if !ledger.complete || ledger_requires_clause_reconciliation(&ledger) {
             // Successful clause edits can invalidate the relative ledger. The
             // existing recovery path rebuilds from the client's current raw
             // input and reconciles clause caches before replaying deferred input.
@@ -973,6 +989,14 @@ impl IPCService {
         }
     }
 
+    fn record_clause_operation(&self, operation: CompositionOperation) {
+        if let Ok(mut ledger) = self.recovery.input_ledger.lock() {
+            if ledger.complete {
+                ledger.operations.push(operation);
+            }
+        }
+    }
+
     fn clear_input_ledger(&self) {
         if let Ok(mut ledger) = self.recovery.input_ledger.lock() {
             ledger.operations.clear();
@@ -984,6 +1008,7 @@ impl IPCService {
         self.clear_input_ledger();
     }
 
+    #[cfg(test)]
     fn invalidate_input_ledger(&self) {
         if let Ok(mut ledger) = self.recovery.input_ledger.lock() {
             mark_input_ledger_incomplete(&mut ledger);
@@ -1387,8 +1412,10 @@ impl IPCService {
         )?;
         let response = response.into_inner();
         self.observe_server_session("shrink_text", response.server_session_id);
-        self.invalidate_input_ledger();
-        Self::candidates_from_composing_text(response.composing_text)
+        self.record_clause_operation(CompositionOperation::Shrink(offset));
+        let mut candidates = Self::candidates_from_composing_text(response.composing_text)?;
+        candidates.canonical_raw_input = response.raw_input;
+        Ok(candidates)
     }
 
     fn send_advance_clause(
@@ -1412,7 +1439,10 @@ impl IPCService {
         )?;
         let response = response.into_inner();
         self.observe_server_session("advance_clause", response.server_session_id);
-        self.invalidate_input_ledger();
+        self.record_clause_operation(CompositionOperation::Snapshot(
+            ClauseSnapshotOperation::Push,
+        ));
+        self.record_clause_operation(CompositionOperation::Shrink(offset));
         let shrunk = Self::candidates_from_composing_text(response.shrunk_text)?;
         let navigation = Self::candidates_from_composing_text(response.navigation_text)?;
         let raw_input = if response.raw_input.is_empty() && !navigation.hiragana.is_empty() {
@@ -1450,9 +1480,7 @@ impl IPCService {
         )?;
         let response = response.into_inner();
         self.observe_server_session("prepare_future_clauses", response.server_session_id);
-        if leave_at_last && response.completed {
-            self.invalidate_input_ledger();
-        }
+        let completed = response.completed;
         let advances = response
             .advances
             .into_iter()
@@ -1464,7 +1492,22 @@ impl IPCService {
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok((advances, response.completed))
+        if leave_at_last && completed {
+            let mut offset = initial_offset;
+            for advance in &advances {
+                self.record_clause_operation(CompositionOperation::Snapshot(
+                    ClauseSnapshotOperation::Push,
+                ));
+                self.record_clause_operation(CompositionOperation::Shrink(offset));
+                offset = advance
+                    .navigation
+                    .corresponding_count
+                    .first()
+                    .copied()
+                    .unwrap_or(0);
+            }
+        }
+        Ok((advances, completed))
     }
 
     fn send_move_cursor(&mut self, offset: i32, request_id: u64) -> anyhow::Result<Candidates> {
@@ -1523,10 +1566,9 @@ impl IPCService {
             );
         }
 
-        // Cursor materialization is absolute and may include a large jump from
-        // the server's previous position. The recovery ledger stores only
-        // relative edits, so do not replay an ambiguous pre-adjustment cursor.
-        self.invalidate_input_ledger();
+        // Record the server's actual movement, not a locally predicted kana/raw
+        // delta. Replaying it keeps styled English boundaries and the caret.
+        self.record_successful_move(response.cursor_offset);
         Ok(super::composition::ClauseBoundaryAdjustment::applied(
             candidates,
             response.adjusted_input_count,
@@ -1554,6 +1596,7 @@ impl IPCService {
         )?;
         let response = response.into_inner();
         self.observe_server_session("update_composition_snapshot", response.server_session_id);
+        self.record_clause_operation(CompositionOperation::Snapshot(operation));
         Ok(())
     }
 
@@ -1606,6 +1649,25 @@ impl IPCService {
                         cursor_offset: *cursor_offset,
                     }
                 }
+                CompositionOperation::Shrink(offset) => shared::proto::CompositionOperation {
+                    kind: shared::proto::CompositionOperationKind::Shrink as i32,
+                    cursor_offset: *offset,
+                    ..Default::default()
+                },
+                CompositionOperation::Snapshot(operation) => shared::proto::CompositionOperation {
+                    kind: match operation {
+                        ClauseSnapshotOperation::Clear => {
+                            shared::proto::CompositionOperationKind::SnapshotClear
+                        }
+                        ClauseSnapshotOperation::Push => {
+                            shared::proto::CompositionOperationKind::SnapshotPush
+                        }
+                        ClauseSnapshotOperation::Pop => {
+                            shared::proto::CompositionOperationKind::SnapshotPop
+                        }
+                    } as i32,
+                    ..Default::default()
+                },
             })
             .collect();
         let mut request = tonic::Request::new(shared::proto::ReplaceCompositionRequest {
@@ -1626,7 +1688,9 @@ impl IPCService {
         if let Ok(mut ledger) = self.recovery.input_ledger.lock() {
             *ledger = input_ledger.clone();
         }
-        Self::candidates_from_composing_text(response.composing_text)
+        let mut candidates = Self::candidates_from_composing_text(response.composing_text)?;
+        candidates.canonical_raw_input = response.raw_input;
+        Ok(candidates)
     }
 
     pub(crate) fn recover_composition_if_needed(
@@ -1647,7 +1711,7 @@ impl IPCService {
         }
 
         let recovery_generation = self.recovery.generation.load(Ordering::Acquire);
-        let input_ledger = self
+        let mut input_ledger = self
             .recovery
             .input_ledger
             .lock()
@@ -1655,6 +1719,18 @@ impl IPCService {
             .filter(|ledger| ledger.complete)
             .map(|ledger| ledger.clone())
             .unwrap_or_else(|| fallback_input_ledger(raw_input, raw_hiragana));
+
+        if ledger_requires_clause_reconciliation(&input_ledger) {
+            // Reconstruction issues fresh learning IDs. The caller rebuilds its
+            // clause caches as one whole remainder, so discard the old server
+            // snapshots too and align its caret with that full-remainder view.
+            input_ledger.operations.push(CompositionOperation::Snapshot(
+                ClauseSnapshotOperation::Clear,
+            ));
+            input_ledger
+                .operations
+                .push(CompositionOperation::MoveCursor(i32::MAX));
+        }
 
         self.reconnect_transport()
             .map_err(preserve_recovery_error)?;
@@ -1858,7 +1934,8 @@ impl IPCService {
                 send(self).map_err(|error| self.defer_failed_reconnect("append_text", error))?
             }
         };
-        let candidates = Self::candidates_from_composing_text(response.composing_text)?;
+        let mut candidates = Self::candidates_from_composing_text(response.composing_text)?;
+        candidates.canonical_raw_input = response.raw_input;
         self.log_client_performance_from_start(
             performance_start,
             request_id,
@@ -3061,6 +3138,7 @@ mod tests {
             hiragana: "す".into(),
             corresponding_count: vec![2],
             candidate_ids: vec![7],
+            canonical_raw_input: None,
         };
         for direct in [false, true] {
             let actual = if direct {
@@ -3146,6 +3224,13 @@ mod tests {
                 .map(|operation| operation.text.as_str())
             {
                 Some("na") => "な",
+                Some("kana")
+                    if request.operations.iter().any(|operation| {
+                        operation.kind == shared::proto::CompositionOperationKind::Shrink as i32
+                    }) =>
+                {
+                    "な"
+                }
                 Some("kana") => "かな",
                 _ => "",
             };
@@ -3162,6 +3247,7 @@ mod tests {
                 Ok(tonic::Response::new(ReplaceCompositionResponse {
                     composing_text: Some(probe_composing_text(reading)),
                     server_session_id: 7,
+                    raw_input: None,
                 }))
             })
         }
@@ -3282,6 +3368,7 @@ mod tests {
                         probe_composing_text("なk")
                     }),
                     server_session_id: 7,
+                    raw_input: None,
                 }))
             })
         }
@@ -3662,6 +3749,40 @@ mod tests {
     }
 
     #[test]
+    fn mixed_input_recovery_keeps_literal_fragment_and_snapshot_operations() {
+        let (mut service, probe, server) = recovery_rpc_service();
+        probe.deny.store(false, Ordering::Release);
+        service.record_successful_append("google", INPUT_STYLE_ROMAN2KANA);
+        service.send_advance_clause(3, 0, 1).unwrap();
+        service.record_successful_append("de", INPUT_STYLE_ROMAN2KANA);
+        service
+            .send_update_composition_snapshot(ClauseSnapshotOperation::Pop, 0, 2)
+            .unwrap();
+        let ledger = service.input_ledger_snapshot().0;
+        assert!(ledger.complete);
+        service.send_replace_composition(&ledger, 3).unwrap();
+        let requests = probe.requests.lock().unwrap();
+        let operations = &requests[0].operations;
+        use shared::proto::CompositionOperationKind as Kind;
+        assert_eq!(
+            operations.iter().map(|op| op.kind).collect::<Vec<_>>(),
+            [
+                Kind::Append as i32,
+                Kind::SnapshotPush as i32,
+                Kind::Shrink as i32,
+                Kind::Append as i32,
+                Kind::SnapshotPop as i32,
+            ]
+        );
+        assert_eq!(operations[0].text, "google");
+        assert_eq!(operations[2].cursor_offset, 3);
+        assert_eq!(operations[3].text, "de");
+        // Rebuilding from only the remaining `gle` would lose its literal style.
+        assert!(!operations.iter().any(|op| op.text == "gle"));
+        server.abort();
+    }
+
+    #[test]
     fn successful_clause_edits_then_unavailable_transport_recover_and_continue_input() {
         for boundary_adjustment in [false, true] {
             let (mut service, probe, server) = recovery_rpc_service();
@@ -3679,10 +3800,10 @@ mod tests {
                 ("na", "な")
             };
             let before = service.input_ledger_snapshot().0;
-            assert!(!before.complete);
+            assert!(before.complete);
 
             // A live owner's denial must never request fallback/restart even
-            // when a preceding successful clause edit left the ledger incomplete.
+            // after a preceding successful clause edit.
             probe.deny.store(true, Ordering::Release);
             let denied = service.append_text("k".into()).unwrap_err();
             assert!(is_ipc_permission_denied(&denied));
@@ -3696,6 +3817,8 @@ mod tests {
             assert!(service.recovery_pending());
             assert!(!service.recovery_restart_ready());
             assert_eq!(service.input_ledger_snapshot().0, before);
+            // Reconcile clause caches explicitly: old learning IDs do not
+            // survive reconstruction, even though raw/style history is complete.
             assert!(probe.requests.lock().unwrap().is_empty());
 
             service.complete_restart_for_test();
@@ -3707,10 +3830,21 @@ mod tests {
             assert!(!service.recovery_pending());
             let ledger = service.input_ledger_snapshot().0;
             assert!(ledger.complete);
-            assert_eq!(ledger, fallback_input_ledger(raw_input, reading));
+            assert_eq!(
+                &ledger.operations[..before.operations.len()],
+                &before.operations
+            );
+            assert_eq!(
+                ledger.operations[before.operations.len()],
+                CompositionOperation::Snapshot(ClauseSnapshotOperation::Clear)
+            );
+            assert_eq!(
+                ledger.operations.last(),
+                Some(&CompositionOperation::MoveCursor(i32::MAX))
+            );
             let requests = probe.requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
-            assert_eq!(requests[0].operations[0].text, raw_input);
+            assert_eq!(requests[0].operations[0].text, "kana");
             assert_eq!(
                 requests[0].operations[0].input_style,
                 INPUT_STYLE_ROMAN2KANA
@@ -3724,9 +3858,9 @@ mod tests {
                 .is_empty_composition());
             let ledger = service.input_ledger_snapshot().0;
             assert!(ledger.complete);
-            assert_eq!(ledger.operations.len(), 2);
+            assert_eq!(ledger.operations.len(), before.operations.len() + 3);
             assert_eq!(
-                ledger.operations[1],
+                *ledger.operations.last().unwrap(),
                 CompositionOperation::Append {
                     text: "k".into(),
                     input_style: INPUT_STYLE_ROMAN2KANA,
@@ -4053,6 +4187,7 @@ mod tests {
             hiragana: "いいかげんとういつ".to_string(),
             corresponding_count: vec![7],
             candidate_ids: vec![1],
+            canonical_raw_input: None,
         };
         let refreshed = Candidates {
             candidate_ids: vec![2],
@@ -4073,6 +4208,7 @@ mod tests {
             hiragana: "いいかげんとういつ".to_string(),
             corresponding_count: vec![7],
             candidate_ids: vec![1],
+            canonical_raw_input: None,
         };
 
         assert!(
@@ -4091,6 +4227,7 @@ mod tests {
             hiragana: "か".to_string(),
             corresponding_count: vec![1],
             candidate_ids: vec![1],
+            canonical_raw_input: None,
         };
 
         let attempt =

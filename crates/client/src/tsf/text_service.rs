@@ -153,6 +153,11 @@ pub struct TextService {
     // (virtual key, selection was non-empty). A matched empty Space skips a
     // second selection edit session in OnKeyDown and follows the normal path.
     pub reconversion_test_result: Option<(usize, bool)>,
+    pub(crate) native_dispatch: std::rc::Rc<super::native_replay::NativeDispatch>,
+    pub(crate) native_replay: Option<super::native_replay::NativeReplay>,
+    pub(crate) native_preview_commit_generation: u64,
+    #[cfg(test)]
+    pub(crate) native_replay_creation_failure_for_test: bool,
 }
 
 impl TextService {

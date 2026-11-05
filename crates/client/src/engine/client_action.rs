@@ -10,6 +10,14 @@ pub enum ClientAction {
     AppendText(String),
     AppendTextRaw(String),
     AppendTextDirect(String),
+    /// Commit the rendered preview by moving the live TSF start boundary,
+    /// after preparing the following input. Do not end/start within one key.
+    CommitPreviewAndAppend {
+        committed: String,
+        text: String,
+        kind: PreviewInputKind,
+        temporary_latin: bool,
+    },
     CommitTextDirect(String),
     RestoreReconversionOriginal,
     RemoveText,
@@ -35,6 +43,13 @@ pub enum ClientAction {
     SetTemporaryLatinShiftPending(bool),
 
     SetIMEMode(InputMode),
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PreviewInputKind {
+    Romaji,
+    Raw,
+    Direct,
 }
 
 #[derive(Clone, Debug, PartialEq)]

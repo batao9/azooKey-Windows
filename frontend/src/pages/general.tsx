@@ -36,6 +36,9 @@ type GeneralConfigState = {
     live_conversion_reading_vertical_adjustment: number;
     jev_conversion: boolean;
     experimental_typo_correction: boolean;
+    experimental_mixed_input: boolean;
+    english_dictionary: boolean;
+    katakana_english_dictionary: boolean;
 };
 type CharacterWidthGroupsState = Record<
     "alphabet" | "number" | "bracket" | "comma_period" | "middle_dot_corner_bracket" |
@@ -57,6 +60,9 @@ const DEFAULT_GENERAL_CONFIG: GeneralConfigState = {
     live_conversion_reading_vertical_adjustment: 4,
     jev_conversion: false,
     experimental_typo_correction: false,
+    experimental_mixed_input: false,
+    english_dictionary: true,
+    katakana_english_dictionary: true,
 };
 const LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MIN = -12;
 const LIVE_CONVERSION_READING_VERTICAL_ADJUSTMENT_MAX = 12;
@@ -156,6 +162,7 @@ export const General = ({ page }: { page: "input" | "conversion" | "keys" | "adv
         reconversionKey: "win_slash" as ReconversionKey,
     });
     const [generalValue, setGeneralValue] = useState(DEFAULT_GENERAL_CONFIG);
+    const [dictionarySaving, setDictionarySaving] = useState(false);
     const [widthGroups, setWidthGroups] = useState(DEFAULT_WIDTH_GROUPS);
     const [learningMode, setLearningMode] = useState<LearningMode>("enabled");
     const [romajiRows, setRomajiRows] = useState<RomajiRow[]>([]);
@@ -204,6 +211,12 @@ export const General = ({ page }: { page: "input" | "conversion" | "keys" | "adv
             config.general[key] = nextValue;
         });
         if (data) setGeneralValue(normalizeGeneralConfig(data.general));
+    };
+    const updateDictionaryConfig = async (key: "english_dictionary" | "katakana_english_dictionary", value: boolean) => {
+        if (dictionarySaving) return;
+        setDictionarySaving(true);
+        try { await updateGeneralConfig(key, value); }
+        finally { setDictionarySaving(false); }
     };
     const updateShortcut = async (key: string, nextValue: boolean | ReconversionKey) => {
         const data = await saveConfigWithToast((config) => {
@@ -339,6 +352,14 @@ export const General = ({ page }: { page: "input" | "conversion" | "keys" | "adv
             </>}
             {page === "conversion" && <>
                 <Zenzai />
+                <SettingsSection title="組み込み辞書">
+                    <SettingsRow label="英単語辞書" htmlFor="english-dictionary">
+                        <Switch id="english-dictionary" disabled={dictionarySaving} checked={generalValue.english_dictionary} onCheckedChange={(value) => void updateDictionaryConfig("english_dictionary", value)} />
+                    </SettingsRow>
+                    <SettingsRow label="カタカナ英語辞書" htmlFor="katakana-english-dictionary">
+                        <Switch id="katakana-english-dictionary" disabled={dictionarySaving} checked={generalValue.katakana_english_dictionary} onCheckedChange={(value) => void updateDictionaryConfig("katakana_english_dictionary", value)} />
+                    </SettingsRow>
+                </SettingsSection>
                 <SettingsSection title="確定">
                     <SettingsRow label="記号入力で変換を確定" htmlFor="punctuation-commit">
                         <Switch id="punctuation-commit" checked={generalValue.punctuation_commit} onCheckedChange={(value) => void updateGeneralConfig("punctuation_commit", value)} />
@@ -440,6 +461,9 @@ export const General = ({ page }: { page: "input" | "conversion" | "keys" | "adv
             </>}
             {page === "advanced" && <>
                 <SettingsSection title="実験的機能">
+                    <SettingsRow label="英単語の混在変換" description="google・github などの英単語を、日本語入力中も英字のまま残します。" htmlFor="mixed-input">
+                        <Switch id="mixed-input" checked={generalValue.experimental_mixed_input} onCheckedChange={(value) => void updateGeneralConfig("experimental_mixed_input", value)} />
+                    </SettingsRow>
                     <SettingsRow label="誤入力の補正" description="意図しない変換結果になる場合があります。" htmlFor="typo-correction">
                         <Switch id="typo-correction" checked={generalValue.experimental_typo_correction} onCheckedChange={(value) => void updateGeneralConfig("experimental_typo_correction", value)} />
                     </SettingsRow>

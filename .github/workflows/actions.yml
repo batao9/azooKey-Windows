@@ -118,6 +118,9 @@ jobs:
     - name: Test reverse dictionary generator
       run: node --test scripts/generate-reverse-dictionary.test.mjs
 
+    - name: Test English dictionary generator
+      run: node --test scripts/generate-english-dictionary.test.mjs
+
   windows-tests:
     name: Windows Rust and Swift tests
     runs-on: windows-2022
@@ -199,8 +202,42 @@ jobs:
       shell: pwsh
       run: Copy-Item "llama_cpu\llama.lib" -Destination "server-swift\" -Force
 
-    - name: Run all Swift tests in parallel
-      run: swift test --package-path server-swift -c release --verbose -Xcc -D_CRT_USE_C_COMPLEX_H -Xcxx -D_CRT_USE_C_COMPLEX_H
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    - name: Generate indexed English dictionaries for Swift tests
+      shell: pwsh
+      run: |
+        # Rust's target cache can retain partial non-Cargo outputs without their
+        # generation marker. Regenerate this owned build tree from source.
+        if (Test-Path -LiteralPath "target/azookey-english-dictionary") {
+          Remove-Item -LiteralPath "target/azookey-english-dictionary" -Recurse -Force
+        }
+        node scripts/generate-english-dictionary.mjs
+
+    - name: Build and run all Swift tests
+      shell: pwsh
+      run: |
+        swift build --package-path server-swift --build-tests -c release --verbose -Xswiftc -enable-testing -Xcc -D_CRT_USE_C_COMPLEX_H -Xcxx -D_CRT_USE_C_COMPLEX_H
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        # Use the same explicit Windows runner as the verified VM test helper.
+        # A successful SwiftPM process alone is not evidence of test execution.
+        $releaseDir = (Resolve-Path "server-swift/.build/x86_64-unknown-windows-msvc/release").Path
+        $bundles = @(Get-ChildItem -LiteralPath $releaseDir -Filter "*.xctest" -File)
+        if ($bundles.Count -ne 1) { throw "Expected exactly one Swift test bundle" }
+        $runner = [IO.Path]::ChangeExtension($bundles[0].FullName, ".exe")
+        Copy-Item -LiteralPath $bundles[0].FullName -Destination $runner -Force
+        $env:Path = $releaseDir + ";" + (Resolve-Path "llama_cpu").Path + ";" + $env:Path
+        Push-Location $releaseDir
+        try {
+          & $runner --testing-library swift-testing 2>&1 | Tee-Object -Variable testOutput
+          $testExit = $LASTEXITCODE
+        } finally { Pop-Location }
+        if ($testExit -ne 0) { exit $testExit }
+        if (($testOutput -join "`n") -notmatch 'Test run with [1-9][0-9]* tests? passed') {
+          throw "Swift runner exited without a nonempty successful test summary"
+        }
 
     - name: Prepare Rust linker input
       shell: pwsh
@@ -321,7 +358,13 @@ jobs:
       run: npm ci --prefer-offline --no-audit
 
     - name: Build
-      run: cargo make build --release
+      shell: pwsh
+      run: |
+        # Do not reuse dictionary fragments restored by the Cargo target cache.
+        if (Test-Path -LiteralPath "target/azookey-english-dictionary") {
+          Remove-Item -LiteralPath "target/azookey-english-dictionary" -Recurse -Force
+        }
+        cargo make build --release
 
     - name: Verify installer metadata
       shell: pwsh
