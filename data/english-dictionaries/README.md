@@ -12,6 +12,10 @@ The exact revisions, SHA256s, counts and ESDB extraction command are in
 `sources.json`. Redistribution notices are in `NOTICE.txt`, copied into the
 installed immutable dictionary as `English-NOTICE.txt`.
 
+The checksummed TSV inputs use canonical UTF-8/LF bytes. Local Git attributes
+retain LF even with Windows `core.autocrlf=true`, and the importer explicitly
+writes LF on every platform. Checksums validate those exact bytes.
+
 ## Regeneration
 
 Use the exact ESDB revision from `sources.json` and run its `make` first. Obtain

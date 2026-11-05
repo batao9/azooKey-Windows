@@ -81,8 +81,8 @@ def main():
     kana_text = '# reading\tword\tsource\n' + ''.join(
         f'{r}\t{w}\t{"project" if (r, w) in supplements else "unidic"}\n' for r, w in sorted(pairs))
     english_text = '# spelling\tsource\n' + ''.join(f'{w}\t{s}\n' for w, s in sorted(english.items()))
-    (output / 'katakana.tsv').write_text(kana_text, encoding='utf-8')
-    (output / 'spelling.tsv').write_text(english_text, encoding='utf-8')
+    (output / 'katakana.tsv').write_text(kana_text, encoding='utf-8', newline='\n')
+    (output / 'spelling.tsv').write_text(english_text, encoding='utf-8', newline='\n')
     notice_text = '\n'.join(line.rstrip() for line in '\n'.join(notices).splitlines())
     (output / 'NOTICE.txt').write_text(notice_text.rstrip() + '\n', encoding='utf-8')
     manifest = {'esdb_revision': ESDB_REV, 'esdb_command': './scowl word-list 50 A 1 --categories= --wo-poses=abbr',
