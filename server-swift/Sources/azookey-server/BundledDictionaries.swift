@@ -210,7 +210,7 @@ public func run_dictionary_model_preparation(job: UnsafeMutableRawPointer) -> In
     pendingBundledDictionaryConfiguration = nil
     let job = DictionaryPreparationJob(mode: mode, base: converterBaseDictionaryURL,
         preload: converterPreloadDictionary, userEntries: userEntries, conversionEntries: conversionEntries,
-        options: warmupOptions, expectedModelStatus: "load \(execURL.appendingPathComponent("zenz.gguf").absoluteString)")
+        options: warmupOptions, expectedModelStatus: "load \(currentZenzaiModelURL().absoluteString)")
     let current = InFlightDictionaryPreparation(job: job)
     preparation = current
     if prepareAsynchronously || warmupOptions != nil {

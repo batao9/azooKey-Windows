@@ -71,7 +71,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_DIR="$REPO_ROOT/.local/logs"
 SWIFT_VENDOR_CACHE_DIR="${SWIFT_VENDOR_CACHE_DIR:-$REPO_ROOT/.local/cache/AzooKeyKanaKanjiConverter}"
 SWIFT_VENDOR_REPO_URL="${SWIFT_VENDOR_REPO_URL:-https://github.com/batao9/AzooKeyKanaKanjiConverter}"
-SWIFT_VENDOR_REVISION="${SWIFT_VENDOR_REVISION:-c228776b0b869f81ee2a1031ff9dbd679f4b3cd9}"
+SWIFT_VENDOR_REVISION="${SWIFT_VENDOR_REVISION:-22b05e31030a981975e89006bc2ad06241f8f264}"
 mkdir -p "$LOG_DIR"
 
 DEFAULT_GATEWAY_IP="$(ip route | awk '/default/ {print $3; exit}' || true)"
@@ -460,6 +460,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Preserve Japanese candidate evidence when PowerShell writes to SSH stdout.
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class VmClientTestAwake { [DllImport("kernel32.dll", SetLastError=true)] public static extern uint SetThreadExecutionState(uint flags); }'
 if ([VmClientTestAwake]::SetThreadExecutionState([uint32]2147483649) -eq 0) { throw "Failed to keep the test thread awake" }
 try {
@@ -876,7 +878,72 @@ if (![string]::IsNullOrWhiteSpace($SwiftTestFilter) -and $SwiftTestFilter -ne "s
   swift build --build-tests -c release --jobs $SwiftTestJobs --verbose -Xswiftc -enable-testing -Xcc -D_CRT_USE_C_COMPLEX_H
   if ($LASTEXITCODE -ne 0) { throw "Swift test compilation failed: $LASTEXITCODE" }
   $env:AZOOKEY_DICTIONARY_MODEL_OUTPUT = Join-Path $SourceDir 'dictionary-model-switch.json'
-  Invoke-SwiftPackageTests -SwiftSourceDir $swiftSourceDir -TestFilter $SwiftTestFilter -Iterations $SwiftTestIterations
+  if ($SwiftTestFilter -eq 'rightContextEvaluation') {
+    $model = Join-Path $SourceDir 'zenz-v3.2-small.gguf'
+    & curl.exe --fail --location --connect-timeout 15 --max-time 120 --output $model 'https://huggingface.co/Miwa-Keita/zenz-v3.2-small-gguf/resolve/c67e03e07d215c869f591b274c1631170d3e11fe/ggml-model-Q5_K_M.gguf'
+    if ($LASTEXITCODE -ne 0) { throw "v3.2-small download failed: $LASTEXITCODE" }
+    $hash = (Get-FileHash -LiteralPath $model -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($hash -ne '29c223d4c23327b80fd13ebb5ab2555057a46317997d5da391584ffbef0db673') { throw 'v3.2-small SHA256 mismatch' }
+    Write-Host "RIGHT_CONTEXT_MODEL revision=c67e03e07d215c869f591b274c1631170d3e11fe sha256=$hash"
+    $savedModel = $env:AZOOKEY_ZENZAI_TEST_MODEL
+    try {
+      $env:AZOOKEY_ZENZAI_TEST_MODEL = $model
+      foreach ($run in @(0, 1)) {
+        $env:AZOOKEY_ZENZ_RIGHT_EVALUATION_OUTPUT = Join-Path $SourceDir "right-context-$run.json"
+        $env:AZOOKEY_ZENZ_RIGHT_EVALUATION_REVERSE = [string]$run
+        Invoke-SwiftPackageTests -SwiftSourceDir $swiftSourceDir -TestFilter 'rightContext' -Iterations 1
+        if (!(Test-Path -LiteralPath $env:AZOOKEY_ZENZ_RIGHT_EVALUATION_OUTPUT)) { throw 'Missing right-context evidence' }
+        Write-Host ('RIGHT_CONTEXT_EVALUATION ' + [IO.File]::ReadAllText($env:AZOOKEY_ZENZ_RIGHT_EVALUATION_OUTPUT))
+      }
+    } finally {
+      $env:AZOOKEY_ZENZAI_TEST_MODEL = $savedModel
+      Remove-Item Env:AZOOKEY_ZENZ_RIGHT_EVALUATION_OUTPUT -ErrorAction SilentlyContinue
+      Remove-Item Env:AZOOKEY_ZENZ_RIGHT_EVALUATION_REVERSE -ErrorAction SilentlyContinue
+    }
+    if ($SingleDictionary -eq '0') {
+      Invoke-SwiftPackageTests -SwiftSourceDir $swiftSourceDir -TestFilter 'all' -Iterations 1
+    } else {
+      Write-Host 'Full Swift suite requires all four dictionary variants; run separately without SWIFT_TEST_SINGLE_DICTIONARY=1'
+    }
+  } elseif ($SwiftTestFilter -eq 'zenzModelEvaluation') {
+    # Opt-in research only: keep distribution URLs/runtime unchanged. Every
+    # measurement launches a fresh process, in forward then reverse order.
+    $models = @(
+      @('v3-small', 'zenz-v3-small-gguf', 'd48369e21adb9f49903eb7c54be1a1d9723eb805', '501f605d088f5b988791a00ae19ed46985ed7c48144f364b2f3f1f951c9b2083'),
+      @('v3.2-small', 'zenz-v3.2-small-gguf', 'c67e03e07d215c869f591b274c1631170d3e11fe', '29c223d4c23327b80fd13ebb5ab2555057a46317997d5da391584ffbef0db673'),
+      @('v3.2-xsmall', 'zenz-v3.2-xsmall-gguf', '4f5423f0fad41a73b1242eb96fe5c12ae4fdca83', '00c64b3d318045a708d0cad5434faccab10f5481a49e6362864551fd0995fa58')
+    )
+    $savedModel = $env:AZOOKEY_ZENZAI_TEST_MODEL
+    try {
+      foreach ($model in $models) {
+        $path = Join-Path $SourceDir ($model[0] + '.gguf')
+        Write-Host "preparing Zenz evaluation model $($model[0]) revision=$($model[2])"
+        if ($model[0] -eq 'v3-small' -and $savedModel) {
+          Copy-Item -LiteralPath $savedModel -Destination $path
+        } else {
+          & curl.exe --fail --location --connect-timeout 15 --max-time 120 --output $path "https://huggingface.co/Miwa-Keita/$($model[1])/resolve/$($model[2])/ggml-model-Q5_K_M.gguf"
+          if ($LASTEXITCODE -ne 0) { throw "Zenz model download failed: $LASTEXITCODE" }
+        }
+        $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($hash -ne $model[3]) { throw "Zenz model SHA256 mismatch: $($model[0])" }
+        Write-Host "ZENZ_MODEL_ID name=$($model[0]) revision=$($model[2]) sha256=$hash bytes=$((Get-Item -LiteralPath $path).Length)"
+      }
+      $run = 0
+      foreach ($index in @(0, 1, 2, 2, 1, 0)) {
+        $env:AZOOKEY_ZENZAI_TEST_MODEL = Join-Path $SourceDir ($models[$index][0] + '.gguf')
+        $env:AZOOKEY_ZENZ_EVALUATION_OUTPUT = Join-Path $SourceDir "zenz-evaluation-$run.json"
+        Invoke-SwiftPackageTests -SwiftSourceDir $swiftSourceDir -TestFilter $SwiftTestFilter -Iterations 1
+        if (!(Test-Path -LiteralPath $env:AZOOKEY_ZENZ_EVALUATION_OUTPUT)) { throw 'Missing Zenz evaluation evidence' }
+        Write-Host ('ZENZ_MODEL_EVALUATION ' + [IO.File]::ReadAllText($env:AZOOKEY_ZENZ_EVALUATION_OUTPUT))
+        $run++
+      }
+    } finally {
+      $env:AZOOKEY_ZENZAI_TEST_MODEL = $savedModel
+      Remove-Item Env:AZOOKEY_ZENZ_EVALUATION_OUTPUT -ErrorAction SilentlyContinue
+    }
+  } else {
+    Invoke-SwiftPackageTests -SwiftSourceDir $swiftSourceDir -TestFilter $SwiftTestFilter -Iterations $SwiftTestIterations
+  }
   if (Test-Path $env:AZOOKEY_DICTIONARY_MODEL_OUTPUT) {
     Write-Host ('ENGLISH_DICTIONARY_MODEL_SWITCH_JSON ' + [IO.File]::ReadAllText($env:AZOOKEY_DICTIONARY_MODEL_OUTPUT))
   }

@@ -267,6 +267,23 @@ impl TextServiceFactory {
         Ok(())
     }
 
+    pub(crate) fn context_input_scope_allows_text(
+        context: &ITfContext,
+        cookie: u32,
+        range: &ITfRange,
+    ) -> Result<bool> {
+        if keyboard_disabled_from_context(context) {
+            return Ok(false);
+        }
+        unsafe {
+            input_scope_allows_remote_scoring(
+                &context
+                    .GetAppProperty(&GUID_PROP_INPUTSCOPE)?
+                    .GetValue(cookie, range)?,
+            )
+        }
+    }
+
     pub(crate) fn jev_context_range_allows_remote_scoring(
         context: &ITfContext,
         cookie: u32,
@@ -609,6 +626,8 @@ mod tests {
 
     fn candidates() -> Candidates {
         Candidates {
+            context_epoch: 0,
+            explicit_selection: None,
             texts: vec!["記者", "汽車", "記者", "木"]
                 .into_iter()
                 .map(str::to_owned)
