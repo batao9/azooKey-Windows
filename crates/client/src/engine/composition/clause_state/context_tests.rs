@@ -338,3 +338,55 @@ fn script_choice_after_candidate_selection_survives_context_refresh_and_navigati
         }
     }
 }
+
+#[test]
+fn reconversion_selection_keeps_merged_reading_candidates_without_context_or_backend_refresh() {
+    use crate::engine::client_action::ClientAction;
+    let action = ClientAction::SetSelection(SetSelectionType::Down);
+    assert!(!TextServiceFactory::action_needs_context_update(
+        &action, true
+    ));
+    assert!(TextServiceFactory::action_needs_context_update(
+        &action, false
+    ));
+    let merged = Candidates {
+        context_epoch: 1,
+        texts: vec!["生".into(), "性".into(), "なま".into()],
+        sub_texts: vec!["".into(); 3],
+        corresponding_count: vec![2; 3],
+        candidate_ids: vec![11, 12, 13],
+        hiragana: "せい".into(),
+        ..Candidates::default()
+    };
+    let mut composition = Composition {
+        reconversion_original: Some("生".into()),
+        preview: "生".into(),
+        raw_input: "せい".into(),
+        raw_hiragana: "せい".into(),
+        corresponding_count: 2,
+        candidates: merged.clone(),
+        ..Composition::default()
+    };
+    // The backend has a newer epoch, but no backend call is valid for a merged
+    // reconversion list: each method panics if selection tries to regenerate it.
+    let mut backend = ContextBackend {
+        popped: false,
+        refreshes: 0,
+    };
+    for expected in ["性", "なま"] {
+        let effect = ClauseState::transition_selection(
+            &mut state(&mut composition),
+            &SetSelectionType::Down,
+            true,
+            &mut backend,
+        )
+        .unwrap()
+        .effect;
+        assert!(effect.applied && !effect.update_pos);
+        assert_eq!(composition.preview, expected);
+        assert_eq!(composition.candidates.texts, merged.texts);
+        assert_eq!(composition.candidates.candidate_ids, merged.candidate_ids);
+        assert_eq!(composition.raw_input, "せい");
+    }
+    assert_eq!(backend.refreshes, 0);
+}

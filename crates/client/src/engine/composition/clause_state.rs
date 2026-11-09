@@ -652,7 +652,27 @@ impl ClauseState {
         Ok(true)
     }
 
-    #[cfg(test)]
+    pub(crate) fn transition_selection<B: ClauseActionBackend>(
+        state: &mut ClauseActionStateMut<'_>,
+        selection: &SetSelectionType,
+        reconverting: bool,
+        backend: &mut B,
+    ) -> Result<ClauseTransition> {
+        if reconverting {
+            Ok(Self::transition_without_backend(
+                state,
+                ClauseCommand::SetSelection(selection),
+            ))
+        } else {
+            Self::transition_with_backend(
+                state,
+                ClauseCommand::SetSelection(selection),
+                ClauseTransitionInput::default(),
+                backend,
+            )
+        }
+    }
+
     pub(crate) fn transition_without_backend(
         state: &mut ClauseActionStateMut<'_>,
         command: ClauseCommand<'_>,

@@ -2216,21 +2216,28 @@ impl TextServiceFactory {
         ipc_service: &mut IPCService,
         reading: Option<&str>,
         reading_vertical_adjustment: Option<i32>,
+        replace_candidates: bool,
     ) -> Result<()> {
+        if replace_candidates {
+            self.borrow_mut()?.candidate_window_sync_state.invalidate();
+        }
         let scope = self.candidate_window_request_scope()?;
         self.set_text(preview, suffix)?;
         if !self.candidate_window_request_is_current(scope) {
             return Ok(());
         }
         let revision = self.borrow()?.candidate_window_sync_state.revision;
+        let (update, kind) = CandidateWindowUpdate::for_selection(
+            &candidates.texts,
+            selection_index,
+            reading,
+            reading_vertical_adjustment,
+            revision,
+            replace_candidates,
+        );
         let delivery = ipc_service.update_candidate_window_scoped(
-            CandidateWindowUpdate {
-                selected_index: Some(selection_index),
-                reading,
-                reading_vertical_adjustment,
-                ..Default::default()
-            },
-            CandidateWindowUpdateKind::Selection(revision),
+            update,
+            kind,
             || self.candidate_window_request_is_current(scope),
             || {
                 if !self.candidate_window_request_is_current(scope) {
@@ -2583,7 +2590,12 @@ impl TextServiceFactory {
     }
 
     #[inline]
-    fn action_needs_context_update(action: &ClientAction) -> bool {
+    fn action_needs_context_update(action: &ClientAction, reconverting: bool) -> bool {
+        // A reconversion snapshot merges multiple inferred readings. Selection
+        // must not replace it with a neural refresh of only the active reading.
+        if reconverting && matches!(action, ClientAction::SetSelection(_)) {
+            return false;
+        }
         matches!(
             action,
             ClientAction::AppendText(_)
@@ -7563,7 +7575,7 @@ impl TextServiceFactory {
                 failed_ledger_snapshot = Some(ipc_service.input_ledger_snapshot());
                 transition = deferred.transition.clone();
                 let action = &deferred.action;
-                if Self::action_needs_context_update(action) {
+                if Self::action_needs_context_update(action, reconversion_original.is_some()) {
                     IMEState::set_ipc_service(ipc_service.clone())?;
                     self.update_context(&format!("{preview}{suffix}"))?;
                     ipc_service = IMEState::ipc_service()?.context("ipc_service is None")?;
@@ -8809,10 +8821,10 @@ impl TextServiceFactory {
                                 &mut current_clause_remainder_origin,
                                 &mut next_split_group_id,
                             );
-                            let transition = ClauseState::transition_with_backend(
+                            let transition = ClauseState::transition_selection(
                                 &mut state,
-                                ClauseCommand::SetSelection(selection),
-                                ClauseTransitionInput::default(),
+                                selection,
+                                reconversion_original.is_some(),
                                 &mut ipc_service,
                             )?;
                             let effect = transition.effect;
@@ -8837,6 +8849,7 @@ impl TextServiceFactory {
                                     &candidates,
                                     &transition,
                                 ),
+                                effect.update_pos,
                             )?;
                             Self::log_clause_action_state(
                                 "after",
