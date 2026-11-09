@@ -15,6 +15,9 @@ use crate::engine::{
 };
 use crate::trace::diagnostic_log_lazy;
 
+#[cfg(test)]
+mod context_tests;
+
 #[derive(Debug, Clone)]
 pub(crate) struct CandidateSelection {
     pub(crate) index: i32,
@@ -59,6 +62,12 @@ impl ClauseBoundaryAdjustment {
 }
 
 pub(crate) trait ClauseActionBackend {
+    fn context_epoch(&self) -> u64 {
+        0
+    }
+    fn refresh_context_candidates(&mut self, _input_count: i32) -> Result<Candidates> {
+        self.move_cursor(0)
+    }
     fn move_cursor(&mut self, offset: i32) -> Result<Candidates>;
     fn shrink_text(&mut self, offset: i32) -> Result<Candidates>;
 
@@ -208,6 +217,12 @@ pub(crate) trait ClauseActionBackend {
 }
 
 impl ClauseActionBackend for IPCService {
+    fn context_epoch(&self) -> u64 {
+        self.candidate_context_epoch()
+    }
+    fn refresh_context_candidates(&mut self, input_count: i32) -> Result<Candidates> {
+        IPCService::refresh_context_candidates(self, input_count)
+    }
     fn move_cursor(&mut self, offset: i32) -> Result<Candidates> {
         IPCService::move_cursor(self, offset)
     }
@@ -505,7 +520,8 @@ impl ClauseState {
         backend: &mut B,
     ) -> Result<ClauseTransition> {
         let candidates = input.candidates;
-        let effect = match command {
+        let refreshed_before = Self::refresh_context_candidates(state, backend)?;
+        let mut effect = match command {
             ClauseCommand::StartClauseNavigation => Self::ensure_clause_navigation_ready(
                 state,
                 backend,
@@ -528,9 +544,115 @@ impl ClauseState {
             | ClauseCommand::CommitCurrentAndMoveNext
             | ClauseCommand::CommitFirst => ClauseActionEffect::skipped(),
         };
+        let refreshed_after = Self::refresh_context_candidates(state, backend)?;
+        if refreshed_before || refreshed_after {
+            effect.applied = true;
+            effect.update_pos = true;
+        }
         Ok(ClauseTransition { effect })
     }
 
+    fn refresh_context_candidates<B: ClauseActionBackend>(
+        state: &mut ClauseActionStateMut<'_>,
+        backend: &mut B,
+    ) -> Result<bool> {
+        if state.candidates.texts.is_empty()
+            || state.candidates.context_epoch == backend.context_epoch()
+        {
+            return Ok(false);
+        }
+        let previous =
+            TextServiceFactory::select_candidate(state.candidates, *state.selection_index);
+        let refreshed = backend.refresh_context_candidates(*state.corresponding_count)?;
+        // Retain the clause geometry. A context refresh changes rankings, not
+        // canonical input or user-adjusted boundaries.
+        let indices: Vec<_> = refreshed
+            .corresponding_count
+            .iter()
+            .enumerate()
+            .filter_map(|(index, count)| (*count == *state.corresponding_count).then_some(index))
+            .collect();
+        if indices.is_empty() {
+            return Err(tonic::Status::failed_precondition(
+                "Context refresh did not preserve clause boundary",
+            )
+            .into());
+        }
+        let mut candidates = Candidates {
+            context_epoch: refreshed.context_epoch,
+            hiragana: refreshed.hiragana.clone(),
+            canonical_raw_input: refreshed.canonical_raw_input.clone(),
+            ..Candidates::default()
+        };
+        for index in indices {
+            candidates.texts.push(refreshed.texts[index].clone());
+            candidates.sub_texts.push(state.suffix.clone());
+            candidates
+                .corresponding_count
+                .push(*state.corresponding_count);
+            candidates
+                .candidate_ids
+                .push(refreshed.candidate_ids.get(index).copied().unwrap_or(0));
+        }
+        let explicit = state.candidates.explicit_selection.is_some() || *state.selection_index > 0;
+        let selected_text = state
+            .candidates
+            .explicit_selection
+            .as_ref()
+            .map(|choice| choice.surface.clone())
+            .or_else(|| previous.map(|candidate| candidate.text));
+        if explicit {
+            candidates.explicit_selection =
+                state.candidates.explicit_selection.clone().or_else(|| {
+                    selected_text.clone().map(|surface| {
+                        crate::engine::ipc_service::ExplicitSelection {
+                            surface,
+                            allow_learning: true,
+                        }
+                    })
+                });
+        }
+        let selection = if explicit {
+            if let Some(text) = selected_text.as_ref() {
+                if let Some(index) = candidates
+                    .texts
+                    .iter()
+                    .position(|candidate| candidate == text)
+                {
+                    index
+                } else {
+                    // Keep an explicit user choice, with no stale learning ID.
+                    candidates.texts.push(text.clone());
+                    candidates.sub_texts.push(state.suffix.clone());
+                    candidates
+                        .corresponding_count
+                        .push(*state.corresponding_count);
+                    candidates.candidate_ids.push(0);
+                    candidates.texts.len() - 1
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        *state.preview = TextServiceFactory::merge_preview_with_prefix(
+            state.fixed_prefix,
+            &candidates.texts[selection],
+        );
+        *state.selection_index = selection as i32;
+        if candidates
+            .explicit_selection
+            .as_ref()
+            .is_some_and(|choice| !choice.allow_learning)
+        {
+            candidates.candidate_ids[selection] = 0;
+        }
+        *state.candidates = candidates;
+        Ok(true)
+    }
+
+    #[cfg(test)]
     pub(crate) fn transition_without_backend(
         state: &mut ClauseActionStateMut<'_>,
         command: ClauseCommand<'_>,
@@ -567,11 +689,16 @@ impl ClauseState {
         candidates: Option<Candidates>,
         prepare_future_clauses: bool,
     ) -> Result<ClauseActionEffect> {
+        let refreshed = Self::refresh_context_candidates(state, backend)?;
         if ClauseState::is_clause_navigation_state_active(state)
             || state.candidates.texts.is_empty()
             || state.raw_hiragana.is_empty()
         {
-            return Ok(ClauseActionEffect::skipped());
+            return Ok(if refreshed {
+                ClauseActionEffect::applied(true)
+            } else {
+                ClauseActionEffect::skipped()
+            });
         }
 
         if !state.suffix.is_empty() {
@@ -1330,6 +1457,11 @@ impl ClauseState {
         if let Some(selected) =
             TextServiceFactory::select_candidate(state.candidates, desired_index)
         {
+            state.candidates.explicit_selection =
+                Some(crate::engine::ipc_service::ExplicitSelection {
+                    surface: selected.text.clone(),
+                    allow_learning: true,
+                });
             *state.selection_index = selected.index;
             *state.corresponding_count = selected.corresponding_count;
             *state.preview =

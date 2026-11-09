@@ -1568,6 +1568,8 @@ impl TextServiceFactory {
         corresponding_count: i32,
     ) -> FutureClauseSnapshot {
         let candidates = Candidates {
+            context_epoch: 0,
+            explicit_selection: None,
             texts: vec![clause_preview.to_string()],
             sub_texts: vec![suffix.to_string()],
             hiragana: raw_hiragana.to_string(),
@@ -2590,6 +2592,12 @@ impl TextServiceFactory {
                 | ClientAction::ShrinkText(_)
                 | ClientAction::ShrinkTextRaw(_)
                 | ClientAction::ShrinkTextDirect(_)
+                | ClientAction::RemoveText
+                | ClientAction::MoveCursor(_)
+                | ClientAction::AdjustBoundary(_)
+                | ClientAction::EnsureClauseNavigationReady { .. }
+                | ClientAction::MoveClause(_)
+                | ClientAction::SetSelection(_)
         )
     }
 
@@ -4596,6 +4604,14 @@ impl TextServiceFactory {
         candidates.candidate_ids.fill(0);
     }
 
+    fn remember_explicit_script_choice(candidates: &mut Candidates, surface: &str) {
+        candidates.explicit_selection = Some(crate::engine::ipc_service::ExplicitSelection {
+            surface: surface.to_owned(),
+            allow_learning: false,
+        });
+        Self::clear_current_learning_candidate_ids(candidates);
+    }
+
     fn collect_learning_candidate_ids(
         scope: LearningCommitScope,
         selection_index: i32,
@@ -4677,10 +4693,11 @@ impl TextServiceFactory {
                 .GetInputScopes(&mut scopes_ptr, &mut scope_count)
                 .is_err()
             {
-                return false;
+                CoTaskMemFree(Some(scopes_ptr.cast()));
+                return true;
             }
             if scopes_ptr.is_null() {
-                return false;
+                return scope_count != 0;
             }
 
             let scopes = std::slice::from_raw_parts(scopes_ptr, scope_count as usize);
@@ -4707,16 +4724,21 @@ impl TextServiceFactory {
                         )?;
                     }
                     if fetched == 0 {
-                        return Ok(false);
+                        return Ok(true);
                     }
 
                     let range = match selection[0].range.as_ref() {
                         Some(range) => unsafe { range.Clone()? },
-                        None => return Ok(false),
+                        None => return Ok(true),
                     };
                     let input_scope_property =
                         unsafe { context.GetAppProperty(&GUID_PROP_INPUTSCOPE)? };
                     let value = unsafe { input_scope_property.GetValue(cookie, &range)? };
+                    // A successfully read empty scope is the application's
+                    // default scope, not a failed/unknown scope lookup.
+                    if value.is_empty() {
+                        return Ok(false);
+                    }
                     let unknown = IUnknown::try_from(&value)?;
                     let input_scope = unknown.cast::<ITfInputScope>()?;
                     Ok(Self::input_scope_list_contains_sensitive(&input_scope))
@@ -4736,7 +4758,7 @@ impl TextServiceFactory {
                             ?error,
                             "Skip learning input scope check because context is unavailable"
                         );
-                        return false;
+                        return true;
                     }
                 }
             }
@@ -4745,7 +4767,7 @@ impl TextServiceFactory {
                     ?error,
                     "Skip learning input scope check because text service borrow failed"
                 );
-                return false;
+                return true;
             }
         };
 
@@ -4756,7 +4778,7 @@ impl TextServiceFactory {
                     ?error,
                     "Skip learning input scope check because input scope could not be read"
                 );
-                false
+                true
             }
         }
     }
@@ -7543,7 +7565,7 @@ impl TextServiceFactory {
                 let action = &deferred.action;
                 if Self::action_needs_context_update(action) {
                     IMEState::set_ipc_service(ipc_service.clone())?;
-                    self.update_context(&preview)?;
+                    self.update_context(&format!("{preview}{suffix}"))?;
                     ipc_service = IMEState::ipc_service()?.context("ipc_service is None")?;
                 }
 
@@ -8787,10 +8809,12 @@ impl TextServiceFactory {
                                 &mut current_clause_remainder_origin,
                                 &mut next_split_group_id,
                             );
-                            let transition = ClauseState::transition_without_backend(
+                            let transition = ClauseState::transition_with_backend(
                                 &mut state,
                                 ClauseCommand::SetSelection(selection),
-                            );
+                                ClauseTransitionInput::default(),
+                                &mut ipc_service,
+                            )?;
                             let effect = transition.effect;
                             ClauseState::write_back(state);
                             effect
@@ -9227,7 +9251,7 @@ impl TextServiceFactory {
                         );
 
                         preview = Self::merge_preview_with_prefix(&fixed_prefix, &converted_clause);
-                        Self::clear_current_learning_candidate_ids(&mut candidates);
+                        Self::remember_explicit_script_choice(&mut candidates, &converted_clause);
                         Self::sync_clause_snapshot_suffixes(
                             &mut clause_snapshots,
                             &preview,
@@ -9274,6 +9298,15 @@ impl TextServiceFactory {
 
             Ok(())
         })();
+
+        if result
+            .as_ref()
+            .is_err_and(|error| error.is::<crate::tsf::surrounded_text::SupersededContext>())
+        {
+            // The host already established a newer lifecycle. Do not persist,
+            // replay or run terminal/generic recovery against that composition.
+            return Ok(());
+        }
 
         if result.is_ok() && start_jev && self.begin_jev_conversion().is_err() {
             tracing::debug!("Jev request unavailable; retain KKC candidates");
