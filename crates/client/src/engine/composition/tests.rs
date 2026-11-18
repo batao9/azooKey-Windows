@@ -779,6 +779,8 @@ pub(super) fn candidates(
     corresponding_count: &[i32],
 ) -> Candidates {
     Candidates {
+        context_epoch: 0,
+        explicit_selection: None,
         texts: texts.iter().map(|value| (*value).to_string()).collect(),
         sub_texts: sub_texts.iter().map(|value| (*value).to_string()).collect(),
         hiragana: hiragana.to_string(),

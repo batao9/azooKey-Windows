@@ -397,12 +397,20 @@ fn fallback_input_ledger(raw_input: &str, raw_hiragana: &str) -> InputLedger {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Candidates {
+    pub context_epoch: u64,
+    pub explicit_selection: Option<ExplicitSelection>,
     pub texts: Vec<String>,
     pub sub_texts: Vec<String>,
     pub hiragana: String,
     pub corresponding_count: Vec<i32>,
     pub candidate_ids: Vec<u64>,
     pub canonical_raw_input: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplicitSelection {
+    pub surface: String,
+    pub allow_learning: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -789,10 +797,13 @@ impl IPCService {
 // implement methods to interact with kkc server
 impl IPCService {
     fn candidates_from_composing_text(
+        &self,
         composing_text: Option<shared::proto::ComposingText>,
     ) -> anyhow::Result<Candidates> {
         if let Some(composing_text) = composing_text {
             Ok(Candidates {
+                context_epoch: self.candidate_context_epoch(),
+                explicit_selection: None,
                 texts: composing_text
                     .suggestions
                     .iter()
@@ -1290,7 +1301,7 @@ impl IPCService {
         };
         self.record_successful_remove();
         Ok(TextRemoval {
-            candidates: Self::candidates_from_composing_text(response.composing_text)?,
+            candidates: self.candidates_from_composing_text(response.composing_text)?,
             raw_input,
         })
     }
@@ -1333,7 +1344,7 @@ impl IPCService {
         if !response.applied {
             return Ok(None);
         }
-        let candidates = Self::candidates_from_composing_text(response.composing_text)?;
+        let candidates = self.candidates_from_composing_text(response.composing_text)?;
         self.replace_input_ledger_direct(&candidates.hiragana);
         // This absolute response fully describes the composition on the observed
         // server session, so an older idle-session change must not cancel the new
@@ -1413,7 +1424,7 @@ impl IPCService {
         let response = response.into_inner();
         self.observe_server_session("shrink_text", response.server_session_id);
         self.record_clause_operation(CompositionOperation::Shrink(offset));
-        let mut candidates = Self::candidates_from_composing_text(response.composing_text)?;
+        let mut candidates = self.candidates_from_composing_text(response.composing_text)?;
         candidates.canonical_raw_input = response.raw_input;
         Ok(candidates)
     }
@@ -1443,8 +1454,8 @@ impl IPCService {
             ClauseSnapshotOperation::Push,
         ));
         self.record_clause_operation(CompositionOperation::Shrink(offset));
-        let shrunk = Self::candidates_from_composing_text(response.shrunk_text)?;
-        let navigation = Self::candidates_from_composing_text(response.navigation_text)?;
+        let shrunk = self.candidates_from_composing_text(response.shrunk_text)?;
+        let navigation = self.candidates_from_composing_text(response.navigation_text)?;
         let raw_input = if response.raw_input.is_empty() && !navigation.hiragana.is_empty() {
             super::composition::ClauseAdvanceRawInput::Unavailable
         } else {
@@ -1486,8 +1497,8 @@ impl IPCService {
             .into_iter()
             .map(|advance| {
                 Ok(super::composition::ClauseAdvance {
-                    shrunk: Self::candidates_from_composing_text(advance.shrunk_text)?,
-                    navigation: Self::candidates_from_composing_text(advance.navigation_text)?,
+                    shrunk: self.candidates_from_composing_text(advance.shrunk_text)?,
+                    navigation: self.candidates_from_composing_text(advance.navigation_text)?,
                     raw_input: super::composition::ClauseAdvanceRawInput::Unverified,
                 })
             })
@@ -1511,8 +1522,20 @@ impl IPCService {
     }
 
     fn send_move_cursor(&mut self, offset: i32, request_id: u64) -> anyhow::Result<Candidates> {
-        let mut request =
-            tonic::Request::new(shared::proto::MoveCursorRequest { offset, request_id });
+        self.send_move_cursor_at_boundary(offset, None, request_id)
+    }
+
+    fn send_move_cursor_at_boundary(
+        &mut self,
+        offset: i32,
+        required_input_count: Option<i32>,
+        request_id: u64,
+    ) -> anyhow::Result<Candidates> {
+        let mut request = tonic::Request::new(shared::proto::MoveCursorRequest {
+            offset,
+            request_id,
+            required_input_count,
+        });
         request.set_timeout(INPUT_RPC_DEADLINE);
         let response = Self::block_on_server_rpc(
             self.runtime.as_ref(),
@@ -1524,7 +1547,7 @@ impl IPCService {
         let response = response.into_inner();
         self.observe_server_session("move_cursor", response.server_session_id);
         self.record_successful_move(offset);
-        Self::candidates_from_composing_text(response.composing_text)
+        self.candidates_from_composing_text(response.composing_text)
     }
 
     fn send_adjust_clause_boundary(
@@ -1554,7 +1577,7 @@ impl IPCService {
             return Ok(super::composition::ClauseBoundaryAdjustment::skipped());
         }
 
-        let candidates = Self::candidates_from_composing_text(response.composing_text)?;
+        let candidates = self.candidates_from_composing_text(response.composing_text)?;
         if candidates.texts.is_empty()
             || !candidates
                 .corresponding_count
@@ -1600,10 +1623,16 @@ impl IPCService {
         Ok(())
     }
 
-    fn send_set_context(&mut self, context: &str, request_id: u64) -> anyhow::Result<()> {
+    fn send_set_context(
+        &mut self,
+        context: &str,
+        right_context: &str,
+        request_id: u64,
+    ) -> anyhow::Result<()> {
         let mut request = tonic::Request::new(shared::proto::SetContextRequest {
             context: context.to_string(),
             request_id,
+            right_context: right_context.to_string(),
         });
         request.set_timeout(STATE_RPC_DEADLINE);
         let response = Self::block_on_server_rpc(
@@ -1615,6 +1644,7 @@ impl IPCService {
         )?;
         let response = response.into_inner();
         self.observe_server_session("set_context", response.server_session_id);
+        self.recovery.context_epoch.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -1688,7 +1718,7 @@ impl IPCService {
         if let Ok(mut ledger) = self.recovery.input_ledger.lock() {
             *ledger = input_ledger.clone();
         }
-        let mut candidates = Self::candidates_from_composing_text(response.composing_text)?;
+        let mut candidates = self.candidates_from_composing_text(response.composing_text)?;
         candidates.canonical_raw_input = response.raw_input;
         Ok(candidates)
     }
@@ -1934,7 +1964,7 @@ impl IPCService {
                 send(self).map_err(|error| self.defer_failed_reconnect("append_text", error))?
             }
         };
-        let mut candidates = Self::candidates_from_composing_text(response.composing_text)?;
+        let mut candidates = self.candidates_from_composing_text(response.composing_text)?;
         candidates.canonical_raw_input = response.raw_input;
         self.log_client_performance_from_start(
             performance_start,
@@ -2414,12 +2444,27 @@ impl IPCService {
         result.map(|_| ())
     }
 
-    pub fn set_context(&mut self, context: String) -> anyhow::Result<()> {
+    pub(crate) fn candidate_context_epoch(&self) -> u64 {
+        self.recovery.context_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn refresh_context_candidates(
+        &mut self,
+        input_count: i32,
+    ) -> anyhow::Result<Candidates> {
+        let request_id = current_or_next_request_id();
+        self.run_rpc_with_reconnect("refresh_context_candidates", |this| {
+            this.send_move_cursor_at_boundary(0, Some(input_count), request_id)
+        })
+        .map(|(candidates, _)| candidates)
+    }
+
+    pub fn set_context(&mut self, context: String, right_context: String) -> anyhow::Result<()> {
         let request_id = current_or_next_request_id();
         let performance_start = client_performance_start();
         let context_len = performance_start.map(|_| context.chars().count());
         let result = self.run_rpc_with_reconnect("set_context", |this| {
-            this.send_set_context(&context, request_id)
+            this.send_set_context(&context, &right_context, request_id)
         });
         self.log_client_performance_from_start(
             performance_start,
@@ -3133,6 +3178,8 @@ mod tests {
         service.record_successful_append("su", INPUT_STYLE_ROMAN2KANA);
         let ledger = service.input_ledger_snapshot().0;
         let remaining = Candidates {
+            context_epoch: 0,
+            explicit_selection: None,
             texts: vec!["す".into()],
             sub_texts: vec![String::new()],
             hiragana: "す".into(),
@@ -3912,12 +3959,20 @@ mod tests {
         let mut service = IPCService::recovery_for_test(false);
         let other_clone = service.clone();
         let mut context = crate::tsf::text_service::SurroundingTextContextState::default();
-        context.remember(other_clone.context_cache_key(), "same preceding text");
-        assert!(!context.should_send(service.context_cache_key(), "same preceding text"));
+        context.remember(
+            other_clone.context_cache_key(),
+            "same preceding text",
+            "right",
+        );
+        assert!(!context.should_send(service.context_cache_key(), "same preceding text", "right"));
         // The fake channel cannot succeed; even an ambiguous/failed release
         // must not leave a successful SetContext entry eligible for dedup.
         let _ = service.clear_text();
-        assert!(context.should_send(other_clone.context_cache_key(), "same preceding text"));
+        assert!(context.should_send(
+            other_clone.context_cache_key(),
+            "same preceding text",
+            "right"
+        ));
     }
 
     #[test]
@@ -4182,6 +4237,8 @@ mod tests {
     #[test]
     fn prepare_future_clauses_retry_accepts_unchanged_composition() {
         let candidates = Candidates {
+            context_epoch: 0,
+            explicit_selection: None,
             texts: vec!["いい加減".to_string()],
             sub_texts: vec!["統一".to_string()],
             hiragana: "いいかげんとういつ".to_string(),
@@ -4203,6 +4260,8 @@ mod tests {
     #[test]
     fn prepare_future_clauses_retry_rejects_reset_server_state() {
         let previous = Candidates {
+            context_epoch: 0,
+            explicit_selection: None,
             texts: vec!["いい加減".to_string()],
             sub_texts: vec!["統一".to_string()],
             hiragana: "いいかげんとういつ".to_string(),
@@ -4222,6 +4281,8 @@ mod tests {
     #[test]
     fn non_idempotent_edit_attempt_completes_without_recovery_on_success() {
         let candidates = Candidates {
+            context_epoch: 0,
+            explicit_selection: None,
             texts: vec!["か".to_string()],
             sub_texts: vec![String::new()],
             hiragana: "か".to_string(),

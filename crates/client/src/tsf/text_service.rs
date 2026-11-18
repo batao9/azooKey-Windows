@@ -114,17 +114,35 @@ impl CandidateWindowVisibilityState {
 pub struct SurroundingTextContextState {
     connection_id: Option<(u64, u64)>,
     context: String,
+    right_context: String,
+    pub(crate) generation: u64,
 }
 
 impl SurroundingTextContextState {
-    pub fn should_send(&self, connection_id: (u64, u64), context: &str) -> bool {
-        self.connection_id != Some(connection_id) || self.context != context
+    pub fn should_send(
+        &self,
+        connection_id: (u64, u64),
+        context: &str,
+        right_context: &str,
+    ) -> bool {
+        self.connection_id != Some(connection_id)
+            || self.context != context
+            || self.right_context != right_context
     }
 
-    pub fn remember(&mut self, connection_id: (u64, u64), context: &str) {
+    pub fn remember(&mut self, connection_id: (u64, u64), context: &str, right_context: &str) {
         self.connection_id = Some(connection_id);
         self.context.clear();
         self.context.push_str(context);
+        self.right_context.clear();
+        self.right_context.push_str(right_context);
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.connection_id = None;
+        self.context.clear();
+        self.right_context.clear();
+        self.generation = self.generation.wrapping_add(1);
     }
 }
 
@@ -200,6 +218,7 @@ impl TextService {
     pub(crate) fn invalidate_mode_switch_requests(&mut self) {
         self.advance_mode_switch_generation();
         self.pending_mode_switch = None;
+        self.surrounding_text_context_state.invalidate();
         // These are composition-lifetime boundaries, including reentrant focus
         // loss. Neither late acknowledgements nor repairs may revive old rows.
         self.candidate_window_sync_state.invalidate();
@@ -233,13 +252,18 @@ mod tests {
     fn surrounding_text_context_state_resends_after_connection_change() {
         let mut state = SurroundingTextContextState::default();
 
-        assert!(state.should_send((1, 0), "context"));
-        state.remember((1, 0), "context");
+        assert!(state.should_send((1, 0), "context", "right"));
+        state.remember((1, 0), "context", "right");
 
-        assert!(!state.should_send((1, 0), "context"));
-        assert!(state.should_send((2, 0), "context"));
-        assert!(state.should_send((1, 1), "context"));
-        assert!(state.should_send((1, 0), "changed"));
+        assert!(!state.should_send((1, 0), "context", "right"));
+        assert!(state.should_send((2, 0), "context", "right"));
+        assert!(state.should_send((1, 1), "context", "right"));
+        assert!(state.should_send((1, 0), "changed", "right"));
+        assert!(state.should_send((1, 0), "context", "changed"));
+        assert!(state.should_send((1, 0), "", ""));
+        state.remember((1, 0), "", "");
+        state.invalidate();
+        assert!(state.should_send((1, 0), "", ""));
     }
 
     #[test]

@@ -22,10 +22,12 @@ struct Document {
     end: i32,
     selection: i32,
     sessions: usize,
+    reads: usize,
     writes: usize,
     ends: usize,
     committed: Vec<String>,
     movement_limit: Option<i32>,
+    on_session: Option<Rc<dyn Fn()>>,
 }
 
 fn unsupported<T>() -> windows::core::Result<T> {
@@ -66,7 +68,8 @@ impl ITfRange_Impl for Range_Impl {
         capacity: u32,
         length: *mut u32,
     ) -> windows::core::Result<()> {
-        let document = self.document.borrow();
+        let mut document = self.document.borrow_mut();
+        document.reads += 1;
         let start = self.start.get() as usize;
         let count = (self.end.get() as usize - start).min(capacity as usize);
         unsafe {
@@ -304,8 +307,12 @@ impl ITfContext_Impl for Context_Impl {
         session: Option<&ITfEditSession>,
         flags: TF_CONTEXT_EDIT_CONTEXT_FLAGS,
     ) -> windows::core::Result<HRESULT> {
-        assert_eq!(flags, TF_ES_READWRITE | TF_ES_SYNC);
+        assert!(flags == TF_ES_READWRITE | TF_ES_SYNC || flags == TF_ES_READ | TF_ES_SYNC);
         self.document.borrow_mut().sessions += 1;
+        let callback = self.document.borrow_mut().on_session.take();
+        if let Some(callback) = callback {
+            callback();
+        }
         Ok(unsafe { session.unwrap().DoEditSession(1) }
             .err()
             .map_or(HRESULT(0), |error| error.code()))
@@ -388,10 +395,12 @@ fn fixture(prefix: &str, old: &str) -> (ITfTextInputProcessor, SharedDocument) {
         end,
         selection: end,
         sessions: 0,
+        reads: 0,
         writes: 0,
         ends: 0,
         committed: Vec::new(),
         movement_limit: None,
+        on_session: None,
     }));
     let processor = TextServiceFactory::create::<ITfTextInputProcessor>().unwrap();
     let factory: &TextServiceFactory = unsafe { processor.as_impl() };
@@ -414,6 +423,80 @@ fn fixture(prefix: &str, old: &str) -> (ITfTextInputProcessor, SharedDocument) {
             .insert(GUID_DISPLAY_ATTRIBUTE, 1);
     }
     (processor, document)
+}
+
+#[test]
+fn superseded_surrounding_read_preserves_newer_composition() {
+    let (processor, document) = fixture("前", "古い候補");
+    let nested = processor.clone();
+    document.borrow_mut().on_session = Some(Rc::new(move || {
+        let factory: &TextServiceFactory = unsafe { nested.as_impl() };
+        let mut service = factory.borrow_mut().unwrap();
+        service.invalidate_mode_switch_requests();
+        let mut composition = service.borrow_mut_composition().unwrap();
+        composition.raw_input = "atarashii".into();
+        composition.preview = "新しい".into();
+    }));
+    let factory: &TextServiceFactory = unsafe { processor.as_impl() };
+    let error = factory.update_context("古い候補").unwrap_err();
+    assert!(error.is::<crate::tsf::surrounded_text::SupersededContext>());
+    let service = factory.borrow().unwrap();
+    let composition = service.borrow_composition().unwrap();
+    assert_eq!(composition.raw_input, "atarashii");
+    assert_eq!(composition.preview, "新しい");
+    assert_eq!(document.borrow().writes, 0);
+}
+
+#[test]
+fn surrounding_context_excludes_full_composition_and_checks_both_sides_before_reading() {
+    use crate::tsf::surrounded_text::read_surrounding_ranges;
+    let (_processor, document) = fixture("左😀\n", "変換中の候補");
+    let (start, end) = {
+        let state = document.borrow();
+        (state.start, state.end)
+    };
+    let excluded = range(&document, start, end);
+    let actual = read_surrounding_ranges(0, &excluded, true, |_| Ok(true)).unwrap();
+    assert_eq!(actual.left, "左😀\n");
+    assert_eq!(actual.right, "後");
+    assert!(actual.permitted);
+    let reads = document.borrow().reads;
+    let denied = read_surrounding_ranges(0, &excluded, true, |span| {
+        Ok(anchor(Some(span), TF_ANCHOR_START) < end)
+    })
+    .unwrap();
+    assert!(!denied.permitted);
+    assert!(denied.left.is_empty() && denied.right.is_empty());
+    assert_eq!(document.borrow().reads, reads);
+    assert!(
+        read_surrounding_ranges(0, &excluded, true, |_| anyhow::bail!("unreadable scope")).is_err()
+    );
+    // A selection (including reconversion) uses the same outside-range contract.
+    let selection = range(&document, start, end);
+    assert_eq!(
+        read_surrounding_ranges(0, &selection, true, |_| Ok(true)).unwrap(),
+        actual
+    );
+}
+
+#[test]
+fn surrounding_context_clips_utf16_edges_and_has_bounded_reads() {
+    use crate::tsf::surrounded_text::read_surrounding_ranges;
+    let left = format!("😀{}", "あ".repeat(63));
+    let (_processor, document) = fixture(&left, "かな");
+    let (start, end) = {
+        let state = document.borrow();
+        (state.start, state.end)
+    };
+    document
+        .borrow_mut()
+        .text
+        .extend(format!("{}😀後", "い".repeat(62)).encode_utf16());
+    let actual =
+        read_surrounding_ranges(0, &range(&document, start, end), true, |_| Ok(true)).unwrap();
+    assert_eq!(actual.left, "あ".repeat(63));
+    assert_eq!(actual.right, format!("後{}", "い".repeat(62)));
+    assert!(!actual.left.contains('�') && !actual.right.contains('�'));
 }
 
 #[test]

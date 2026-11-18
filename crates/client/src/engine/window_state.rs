@@ -25,7 +25,32 @@ pub(crate) struct CandidateWindowUpdate<'a> {
     pub reading_vertical_adjustment: Option<i32>,
 }
 
-impl CandidateWindowUpdate<'_> {
+impl<'a> CandidateWindowUpdate<'a> {
+    pub(crate) fn for_selection(
+        candidates: &'a [String],
+        selected_index: i32,
+        reading: Option<&'a str>,
+        reading_vertical_adjustment: Option<i32>,
+        revision: Option<CandidateWindowRevision>,
+        replace_candidates: bool,
+    ) -> (Self, CandidateWindowUpdateKind) {
+        let kind = if replace_candidates {
+            CandidateWindowUpdateKind::Unconditional
+        } else {
+            CandidateWindowUpdateKind::Selection(revision)
+        };
+        (
+            Self {
+                candidates: replace_candidates.then_some(candidates),
+                selected_index: Some(selected_index),
+                reading,
+                reading_vertical_adjustment,
+                ..Self::default()
+            },
+            kind,
+        )
+    }
+
     pub fn to_request(self) -> UpdateCandidateWindowRequest {
         UpdateCandidateWindowRequest {
             visible: self.visible,

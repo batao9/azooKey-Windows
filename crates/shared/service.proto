@@ -100,6 +100,9 @@ message RemoveTextResponse {
 message MoveCursorRequest {
   int32 offset = 1; // Relative cursor movement in input units.
   uint64 request_id = 2;
+  // Offset-zero context refresh at an exact raw-input boundary, without
+  // changing the live cursor or choosing an automatic first clause.
+  optional int32 required_input_count = 3;
 }
 
 // Moves a clause boundary to the adjacent independent input segment. The
@@ -217,6 +220,8 @@ message ClearTextResponse {
 message SetContextRequest {
   string context = 1;
   uint64 request_id = 2;
+  // Committed text outside the selection/composition. Empty explicitly clears it.
+  string right_context = 3;
 }
 
 message SetContextResponse {

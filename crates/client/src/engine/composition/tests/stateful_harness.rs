@@ -447,6 +447,8 @@ fn candidates_owned(
 ) -> Candidates {
     let candidate_ids = (1..=texts.len() as u64).collect();
     Candidates {
+        context_epoch: 0,
+        explicit_selection: None,
         texts,
         sub_texts,
         hiragana,

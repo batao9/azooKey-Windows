@@ -208,6 +208,59 @@ fn selection(
 }
 
 #[test]
+fn context_refreshed_selection_replaces_rows_even_when_ui_revision_is_current() {
+    let (mut service, probe, server) = fixture();
+    let old = vec!["橋".into(), "箸".into()];
+    let revision = initial(&mut service, &old);
+    let refreshed = vec!["箸".into(), "橋".into()];
+    let (update, kind) = CandidateWindowUpdate::for_selection(
+        &refreshed,
+        1,
+        Some("はし"),
+        None,
+        Some(revision),
+        true,
+    );
+    let delivery = service
+        .update_candidate_window_scoped(
+            update,
+            kind,
+            || true,
+            || panic!("a context replacement must not depend on a rejected UI revision"),
+        )
+        .unwrap();
+    let new_revision = delivery.candidate_revision().unwrap();
+    assert_ne!(new_revision, revision);
+    {
+        let state = probe.state.lock().unwrap();
+        assert_eq!(state.requests.len(), 2);
+        assert_eq!(state.requests[1].expected_candidate_revision, None);
+        let applied = &state.applied[1];
+        assert_eq!(applied.candidates.as_ref().unwrap().candidates, refreshed);
+        assert_eq!(applied.selected_index, Some(1));
+        assert_eq!(applied.reading.as_deref(), Some("はし"));
+    }
+    let (update, kind) = CandidateWindowUpdate::for_selection(
+        &refreshed,
+        0,
+        Some("はし"),
+        None,
+        Some(new_revision),
+        false,
+    );
+    service
+        .update_candidate_window_scoped(update, kind, || true, || None)
+        .unwrap();
+    let state = probe.state.lock().unwrap();
+    assert!(state.applied[2].candidates.is_none());
+    assert_eq!(
+        state.requests[2].expected_candidate_revision,
+        Some(new_revision.candidate_revision)
+    );
+    server.abort();
+}
+
+#[test]
 fn candidate_window_selection_omits_rows_until_restart_or_another_owner_requires_full_state() {
     let (mut service, probe, server) = fixture();
     let candidates = vec!["かな".into(), "仮名".into(), "カナ".into()];

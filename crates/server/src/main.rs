@@ -412,6 +412,7 @@ struct FFICandidate {
 unsafe extern "C" {
     fn Initialize(path: *const c_char, use_zenzai: bool);
     fn SetContext(context: *const c_char);
+    fn SetSurroundingContext(context: *const c_char, right_context: *const c_char);
     fn AppendText(input: *const c_char, cursorPtr: *mut c_int) -> *mut c_char;
     fn AppendTextDirect(input: *const c_char, cursorPtr: *mut c_int) -> *mut c_char;
     fn RemoveText(cursorPtr: *mut c_int) -> *mut c_char;
@@ -439,6 +440,10 @@ unsafe extern "C" {
     fn SelectJevCandidate(json: *const c_char) -> c_int;
     fn GetComposedText(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
     fn GetComposedTextForReconversion(lengthPtr: *mut c_int) -> *mut *mut FFICandidate;
+    fn RefreshComposedTextForInputCount(
+        requiredInputCount: c_int,
+        lengthPtr: *mut c_int,
+    ) -> *mut *mut FFICandidate;
     fn GetComposedTextForCursorPrefix(
         requiredInputCount: c_int,
         lengthPtr: *mut c_int,
@@ -1446,11 +1451,12 @@ fn get_composed_text(
         required_cursor_prefix_input_count,
         false,
         request_id,
+        false,
     )
 }
 
 fn get_reconversion_composed_text(request_id: u64) -> Result<ComposedText, String> {
-    get_composed_text_from_ffi(false, None, true, request_id)
+    get_composed_text_from_ffi(false, None, true, request_id, false)
 }
 
 fn get_composed_text_from_ffi(
@@ -1458,6 +1464,7 @@ fn get_composed_text_from_ffi(
     required_cursor_prefix_input_count: Option<i32>,
     reconversion: bool,
     request_id: u64,
+    context_refresh: bool,
 ) -> Result<ComposedText, String> {
     let mut length: c_int = 0;
     let operation = if reconversion {
@@ -1469,7 +1476,12 @@ fn get_composed_text_from_ffi(
     };
     let ffi_call_start = Instant::now();
     let result = unsafe {
-        if reconversion {
+        if context_refresh {
+            RefreshComposedTextForInputCount(
+                required_cursor_prefix_input_count.unwrap_or(-1),
+                &mut length,
+            )
+        } else if reconversion {
             GetComposedTextForReconversion(&mut length)
         } else if use_cursor_prefix {
             GetComposedTextForCursorPrefix(
@@ -2080,6 +2092,11 @@ impl AzookeyService for MyAzookeyService {
         set_request_id(request_id);
         let handler_start = Instant::now();
         let raw_offset = request.offset;
+        if request.required_input_count.is_some() && raw_offset != 0 {
+            return Err(Status::invalid_argument(
+                "context refresh cannot move the cursor",
+            ));
+        }
 
         let use_cursor_prefix = raw_offset == 0;
         let move_start = Instant::now();
@@ -2094,8 +2111,12 @@ impl AzookeyService for MyAzookeyService {
             composing_text.text.chars().count()
         );
         let get_composed_start = Instant::now();
-        let composed_text = get_composed_text(use_cursor_prefix, None, request_id)
-            .map_err(|error| status_from_error("move_cursor", error))?;
+        let composed_text = if let Some(boundary) = request.required_input_count {
+            get_composed_text_from_ffi(true, Some(boundary), false, request_id, true)
+        } else {
+            get_composed_text(use_cursor_prefix, None, request_id)
+        }
+        .map_err(|error| status_from_error("move_cursor", error))?;
         let raw_input = use_cursor_prefix
             .then(get_raw_input)
             .transpose()
@@ -2618,9 +2639,11 @@ impl AzookeyService for MyAzookeyService {
 
         let context = cstring_from_input("SetContext.context", trimmed_context)
             .map_err(|error| status_from_error("set_context", error))?;
+        let right_context = cstring_from_input("SetContext.right_context", &request.right_context)
+            .map_err(|error| status_from_error("set_context", error))?;
 
         let set_context_start = Instant::now();
-        unsafe { SetContext(context.as_ptr()) };
+        unsafe { SetSurroundingContext(context.as_ptr(), right_context.as_ptr()) };
         performance_event_lazy!(
             request_id,
             "set_context",

@@ -1142,6 +1142,7 @@ private func learningCandidateOutput(_ candidate: Candidate) -> String {
 
 private func makeConvertRequestOptions(
     context: String,
+    rightContext: String = "",
     zenzaiEnabled: Bool,
     runtimeDirectoryURL: URL,
     textReplacer: TextReplacer,
@@ -1168,7 +1169,8 @@ private func makeConvertRequestOptions(
             versionDependentMode: .v3(
                 .init(
                     profile: profile,
-                    leftSideContext: context
+                    leftSideContext: context,
+                    rightSideContext: rightContext.isEmpty ? nil : rightContext
                 )
             )
         ) : .off,
@@ -1891,15 +1893,18 @@ private func preferCursorPrefixBoundary(
 
 @MainActor func getOptions(
     context: String = "",
+    rightContext: String? = nil,
     zenzaiEnabled: Bool
 ) -> ConvertRequestOptions {
     configureEngineRuntime()
     var options = makeConvertRequestOptions(
         context: context,
+        rightContext: (config["rightContextSupported"] as? Bool) == true
+            ? (rightContext ?? (config["rightContext"] as? String) ?? "") : "",
         zenzaiEnabled: zenzaiEnabled,
         runtimeDirectoryURL: converterRuntimeDirectoryURL(),
         textReplacer: currentEmojiTextReplacer(),
-        zenzaiWeightURL: execURL.appendingPathComponent("zenz.gguf"),
+        zenzaiWeightURL: currentZenzaiModelURL(),
         profile: (config["profile"] as? String) ?? "",
         learningType: currentLearningType,
         learningMemoryDirectoryURL: currentLearningMemoryDirectoryURL,
@@ -1921,6 +1926,17 @@ private func preferCursorPrefixBoundary(
         backend: config["backend"] as? String,
         cpuBackendSupported: cpuZenzaiBackendSupportedFromEnvironment()
     )
+}
+
+@MainActor func currentZenzaiModelURL() -> URL {
+    execURL.appendingPathComponent((config["modelFilename"] as? String) ?? "zenz.gguf")
+}
+
+@MainActor func selectZenzaiModel() {
+    let filename = "zenz-v3.2-small.gguf"
+    let supported = FileManager.default.fileExists(atPath: execURL.appendingPathComponent(filename).path)
+    config["modelFilename"] = supported ? filename : "zenz.gguf"
+    config["rightContextSupported"] = supported
 }
 
 private struct ZenzaiDiagnosticSnapshot {
@@ -2198,7 +2214,7 @@ private let backgroundWarmupRunner = BackgroundWarmupRunner()
         preloadDictionary: backgroundWarmupPreloadsDictionary,
         runtimeDirectoryURL: converterRuntimeDirectoryURL(),
         textReplacer: currentEmojiTextReplacer(),
-        zenzaiWeightURL: execURL.appendingPathComponent("zenz.gguf"),
+        zenzaiWeightURL: currentZenzaiModelURL(),
         profile: (config["profile"] as? String) ?? "",
         context: contextString,
         input: input,
@@ -2528,6 +2544,7 @@ func cursorPrefixBoundaryFirstClauseResults(
     let previousZenzaiEnabled = (config["enable"] as? Bool) ?? false
     let previousProfile = (config["profile"] as? String) ?? ""
     let previousBackend = (config["backend"] as? String) ?? "cpu"
+    let previousModel = currentZenzaiModelURL()
     let previousExperimentalTypoCorrection =
         (config["experimentalTypoCorrection"] as? Bool) ?? false
     let previousMixedInput = (config["experimentalMixedInput"] as? Bool) ?? false
@@ -2544,6 +2561,10 @@ func cursorPrefixBoundaryFirstClauseResults(
     config["enable"] = false
     config["profile"] = ""
     config["backend"] = "cpu"
+    // The explicit v3.2 asset may coexist with legacy zenz.gguf. Resolve only
+    // on config reload; no filesystem access is added to the key path. Legacy
+    // assets never receive the v3.2-only right-context tag.
+    selectZenzaiModel()
     config["experimentalTypoCorrection"] = false
     config["experimentalMixedInput"] = false
     config["englishDictionary"] = true
@@ -2640,6 +2661,7 @@ func cursorPrefixBoundaryFirstClauseResults(
     if previousEffectiveZenzaiEnabled != currentEffectiveZenzaiEnabled
         || previousProfile != currentProfile
         || backendChanged
+        || previousModel != currentZenzaiModelURL()
         || previousUsedCustomRomajiTable != currentUsedCustomRomajiTable
         || previousExperimentalTypoCorrection != currentExperimentalTypoCorrection
         || previousMixedInput != ((config["experimentalMixedInput"] as? Bool) ?? false)
@@ -2657,7 +2679,7 @@ func cursorPrefixBoundaryFirstClauseResults(
     }
     let conversionDictionary = makeConversionDictionaryEntries(userEntries: dynamicUserDictionary,
         experimentalTypoCorrectionEnabled: currentExperimentalTypoCorrection)
-    let previousModelReady = converter.zenzStatus == "load \(execURL.appendingPathComponent("zenz.gguf").absoluteString)"
+    let previousModelReady = converter.zenzStatus == "load \(currentZenzaiModelURL().absoluteString)"
     let dictionariesApplied = configureBundledDictionaries(
         mode: .init(english: config["englishDictionary"] as? Bool ?? true,
                     katakana: config["katakanaEnglishDictionary"] as? Bool ?? true),
@@ -2695,6 +2717,8 @@ func cursorPrefixBoundaryFirstClauseResults(
     converterPreloadDictionary = true
     composingText = ComposingText()
     composingTextSnapshots.removeAll()
+    config["context"] = ""
+    config["rightContext"] = ""
     bundledDictionaryConfigurationInitialized = false
     pendingBundledDictionaryConfiguration = nil
     ensureConverterRuntimeDirectory()
@@ -3088,6 +3112,8 @@ func cursorPrefixBoundaryFirstClauseResults(
     normalNBestSupplementConverter.stopComposition()
     composingText = ComposingText()
     composingTextSnapshots.removeAll()
+    config["context"] = ""
+    config["rightContext"] = ""
     clearLearningCandidateCache()
     if applyDictionaryChange { applyPendingBundledDictionaries() }
     serverLog("DEBUG", "\(operation): completed")
@@ -3478,6 +3504,29 @@ public func free_candidate_list(
     requiredInputCount: Int32,
     lengthPtr: UnsafeMutablePointer<CInt>
 ) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
+    getComposedTextForCursorPrefix(requiredInputCount: requiredInputCount, lengthPtr: lengthPtr)
+}
+
+@_silgen_name("RefreshComposedTextForInputCount")
+@MainActor public func refresh_composed_text_for_input_count(
+    requiredInputCount: Int32,
+    lengthPtr: UnsafeMutablePointer<CInt>
+) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
+    guard requiredInputCount > 0, Int(requiredInputCount) <= composingText.input.count else {
+        lengthPtr.pointee = 0
+        return to_list_pointer([])
+    }
+    let saved = composingText
+    defer { composingText = saved }
+    let prefix = makeCursorPrefixExactClauseComposingText(prefixComposingText: saved, correspondingCount: Int(requiredInputCount))
+    _ = composingText.moveCursorFromCursorPosition(count: prefix.convertTarget.count - composingText.convertTargetCursorPosition)
+    return getComposedTextForCursorPrefix(requiredInputCount: requiredInputCount, lengthPtr: lengthPtr)
+}
+
+@MainActor private func getComposedTextForCursorPrefix(
+    requiredInputCount: Int32,
+    lengthPtr: UnsafeMutablePointer<CInt>
+) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
     let functionStart = performanceNow()
     let performanceEnabled = serverLogCallbacks.isPerformanceLogEnabled()
     let hiragana = composingText.convertTarget
@@ -3826,7 +3875,17 @@ public func free_candidate_list(
 @MainActor public func set_context(
     context: UnsafePointer<CChar>
 ) {
-    let contextString = String(cString: context)
-    config["context"] = contextString
-    serverLog("DEBUG", "SetContext: contextLength=\(contextString.count)")
+    setSurroundingContext(left: String(cString: context), right: "")
+}
+
+@_silgen_name("SetSurroundingContext")
+@MainActor public func set_surrounding_context(context: UnsafePointer<CChar>, rightContext: UnsafePointer<CChar>) {
+    setSurroundingContext(left: String(cString: context), right: String(cString: rightContext))
+}
+
+@MainActor func setSurroundingContext(left: String, right: String) {
+    // Keep external context separate from composition, including cursor-prefix
+    // suffixes. The converter invalidates neural prefix constraints on mode changes.
+    config["context"] = String(left.suffix(40))
+    config["rightContext"] = String(right.prefix(40))
 }
